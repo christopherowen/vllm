@@ -448,7 +448,7 @@ def use_flashinfer_prefill() -> bool:
         and flashinfer_available
         and not vllm_config.attention_config.use_cudnn_prefill
         and not vllm_config.attention_config.use_trtllm_ragged_deepseek_prefill
-        and current_platform.is_device_capability_family(100)
+        and current_platform.is_blackwell_class()
     )
 
 
@@ -459,7 +459,7 @@ def use_cudnn_prefill() -> bool:
     return (
         flashinfer_available
         and vllm_config.attention_config.use_cudnn_prefill
-        and current_platform.is_device_capability_family(100)
+        and current_platform.is_blackwell_class()
         and has_nvidia_artifactory()
     )
 
@@ -472,7 +472,7 @@ def use_trtllm_ragged_deepseek_prefill() -> bool:
     return (
         flashinfer_available
         and vllm_config.attention_config.use_trtllm_ragged_deepseek_prefill
-        and current_platform.is_device_capability_family(100)
+        and current_platform.is_blackwell_class()
     )
 
 

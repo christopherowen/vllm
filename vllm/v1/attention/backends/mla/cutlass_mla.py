@@ -60,7 +60,8 @@ class CutlassMLABackend(MLACommonBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return capability.major == 10
+        # Blackwell-class: SM10x, SM11x, SM12x (GB10)
+        return capability.major in (10, 11, 12)
 
 
 class SM100Workspace:
