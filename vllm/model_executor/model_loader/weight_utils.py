@@ -29,6 +29,7 @@ from vllm import envs
 from vllm.config import ModelConfig
 from vllm.config.load import LoadConfig
 from vllm.distributed import get_tensor_model_parallel_rank
+from vllm.distributed.parallel_state import get_world_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import (
     QuantizationConfig,
@@ -793,11 +794,13 @@ def fastsafetensors_weights_iterator(
     """Iterate over the weights in the model safetensor files
     using fastsafetensor library."""
     if torch.distributed.is_initialized():
-        pg = torch.distributed.group.WORLD
+        world = get_world_group()
+        pg = world.device_group
+        device = world.device
     else:
         pg = SingleGroup()
+        device = torch.device(f"cuda:{pg.rank()}")
 
-    device = torch.device(f"cuda:{pg.rank()}")
     weight_files_sub_lists = [
         hf_weights_files[i : i + pg.size()]
         for i in range(0, len(hf_weights_files), pg.size())

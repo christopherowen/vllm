@@ -131,6 +131,14 @@ def get_mxfp4_backend(with_lora_support: bool) -> Mxfp4Backend:
         ):
             return Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM
         elif current_platform.is_blackwell_class() and has_flashinfer():
+            # Check if this is SM121 (DGX Spark) - needs special handling
+            # SM121 doesn't support TRT-LLM backend, must use CUTLASS (SM90 path)
+            capability = current_platform.get_device_capability()
+            if capability and capability.major == 12 and capability.minor == 1:
+                logger.info_once(
+                    "Using FlashInfer MXFP4 BF16 CUTLASS backend for SM121 (DGX Spark)"
+                )
+                return Mxfp4Backend.SM90_FI_MXFP4_BF16
             logger.info_once(
                 "Using FlashInfer MXFP4 BF16 backend for SM100, "
                 "For faster performance on SM100, consider setting "
