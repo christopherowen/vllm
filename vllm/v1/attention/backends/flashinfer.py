@@ -1500,6 +1500,7 @@ class FlashInferImpl(AttentionImpl):
                         kv_cache_permute,
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
+                        sinks=self.sinks,
                         out=output_tmp,
                         lse=lse,
                         return_lse=True,
@@ -1516,6 +1517,7 @@ class FlashInferImpl(AttentionImpl):
                         kv_cache_permute,
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
+                        sinks=self.sinks,
                         out=output[:num_decode_tokens],
                     )
             else:
