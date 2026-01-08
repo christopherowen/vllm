@@ -356,7 +356,13 @@ class FlashInferBackend(AttentionBackend):
 
     @classmethod
     def supports_sink(cls) -> bool:
-        """FlashInfer supports sinks when TRTLLM attention is available (SM100)."""
+        """FlashInfer supports sinks when TRTLLM attention is available (SM100).
+        
+        For SM12x (GB10/DGX Spark), we report sink support as True to allow
+        model loading, but sinks will be disabled at runtime with a warning.
+        This enables throughput benchmarking while noting quality implications.
+        """
+        from vllm.platforms import current_platform
         from vllm.utils.flashinfer import (
             force_use_trtllm_attention,
             supports_trtllm_attention,
@@ -368,7 +374,16 @@ class FlashInferBackend(AttentionBackend):
             return False
 
         # Check if TRTLLM is supported on this platform
-        return supports_trtllm_attention()
+        if supports_trtllm_attention():
+            return True
+        
+        # SM12x special case: allow loading models with sinks
+        # (sinks will be disabled at runtime with a warning)
+        capability = current_platform.get_device_capability()
+        if capability is not None and capability.major == 12:
+            return True
+        
+        return False
 
     @classmethod
     def get_required_kv_cache_layout(cls) -> KVCacheLayoutType | None:
@@ -595,12 +610,22 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.window_left = self.global_hyperparameters.window_left
         self.logits_soft_cap = self.global_hyperparameters.logits_soft_cap
         self.has_sinks = self.global_hyperparameters.has_sinks
+        self.use_native_sinks = False  # Flag for SM12x native sink support
         if self.has_sinks and not can_use_trtllm:
-            raise NotImplementedError(
-                "FlashInfer backend currently does not support attention "
-                "sinks, please use trtllm on blackwell or flash attention on "
-                "earlier GPUs."
-            )
+            # SM12x (GB10/DGX Spark) uses FlashInfer native FA2 attention sink module
+            capability = current_platform.get_device_capability()
+            if capability is not None and capability.major == 12:
+                logger.info_once(
+                    "SM12x detected with attention sinks - using FlashInfer native "
+                    "FA2 attention sink module for full sink support."
+                )
+                self.use_native_sinks = True
+            else:
+                raise NotImplementedError(
+                    "FlashInfer backend currently does not support attention "
+                    "sinks, please use trtllm on blackwell or flash attention on "
+                    "earlier GPUs."
+                )
         # Preparing persistent buffers
         self.pin_memory = is_pin_memory_available()
         self.paged_kv_indptr = self._make_buffer(max_num_reqs + 1)
@@ -827,13 +852,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         )
 
         if not all_uses_trtllm:
-            if self.has_sinks:
-                raise NotImplementedError(
-                    "FlashInfer backend currently does not support attention "
-                    "sinks, please use trtllm on blackwell or flash attention "
-                    "on earlier GPUs."
-                )
-
             if not self.global_hyperparameters.has_same_window_lefts:
                 raise ValueError(
                     "Window left is not the same for all layers. "
@@ -1052,6 +1070,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         kv_data_type=self.kv_cache_dtype,
                         fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
+                        use_sinks=self.use_native_sinks,
                     )
                 attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)
 
@@ -1375,12 +1394,18 @@ class FlashInferImpl(AttentionImpl):
                     )
                     assert prefill_wrapper._sm_scale == self.scale
                     assert prefill_wrapper._causal
+                    # Pass sinks if using native FlashInfer sink support (SM12x)
+                    run_kwargs: dict = {
+                        "k_scale": layer._k_scale_float,
+                        "v_scale": layer._v_scale_float,
+                        "out": output[num_decode_tokens:],
+                    }
+                    if getattr(prefill_wrapper, '_use_sinks', False):
+                        run_kwargs["sinks"] = self.sinks
                     prefill_wrapper.run(
                         prefill_query,
                         kv_cache_permute,
-                        k_scale=layer._k_scale_float,
-                        v_scale=layer._v_scale_float,
-                        out=output[num_decode_tokens:],
+                        **run_kwargs,
                     )
             else:
                 assert isinstance(attn_metadata.prefill, TRTLLMPrefill)
@@ -1599,6 +1624,7 @@ def fast_plan_decode(
             logits_soft_cap,
             q_data_type,
             kv_data_type,
+            None,  # o_data_type
             data_type,
             sm_scale,
             rope_scale,

@@ -131,14 +131,15 @@ def get_mxfp4_backend(with_lora_support: bool) -> Mxfp4Backend:
         ):
             return Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM
         elif current_platform.is_blackwell_class() and has_flashinfer():
-            # Check if this is SM121 (DGX Spark) - needs special handling
-            # SM121 doesn't support TRT-LLM backend, must use CUTLASS (SM90 path)
+            # Check if this is SM12x (GB10 DGX Spark, Thor) - use native CUTLASS path
+            # SM12x supports block-scaled CUTLASS kernels with identity SFA
             capability = current_platform.get_device_capability()
-            if capability and capability.major == 12 and capability.minor == 1:
+            if capability and capability.major == 12:
                 logger.info_once(
-                    "Using FlashInfer MXFP4 BF16 CUTLASS backend for SM121 (DGX Spark)"
+                    "Using FlashInfer MXFP4 MXFP8 CUTLASS backend for SM12x "
+                    f"(SM{capability.major}{capability.minor}) with identity SFA"
                 )
-                return Mxfp4Backend.SM90_FI_MXFP4_BF16
+                return Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS
             logger.info_once(
                 "Using FlashInfer MXFP4 BF16 backend for SM100, "
                 "For faster performance on SM100, consider setting "
@@ -1004,6 +1005,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             # Backend-specific preparation
             if self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS:
+                logger.debug_once(
+                    "[SM12x MXFP4] Using FlashInfer CUTLASS MoE with "
+                    "MXFP8 activation quantization and identity SFA"
+                )
                 from flashinfer import mxfp8_quantize
 
                 x_quant, x_scale = mxfp8_quantize(x, True, 32)

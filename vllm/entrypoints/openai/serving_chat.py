@@ -153,11 +153,27 @@ class OpenAIServingChat(OpenAIServing):
 
         self.use_harmony = self.model_config.hf_config.model_type == "gpt_oss"
         if self.use_harmony:
-            if "stop_token_ids" not in self.default_sampling_params:
-                self.default_sampling_params["stop_token_ids"] = []
-            self.default_sampling_params["stop_token_ids"].extend(
-                get_stop_tokens_for_assistant_actions()
-            )
+            # Check if harmony encoding is available before enabling harmony path
+            try:
+                from vllm.entrypoints.openai.parser.harmony_utils import get_encoding
+                encoding = get_encoding()
+                if encoding is None:
+                    raise ValueError("Harmony encoding returned None")
+            except Exception as e:
+                logger.warning(
+                    f"Harmony encoding not available for gpt_oss model: {e}. "
+                    "Falling back to standard tokenization. "
+                    "Model quality may be affected. "
+                    "To use harmony encoding, ensure vocab files are accessible."
+                )
+                self.use_harmony = False
+            
+            if self.use_harmony:
+                if "stop_token_ids" not in self.default_sampling_params:
+                    self.default_sampling_params["stop_token_ids"] = []
+                self.default_sampling_params["stop_token_ids"].extend(
+                    get_stop_tokens_for_assistant_actions()
+                )
 
         # NOTE(woosuk): While OpenAI's chat completion API supports browsing
         # for some models, currently vLLM doesn't support it. Please use the

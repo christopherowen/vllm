@@ -481,11 +481,28 @@ def construct_harmony_previous_input_messages(
 
 
 def render_for_completion(messages: list[Message]) -> list[int]:
-    conversation = Conversation.from_messages(messages)
-    token_ids = get_encoding().render_conversation_for_completion(
-        conversation, Role.ASSISTANT
-    )
-    return token_ids
+    try:
+        encoding = get_encoding()
+        if encoding is None:
+            raise ValueError("Harmony encoding not available")
+        conversation = Conversation.from_messages(messages)
+        token_ids = encoding.render_conversation_for_completion(
+            conversation, Role.ASSISTANT
+        )
+        return token_ids
+    except Exception as e:
+        # Fallback: return empty token_ids and let the caller handle it
+        # This allows the model to run without harmony encoding (quality may be affected)
+        import logging
+        logging.warning(
+            f"Failed to render with harmony encoding: {e}. "
+            "Chat messages will use fallback tokenization. Quality may be affected."
+        )
+        raise ValueError(
+            f"Harmony encoding not available: {e}. "
+            "The gpt-oss model requires the harmony tokenizer vocab files. "
+            "Please ensure TIKTOKEN_ENCODINGS_BASE is set or use a different model."
+        ) from e
 
 
 def _parse_browser_tool_call(message: Message, recipient: str) -> ResponseOutputItem:
@@ -769,7 +786,12 @@ def parse_remaining_state(parser: StreamableParser) -> list[ResponseOutputItem]:
 
 
 def get_stop_tokens_for_assistant_actions() -> list[int]:
-    return get_encoding().stop_tokens_for_assistant_actions()
+    try:
+        return get_encoding().stop_tokens_for_assistant_actions()
+    except Exception as e:
+        import logging
+        logging.warning(f"Failed to load harmony encoding: {e}. Using empty stop tokens.")
+        return []
 
 
 def get_streamable_parser_for_assistant() -> StreamableParser:

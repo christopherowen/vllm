@@ -219,17 +219,32 @@ class OpenAIServingResponses(OpenAIServing):
 
         self.use_harmony = self.model_config.hf_config.model_type == "gpt_oss"
         if self.use_harmony:
-            logger.warning(
-                "For gpt-oss, we ignore --enable-auto-tool-choice "
-                "and always enable tool use."
-            )
-            # OpenAI models have two EOS-like tokens: <|return|> and <|call|>.
-            # We need to add them to the stop token ids.
-            if "stop_token_ids" not in self.default_sampling_params:
-                self.default_sampling_params["stop_token_ids"] = []
-            self.default_sampling_params["stop_token_ids"].extend(
-                get_stop_tokens_for_assistant_actions()
-            )
+            # Check if harmony encoding is available before enabling harmony path
+            try:
+                from vllm.entrypoints.openai.parser.harmony_utils import get_encoding
+                encoding = get_encoding()
+                if encoding is None:
+                    raise ValueError("Harmony encoding returned None")
+            except Exception as e:
+                logger.warning(
+                    f"Harmony encoding not available for gpt_oss model: {e}. "
+                    "Falling back to standard tokenization. "
+                    "Model quality may be affected."
+                )
+                self.use_harmony = False
+            
+            if self.use_harmony:
+                logger.warning(
+                    "For gpt-oss, we ignore --enable-auto-tool-choice "
+                    "and always enable tool use."
+                )
+                # OpenAI models have two EOS-like tokens: <|return|> and <|call|>.
+                # We need to add them to the stop token ids.
+                if "stop_token_ids" not in self.default_sampling_params:
+                    self.default_sampling_params["stop_token_ids"] = []
+                self.default_sampling_params["stop_token_ids"].extend(
+                    get_stop_tokens_for_assistant_actions()
+                )
         self.enable_auto_tools = enable_auto_tools
         # set up tool use
         self.tool_parser = self._get_tool_parser(
