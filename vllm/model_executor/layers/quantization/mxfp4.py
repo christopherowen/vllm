@@ -131,24 +131,20 @@ def get_mxfp4_backend(with_lora_support: bool) -> Mxfp4Backend:
         ):
             return Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM
         elif current_platform.is_blackwell_class() and has_flashinfer():
+            # Check if this is SM12x (GB10 DGX Spark, Thor) - use native CUTLASS path
+            # SM12x supports block-scaled CUTLASS kernels with identity SFA
             capability = current_platform.get_device_capability()
-            sm_str = f"SM{capability.major}{capability.minor}" if capability else "Blackwell"
-            
-            # SM12x (GB10 DGX Spark, Thor) uses the local SM120 CUTLASS GEMM
-            # which supports nvfp4 weights + MXFP8 activations with identity SFA
             if capability and capability.major == 12:
                 logger.info_once(
-                    f"Using FlashInfer MXFP4 MXFP8 CUTLASS backend for {sm_str} "
-                    "with SM120 CUTLASS GEMM and identity SFA"
+                    "Using FlashInfer MXFP4 MXFP8 CUTLASS backend for SM12x "
+                    f"(SM{capability.major}{capability.minor}) with identity SFA"
                 )
                 return Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS
-            
-            # SM100/SM103/SM110 default to BF16 path
             logger.info_once(
-                f"Using FlashInfer MXFP4 BF16 backend for {sm_str}. "
-                "For faster performance, consider setting "
-                "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS=1 or "
-                "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8=1 (TRT-LLM path)."
+                "Using FlashInfer MXFP4 BF16 backend for SM100, "
+                "For faster performance on SM100, consider setting "
+                "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8=1, though this may impact "
+                "accuracy."
             )
             return Mxfp4Backend.SM100_FI_MXFP4_BF16
         elif (
@@ -1009,10 +1005,34 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             # Backend-specific preparation
             if self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS:
-                logger.debug_once(
-                    "[SM12x MXFP4] Using FlashInfer CUTLASS MoE with "
-                    "MXFP8 activation quantization and identity SFA"
+                # === MXFP4 CALLSITE LOGGING (one-time) ===
+                # Proves vLLM is calling the correct FlashInfer MXFP4 path
+                logger.info_once(
+                    "[MoE] backend=flashinfer format=MXFP4_NATIVE "
+                    "fn=flashinfer.fused_moe.cutlass_fused_moe"
                 )
+                logger.info_once(
+                    f"[MoE] w13_weight dtype={layer.w13_weight.dtype} "
+                    f"shape={tuple(layer.w13_weight.shape)}"
+                )
+                logger.info_once(
+                    f"[MoE] w2_weight dtype={layer.w2_weight.dtype} "
+                    f"shape={tuple(layer.w2_weight.shape)}"
+                )
+                logger.info_once(
+                    f"[MoE] w13_weight_scale dtype={layer.w13_weight_scale.dtype} "
+                    f"shape={tuple(layer.w13_weight_scale.shape)}"
+                )
+                logger.info_once(
+                    f"[MoE] w2_weight_scale dtype={layer.w2_weight_scale.dtype} "
+                    f"shape={tuple(layer.w2_weight_scale.shape)}"
+                )
+                logger.info_once(
+                    f"[MoE] activation input dtype={x.dtype} "
+                    f"shape={tuple(x.shape)} → MXFP8 quantized"
+                )
+                # === END CALLSITE LOGGING ===
+                
                 from flashinfer import mxfp8_quantize
 
                 x_quant, x_scale = mxfp8_quantize(x, True, 32)
@@ -1033,6 +1053,24 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     fc2_expert_weights=layer.w2_weight.contiguous().view(torch.long),
                 )
             elif self.mxfp4_backend == Mxfp4Backend.SM90_FI_MXFP4_BF16:
+                # === MXFP4 CALLSITE LOGGING (one-time) ===
+                logger.info_once(
+                    "[MoE] backend=flashinfer format=MXFP4_BF16 "
+                    "fn=flashinfer.fused_moe.cutlass_fused_moe"
+                )
+                logger.info_once(
+                    f"[MoE] w13_weight dtype={layer.w13_weight.dtype} "
+                    f"shape={tuple(layer.w13_weight.shape)}"
+                )
+                logger.info_once(
+                    f"[MoE] w2_weight dtype={layer.w2_weight.dtype} "
+                    f"shape={tuple(layer.w2_weight.shape)}"
+                )
+                logger.info_once(
+                    f"[MoE] activation input dtype={x.dtype} (no quantization)"
+                )
+                # === END CALLSITE LOGGING ===
+                
                 assert x.dtype == torch.bfloat16
 
                 quant_scales = [

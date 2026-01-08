@@ -158,12 +158,30 @@ class FlashInferExperts(mk.FusedMoEPermuteExpertsUnpermute):
             f"{activation=} missing from {activation_str_to_value_map.keys()=}"
         )
 
+        # === CALLSITE LOGGING (one-time) ===
+        logger.info_once(
+            f"[MoE FlashInferExperts] quant_dtype={self.quant_dtype} "
+            f"use_deepseek_fp8_block_scale={self.use_deepseek_fp8_block_scale}"
+        )
+        logger.info_once(
+            f"[MoE FlashInferExperts] w1 dtype={w1.dtype} shape={tuple(w1.shape)}"
+        )
+        logger.info_once(
+            f"[MoE FlashInferExperts] w2 dtype={w2.dtype} shape={tuple(w2.shape)}"
+        )
+        logger.info_once(
+            f"[MoE FlashInferExperts] hidden_states dtype={hidden_states.dtype} "
+            f"shape={tuple(hidden_states.shape)}"
+        )
+        # === END CALLSITE LOGGING ===
+
         # Select quantization metadata based on FP8 format/path
         if (
             self.quant_dtype == torch.float8_e4m3fn
             and not self.use_deepseek_fp8_block_scale
         ):
             # FP8 per-tensor path: use global alphas/scales; do not pass input_sf
+            logger.debug_once("[MoE] Using FP8 per-tensor path")
             quant_scales = [
                 self.g1_alphas,  # w13_weight_scale * w13_input_scale
                 self.a2_gscale,  # 1.0 / w2_input_scale
@@ -175,6 +193,11 @@ class FlashInferExperts(mk.FusedMoEPermuteExpertsUnpermute):
             fc1_expert_weights = w1
             fc2_expert_weights = w2
         elif self.quant_dtype == "nvfp4":
+            # WARNING: This is NVFP4, not MXFP4!
+            logger.info_once(
+                "[MoE] WARNING: Using NVFP4 path (not MXFP4). "
+                "If you expected MXFP4, check your configuration."
+            )
             # Ensure w1_scale and w2_scale are not None before calling view
             assert self.w1_scale is not None and self.w2_scale is not None, (
                 "w1_scale and w2_scale must not be None for FlashInferExperts"
@@ -194,6 +217,7 @@ class FlashInferExperts(mk.FusedMoEPermuteExpertsUnpermute):
             fc2_expert_weights = w2.view(torch.long)
         elif self.use_deepseek_fp8_block_scale:
             # FP8 block-scale path: provide block-scale weights, omit a1q_scale
+            logger.debug_once("[MoE] Using DeepSeek FP8 block-scale path")
             quant_scales = [
                 self.w1_scale,
                 self.w2_scale,
@@ -202,6 +226,8 @@ class FlashInferExperts(mk.FusedMoEPermuteExpertsUnpermute):
             fc1_expert_weights = w1
             fc2_expert_weights = w2
         else:
+            # BF16/FP16 path (no quantization)
+            logger.debug_once("[MoE] Using BF16/FP16 path (no weight quantization)")
             quant_scales = None
             a1q_scale = None
             fc1_expert_weights = w1
