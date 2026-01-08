@@ -131,20 +131,24 @@ def get_mxfp4_backend(with_lora_support: bool) -> Mxfp4Backend:
         ):
             return Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM
         elif current_platform.is_blackwell_class() and has_flashinfer():
-            # Check if this is SM12x (GB10 DGX Spark, Thor) - use native CUTLASS path
-            # SM12x supports block-scaled CUTLASS kernels with identity SFA
             capability = current_platform.get_device_capability()
+            sm_str = f"SM{capability.major}{capability.minor}" if capability else "Blackwell"
+            
+            # SM12x (GB10 DGX Spark, Thor) uses the local SM120 CUTLASS GEMM
+            # which supports nvfp4 weights + MXFP8 activations with identity SFA
             if capability and capability.major == 12:
                 logger.info_once(
-                    "Using FlashInfer MXFP4 MXFP8 CUTLASS backend for SM12x "
-                    f"(SM{capability.major}{capability.minor}) with identity SFA"
+                    f"Using FlashInfer MXFP4 MXFP8 CUTLASS backend for {sm_str} "
+                    "with SM120 CUTLASS GEMM and identity SFA"
                 )
                 return Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS
+            
+            # SM100/SM103/SM110 default to BF16 path
             logger.info_once(
-                "Using FlashInfer MXFP4 BF16 backend for SM100, "
-                "For faster performance on SM100, consider setting "
-                "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8=1, though this may impact "
-                "accuracy."
+                f"Using FlashInfer MXFP4 BF16 backend for {sm_str}. "
+                "For faster performance, consider setting "
+                "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS=1 or "
+                "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8=1 (TRT-LLM path)."
             )
             return Mxfp4Backend.SM100_FI_MXFP4_BF16
         elif (
