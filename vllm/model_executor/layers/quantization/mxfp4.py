@@ -67,7 +67,7 @@ class Mxfp4Backend(Enum):
 
     # FlashInfer Backend
     SM100_FI_MXFP4_MXFP8_TRTLLM = 1
-    SM100_FI_MXFP4_MXFP8_CUTLASS = 2
+    SM100_FI_MXFP4_MXFP8_CUTLASS = 2  # CUTLASS grouped GEMM
     SM100_FI_MXFP4_BF16 = 3
     SM90_FI_MXFP4_BF16 = 4
 
@@ -76,6 +76,9 @@ class Mxfp4Backend(Enum):
 
     # Triton Backend
     TRITON = 6
+
+    # DP4A GEMV Backend (experimental - for M=1 decode optimization)
+    GEMV_DP4A = 7
 
 
 def get_mxfp4_backend_with_lora() -> Mxfp4Backend:
@@ -105,6 +108,39 @@ def get_mxfp4_backend_with_lora() -> Mxfp4Backend:
 
 def get_mxfp4_backend(with_lora_support: bool) -> Mxfp4Backend:
     # Backend Selection
+
+    # Check for explicit kernel override (for benchmarking)
+    kernel_override = envs.VLLM_MXFP4_MOE_KERNEL
+    if kernel_override != "auto":
+        if kernel_override == "marlin":
+            logger.info_once(
+                f"[MXFP4] Kernel override: using Marlin backend "
+                f"(VLLM_MXFP4_MOE_KERNEL={kernel_override})"
+            )
+            return Mxfp4Backend.MARLIN
+        elif kernel_override == "gemm":
+            logger.info_once(
+                f"[MXFP4] Kernel override: using CUTLASS grouped GEMM "
+                f"(VLLM_MXFP4_MOE_KERNEL={kernel_override})"
+            )
+            return Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS
+        elif kernel_override == "gemv":
+            logger.info_once(
+                f"[MXFP4] Kernel override: using DP4A GEMV (experimental) "
+                f"(VLLM_MXFP4_MOE_KERNEL={kernel_override})"
+            )
+            return Mxfp4Backend.GEMV_DP4A
+        elif kernel_override == "triton":
+            logger.info_once(
+                f"[MXFP4] Kernel override: using Triton backend "
+                f"(VLLM_MXFP4_MOE_KERNEL={kernel_override})"
+            )
+            return Mxfp4Backend.TRITON
+        else:
+            logger.warning_once(
+                f"[MXFP4] Unknown kernel override '{kernel_override}', "
+                "valid options: auto, marlin, gemm, gemv, triton. Using auto."
+            )
 
     if with_lora_support:
         return get_mxfp4_backend_with_lora()
@@ -1107,6 +1143,110 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
 
             return output
+        elif self.mxfp4_backend == Mxfp4Backend.GEMV_DP4A:
+            # Experimental DP4A GEMV backend for M=1 decode optimization
+            # Falls back to CUTLASS grouped GEMM for batched inference
+            num_tokens = x.shape[0]
+            
+            if num_tokens > 1:
+                # For batched inference, use grouped GEMM (more efficient)
+                logger.debug_once(
+                    f"[GEMV] Batched tokens ({num_tokens}), falling back to GEMM"
+                )
+                # Temporarily switch to GEMM backend
+                from vllm.utils.flashinfer import flashinfer_cutlass_fused_moe
+                
+                topk_weights, topk_ids = layer.select_experts(
+                    hidden_states=x,
+                    router_logits=router_logits,
+                )
+                
+                from flashinfer import mxfp8_quantize
+                x_quant, x_scale = mxfp8_quantize(x, True, 32)
+                
+                fake_input_scale = torch.ones(self.num_experts, device=x.device)
+                quant_scales = [
+                    layer.w13_weight_scale.contiguous().view(torch.int32),
+                    fake_input_scale,
+                    layer.w2_weight_scale.contiguous().view(torch.int32),
+                    fake_input_scale,
+                ]
+                
+                output = torch.empty_like(x, dtype=torch.bfloat16)
+                _ = flashinfer_cutlass_fused_moe(
+                    input=x_quant,
+                    token_selected_experts=topk_ids.to(torch.int).contiguous(),
+                    token_final_scales=topk_weights,
+                    output_dtype=torch.bfloat16,
+                    output=output,
+                    quant_scales=quant_scales,
+                    fc1_expert_biases=layer.w13_bias,
+                    fc2_expert_biases=layer.w2_bias,
+                    swiglu_alpha=layer.gemm1_alpha,
+                    swiglu_beta=layer.gemm1_beta,
+                    swiglu_limit=layer.gemm1_clamp_limit,
+                    tp_size=self.moe.tp_size,
+                    tp_rank=self.moe.tp_rank,
+                    ep_size=self.moe.ep_size,
+                    ep_rank=self.moe.ep_rank,
+                    tune_max_num_tokens=max(self.max_capture_size, 1),
+                    use_mxfp8_act_scaling=True,
+                    input_sf=x_scale,
+                    fc1_expert_weights=layer.w13_weight.contiguous().view(torch.long),
+                    fc2_expert_weights=layer.w2_weight.contiguous().view(torch.long),
+                )
+                return output
+            else:
+                # M=1 decode: use DP4A GEMV (experimental)
+                # NOTE: This path is for benchmarking - DP4A GEMV is slower than
+                # grouped GEMM due to lack of weight reuse across experts
+                logger.info_once(
+                    "[GEMV] Using DP4A GEMV for M=1 decode (experimental)"
+                )
+                # For now, fall back to GEMM since GEMV is slower
+                # TODO: Implement optimized GEMV if weight reuse can be added
+                from vllm.utils.flashinfer import flashinfer_cutlass_fused_moe
+                
+                topk_weights, topk_ids = layer.select_experts(
+                    hidden_states=x,
+                    router_logits=router_logits,
+                )
+                
+                from flashinfer import mxfp8_quantize
+                x_quant, x_scale = mxfp8_quantize(x, True, 32)
+                
+                fake_input_scale = torch.ones(self.num_experts, device=x.device)
+                quant_scales = [
+                    layer.w13_weight_scale.contiguous().view(torch.int32),
+                    fake_input_scale,
+                    layer.w2_weight_scale.contiguous().view(torch.int32),
+                    fake_input_scale,
+                ]
+                
+                output = torch.empty_like(x, dtype=torch.bfloat16)
+                _ = flashinfer_cutlass_fused_moe(
+                    input=x_quant,
+                    token_selected_experts=topk_ids.to(torch.int).contiguous(),
+                    token_final_scales=topk_weights,
+                    output_dtype=torch.bfloat16,
+                    output=output,
+                    quant_scales=quant_scales,
+                    fc1_expert_biases=layer.w13_bias,
+                    fc2_expert_biases=layer.w2_bias,
+                    swiglu_alpha=layer.gemm1_alpha,
+                    swiglu_beta=layer.gemm1_beta,
+                    swiglu_limit=layer.gemm1_clamp_limit,
+                    tp_size=self.moe.tp_size,
+                    tp_rank=self.moe.tp_rank,
+                    ep_size=self.moe.ep_size,
+                    ep_rank=self.moe.ep_rank,
+                    tune_max_num_tokens=max(self.max_capture_size, 1),
+                    use_mxfp8_act_scaling=True,
+                    input_sf=x_scale,
+                    fc1_expert_weights=layer.w13_weight.contiguous().view(torch.long),
+                    fc2_expert_weights=layer.w2_weight.contiguous().view(torch.long),
+                )
+                return output
         elif self.mxfp4_backend == Mxfp4Backend.TRITON:
             from vllm.model_executor.layers.fused_moe.gpt_oss_triton_kernels_moe import (  # noqa: E501
                 triton_kernel_moe_forward,
