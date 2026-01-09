@@ -106,6 +106,34 @@ def get_mxfp4_backend_with_lora() -> Mxfp4Backend:
 def get_mxfp4_backend(with_lora_support: bool) -> Mxfp4Backend:
     # Backend Selection
 
+
+    # Check for explicit kernel override (for benchmarking)
+    kernel_override = envs.VLLM_MXFP4_MOE_KERNEL
+    if kernel_override != "auto":
+        if kernel_override == "marlin":
+            logger.info_once(
+                f"[MXFP4] Kernel override: using Marlin backend "
+                f"(VLLM_MXFP4_MOE_KERNEL={kernel_override})"
+            )
+            return Mxfp4Backend.MARLIN
+        elif kernel_override == "gemm":
+            logger.info_once(
+                f"[MXFP4] Kernel override: using CUTLASS grouped GEMM "
+                f"(VLLM_MXFP4_MOE_KERNEL={kernel_override})"
+            )
+            return Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS
+        elif kernel_override == "triton":
+            logger.info_once(
+                f"[MXFP4] Kernel override: using Triton backend "
+                f"(VLLM_MXFP4_MOE_KERNEL={kernel_override})"
+            )
+            return Mxfp4Backend.TRITON
+        else:
+            logger.warning_once(
+                f"[MXFP4] Unknown kernel override '{kernel_override}', "
+                "valid options: auto, marlin, gemm, triton. Using auto."
+            )
+
     if with_lora_support:
         return get_mxfp4_backend_with_lora()
 
