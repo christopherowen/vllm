@@ -174,7 +174,9 @@ class FlashAttentionBackend(AttentionBackend):
         device_capability: DeviceCapability,
     ) -> str | None:
         if has_sink and device_capability < DeviceCapability(9, 0):
-            return "sink not supported on compute capability < 9.0"
+            from vllm import envs
+            if not envs.VLLM_IGNORE_SINK_VALIDATION:
+                return "sink not supported on compute capability < 9.0"
         return None
 
 
@@ -563,6 +565,17 @@ class FlashAttentionImpl(AttentionImpl):
                 "FlashAttention does not support fp8 kv-cache on this device."
             )
 
+        # Disable sinks if env var is set (for testing on unsupported hardware)
+        from vllm import envs
+        if envs.VLLM_IGNORE_SINK_VALIDATION and sinks is not None:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                "Model has attention sinks but VLLM_IGNORE_SINK_VALIDATION=1. "
+                "Sinks will be DISABLED in FLASH_ATTN backend."
+            )
+            sinks = None
+        
         self.sinks = sinks
         if self.sinks is not None:
             assert flash_attn_supports_sinks(), (

@@ -155,6 +155,7 @@ if TYPE_CHECKING:
     VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
     VLLM_MXFP4_USE_MARLIN: bool | None = None
     VLLM_MXFP4_MOE_KERNEL: str = "auto"
+    VLLM_IGNORE_SINK_VALIDATION: bool = False
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
@@ -219,6 +220,7 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_MOE_MXFP4_BF16: bool = False
     # Kernel selection for MXFP4 MoE benchmarking: "auto", "marlin", "gemm", "gemv"
     VLLM_MXFP4_MOE_KERNEL: str = "auto"
+    VLLM_IGNORE_SINK_VALIDATION: bool = False
     VLLM_ROCM_FP8_MFMA_PAGE_ATTN: bool = False
     VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS: bool = False
     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = True
@@ -1148,6 +1150,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MXFP4_MOE_KERNEL": lambda: os.environ.get(
         "VLLM_MXFP4_MOE_KERNEL", "auto"
     ).lower(),
+    # Ignore sink validation - allows models with sinks to load on backends without native sink support
+    "VLLM_IGNORE_SINK_VALIDATION": lambda: bool(int(os.getenv("VLLM_IGNORE_SINK_VALIDATION", "0"))),
     # The activation dtype for marlin kernel
     "VLLM_MARLIN_INPUT_DTYPE": env_with_choices(
         "VLLM_MARLIN_INPUT_DTYPE", None, ["int8", "fp8"]

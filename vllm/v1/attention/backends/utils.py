@@ -542,6 +542,18 @@ def get_per_layer_parameters(
         logits_soft_cap = getattr(impl, "logits_soft_cap", None)
         sm_scale = impl.scale
         has_sinks = getattr(impl, "sinks", None) is not None
+        
+        # Allow disabling sinks via env var for testing on unsupported backends
+        if has_sinks:
+            from vllm import envs
+            if envs.VLLM_IGNORE_SINK_VALIDATION:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(
+                    "Model has attention sinks but VLLM_IGNORE_SINK_VALIDATION=1. "
+                    "Sinks will be DISABLED - may affect model quality."
+                )
+                has_sinks = False
 
         per_layer_params[key] = PerLayerParameters(
             window_left, logits_soft_cap, sm_scale, has_sinks
