@@ -221,7 +221,13 @@ class Attention(nn.Module, AttentionLayerBase):
         self.head_size_v = self.head_size if head_size_v is None else head_size_v
         self.num_kv_heads = num_kv_heads
         self.sliding_window = sliding_window
-        self.has_sink = extra_impl_args.get("sinks") is not None
+        # Check if sinks are present and not disabled via env var
+        from vllm import envs
+        has_sinks_in_model = extra_impl_args.get("sinks") is not None
+        if has_sinks_in_model and envs.VLLM_ATTENTION_SINKS == "false":
+            self.has_sink = False
+        else:
+            self.has_sink = has_sinks_in_model
 
         # NOTE: model_config may be None during certain tests
         model_config = vllm_config.model_config

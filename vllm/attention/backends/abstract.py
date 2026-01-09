@@ -236,7 +236,7 @@ class AttentionBackend(ABC):
                 invalid_reasons.append("non-MLA not supported")
         if has_sink and not cls.supports_sink():
             from vllm import envs
-            if not envs.VLLM_IGNORE_SINK_VALIDATION:
+            if envs.VLLM_ATTENTION_SINKS == "false":
                 invalid_reasons.append("sink setting not supported")
         if use_sparse != cls.is_sparse():
             if use_sparse:

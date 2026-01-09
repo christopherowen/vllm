@@ -546,11 +546,11 @@ def get_per_layer_parameters(
         # Allow disabling sinks via env var for testing on unsupported backends
         if has_sinks:
             from vllm import envs
-            if envs.VLLM_IGNORE_SINK_VALIDATION:
+            if envs.VLLM_ATTENTION_SINKS == "false":
                 import logging
                 logger = logging.getLogger(__name__)
                 logger.warning(
-                    "Model has attention sinks but VLLM_IGNORE_SINK_VALIDATION=1. "
+                    "Model has attention sinks but VLLM_ATTENTION_SINKS=false. "
                     "Sinks will be DISABLED - may affect model quality."
                 )
                 has_sinks = False
