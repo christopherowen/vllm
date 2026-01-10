@@ -273,14 +273,30 @@ def has_nvidia_artifactory() -> bool:
 @functools.cache
 def supports_trtllm_attention() -> bool:
     """
-    TRTLLM attention is supported if the platform is SM100,
+    TRTLLM attention is supported if the platform is SM100/SM103,
     NVIDIA artifactory is accessible, and batch-invariant mode is not enabled.
+    Note: SM120/SM121 (DGX Spark) cannot use TRT-LLM attention cubins - they are
+    compiled for SM100a and are binary-incompatible with SM12x architecture.
+    SM120/SM121 should use native FlashInfer CUTLASS attention (JIT-compiled).
     """
     # Batch-invariant mode disables TRTLLM attention
     if vllm_is_batch_invariant():
         return False
 
-    # Requires SM100 and NVIDIA artifactory to be accessible to download cubins
+    # Check device capability - TRT-LLM cubins only work on SM100/SM103
+    capability = current_platform.get_device_capability()
+    if capability is None:
+        return False
+
+    # SM120/SM121 cannot use TRT-LLM cubins - use native FlashInfer attention
+    if capability.major == 12:
+        logger.info_once(
+            "SM12x detected - using native FlashInfer CUTLASS attention instead "
+            "of TRT-LLM attention (cubins not available for SM12x)"
+        )
+        return False
+
+    # Requires SM100/SM103 and NVIDIA artifactory to be accessible to download cubins
     return current_platform.is_blackwell_class() and has_nvidia_artifactory()
 
 

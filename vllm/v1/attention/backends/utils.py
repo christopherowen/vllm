@@ -547,9 +547,7 @@ def get_per_layer_parameters(
         if has_sinks:
             from vllm import envs
             if envs.VLLM_ATTENTION_SINKS == "false":
-                import logging
-                logger = logging.getLogger(__name__)
-                logger.warning(
+                logger.warning_once(
                     "Model has attention sinks but VLLM_ATTENTION_SINKS=false. "
                     "Sinks will be DISABLED - may affect model quality."
                 )

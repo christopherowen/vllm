@@ -356,19 +356,24 @@ class FlashInferBackend(AttentionBackend):
 
     @classmethod
     def supports_sink(cls) -> bool:
-        """FlashInfer supports sinks when TRTLLM attention is available (SM100)."""
+        """FlashInfer supports sinks via TRTLLM (SM100) or FA2 sink module (SM121)."""
         from vllm.utils.flashinfer import (
             force_use_trtllm_attention,
             supports_trtllm_attention,
         )
 
-        # Respect explicit disable flag (e.g.,
-        # --attention-config.use_trtllm_attention=0)
-        if force_use_trtllm_attention() is False:
-            return False
-
         # Check if TRTLLM is supported on this platform
-        return supports_trtllm_attention()
+        if supports_trtllm_attention():
+            # Respect explicit disable flag (e.g.,
+            # --attention-config.use_trtllm_attention=0)
+            if force_use_trtllm_attention() is not False:
+                return True
+
+        # FA2 sink module is available on Blackwell-class devices (SM121)
+        if current_platform.is_blackwell_class():
+            return True
+
+        return False
 
     @classmethod
     def get_required_kv_cache_layout(cls) -> KVCacheLayoutType | None:
@@ -597,11 +602,17 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.logits_soft_cap = self.global_hyperparameters.logits_soft_cap
         self.has_sinks = self.global_hyperparameters.has_sinks
         if self.has_sinks and not can_use_trtllm:
-            raise NotImplementedError(
-                "FlashInfer backend currently does not support attention "
-                "sinks, please use trtllm on blackwell or flash attention on "
-                "earlier GPUs."
-            )
+            # Sinks without TRTLLM are supported on Blackwell-class via FA2 sink module
+            if not current_platform.is_blackwell_class():
+                raise NotImplementedError(
+                    "FlashInfer backend currently does not support attention "
+                    "sinks, please use trtllm on blackwell or flash attention on "
+                    "earlier GPUs."
+                )
+            # Mark that we're using FA2 sink module instead of TRTLLM
+            self._use_fa2_sinks = True
+        else:
+            self._use_fa2_sinks = False
         # Preparing persistent buffers
         self.pin_memory = is_pin_memory_available()
         self.paged_kv_indptr = self._make_buffer(max_num_reqs + 1)
@@ -828,12 +839,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         )
 
         if not all_uses_trtllm:
-            if self.has_sinks:
-                raise NotImplementedError(
-                    "FlashInfer backend currently does not support attention "
-                    "sinks, please use trtllm on blackwell or flash attention "
-                    "on earlier GPUs."
-                )
+            # has_sinks is now supported on SM12x via FA2 sink module
+            # (handled by _use_fa2_sinks flag set in __init__)
 
             if not self.global_hyperparameters.has_same_window_lefts:
                 raise ValueError(
@@ -1053,6 +1060,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         kv_data_type=self.kv_cache_dtype,
                         fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
+                        use_sinks=getattr(self, '_use_fa2_sinks', False),
                     )
                 attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)
 
@@ -1101,6 +1109,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     kv_data_type=self.kv_cache_dtype,
                     fixed_split_size=self.decode_fixed_split_size,
                     disable_split_kv=self.disable_split_kv,
+                    use_sinks=getattr(self, '_use_fa2_sinks', False),
                 )
                 attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
         return attn_metadata
@@ -1376,12 +1385,17 @@ class FlashInferImpl(AttentionImpl):
                     )
                     assert prefill_wrapper._sm_scale == self.scale
                     assert prefill_wrapper._causal
+                    run_kwargs = {
+                        "k_scale": layer._k_scale_float,
+                        "v_scale": layer._v_scale_float,
+                        "out": output[num_decode_tokens:],
+                    }
+                    if getattr(prefill_wrapper, '_use_sinks', False):
+                        run_kwargs["sinks"] = self.sinks
                     prefill_wrapper.run(
                         prefill_query,
                         kv_cache_permute,
-                        k_scale=layer._k_scale_float,
-                        v_scale=layer._v_scale_float,
-                        out=output[num_decode_tokens:],
+                        **run_kwargs,
                     )
             else:
                 assert isinstance(attn_metadata.prefill, TRTLLMPrefill)
@@ -1471,14 +1485,19 @@ class FlashInferImpl(AttentionImpl):
                         dtype=torch.float32,
                         device=decode_query.device,
                     )
+                    run_kwargs = {
+                        "k_scale": layer._k_scale_float,
+                        "v_scale": layer._v_scale_float,
+                        "out": output_tmp,
+                        "lse": lse,
+                        "return_lse": True,
+                    }
+                    if getattr(decode_wrapper, '_use_sinks', False):
+                        run_kwargs["sinks"] = self.sinks
                     decode_wrapper.run(
                         decode_query,
                         kv_cache_permute,
-                        k_scale=layer._k_scale_float,
-                        v_scale=layer._v_scale_float,
-                        out=output_tmp,
-                        lse=lse,
-                        return_lse=True,
+                        **run_kwargs,
                     )
                     output[:num_decode_tokens] = cp_lse_ag_out_rs(
                         output_tmp,
@@ -1487,12 +1506,17 @@ class FlashInferImpl(AttentionImpl):
                         is_lse_base_on_e=False,
                     )
                 else:
+                    run_kwargs = {
+                        "k_scale": layer._k_scale_float,
+                        "v_scale": layer._v_scale_float,
+                        "out": output[:num_decode_tokens],
+                    }
+                    if getattr(decode_wrapper, '_use_sinks', False):
+                        run_kwargs["sinks"] = self.sinks
                     decode_wrapper.run(
                         decode_query,
                         kv_cache_permute,
-                        k_scale=layer._k_scale_float,
-                        v_scale=layer._v_scale_float,
-                        out=output[:num_decode_tokens],
+                        **run_kwargs,
                     )
             else:
                 # decode_query may be non-contiguous
@@ -1569,6 +1593,7 @@ def fast_plan_decode(
     non_blocking: bool = True,
     fixed_split_size: int = -1,
     disable_split_kv: bool = False,
+    use_sinks: bool = False,
 ) -> None:
     """
     A faster version of BatchDecodeWithPagedKVCacheWrapper::plan used for
@@ -1600,6 +1625,7 @@ def fast_plan_decode(
             logits_soft_cap,
             q_data_type,
             kv_data_type,
+            None,  # o_data_type
             data_type,
             sm_scale,
             rope_scale,
@@ -1609,7 +1635,9 @@ def fast_plan_decode(
             None,  # seq_lens
             fixed_split_size,
             disable_split_kv,
+            use_sinks,
         )
+        self._use_sinks = use_sinks  # Store for run() to use
         self.vllm_first_call = False
         return
 
