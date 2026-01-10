@@ -53,9 +53,11 @@ from vllm.v1.attention.backends.utils import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
     KVCacheLayoutType,
+    PerLayerParameters,
     get_dcp_local_seq_lens,
     get_kv_cache_layout,
     get_per_layer_parameters,
+    group_layers_by_hyperparameters,
     infer_global_hyperparameters,
     split_decodes_and_prefills,
 )
@@ -386,18 +388,95 @@ class FlashInferBackend(AttentionBackend):
         return None
 
 
+# Group ID type for per-hyperparameter-group wrappers
+# Using int IDs instead of float-containing tuples for stable dict keys
+GroupId = int
+
+
 @dataclass
 class FIPrefill:
-    """Metadata for the native FlashInfer prefill pathway (non-TRTLLM)."""
+    """Metadata for the native FlashInfer prefill pathway (non-TRTLLM).
+    
+    For speculative decoding support, stores multiple wrappers keyed by
+    group ID (main model and draft model may have different configs).
+    
+    DCP and non-DCP modes are mutually exclusive; only one set of fields
+    will be populated based on the mode.
+    """
 
-    wrapper: BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper
+    # Non-DCP mode wrappers (mutually exclusive with DCP)
+    wrapper: BatchPrefillWithPagedKVCacheWrapper | None = None
+    wrappers_by_group: dict[GroupId, BatchPrefillWithPagedKVCacheWrapper] | None = None
+    
+    # DCP mode wrappers (mutually exclusive with non-DCP)
+    dcp_wrapper: BatchDCPPrefillWrapper | None = None
+    dcp_wrappers_by_group: dict[GroupId, BatchDCPPrefillWrapper] | None = None
+    
+    @property
+    def is_dcp(self) -> bool:
+        """Returns True if using DCP mode."""
+        return self.dcp_wrapper is not None
+    
+    def get_wrapper(self, group_id: GroupId | None = None) -> BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper:
+        """Get the appropriate wrapper for the given group.
+        
+        Args:
+            group_id: Optional group ID for multi-group (speculative decoding) case.
+                      If None, returns the primary wrapper.
+        
+        Raises:
+            AssertionError: If wrapper is not configured (misconfigured FIPrefill).
+        """
+        if self.is_dcp:
+            if group_id is not None and self.dcp_wrappers_by_group:
+                result = self.dcp_wrappers_by_group.get(group_id, self.dcp_wrapper)
+            else:
+                result = self.dcp_wrapper
+            assert result is not None, (
+                "FIPrefill.dcp_wrapper is None. DCP mode requires dcp_wrapper to be set."
+            )
+        else:
+            if group_id is not None and self.wrappers_by_group:
+                result = self.wrappers_by_group.get(group_id, self.wrapper)
+            else:
+                result = self.wrapper
+            assert result is not None, (
+                "FIPrefill.wrapper is None. Non-DCP mode requires wrapper to be set."
+            )
+        return result
 
 
 @dataclass
 class FIDecode:
-    """Metadata for the native FlashInfer decode pathway (non-TRTLLM)."""
+    """Metadata for the native FlashInfer decode pathway (non-TRTLLM).
+    
+    For speculative decoding support, stores multiple wrappers keyed by
+    group ID (main model and draft model may have different configs).
+    """
 
+    # Primary wrapper (for single-config case)
     wrapper: BatchDecodeWithPagedKVCacheWrapper
+    # Per-group wrappers for multi-config case (speculative decoding)
+    wrappers_by_group: dict[GroupId, BatchDecodeWithPagedKVCacheWrapper] | None = None
+    
+    def get_wrapper(self, group_id: GroupId | None = None) -> BatchDecodeWithPagedKVCacheWrapper:
+        """Get the appropriate wrapper for the given group.
+        
+        Args:
+            group_id: Optional group ID for multi-group (speculative decoding) case.
+                      If None, returns the primary wrapper.
+        
+        Raises:
+            AssertionError: If multi-group mode is active but group_id not found.
+        """
+        if group_id is not None and self.wrappers_by_group is not None:
+            assert group_id in self.wrappers_by_group, (
+                f"FIDecode: group_id={group_id} not found in wrappers_by_group. "
+                f"Available groups: {list(self.wrappers_by_group.keys())}. "
+                "This indicates a mismatch between layer grouping and wrapper creation."
+            )
+            return self.wrappers_by_group[group_id]
+        return self.wrapper
 
 
 @dataclass
@@ -485,6 +564,14 @@ class FlashInferMetadata:
 
     cascade_wrapper: MultiLevelCascadeAttentionWrapper | None
 
+    # Layer name -> group_id mapping for speculative decoding support
+    # Used in forward() to look up the correct wrapper for each layer
+    layer_to_group_id: dict[str, GroupId] | None = None
+    """
+    Maps layer names to their hyperparameter group IDs.
+    Only set when there are multiple groups (speculative decoding).
+    """
+
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     reorder_batch_threshold: int = 1
@@ -505,6 +592,17 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper | None
         ) = None  # Wrapper for prefill/append
         self._decode_wrapper = None  # Wrapper for decode (general shape)
+        
+        # Per-group wrappers for speculative decoding support
+        # Key: group_id (int) - stable identifier, avoids float comparison issues
+        # Wrappers are cached and re-planned each batch. FlashInfer's plan()
+        # handles buffer allocation/resizing internally when we pass None buffers.
+        self._prefill_wrappers_by_group: dict[
+            GroupId, BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper
+        ] = {}
+        self._decode_wrappers_by_group: dict[
+            GroupId, BatchDecodeWithPagedKVCacheWrapper
+        ] = {}
 
         if vllm_is_batch_invariant():
             self.decode_fixed_split_size = 2048
@@ -592,16 +690,36 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
         self._cascade_wrapper = None  # Wrapper for cascade attention
 
-        # Global hyperparameters shared by all attention layers
-        # TODO: discard this for trtllm-gen backend
-        self.global_hyperparameters = infer_global_hyperparameters(
-            get_per_layer_parameters(vllm_config, layer_names, FlashInferImpl)
+        # Per-layer hyperparameters for speculative decoding support
+        # Different models (main vs draft) may have different hyperparameters
+        self.per_layer_params = get_per_layer_parameters(
+            vllm_config, layer_names, FlashInferImpl
         )
-        self.sm_scale = self.global_hyperparameters.sm_scale
-        self.window_left = self.global_hyperparameters.window_left
-        self.logits_soft_cap = self.global_hyperparameters.logits_soft_cap
-        self.has_sinks = self.global_hyperparameters.has_sinks
-        if self.has_sinks and not can_use_trtllm:
+        
+        # Group layers by hyperparameters for efficient wrapper creation
+        self.hyperparam_groups = group_layers_by_hyperparameters(self.per_layer_params)
+        
+        # Create layer -> group_id mapping for fast lookup in forward()
+        # Using stable integer IDs avoids float comparison issues in dict keys
+        self.layer_to_group_id: dict[str, GroupId] = {}
+        self.group_id_to_params: dict[GroupId, PerLayerParameters] = {}
+        for group_id, (params, layer_list) in enumerate(self.hyperparam_groups):
+            self.group_id_to_params[group_id] = params
+            for layer_name in layer_list:
+                self.layer_to_group_id[layer_name] = group_id
+        
+        # For backward compatibility, use first group as "global" hyperparameters
+        # This is typically the main model's hyperparameters
+        self.global_hyperparameters = infer_global_hyperparameters(self.per_layer_params)
+        first_group_params = self.hyperparam_groups[0][0]
+        self.sm_scale = first_group_params.sm_scale
+        self.window_left = first_group_params.window_left
+        self.logits_soft_cap = first_group_params.logits_soft_cap
+        self.has_sinks = first_group_params.has_sinks
+        
+        # Check if any group has sinks (for FA2 sink module support)
+        any_has_sinks = any(params.has_sinks for params, _ in self.hyperparam_groups)
+        if any_has_sinks and not can_use_trtllm:
             # Sinks without TRTLLM are supported on Blackwell-class via FA2 sink module
             if not current_platform.is_blackwell_class():
                 raise NotImplementedError(
@@ -613,6 +731,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self._use_fa2_sinks = True
         else:
             self._use_fa2_sinks = False
+        
         # Preparing persistent buffers
         self.pin_memory = is_pin_memory_available()
         self.paged_kv_indptr = self._make_buffer(max_num_reqs + 1)
@@ -661,6 +780,17 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
     def _get_workspace_buffer(self):
+        """Get the shared workspace buffer for FlashInfer wrappers.
+        
+        IMPORTANT: This buffer is shared across all wrappers (prefill, decode,
+        per-group). This is safe because:
+        1. vLLM executes attention layers sequentially (no concurrent wrappers)
+        2. Workspace is only used during run(), not persisted between calls
+        3. Each run() completes before the next wrapper's run() begins
+        
+        If future vLLM versions add pipeline parallelism or concurrent attention
+        execution, this must be revisited (per-wrapper workspaces or serialization).
+        """
         if self._workspace_buffer is None:
             buffer_size = envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE
             if vllm_is_batch_invariant():
@@ -687,6 +817,23 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 )
         assert self._prefill_wrapper is not None
         return self._prefill_wrapper
+
+    def _get_prefill_wrapper_for_group(
+        self,
+        group_id: GroupId,
+    ) -> BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper:
+        """Get or create a prefill wrapper for a specific hyperparameter group."""
+        if group_id not in self._prefill_wrappers_by_group:
+            if self.use_dcp:
+                wrapper = BatchDCPPrefillWrapper(
+                    workspace_buffer=self._get_workspace_buffer(),
+                )
+            else:
+                wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                    self._get_workspace_buffer(), get_kv_cache_layout()
+                )
+            self._prefill_wrappers_by_group[group_id] = wrapper
+        return self._prefill_wrappers_by_group[group_id]
 
     def _get_decode_wrapper(self, batch_size: int, use_cudagraph: bool = False):
         if use_cudagraph:
@@ -723,6 +870,27 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 self._decode_wrapper = decode_wrapper
 
         return decode_wrapper
+
+    def _get_decode_wrapper_for_group(
+        self, group_id: GroupId
+    ) -> BatchDecodeWithPagedKVCacheWrapper:
+        """Get or create a decode wrapper for a non-primary group.
+        
+        Wrappers are cached by group_id and re-planned each batch.
+        Since we pass None for internal buffers, FlashInfer's plan()
+        handles buffer allocation/resizing internally as batch size varies.
+        """
+        if group_id not in self._decode_wrappers_by_group:
+            self._decode_wrappers_by_group[group_id] = BatchDecodeWithPagedKVCacheWrapper(
+                self._get_workspace_buffer(),
+                get_kv_cache_layout(),
+                use_cuda_graph=False,  # Per-group wrappers don't use cudagraph
+                paged_kv_indptr_buffer=None,
+                paged_kv_indices_buffer=None,
+                paged_kv_last_page_len_buffer=None,
+                use_tensor_cores=True,
+            )
+        return self._decode_wrappers_by_group[group_id]
 
     def _get_cascade_wrapper(self):
         if self._cascade_wrapper is None:
@@ -841,19 +1009,17 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         if not all_uses_trtllm:
             # has_sinks is now supported on SM12x via FA2 sink module
             # (handled by _use_fa2_sinks flag set in __init__)
-
-            if not self.global_hyperparameters.has_same_window_lefts:
-                raise ValueError(
-                    "Window left is not the same for all layers. "
-                    "One potential fix is to set disable_sliding_window=True"
+            
+            # For speculative decoding, we now support multiple hyperparameter
+            # groups (main model + draft model). Each group can have different
+            # window_left, logits_soft_cap, sm_scale, and has_sinks values.
+            # We create separate wrappers for each group.
+            num_groups = len(self.hyperparam_groups)
+            if num_groups > 1:
+                logger.debug(
+                    f"FlashInfer: {num_groups} hyperparameter groups detected "
+                    "(speculative decoding mode)"
                 )
-
-            assert self.global_hyperparameters.has_same_all_params, (
-                "FlashInfer backend currently only supports models in which "
-                "all layers share the same values for the following "
-                "hyperparameters: `window_left`, `logits_soft_cap`, "
-                "`sm_scale`."
-            )
 
             # The q quantization is not supported for non-trtllm attention,
             # fall back to model dtype.
@@ -862,6 +1028,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # Step 2: Initialize the output metadata
         # Leave prefill/decode/cascade_wrapper empty, to be populated
         # case by case depending on the batch contents and backend selection.
+        # Include layer_to_group_id mapping if there are multiple groups
+        has_multiple_groups = len(self.group_id_to_params) > 1
         attn_metadata = FlashInferMetadata(
             num_actual_tokens=num_actual_tokens,
             slot_mapping=common_attn_metadata.slot_mapping,
@@ -874,6 +1042,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             prefill=None,
             decode=None,
             cascade_wrapper=None,
+            layer_to_group_id=self.layer_to_group_id if has_multiple_groups else None,
         )
 
         # Guard access to seq_lens_cpu, which may not always be needed
@@ -1008,7 +1177,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     max_seq_len=max_seq_len,
                 )
             else:
-                prefill_wrapper = self._get_prefill_wrapper()
                 # Slicing CPU buffers that are only needed for FI native prefills
                 paged_kv_last_page_len_prefill_cpu = self.paged_kv_last_page_len.cpu[
                     prefill_start:num_reqs
@@ -1018,51 +1186,80 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     prefill_start : num_reqs + 1
                 ]
                 assert paged_kv_indptr_prefill_cpu.shape[0] == num_prefills + 1
+                
+                # Create and plan wrappers for each hyperparameter group
+                # This supports speculative decoding where main/draft models
+                # have different hyperparameters
+                # DCP and non-DCP modes use separate typed dicts for clarity
+                #
+                # Note: In speculative decoding, both models' layers run every
+                # forward, so all groups must be planned. The plan() calls are
+                # unavoidable since batch parameters (qo_indptr, etc.) change
+                # per-batch. Wrapper objects ARE cached to avoid re-allocation.
                 if self.use_dcp:
-                    assert isinstance(prefill_wrapper, BatchDCPPrefillWrapper)
-                    prefill_wrapper.plan(
-                        qo_indptr_cpu=qo_indptr_prefill_cpu,
-                        paged_kv_indptr_cpu=paged_kv_indptr_prefill_cpu,
-                        paged_kv_indices=paged_kv_indices,
-                        paged_kv_last_page_len_cpu=paged_kv_last_page_len_prefill_cpu,
-                        page_size=self.page_size,
-                        num_qo_heads=self.num_qo_heads,
-                        dcp_world_size=self.dcp_world_size,
-                        num_kv_heads=self.num_kv_heads,
-                        head_dim=self.head_dim,
-                        sm_scale=self.sm_scale,
-                        window_left=self.window_left,
-                        logits_soft_cap=self.logits_soft_cap,
-                        q_data_type=self.q_data_type,
-                        kv_cache_dtype=self.kv_cache_dtype,
-                        prefill_fixed_split_size=self.prefill_fixed_split_size,
-                        disable_split_kv=self.disable_split_kv,
+                    dcp_wrappers: dict[GroupId, BatchDCPPrefillWrapper] = {}
+                    for group_id, group_params in self.group_id_to_params.items():
+                        wrapper = self._get_prefill_wrapper_for_group(group_id)
+                        assert isinstance(wrapper, BatchDCPPrefillWrapper)
+                        wrapper.plan(
+                            qo_indptr_cpu=qo_indptr_prefill_cpu,
+                            paged_kv_indptr_cpu=paged_kv_indptr_prefill_cpu,
+                            paged_kv_indices=paged_kv_indices,
+                            paged_kv_last_page_len_cpu=paged_kv_last_page_len_prefill_cpu,
+                            page_size=self.page_size,
+                            num_qo_heads=self.num_qo_heads,
+                            dcp_world_size=self.dcp_world_size,
+                            num_kv_heads=self.num_kv_heads,
+                            head_dim=self.head_dim,
+                            sm_scale=group_params.sm_scale,
+                            window_left=group_params.window_left,
+                            logits_soft_cap=group_params.logits_soft_cap,
+                            q_data_type=self.q_data_type,
+                            kv_cache_dtype=self.kv_cache_dtype,
+                            prefill_fixed_split_size=self.prefill_fixed_split_size,
+                            disable_split_kv=self.disable_split_kv,
+                        )
+                        dcp_wrappers[group_id] = wrapper
+                    
+                    attn_metadata.prefill = FIPrefill(
+                        dcp_wrapper=dcp_wrappers[0],
+                        dcp_wrappers_by_group=dcp_wrappers if len(dcp_wrappers) > 1 else None,
                     )
                 else:
-                    assert isinstance(
-                        prefill_wrapper,
-                        BatchPrefillWithPagedKVCacheWrapper,
+                    wrappers: dict[GroupId, BatchPrefillWithPagedKVCacheWrapper] = {}
+                    for group_id, group_params in self.group_id_to_params.items():
+                        wrapper = self._get_prefill_wrapper_for_group(group_id)
+                        assert isinstance(wrapper, BatchPrefillWithPagedKVCacheWrapper)
+                        
+                        # Determine if this group needs sinks
+                        use_sinks = (group_params.has_sinks and 
+                                     getattr(self, '_use_fa2_sinks', False))
+                        
+                        wrapper.plan(
+                            qo_indptr_prefill_cpu,
+                            paged_kv_indptr_prefill_cpu,
+                            paged_kv_indices,
+                            paged_kv_last_page_len_prefill_cpu,
+                            self.num_qo_heads,
+                            self.num_kv_heads,
+                            self.head_dim,
+                            self.page_size,
+                            causal=True,
+                            sm_scale=group_params.sm_scale,
+                            window_left=group_params.window_left,
+                            logits_soft_cap=group_params.logits_soft_cap,
+                            q_data_type=self.q_data_type,
+                            kv_data_type=self.kv_cache_dtype,
+                            fixed_split_size=self.prefill_fixed_split_size,
+                            disable_split_kv=self.disable_split_kv,
+                            use_sinks=use_sinks,
+                        )
+                        wrappers[group_id] = wrapper
+                    
+                    attn_metadata.prefill = FIPrefill(
+                        wrapper=wrappers[0],
+                        wrappers_by_group=wrappers if len(wrappers) > 1 else None,
                     )
-                    prefill_wrapper.plan(
-                        qo_indptr_prefill_cpu,
-                        paged_kv_indptr_prefill_cpu,
-                        paged_kv_indices,
-                        paged_kv_last_page_len_prefill_cpu,
-                        self.num_qo_heads,
-                        self.num_kv_heads,
-                        self.head_dim,
-                        self.page_size,
-                        causal=True,
-                        sm_scale=self.sm_scale,
-                        window_left=self.window_left,
-                        logits_soft_cap=self.logits_soft_cap,
-                        q_data_type=self.q_data_type,
-                        kv_data_type=self.kv_cache_dtype,
-                        fixed_split_size=self.prefill_fixed_split_size,
-                        disable_split_kv=self.disable_split_kv,
-                        use_sinks=getattr(self, '_use_fa2_sinks', False),
-                    )
-                attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)
 
         ## DECODE PATHWAY
         if num_decodes > 0:
@@ -1077,21 +1274,32 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 )
             else:
                 pure_decode = num_prefills == 0
+                has_multiple_groups = len(self.group_id_to_params) > 1
                 use_cudagraph = (
                     self.enable_cuda_graph
                     and pure_decode
                     and num_decode_tokens <= self._decode_cudagraph_max_bs
+                    # Cudagraph captures a single execution path with fixed hyperparams.
+                    # Multiple groups (speculative decoding) require different wrappers
+                    # per group, so cudagraph is incompatible.
+                    and not has_multiple_groups
                 )
                 num_input_tokens = num_decode_tokens
 
-                decode_wrapper = self._get_decode_wrapper(
+                # Create and plan decode wrappers
+                # - Cudagraph mode: Single group only (graph captures one execution path)
+                # - Non-cudagraph: All groups for speculative decoding
+                # Non-primary group wrappers are cached and re-planned each batch.
+                primary_group_params = self.group_id_to_params[0]
+                primary_wrapper = self._get_decode_wrapper(
                     num_input_tokens, use_cudagraph
                 )
-                # Use the persistent buffer with padding length,
-                # instead of the same address but chunked version
-                # in atten_metadata when using cudagraph.
+                
+                # Plan primary wrapper
+                primary_use_sinks = (primary_group_params.has_sinks and 
+                                     getattr(self, '_use_fa2_sinks', False))
                 fast_plan_decode(
-                    decode_wrapper,
+                    primary_wrapper,
                     self.paged_kv_indptr.cpu[: num_input_tokens + 1],
                     paged_kv_indices,
                     self.paged_kv_last_page_len.cpu[:num_input_tokens],
@@ -1100,18 +1308,57 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     self.num_kv_heads,
                     self.head_dim,
                     self.page_size,
-                    # Disable flashinfer's pos encoding and use vllm's rope.
                     pos_encoding_mode="NONE",
-                    sm_scale=self.sm_scale,
-                    window_left=self.window_left,
-                    logits_soft_cap=self.logits_soft_cap,
+                    sm_scale=primary_group_params.sm_scale,
+                    window_left=primary_group_params.window_left,
+                    logits_soft_cap=primary_group_params.logits_soft_cap,
                     q_data_type=self.q_data_type,
                     kv_data_type=self.kv_cache_dtype,
                     fixed_split_size=self.decode_fixed_split_size,
                     disable_split_kv=self.disable_split_kv,
-                    use_sinks=getattr(self, '_use_fa2_sinks', False),
+                    use_sinks=primary_use_sinks,
                 )
-                attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
+                
+                # For non-cudagraph mode with multiple groups, create per-group wrappers
+                decode_wrappers_by_group: dict[GroupId, BatchDecodeWithPagedKVCacheWrapper] | None = None
+                if not use_cudagraph and len(self.group_id_to_params) > 1:
+                    decode_wrappers_by_group = {0: primary_wrapper}
+                    
+                    for group_id, group_params in self.group_id_to_params.items():
+                        if group_id == 0:
+                            continue  # Already handled above
+                        
+                        # Create ephemeral wrapper for non-primary group
+                        wrapper = self._get_decode_wrapper_for_group(group_id)
+                        use_sinks = (group_params.has_sinks and 
+                                     getattr(self, '_use_fa2_sinks', False))
+                        
+                        fast_plan_decode(
+                            wrapper,
+                            self.paged_kv_indptr.cpu[: num_input_tokens + 1],
+                            paged_kv_indices,
+                            self.paged_kv_last_page_len.cpu[:num_input_tokens],
+                            seq_lens_cpu[:num_input_tokens],
+                            self.num_qo_heads * self.dcp_world_size,
+                            self.num_kv_heads,
+                            self.head_dim,
+                            self.page_size,
+                            pos_encoding_mode="NONE",
+                            sm_scale=group_params.sm_scale,
+                            window_left=group_params.window_left,
+                            logits_soft_cap=group_params.logits_soft_cap,
+                            q_data_type=self.q_data_type,
+                            kv_data_type=self.kv_cache_dtype,
+                            fixed_split_size=self.decode_fixed_split_size,
+                            disable_split_kv=self.disable_split_kv,
+                            use_sinks=use_sinks,
+                        )
+                        decode_wrappers_by_group[group_id] = wrapper
+                
+                attn_metadata.decode = FIDecode(
+                    wrapper=primary_wrapper,
+                    wrappers_by_group=decode_wrappers_by_group,
+                )
         return attn_metadata
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
@@ -1350,8 +1597,25 @@ class FlashInferImpl(AttentionImpl):
 
             if not prefill_use_trtllm:
                 assert isinstance(attn_metadata.prefill, FIPrefill)
-                prefill_wrapper = attn_metadata.prefill.wrapper
-                assert prefill_wrapper is not None
+                
+                # Look up the wrapper for this layer's group
+                # This supports speculative decoding with different configs
+                # layer is the Attention instance which has layer_name set from prefix
+                group_id = None
+                if attn_metadata.layer_to_group_id is not None:
+                    layer_name = getattr(layer, 'layer_name', None)
+                    assert layer_name is not None, (
+                        "Multi-group attention requires layer.layer_name to be set. "
+                        "The Attention class should set self.layer_name = prefix in __init__."
+                    )
+                    group_id = attn_metadata.layer_to_group_id.get(layer_name)
+                    assert group_id is not None, (
+                        f"Layer '{layer_name}' not found in layer_to_group_id mapping. "
+                        f"Available layers: {list(attn_metadata.layer_to_group_id.keys())[:5]}..."
+                    )
+                
+                prefill_wrapper = attn_metadata.prefill.get_wrapper(group_id)
+                
                 if use_dcp:
                     assert isinstance(prefill_wrapper, BatchDCPPrefillWrapper)
                     assert prefill_wrapper._context._window_left == self.window_left
@@ -1469,8 +1733,24 @@ class FlashInferImpl(AttentionImpl):
 
             if not decode_use_trtllm:
                 assert isinstance(attn_metadata.decode, FIDecode)
-                decode_wrapper = attn_metadata.decode.wrapper
-                assert decode_wrapper is not None
+                
+                # Look up the wrapper for this layer's group
+                # This supports speculative decoding with different configs
+                # layer is the Attention instance which has layer_name set from prefix
+                group_id = None
+                if attn_metadata.layer_to_group_id is not None:
+                    layer_name = getattr(layer, 'layer_name', None)
+                    assert layer_name is not None, (
+                        "Multi-group attention requires layer.layer_name to be set. "
+                        "The Attention class should set self.layer_name = prefix in __init__."
+                    )
+                    group_id = attn_metadata.layer_to_group_id.get(layer_name)
+                    assert group_id is not None, (
+                        f"Layer '{layer_name}' not found in layer_to_group_id mapping. "
+                        f"Available layers: {list(attn_metadata.layer_to_group_id.keys())[:5]}..."
+                    )
+                
+                decode_wrapper = attn_metadata.decode.get_wrapper(group_id)
                 assert decode_wrapper._window_left == self.window_left
                 assert decode_wrapper._logits_soft_cap == (self.logits_soft_cap or 0.0)
                 assert decode_wrapper._sm_scale == self.scale

@@ -502,17 +502,22 @@ def set_kv_cache_layout(cache_layout: KVCacheLayoutType):
 @dataclass
 class PerLayerParameters:
     """
-    Currently, FlashInfer backend only support models in which all layers share
-    the same values for the following hyperparameters. Should not be used for
-    trtllm-gen backend since it supports different values for the following
-    hyperparameters.
+    Per-layer attention hyperparameters.
+    
+    FlashInfer now supports different hyperparameters across layer groups
+    (e.g., main model vs draft model in speculative decoding). Use
+    group_layers_by_hyperparameters() to organize layers into groups.
+    
+    The has_same_* fields are informational only, set by infer_global_hyperparameters()
+    for backward compatibility with code that assumes uniform hyperparameters.
     """
 
     window_left: int
     logits_soft_cap: float | None
     sm_scale: float
     has_sinks: bool = False
-    # has same params for all layers
+    
+    # Informational flags set by infer_global_hyperparameters() for backward compat
     has_same_window_lefts: bool | None = field(default=None, compare=False)
     has_same_all_params: bool | None = field(default=None, compare=False)
 
@@ -564,17 +569,24 @@ def infer_global_hyperparameters(
     per_layer_params: dict[str, PerLayerParameters],
 ) -> PerLayerParameters:
     """
-    Currently, FlashInfer backend other than trtllm-gen
-    only support models in which all layers share
-    the same values for the following hyperparameters:
-    - `window_left`
-    - `logits_soft_cap`
-    - `sm_scale`
-
-    So this function asserts that all layers share the same values for these
-    hyperparameters and returns the global values.
+    Infer "global" hyperparameters from the first layer for backward compatibility.
+    
+    This function returns the first layer's parameters and sets informational
+    flags indicating whether all layers share the same values. It does NOT
+    enforce uniformity - FlashInfer now supports per-group hyperparameters
+    via group_layers_by_hyperparameters().
+    
+    NOTE: This function MUTATES the first PerLayerParameters object in-place
+    to set the has_same_* flags. The same object is returned.
+    
+    The returned PerLayerParameters has:
+    - has_same_window_lefts: True if all layers have the same window_left
+    - has_same_all_params: True if all layers have identical parameters
+    
+    These flags are informational only and do not affect execution.
+    For speculative decoding with different hyperparameters, use
+    group_layers_by_hyperparameters() instead.
     """
-
     assert len(per_layer_params) > 0, "No attention layers found in the model."
 
     param_sets = list(per_layer_params.values())
@@ -588,6 +600,61 @@ def infer_global_hyperparameters(
     )
 
     return global_params
+
+
+def group_layers_by_hyperparameters(
+    per_layer_params: dict[str, PerLayerParameters],
+) -> list[tuple[PerLayerParameters, list[str]]]:
+    """
+    Group layers by their hyperparameters for speculative decoding support.
+    
+    In speculative decoding, the main model and draft model may have different
+    hyperparameters (e.g., main model has sinks, draft model doesn't).
+    This function groups layers with identical hyperparameters together.
+    
+    Returns:
+        A list of (params, layer_names) tuples, where each tuple contains:
+        - params: The PerLayerParameters for that group
+        - layer_names: List of layer names belonging to that group
+        
+    The groups are returned in semantic order to ensure the main model is
+    the primary group (group_id=0):
+        1. Prefer groups with has_sinks=True (main model typically has sinks)
+        2. Prefer groups with more layers (main model has more layers than draft)
+        3. Fall back to first layer name for deterministic tie-breaking
+    """
+    assert len(per_layer_params) > 0, "No attention layers found in the model."
+    
+    # Group layers by their params
+    groups: dict[tuple, tuple[PerLayerParameters, list[str]]] = {}
+    
+    for layer_name, params in per_layer_params.items():
+        # Create a hashable key from params (dataclass isn't hashable by default)
+        key = (params.window_left, params.logits_soft_cap, params.sm_scale, 
+               params.has_sinks)
+        
+        if key not in groups:
+            groups[key] = (params, [layer_name])
+        else:
+            groups[key][1].append(layer_name)
+    
+    # Sort each group's layer names for deterministic ordering
+    # This ensures min(layer_names) is stable across runs
+    for _, layer_list in groups.values():
+        layer_list.sort()
+    
+    # Sort groups semantically to ensure main model is primary (group_id=0):
+    # 1. has_sinks=True first (main model typically has sinks, draft doesn't)
+    # 2. More layers first (main model has more layers than draft)
+    # 3. min(layer_names) for deterministic tie-breaking
+    result = list(groups.values())
+    result.sort(key=lambda x: (
+        not x[0].has_sinks,  # False (has sinks) sorts before True (no sinks)
+        -len(x[1]),          # More layers sorts first (negative for descending)
+        x[1][0],             # min(layer_names) after sort for tie-breaking
+    ))
+    
+    return result
 
 
 #
