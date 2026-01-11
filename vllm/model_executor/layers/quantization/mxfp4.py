@@ -53,7 +53,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_s
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
-from vllm.utils.flashinfer import has_flashinfer
+from vllm.utils.flashinfer import has_flashinfer, has_flashinfer_sm12x_cutlass_moe
 from vllm.utils.import_utils import has_triton_kernels
 from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import is_torch_equal_or_newer
@@ -61,32 +61,63 @@ from vllm.utils.torch_utils import is_torch_equal_or_newer
 logger = init_logger(__name__)
 
 
-# enum for mxfp4 backend
+# Enum for MXFP4 backend selection
+#
+# Naming convention: ENGINE_ARCH_QUANT
+#   ENGINE: Kernel technology (CUTLASS, TRTLLM, MARLIN, TRITON)
+#   ARCH: GPU architecture (BLACKWELL=SM10x+SM12x, SM100, SM90, or omitted for universal)
+#   QUANT: Quantization format (FP4FP8=FP4 weights×FP8 acts, FP4BF16=FP4 weights×BF16 acts)
+#
 class Mxfp4Backend(Enum):
     NONE = 0
 
-    # FlashInfer Backend
-    SM100_FI_MXFP4_MXFP8_TRTLLM = 1
-    SM100_FI_MXFP4_MXFP8_CUTLASS = 2
-    SM100_FI_MXFP4_BF16 = 3
-    SM90_FI_MXFP4_BF16 = 4
+    # Universal backends (all architectures)
+    MARLIN = 5                        # Dequant to BF16, works everywhere
+    TRITON = 6                        # OpenAI Triton, SM90-SM100
 
-    # Marlin Backend
-    MARLIN = 5
+    # CUTLASS backends (FlashInfer dispatch)
+    CUTLASS_BLACKWELL_FP4FP8 = 2      # SM10x + SM12x: FP8×FP4 native MMA
+    CUTLASS_SM90_FP4BF16 = 4          # SM90: BF16×FP4 (opt-in)
 
-    # Triton Backend
-    TRITON = 6
+    # TRT-LLM backends (SM100 only, FlashInfer dispatch)
+    TRTLLM_SM100_FP4FP8 = 1           # FP8×FP4
+    TRTLLM_SM100_FP4BF16 = 3          # BF16×FP4
 
 
 def get_mxfp4_backend_with_lora() -> Mxfp4Backend:
     """
-    Not all MXFP4 backends support LoRA. Select backends that are known to
-    have LoRA support.
+    Select LoRA-compatible MXFP4 backend.
+    
+    Not all MXFP4 backends support LoRA. Currently supported:
+    - MARLIN: Full LoRA support
+    - TRITON: Full LoRA support (SM90-SM100)
+    
+    Not yet supported:
+    - CUTLASS_BLACKWELL_FP4FP8: LoRA not implemented
+    - TRTLLM_*: LoRA not implemented
     """
     if not current_platform.is_cuda():
         return Mxfp4Backend.NONE
 
-    # If FlashInfer is not available, try either Marlin or Triton
+    # LoRA-compatible backends
+    LORA_COMPATIBLE = {"marlin", "triton"}
+    
+    # Check if user explicitly requested a backend via VLLM_MXFP4_BACKEND
+    explicit_backend = envs.VLLM_MXFP4_BACKEND
+    if explicit_backend and explicit_backend != "auto":
+        if explicit_backend in LORA_COMPATIBLE:
+            logger.info_once(
+                f"[MXFP4+LoRA] Using explicit backend: {explicit_backend}"
+            )
+            return MXFP4_BACKEND_MAP[explicit_backend]
+        else:
+            logger.warning_once(
+                f"[MXFP4+LoRA] VLLM_MXFP4_BACKEND={explicit_backend} does not support LoRA. "
+                f"Falling back to Marlin. LoRA-compatible backends: {', '.join(LORA_COMPATIBLE)}"
+            )
+            return Mxfp4Backend.MARLIN
+
+    # Auto-select from LoRA-compatible backends
     triton_kernels_supported = (
         has_triton_kernels()
         and is_torch_equal_or_newer("2.8.0")
@@ -95,110 +126,207 @@ def get_mxfp4_backend_with_lora() -> Mxfp4Backend:
         # SM120 needs this fix: https://github.com/triton-lang/triton/pull/8498
         and (9, 0) <= current_platform.get_device_capability() < (11, 0)
     )
+    
+    # Legacy flag support (deprecated)
     if envs.VLLM_MXFP4_USE_MARLIN is False and triton_kernels_supported:
-        logger.info_once("[get_mxfp4_backend_with_lora] Using Triton backend")
+        logger.info_once("[MXFP4+LoRA] Auto-selected: Triton")
         return Mxfp4Backend.TRITON
 
-    logger.info_once("[get_mxfp4_backend_with_lora] Using Marlin backend")
+    logger.info_once("[MXFP4+LoRA] Auto-selected: Marlin")
     return Mxfp4Backend.MARLIN
 
 
-def get_mxfp4_backend(with_lora_support: bool) -> Mxfp4Backend:
-    # Backend Selection
-
-
-    # Check for explicit kernel override (for benchmarking)
-    kernel_override = envs.VLLM_MXFP4_MOE_KERNEL
-    if kernel_override != "auto":
-        if kernel_override == "marlin":
-            logger.info_once(
-                f"[MXFP4] Kernel override: using Marlin backend "
-                f"(VLLM_MXFP4_MOE_KERNEL={kernel_override})"
-            )
+def _check_legacy_mxfp4_flags() -> Mxfp4Backend | None:
+    """Check legacy MXFP4 env vars and return backend if set, with deprecation warnings."""
+    # Check legacy kernel override
+    kernel = envs.VLLM_MXFP4_MOE_KERNEL
+    if kernel != "auto":
+        logger.warning_once(
+            f"[MXFP4] VLLM_MXFP4_MOE_KERNEL is deprecated. "
+            f"Use VLLM_MXFP4_BACKEND instead. "
+            f"Example: VLLM_MXFP4_BACKEND=CUTLASS"
+        )
+        if kernel in ("cutlass", "gemm"):
+            return Mxfp4Backend.CUTLASS_BLACKWELL_FP4FP8
+        elif kernel == "marlin":
             return Mxfp4Backend.MARLIN
-        elif kernel_override == "gemm":
-            logger.info_once(
-                f"[MXFP4] Kernel override: using CUTLASS grouped GEMM "
-                f"(VLLM_MXFP4_MOE_KERNEL={kernel_override})"
-            )
-            return Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS
-        elif kernel_override == "triton":
-            logger.info_once(
-                f"[MXFP4] Kernel override: using Triton backend "
-                f"(VLLM_MXFP4_MOE_KERNEL={kernel_override})"
-            )
+        elif kernel == "triton":
             return Mxfp4Backend.TRITON
-        else:
+
+    # Check legacy boolean flags
+    if envs.VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS:
+        logger.warning_once(
+            "[MXFP4] VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS is deprecated. "
+            "Use VLLM_MXFP4_BACKEND=CUTLASS instead."
+        )
+        return Mxfp4Backend.CUTLASS_BLACKWELL_FP4FP8
+
+    if envs.VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8:
+        logger.warning_once(
+            "[MXFP4] VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8 is deprecated. "
+            "Use VLLM_MXFP4_BACKEND=TRTLLM_MXFP8 instead."
+        )
+        return Mxfp4Backend.TRTLLM_SM100_FP4FP8
+
+    if envs.VLLM_USE_FLASHINFER_MOE_MXFP4_BF16:
+        logger.warning_once(
+            "[MXFP4] VLLM_USE_FLASHINFER_MOE_MXFP4_BF16 is deprecated. "
+            "Use VLLM_MXFP4_BACKEND=TRTLLM instead."
+        )
+        return Mxfp4Backend.TRTLLM_SM100_FP4BF16
+
+    if envs.VLLM_MXFP4_USE_MARLIN:
+        logger.warning_once(
+            "[MXFP4] VLLM_MXFP4_USE_MARLIN is deprecated. "
+            "Use VLLM_MXFP4_BACKEND=MARLIN instead."
+        )
+        return Mxfp4Backend.MARLIN
+
+    return None
+
+
+def _auto_select_mxfp4_backend() -> Mxfp4Backend:
+    """Auto-select MXFP4 backend based on hardware capabilities."""
+    if not current_platform.is_cuda():
+        if current_platform.is_xpu():
+            logger.info_once("[MXFP4] Auto-selected: Marlin (XPU)")
+            return Mxfp4Backend.MARLIN
+        elif current_platform.is_rocm() and has_triton_kernels():
+            logger.info_once("[MXFP4] Auto-selected: Triton (ROCm)")
+            return Mxfp4Backend.TRITON
+        return Mxfp4Backend.NONE
+
+    # SM12x (GB10, Thor): use CUTLASS FP8×FP4 for native block-scaled MMA
+    # This uses a stronger predicate that verifies:
+    # 1. FlashInfer is installed with CUTLASS MoE support
+    # 2. SM12x-specific kernels are available
+    # 3. Current GPU is SM12x (major=12)
+    capability = current_platform.get_device_capability()
+    if has_flashinfer_sm12x_cutlass_moe():
+        logger.info_once(
+            "[MXFP4] Auto-selected: cutlass (FlashInfer CUTLASS FP8×FP4 for SM12x)"
+        )
+        return Mxfp4Backend.CUTLASS_BLACKWELL_FP4FP8
+
+    # SM100 (B100/B200): default to TRT-LLM BF16×FP4 (upstream behavior)
+    # Can opt-in to CUTLASS FP8×FP4 for potentially better performance
+    is_sm100 = capability is not None and capability.major == 10
+    if is_sm100 and has_flashinfer():
+        logger.info_once(
+            "[MXFP4] SM100 auto-selected: trtllm (BF16×FP4). "
+            "For CUTLASS FP8×FP4, set VLLM_MXFP4_BACKEND=CUTLASS"
+        )
+        return Mxfp4Backend.TRTLLM_SM100_FP4BF16
+
+    # Hopper (SM90): prefer Triton or Marlin
+    if current_platform.is_device_capability(90):
+        if has_flashinfer():
             logger.warning_once(
-                f"[MXFP4] Unknown kernel override '{kernel_override}', "
-                "valid options: auto, marlin, gemm, triton. Using auto."
+                "[MXFP4] SM90 auto-selected: Marlin. "
+                "For FlashInfer BF16, use VLLM_MXFP4_BACKEND=TRTLLM"
             )
 
+    # Fallback: Triton or Marlin
+    triton_kernels_supported = (
+        has_triton_kernels()
+        and is_torch_equal_or_newer("2.8.0")
+        and (9, 0) <= current_platform.get_device_capability() < (11, 0)
+    )
+    if triton_kernels_supported:
+        logger.info_once("[MXFP4] Auto-selected: Triton")
+        return Mxfp4Backend.TRITON
+    else:
+        logger.info_once("[MXFP4] Auto-selected: Marlin (universal fallback)")
+        return Mxfp4Backend.MARLIN
+
+
+# Backend name to enum mapping
+MXFP4_BACKEND_MAP: dict[str, Mxfp4Backend] = {
+    # Primary names (UPPERCASE for consistency with VLLM_ATTENTION_BACKEND)
+    "MARLIN": Mxfp4Backend.MARLIN,
+    "CUTLASS": Mxfp4Backend.CUTLASS_BLACKWELL_FP4FP8,
+    "TRITON": Mxfp4Backend.TRITON,
+    "TRTLLM": Mxfp4Backend.TRTLLM_SM100_FP4BF16,
+    "TRTLLM_MXFP8": Mxfp4Backend.TRTLLM_SM100_FP4FP8,
+    # Lowercase aliases for backwards compatibility
+    "marlin": Mxfp4Backend.MARLIN,
+    "cutlass": Mxfp4Backend.CUTLASS_BLACKWELL_FP4FP8,
+    "triton": Mxfp4Backend.TRITON,
+    "trtllm": Mxfp4Backend.TRTLLM_SM100_FP4BF16,
+    "trtllm-mxfp8": Mxfp4Backend.TRTLLM_SM100_FP4FP8,
+    # Legacy aliases
+    "gemm": Mxfp4Backend.CUTLASS_BLACKWELL_FP4FP8,
+}
+
+
+def get_mxfp4_backend(with_lora_support: bool) -> Mxfp4Backend:
+    """Select the MXFP4 MoE backend.
+
+    Configuration priority:
+    1. CLI argument --mxfp4-backend (highest)
+    2. VLLM_MXFP4_BACKEND env var
+    3. Legacy env vars (with deprecation warnings)
+    4. Hardware-based auto-selection
+
+    Backend options:
+    - marlin: Marlin dequant→BF16 (works on all GPUs)
+    - cutlass: FlashInfer CUTLASS FP8×FP4 (SM12x/SM100 native)
+    - triton: OpenAI Triton (SM90-SM100)
+    - trtllm: TRT-LLM BF16×FP4 (SM100 only)
+    - trtllm-mxfp8: TRT-LLM FP8×FP4 (SM100 only)
+
+    For SM12x (GB10):
+        vllm serve ... --mxfp4-backend cutlass
+    """
+    # Step 1: Check CLI argument (highest priority)
+    try:
+        vllm_config = get_current_vllm_config()
+        cli_backend = vllm_config.model_config.mxfp4_backend
+        if cli_backend and cli_backend != "auto":
+            if cli_backend not in MXFP4_BACKEND_MAP:
+                valid = ", ".join(sorted(set(MXFP4_BACKEND_MAP.keys()) - {"gemm"}))
+                logger.warning_once(
+                    f"[MXFP4] Unknown backend '{cli_backend}' from --mxfp4-backend. "
+                    f"Valid options: auto, {valid}. Using auto."
+                )
+            else:
+                backend = MXFP4_BACKEND_MAP[cli_backend]
+                logger.info_once(
+                    f"[MXFP4] Using backend: {cli_backend} (--mxfp4-backend)"
+                )
+                return backend
+    except Exception:
+        # Config not available yet, fall through to env var
+        pass
+
+    # Step 2: Check unified backend env var
+    backend_name = envs.VLLM_MXFP4_BACKEND
+    if backend_name != "auto":
+        if backend_name not in MXFP4_BACKEND_MAP:
+            valid = ", ".join(sorted(set(MXFP4_BACKEND_MAP.keys()) - {"gemm"}))
+            logger.warning_once(
+                f"[MXFP4] Unknown backend '{backend_name}'. "
+                f"Valid options: auto, {valid}. Using auto."
+            )
+        else:
+            backend = MXFP4_BACKEND_MAP[backend_name]
+            logger.info_once(
+                f"[MXFP4] Using backend: {backend_name} "
+                f"(VLLM_MXFP4_BACKEND={backend_name})"
+            )
+            return backend
+
+    # Step 2: Check legacy env vars (with deprecation warnings)
+    legacy_backend = _check_legacy_mxfp4_flags()
+    if legacy_backend is not None:
+        return legacy_backend
+
+    # Step 3: LoRA support requires specific backends
     if with_lora_support:
         return get_mxfp4_backend_with_lora()
 
-    if current_platform.is_cuda():
-        if (
-            current_platform.is_device_capability(90)
-            and has_flashinfer()
-            and envs.VLLM_USE_FLASHINFER_MOE_MXFP4_BF16
-        ):
-            logger.info_once("Using FlashInfer MXFP4 BF16 backend for SM90")
-            return Mxfp4Backend.SM90_FI_MXFP4_BF16
-        elif (
-            current_platform.is_blackwell_class()
-            and has_flashinfer()
-            and envs.VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS
-        ):
-            logger.info_once("Using FlashInfer MXFP4 MXFP8 CUTLASS backend for SM100")
-            return Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS
-        elif (
-            current_platform.is_blackwell_class()
-            and has_flashinfer()
-            and envs.VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8
-        ):
-            return Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM
-        elif current_platform.is_blackwell_class() and has_flashinfer():
-            logger.info_once(
-                "Using FlashInfer MXFP4 BF16 backend for SM100, "
-                "For faster performance on SM100, consider setting "
-                "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8=1, though this may impact "
-                "accuracy."
-            )
-            return Mxfp4Backend.SM100_FI_MXFP4_BF16
-        elif (
-            current_platform.is_blackwell_class()
-            or current_platform.is_device_capability(90)
-        ) and not has_flashinfer():
-            logger.warning_once(
-                "MXFP4 MoE is enabled on Hopper/Blackwell but FlashInfer "
-                "is not available. This may result in degraded performance. "
-                "Please `pip install vllm[flashinfer]` for best results."
-            )
-
-        # If FlashInfer is not available, try either Marlin or Triton
-        triton_kernels_supported = (
-            has_triton_kernels()
-            and is_torch_equal_or_newer("2.8.0")
-            # NOTE: triton_kernels are only confirmed to work on SM90 and SM100
-            # SM110 fails with this error: https://github.com/vllm-project/vllm/issues/29317
-            # SM120 needs this fix: https://github.com/triton-lang/triton/pull/8498
-            and (9, 0) <= current_platform.get_device_capability() < (11, 0)
-        )
-        if envs.VLLM_MXFP4_USE_MARLIN or not triton_kernels_supported:
-            logger.info_once("Using Marlin backend")
-            return Mxfp4Backend.MARLIN
-        else:
-            logger.info_once("Using Triton backend")
-            return Mxfp4Backend.TRITON
-    elif current_platform.is_xpu():
-        logger.info_once("Using ipex marlin backend on XPU")
-        return Mxfp4Backend.MARLIN
-    elif current_platform.is_rocm() and has_triton_kernels():
-        logger.info_once("Using Triton backend")
-        return Mxfp4Backend.TRITON
-
-    return Mxfp4Backend.NONE
+    # Step 4: Auto-select based on hardware
+    return _auto_select_mxfp4_backend()
 
 
 class Mxfp4Config(QuantizationConfig):
@@ -327,8 +455,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_size_per_partition_after_pad
             )
         elif (
-            self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM
-            or self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_BF16
+            self.mxfp4_backend == Mxfp4Backend.TRTLLM_SM100_FP4FP8
+            or self.mxfp4_backend == Mxfp4Backend.TRTLLM_SM100_FP4BF16
         ):
             # pad the intermediate size to be a multiple of 2 * mxfp4_block
             # for to hold non-uniform sharded tensor as well as swizzling
@@ -338,8 +466,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
             hidden_size = round_up(hidden_size, 256)
         elif (
-            self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS
-            or self.mxfp4_backend == Mxfp4Backend.SM90_FI_MXFP4_BF16
+            self.mxfp4_backend == Mxfp4Backend.CUTLASS_BLACKWELL_FP4FP8
+            or self.mxfp4_backend == Mxfp4Backend.CUTLASS_SM90_FP4BF16
         ):
             intermediate_size_per_partition_after_pad = round_up(
                 intermediate_size_per_partition, 128
@@ -434,8 +562,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if self.mxfp4_backend == Mxfp4Backend.MARLIN:
             prepare_moe_fp4_layer_for_marlin(layer, input_dtype=self.marlin_input_dtype)
         elif (
-            self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM
-            or self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_BF16
+            self.mxfp4_backend == Mxfp4Backend.TRTLLM_SM100_FP4FP8
+            or self.mxfp4_backend == Mxfp4Backend.TRTLLM_SM100_FP4BF16
         ):
             from flashinfer.fp4_quantization import nvfp4_block_scale_interleave
             from flashinfer.fused_moe.core import get_w2_permute_indices_with_cache
@@ -643,8 +771,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
         elif (
-            self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS
-            or self.mxfp4_backend == Mxfp4Backend.SM90_FI_MXFP4_BF16
+            self.mxfp4_backend == Mxfp4Backend.CUTLASS_BLACKWELL_FP4FP8
+            or self.mxfp4_backend == Mxfp4Backend.CUTLASS_SM90_FP4BF16
         ):
             layer.gemm1_alpha = Parameter(
                 torch.tensor([1.702] * self.num_experts, dtype=torch.float32).cuda(),
@@ -716,7 +844,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             s1, s3 = torch.chunk(deinterleaved_w13_s, 2, dim=1)
             w13_scale_swapped = torch.cat([s3, s1], dim=1)
 
-            if self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS:
+            if self.mxfp4_backend == Mxfp4Backend.CUTLASS_BLACKWELL_FP4FP8:
                 from flashinfer import block_scale_interleave
 
                 orig_shape = w13_scale_swapped.shape
@@ -738,7 +866,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight_scale = Parameter(
                     w2_scale_interleaved, requires_grad=False
                 )
-            elif self.mxfp4_backend == Mxfp4Backend.SM90_FI_MXFP4_BF16:
+            elif self.mxfp4_backend == Mxfp4Backend.CUTLASS_SM90_FP4BF16:
 
                 def _interleave_mxfp4_cutlass_sm90(w):
                     w_shape = w.shape
@@ -836,8 +964,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w2_scale=w2_scale,
             )
         elif self.mxfp4_backend in [
-            Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM,
-            Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS,
+            Mxfp4Backend.TRTLLM_SM100_FP4FP8,
+            Mxfp4Backend.CUTLASS_BLACKWELL_FP4FP8,
         ]:
             return mxfp4_mxfp8_moe_quant_config(
                 w1_bias=layer.w13_bias,
@@ -845,7 +973,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
             )
-        elif self.mxfp4_backend in [Mxfp4Backend.SM100_FI_MXFP4_BF16]:
+        elif self.mxfp4_backend in [Mxfp4Backend.TRTLLM_SM100_FP4BF16]:
             return mxfp4_w4a16_moe_quant_config(
                 w1_bias=layer.w13_bias,
                 w2_bias=layer.w2_bias,
@@ -889,8 +1017,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         else:
             assert self.moe_quant_config is not None
             if (
-                self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM
-                or self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_BF16
+                self.mxfp4_backend == Mxfp4Backend.TRTLLM_SM100_FP4FP8
+                or self.mxfp4_backend == Mxfp4Backend.TRTLLM_SM100_FP4BF16
             ):
                 # B200 code-path
                 kwargs = {
@@ -968,16 +1096,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         ), "MXFP4 are not supported with this configuration."
 
         if (
-            self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM
-            or self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_BF16
+            self.mxfp4_backend == Mxfp4Backend.TRTLLM_SM100_FP4FP8
+            or self.mxfp4_backend == Mxfp4Backend.TRTLLM_SM100_FP4BF16
         ):
             from flashinfer import trtllm_fp4_block_scale_moe
 
-            if self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_BF16:
+            if self.mxfp4_backend == Mxfp4Backend.TRTLLM_SM100_FP4BF16:
                 assert x.dtype == torch.bfloat16
                 x_quant = x
                 x_scale = None
-            elif self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM:
+            elif self.mxfp4_backend == Mxfp4Backend.TRTLLM_SM100_FP4FP8:
                 from flashinfer import mxfp8_quantize
 
                 x_quant, x_scale = mxfp8_quantize(x, False)  # to mxfp8
@@ -1011,12 +1139,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 None,
                 1 if layer.renormalize else 0,  # routing_method_type, renormalize
                 True,  # do finalize
-                tune_max_num_tokens=max(self.max_capture_size, 1),
+                # FlashInfer uses tune_max_num_tokens to set up tuning/profile buckets.
+                # It must be >= the actual number of tokens passed at runtime, otherwise
+                # CUTLASS/runner initialization may fail internally for larger shapes.
+                tune_max_num_tokens=max(self.max_capture_size, int(x.shape[0]), 1),
             )[0]
             return trtllm_gen_output
         elif (
-            self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS
-            or self.mxfp4_backend == Mxfp4Backend.SM90_FI_MXFP4_BF16
+            self.mxfp4_backend == Mxfp4Backend.CUTLASS_BLACKWELL_FP4FP8
+            or self.mxfp4_backend == Mxfp4Backend.CUTLASS_SM90_FP4BF16
         ):
             from vllm.utils.flashinfer import flashinfer_cutlass_fused_moe
 
@@ -1025,10 +1156,26 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 router_logits=router_logits,
             )
 
+            # Optional warmup fix: vLLM startup profile runs can route nearly all tokens to a single
+            # expert, creating many empty experts (M=0) that some grouped GEMM implementations
+            # cannot initialize. When enabled, force a balanced routing pattern ONLY for dummy runs.
+            try:
+                from vllm.forward_context import get_forward_context
+
+                _ctx = get_forward_context()
+                _is_dummy = bool(_ctx.additional_kwargs.get("vllm_dummy_run", False))
+            except Exception:
+                _is_dummy = False
+
+            # Optional debug: summarize routing distribution (helps diagnose empty experts / M=0 groups
+            # during startup profile runs).
+            # NOTE: this will incur GPU work and a small device->host copy.
+            import os as _os
             # Backend-specific preparation
-            if self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS:
+            if self.mxfp4_backend == Mxfp4Backend.CUTLASS_BLACKWELL_FP4FP8:
                 from flashinfer import mxfp8_quantize
 
+                import os as _os
                 x_quant, x_scale = mxfp8_quantize(x, True, 32)
 
                 fake_input_scale = torch.ones(self.num_experts, device=x.device)
@@ -1046,7 +1193,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     fc1_expert_weights=layer.w13_weight.contiguous().view(torch.long),
                     fc2_expert_weights=layer.w2_weight.contiguous().view(torch.long),
                 )
-            elif self.mxfp4_backend == Mxfp4Backend.SM90_FI_MXFP4_BF16:
+            elif self.mxfp4_backend == Mxfp4Backend.CUTLASS_SM90_FP4BF16:
                 assert x.dtype == torch.bfloat16
 
                 quant_scales = [
@@ -1078,7 +1225,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 tp_rank=self.moe.tp_rank,
                 ep_size=self.moe.ep_size,
                 ep_rank=self.moe.ep_rank,
-                tune_max_num_tokens=max(self.max_capture_size, 1),
+                # FlashInfer uses tune_max_num_tokens to set up tuning/profile buckets.
+                # It must be >= the actual number of tokens passed at runtime, otherwise
+                # CUTLASS/runner initialization may fail internally for larger shapes.
+                tune_max_num_tokens=max(self.max_capture_size, int(fi_input.shape[0]), 1),
                 **extra_kwargs,
             )
 
