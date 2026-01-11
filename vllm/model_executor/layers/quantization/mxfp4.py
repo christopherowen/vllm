@@ -370,19 +370,16 @@ class Mxfp4Config(QuantizationConfig):
                 fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedLinearMethod()
-            # Use MXFP4 linear on Blackwell (SM12x) which has native FP8×FP4 support
-            if current_platform.is_cuda() and current_platform.is_blackwell_class():
-                logger.debug_once(
-                    "Using Mxfp4LinearMethod for linear layers on Blackwell.",
-                    scope="local",
+            # MXFP4 linear is ONLY applied to lm_head on Blackwell
+            # Other linear layers (attention, MLP, etc.) remain unquantized
+            # to preserve model quality - only lm_head is the decode bottleneck
+            is_lm_head = "lm_head" in prefix or prefix.endswith(".lm_head")
+            if is_lm_head and current_platform.is_cuda() and current_platform.is_blackwell_class():
+                logger.info_once(
+                    f"Using Mxfp4LinearMethod for lm_head ({prefix}) on Blackwell.",
                 )
                 return Mxfp4LinearMethod()
-            # Fall back to UnquantizedLinearMethod on other platforms
-            logger.debug_once(
-                "MXFP4 linear layer requires Blackwell GPU - falling back to "
-                "UnquantizedLinearMethod.",
-                scope="local",
-            )
+            # All other linear layers use BF16 (unquantized)
             return UnquantizedLinearMethod()
         elif isinstance(layer, FusedMoE):
             if current_platform.is_xpu():
