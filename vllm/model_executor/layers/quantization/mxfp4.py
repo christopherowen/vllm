@@ -32,7 +32,13 @@ from vllm.model_executor.layers.fused_moe.gpt_oss_triton_kernels_moe import (
     UnfusedOAITritonExperts,
 )
 from vllm.model_executor.layers.fused_moe.trtllm_moe import TrtLlmGenExperts
-from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+from vllm.model_executor.layers.linear import (
+    LinearBase,
+    LinearMethodBase,
+    UnquantizedLinearMethod,
+)
+from vllm.model_executor.parameter import ModelWeightParameter
+from vllm.model_executor.utils import replace_parameter
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
@@ -126,6 +132,11 @@ def get_mxfp4_backend_with_lora() -> Mxfp4Backend:
         # SM120 needs this fix: https://github.com/triton-lang/triton/pull/8498
         and (9, 0) <= current_platform.get_device_capability() < (11, 0)
     )
+    
+    # Legacy flag support (deprecated)
+    if envs.VLLM_MXFP4_USE_MARLIN is False and triton_kernels_supported:
+        logger.info_once("[MXFP4+LoRA] Auto-selected: Triton")
+        return Mxfp4Backend.TRITON
 
     logger.info_once("[MXFP4+LoRA] Auto-selected: Marlin")
     return Mxfp4Backend.MARLIN
@@ -133,13 +144,9 @@ def get_mxfp4_backend_with_lora() -> Mxfp4Backend:
 
 def _check_legacy_mxfp4_flags() -> Mxfp4Backend | None:
     """Check legacy MXFP4 env vars and return backend if set, with deprecation warnings."""
-    import os as _os
-
-    # Check legacy kernel override (only if explicitly set)
-    kernel = _os.environ.get("VLLM_MXFP4_MOE_KERNEL", None)
-    if kernel is not None and kernel.lower() != "auto":
-        kernel = kernel.lower()
-
+    # Check legacy kernel override
+    kernel = envs.VLLM_MXFP4_MOE_KERNEL
+    if kernel != "auto":
         logger.warning_once(
             f"[MXFP4] VLLM_MXFP4_MOE_KERNEL is deprecated. "
             f"Use VLLM_MXFP4_BACKEND instead. "
@@ -153,28 +160,28 @@ def _check_legacy_mxfp4_flags() -> Mxfp4Backend | None:
             return Mxfp4Backend.TRITON
 
     # Check legacy boolean flags
-    if _os.environ.get("VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS") is not None and _os.getenv("VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS", "0") != "0":
+    if envs.VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS:
         logger.warning_once(
             "[MXFP4] VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS is deprecated. "
             "Use VLLM_MXFP4_BACKEND=CUTLASS instead."
         )
         return Mxfp4Backend.CUTLASS_BLACKWELL_FP4FP8
 
-    if _os.environ.get("VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8") is not None and _os.getenv("VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8", "0") != "0":
+    if envs.VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8:
         logger.warning_once(
             "[MXFP4] VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8 is deprecated. "
             "Use VLLM_MXFP4_BACKEND=TRTLLM_MXFP8 instead."
         )
         return Mxfp4Backend.TRTLLM_SM100_FP4FP8
 
-    if _os.environ.get("VLLM_USE_FLASHINFER_MOE_MXFP4_BF16") is not None and _os.getenv("VLLM_USE_FLASHINFER_MOE_MXFP4_BF16", "0") != "0":
+    if envs.VLLM_USE_FLASHINFER_MOE_MXFP4_BF16:
         logger.warning_once(
             "[MXFP4] VLLM_USE_FLASHINFER_MOE_MXFP4_BF16 is deprecated. "
             "Use VLLM_MXFP4_BACKEND=TRTLLM instead."
         )
         return Mxfp4Backend.TRTLLM_SM100_FP4BF16
 
-    if _os.environ.get("VLLM_MXFP4_USE_MARLIN") is not None and _os.getenv("VLLM_MXFP4_USE_MARLIN", "0") != "0":
+    if envs.VLLM_MXFP4_USE_MARLIN:
         logger.warning_once(
             "[MXFP4] VLLM_MXFP4_USE_MARLIN is deprecated. "
             "Use VLLM_MXFP4_BACKEND=MARLIN instead."
@@ -363,11 +370,16 @@ class Mxfp4Config(QuantizationConfig):
                 fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedLinearMethod()
-            # TODO: Add support for MXFP4 Linear Method.
-            # MXFP4 LinearMethod is available in AMD-Quark, refer to that implementation
-            # if you are interested in enabling MXFP4 here.
+            # Use MXFP4 linear on Blackwell (SM12x) which has native FP8×FP4 support
+            if current_platform.is_cuda() and current_platform.is_blackwell_class():
+                logger.debug_once(
+                    "Using Mxfp4LinearMethod for linear layers on Blackwell.",
+                    scope="local",
+                )
+                return Mxfp4LinearMethod()
+            # Fall back to UnquantizedLinearMethod on other platforms
             logger.debug_once(
-                "MXFP4 linear layer is not implemented - falling back to "
+                "MXFP4 linear layer requires Blackwell GPU - falling back to "
                 "UnquantizedLinearMethod.",
                 scope="local",
             )
@@ -387,6 +399,106 @@ class Mxfp4Config(QuantizationConfig):
                 scope="local",
             )
         return None
+
+
+class Mxfp4LinearMethod(LinearMethodBase):
+    """Linear method for MXFP4 quantization.
+    
+    Supports loading BF16 checkpoints and quantizing weights to MXFP4 format.
+    Uses FP8 activation quantization with FP8×FP4 GEMM kernel.
+    
+    MXFP4 format (OCP MX specification):
+    - 4-bit E2M1 values packed as uint8 (2 values per byte)
+    - E8M0 block scales (1 byte per 32 elements)
+    - Block size: 32
+    """
+
+    def __init__(self):
+        pass
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        """Create BF16 weights that will be quantized after loading."""
+        output_size_per_partition = sum(output_partition_sizes)
+        weight_loader = extra_weight_attrs.get("weight_loader")
+
+        # Store dimensions for later use in process_weights_after_loading
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+
+        # Create BF16 weight parameter - will be quantized after loading
+        weight = ModelWeightParameter(
+            data=torch.empty(
+                output_size_per_partition,
+                input_size_per_partition,
+                dtype=params_dtype,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight", weight)
+        set_weight_attrs(weight, extra_weight_attrs)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Quantize BF16 weights to MXFP4 format after loading."""
+        from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
+            mxfp4_e2m1_quantize,
+        )
+
+        # Get the BF16 weight
+        weight_bf16 = layer.weight.data
+
+        # Quantize to MXFP4: weight_fp4 is [out, in/2] uint8, weight_scale is [out, in/32] uint8
+        weight_fp4, weight_scale = mxfp4_e2m1_quantize(weight_bf16)
+
+        # Replace the BF16 weight with quantized FP4 weight
+        replace_parameter(layer, "weight", weight_fp4)
+
+        # Register the weight scale as a new parameter
+        layer.register_parameter(
+            "weight_scale",
+            torch.nn.Parameter(weight_scale, requires_grad=False),
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply MXFP4 linear layer.
+        
+        Dequantizes FP4 weights to BF16 and performs BF16 GEMM.
+        Memory bandwidth is saved because weights are stored as FP4 (4x smaller).
+        
+        TODO: Use native FP8×FP4 kernel when available for small-M workloads.
+        """
+        from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
+            mxfp4_e2m1_dequantize,
+        )
+
+        # Dequantize weights from FP4 to BF16
+        # weight is [N, K/2] uint8, weight_scale is [N, K/32] uint8
+        weight_bf16 = mxfp4_e2m1_dequantize(
+            layer.weight.data,
+            layer.weight_scale.data,
+            out_dtype=x.dtype,
+        )
+
+        # Perform BF16 GEMM: x @ weight.T
+        # x: [M, K], weight_bf16: [N, K] -> output: [M, N]
+        output = torch.nn.functional.linear(x, weight_bf16, bias)
+
+        return output
 
 
 class Mxfp4MoEMethod(FusedMoEMethodBase):
@@ -1166,16 +1278,124 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             except Exception:
                 _is_dummy = False
 
+            import os as _os
+            if _is_dummy and _os.environ.get("VLLM_MOE_WARMUP_FORCE_UNIFORM", "0") == "1":
+                num_tokens = int(x.shape[0])
+                top_k = int(layer.top_k)
+                num_experts = int(self.num_experts)
+                # Choose a step coprime with 128 (65) so top-k experts are distinct per token.
+                step = 65 if (num_experts % 2 == 0) else (num_experts // 2 + 1)
+                tok = torch.arange(num_tokens, device=x.device, dtype=torch.int64).unsqueeze(1)
+                offs = (torch.arange(top_k, device=x.device, dtype=torch.int64) * step).unsqueeze(0)
+                topk_ids = ((tok + offs) % num_experts).to(torch.int32).contiguous()
+                topk_weights = torch.full(
+                    (num_tokens, top_k),
+                    1.0 / float(top_k),
+                    device=x.device,
+                    dtype=torch.float32,
+                )
+                # Helpful one-liner for correlating logs.
+                _os.write(
+                    2,
+                    (
+                        f'{{"event":"vllm_moe_warmup_force_uniform","num_tokens":{num_tokens},'
+                        f'"top_k":{top_k},"num_experts":{num_experts}}}\n'
+                    ).encode("utf-8"),
+                )
+
             # Optional debug: summarize routing distribution (helps diagnose empty experts / M=0 groups
             # during startup profile runs).
             # NOTE: this will incur GPU work and a small device->host copy.
             import os as _os
+            if _os.environ.get("VLLM_MOE_ROUTING_LOG", "0") == "1":
+                import json as _json
+                import time as _time
+
+                with torch.no_grad():
+                    flat = topk_ids.to(torch.int64).flatten()
+                    # bincount on GPU, then copy to CPU for summary.
+                    counts = torch.bincount(flat, minlength=int(self.num_experts)).cpu()
+                    num_zero = int((counts == 0).sum().item())
+                    payload = {
+                        "event": "vllm_moe_routing_summary",
+                        "pid": _os.getpid(),
+                        "time": _time.time(),
+                        "num_tokens": int(x.shape[0]),
+                        "top_k": int(layer.top_k),
+                        "num_experts": int(self.num_experts),
+                        "num_zero_experts": num_zero,
+                        "min_tokens_per_expert": int(counts.min().item()),
+                        "max_tokens_per_expert": int(counts.max().item()),
+                        # Head of counts for quick eyeballing.
+                        "counts_head": [int(v) for v in counts[:16].tolist()],
+                    }
+                    _os.write(2, (_json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"))
+
             # Backend-specific preparation
             if self.mxfp4_backend == Mxfp4Backend.CUTLASS_BLACKWELL_FP4FP8:
                 from flashinfer import mxfp8_quantize
 
                 import os as _os
+                if _os.environ.get("VLLM_MXFP8_QUANT_LOG", "0") == "1":
+                    import json as _json
+                    import time as _time
+
+                    def _tmeta(t: torch.Tensor):
+                        ptr = int(t.data_ptr())
+                        return {
+                            "dtype": str(t.dtype),
+                            "shape": list(t.shape),
+                            "stride": list(t.stride()),
+                            "device": str(t.device),
+                            "is_contiguous": bool(t.is_contiguous()),
+                            "data_ptr": ptr,
+                            "ptr_mod_128": ptr % 128,
+                        }
+
+                    # NOTE: torch reductions will synchronize; only use in debug.
+                    x_f = x.float()
+                    payload = {
+                        "event": "vllm_mxfp8_quantize_input",
+                        "pid": _os.getpid(),
+                        "time": _time.time(),
+                        "x": _tmeta(x),
+                        "x_stats": {
+                            "amin": float(x_f.amin().item()),
+                            "amax": float(x_f.amax().item()),
+                            "num_nan": int(torch.isnan(x_f).sum().item()),
+                            "num_inf": int(torch.isinf(x_f).sum().item()),
+                        },
+                    }
+                    _os.write(2, (_json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"))
+
                 x_quant, x_scale = mxfp8_quantize(x, True, 32)
+
+                if _os.environ.get("VLLM_MXFP8_QUANT_LOG", "0") == "1":
+                    import json as _json
+                    import time as _time
+
+                    def _tmeta(t: torch.Tensor):
+                        ptr = int(t.data_ptr())
+                        return {
+                            "dtype": str(t.dtype),
+                            "shape": list(t.shape),
+                            "stride": list(t.stride()),
+                            "device": str(t.device),
+                            "is_contiguous": bool(t.is_contiguous()),
+                            "data_ptr": ptr,
+                            "ptr_mod_128": ptr % 128,
+                        }
+
+                    payload = {
+                        "event": "vllm_mxfp8_quantize_output",
+                        "pid": _os.getpid(),
+                        "time": _time.time(),
+                        "x_quant": _tmeta(x_quant),
+                        "x_scale": _tmeta(x_scale),
+                        "is_sf_swizzled_layout": True,
+                        "sf_vec_size": 32,
+                    }
+                    _os.write(2, (_json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"))
 
                 fake_input_scale = torch.ones(self.num_experts, device=x.device)
                 quant_scales = [

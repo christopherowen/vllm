@@ -187,3 +187,92 @@ try:
     quant_dequant_mxfp4 = torch.ops.vllm.quant_dequant_mxfp4
 except AttributeError as error:
     raise error
+
+
+# -----------------------------------------------------------------------------
+# FlashInfer-based MXFP4 quantization utilities
+# -----------------------------------------------------------------------------
+# These functions provide real MXFP4 quantization using FlashInfer,
+# as opposed to the AMD quark-based functions above.
+#
+# MXFP4 format (OCP MX specification):
+# - 4-bit E2M1 values packed as uint8 (2 values per byte)
+# - E8M0 block scales (1 byte per 32 elements)
+# - Block size: 32
+
+
+def mxfp4_e2m1_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a tensor to MXFP4 format using FlashInfer.
+
+    Uses non-swizzled scale layout for compatibility with mxfp4_dequantize_host.
+
+    Args:
+        x: Input tensor of shape [M, K] with dtype fp16/bf16.
+
+    Returns:
+        Tuple of:
+            - Quantized tensor of shape [M, K/2] with dtype uint8 (packed FP4)
+            - Scale factors tensor of shape [M, K/32] with dtype uint8 (E8M0)
+    """
+    try:
+        from flashinfer import fp4_quantize
+    except ImportError as err:
+        raise ImportError(
+            "The package `flashinfer` is required to do "
+            "MX-FP4 quantization. Please install it with "
+            "`pip install flashinfer`"
+        ) from err
+
+    # Calculate global scale like mxfp4_quantize does
+    a_global_sf = (448 * 6) / x.float().abs().nan_to_num().max()
+    
+    # Use fp4_quantize with:
+    # - sf_vec_size=32 (MXFP4 block size)
+    # - sf_use_ue8m0=True (E8M0 scale format)
+    # - is_sf_swizzled_layout=False (linear layout for dequantize_host compatibility)
+    x_q, x_scales = fp4_quantize(
+        x.cuda(),
+        a_global_sf.cuda(),
+        sf_vec_size=32,
+        sf_use_ue8m0=True,
+        is_sf_swizzled_layout=False,
+    )
+    
+    # Ensure scales have proper 2D shape [M, K/32]
+    if x_scales.ndim == 1:
+        x_scales = x_scales.view(x.size(0), -1)
+    return x_q, x_scales
+
+
+def mxfp4_e2m1_dequantize(
+    x_q: torch.Tensor,
+    x_scales: torch.Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Dequantize a tensor from MXFP4 format using FlashInfer.
+
+    Uses mxfp4_dequantize_host which handles the scale format correctly
+    for non-swizzled linear layout scales.
+
+    Args:
+        x_q: Quantized tensor of shape [M, K/2] with dtype uint8.
+        x_scales: Scale factors tensor of shape [M, K/32] with dtype uint8.
+        out_dtype: Output dtype (bf16 or fp16).
+
+    Returns:
+        Dequantized tensor of shape [M, K] with dtype out_dtype.
+    """
+    try:
+        from flashinfer import mxfp4_dequantize_host
+    except ImportError as err:
+        raise ImportError(
+            "The package `flashinfer` is required to do "
+            "MX-FP4 dequantization. Please install it with "
+            "`pip install flashinfer`"
+        ) from err
+
+    # mxfp4_dequantize_host handles the scale format correctly
+    # Note: scale tensor should be in linear layout [M, K/32]
+    orig_device = x_q.device
+    result = mxfp4_dequantize_host(x_q.cpu(), x_scales.cpu(), group_size=32)
+    return result.to(out_dtype).to(orig_device)
