@@ -399,15 +399,19 @@ class Mxfp4Config(QuantizationConfig):
 
 
 class Mxfp4LinearMethod(LinearMethodBase):
-    """Linear method for MXFP4 quantization.
+    """Linear method for MXFP4 quantization using Marlin kernel.
     
     Supports loading BF16 checkpoints and quantizing weights to MXFP4 format.
-    Uses FP8 activation quantization with FP8×FP4 GEMM kernel.
+    Uses the Marlin kernel for fused dequant+GEMM on GPU.
     
     MXFP4 format (OCP MX specification):
     - 4-bit E2M1 values packed as uint8 (2 values per byte)
     - E8M0 block scales (1 byte per 32 elements)
     - Block size: 32
+    
+    The Marlin kernel reads FP4 weights (4x smaller than BF16), dequantizes
+    on-the-fly in registers, and performs GEMM - all on GPU with no CPU
+    round-trip.
     """
 
     def __init__(self):
@@ -427,9 +431,10 @@ class Mxfp4LinearMethod(LinearMethodBase):
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
 
-        # Store dimensions for later use in process_weights_after_loading
+        # Store dimensions for Marlin kernel
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
+        layer.params_dtype = params_dtype
 
         # Create BF16 weight parameter - will be quantized after loading
         weight = ModelWeightParameter(
@@ -446,7 +451,10 @@ class Mxfp4LinearMethod(LinearMethodBase):
         set_weight_attrs(weight, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Quantize BF16 weights to MXFP4 format after loading."""
+        """Quantize BF16 weights to MXFP4 and prepare for Marlin kernel."""
+        from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+            prepare_fp4_layer_for_marlin,
+        )
         from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
             mxfp4_e2m1_quantize,
         )
@@ -466,36 +474,38 @@ class Mxfp4LinearMethod(LinearMethodBase):
             torch.nn.Parameter(weight_scale, requires_grad=False),
         )
 
+        # Repack weights and scales for Marlin kernel
+        # This creates layer.workspace and repacks weight/weight_scale
+        prepare_fp4_layer_for_marlin(layer)
+
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Apply MXFP4 linear layer.
+        """Apply MXFP4 linear layer using Marlin fused dequant+GEMM kernel.
         
-        Dequantizes FP4 weights to BF16 and performs BF16 GEMM.
-        Memory bandwidth is saved because weights are stored as FP4 (4x smaller).
-        
-        TODO: Use native FP8×FP4 kernel when available for small-M workloads.
+        The Marlin kernel:
+        1. Reads FP4 weights from memory (4x smaller than BF16)
+        2. Dequantizes on-the-fly in registers
+        3. Performs GEMM
+        All on GPU, no CPU round-trip.
         """
-        from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
-            mxfp4_e2m1_dequantize,
+        from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+            apply_fp4_marlin_linear,
         )
 
-        # Dequantize weights from FP4 to BF16
-        # weight is [N, K/2] uint8, weight_scale is [N, K/32] uint8
-        weight_bf16 = mxfp4_e2m1_dequantize(
-            layer.weight.data,
-            layer.weight_scale.data,
-            out_dtype=x.dtype,
+        return apply_fp4_marlin_linear(
+            input=x,
+            weight=layer.weight,
+            weight_scale=layer.weight_scale,
+            weight_scale_2=None,  # MXFP4 uses single scale, not NVFP4
+            workspace=layer.workspace,
+            size_n=layer.output_size_per_partition,
+            size_k=layer.input_size_per_partition,
+            bias=bias,
         )
-
-        # Perform BF16 GEMM: x @ weight.T
-        # x: [M, K], weight_bf16: [N, K] -> output: [M, N]
-        output = torch.nn.functional.linear(x, weight_bf16, bias)
-
-        return output
 
 
 class Mxfp4MoEMethod(FusedMoEMethodBase):
