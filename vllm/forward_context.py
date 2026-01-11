@@ -278,6 +278,7 @@ def set_forward_context(
     cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     batch_descriptor: BatchDescriptor | None = None,
     ubatch_slices: UBatchSlices | None = None,
+    extra_forward_kwargs: dict[str, Any] | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -325,6 +326,8 @@ def set_forward_context(
         batch_descriptor=batch_descriptor,
         ubatch_slices=ubatch_slices,
     )
+    if extra_forward_kwargs:
+        additional_kwargs = {**additional_kwargs, **extra_forward_kwargs}
 
     forward_context = create_forward_context(
         attn_metadata,

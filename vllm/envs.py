@@ -153,8 +153,11 @@ if TYPE_CHECKING:
     VLLM_RAY_DP_PACK_STRATEGY: Literal["strict", "fill", "span"] = "strict"
     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
     VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
-    VLLM_MXFP4_USE_MARLIN: bool | None = None
-    VLLM_MXFP4_MOE_KERNEL: str = "auto"
+    # MXFP4 backend selector. Options (case-insensitive):
+    #   auto|marlin|cutlass|triton|trtllm|trtllm_mxfp8
+    VLLM_MXFP4_BACKEND: str = "auto"
+    # MXFP4 activation / internal representation selector (work in progress).
+    VLLM_MXFP4_ACTIVATION: str = "auto"
     VLLM_ATTENTION_SINKS: str = "auto"
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
@@ -216,13 +219,8 @@ if TYPE_CHECKING:
     VLLM_NVFP4_GEMM_BACKEND: str | None = None
     VLLM_FLASHINFER_DISABLE_Q_QUANTIZATION: bool = False
     VLLM_HAS_FLASHINFER_CUBIN: bool = False
-    VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8: bool = False
-    VLLM_USE_FLASHINFER_MOE_MXFP4_BF16: bool = False
-    # Kernel selection for MXFP4 MoE benchmarking: "auto", "marlin", "gemm", "gemv"
-    VLLM_MXFP4_MOE_KERNEL: str = "auto"
     VLLM_ATTENTION_SINKS: str = "auto"
     VLLM_ROCM_FP8_MFMA_PAGE_ATTN: bool = False
-    VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS: bool = False
     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = True
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
@@ -1142,20 +1140,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_MARLIN_USE_ATOMIC_ADD", "0"
     )
     == "1",
-    # Whether to use marlin kernel in mxfp4 quantization method
-    "VLLM_MXFP4_USE_MARLIN": lambda: maybe_convert_bool(
-        os.environ.get("VLLM_MXFP4_USE_MARLIN", None)
-    ),
-    # Override MXFP4 MoE kernel selection: auto, marlin, gemm, gemv, triton
-    "VLLM_MXFP4_MOE_KERNEL": lambda: os.environ.get(
-        "VLLM_MXFP4_MOE_KERNEL", "auto"
-    ).lower(),
-    # Control attention sinks: auto (use model config), true (force enable), false (force disable)
     "VLLM_ATTENTION_SINKS": lambda: os.getenv("VLLM_ATTENTION_SINKS", "auto").lower(),
     # The activation dtype for marlin kernel
     "VLLM_MARLIN_INPUT_DTYPE": env_with_choices(
         "VLLM_MARLIN_INPUT_DTYPE", None, ["int8", "fp8"]
     ),
+    # Unified MXFP4 backend selector (case-insensitive).
+    "VLLM_MXFP4_BACKEND": lambda: os.getenv("VLLM_MXFP4_BACKEND", "auto").lower(),
+    # MXFP4 activation / internal representation selector (work in progress).
+    "VLLM_MXFP4_ACTIVATION": lambda: os.getenv("VLLM_MXFP4_ACTIVATION", "auto").lower(),
     # Whether to use DeepEPLL kernels for NVFP4 quantization and dispatch method
     # only supported on Blackwell GPUs and with
     # https://github.com/deepseek-ai/DeepEP/pull/341
@@ -1229,32 +1222,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_FLASHINFER_MOE_FP4": lambda: bool(
         int(os.getenv("VLLM_USE_FLASHINFER_MOE_FP4", "0"))
     ),
-    # If set to 1, use the FlashInfer
-    # MXFP8 (activation) x MXFP4 (weight) MoE backend.
-    "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8": lambda: bool(
-        int(os.getenv("VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8", "0"))
-    ),
-    # If set to 1, use the FlashInfer CUTLASS backend for
-    # MXFP8 (activation) x MXFP4 (weight) MoE.
-    # This is separate from the TRTLLMGEN path controlled by
-    # VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8.
-    "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS": lambda: bool(
-        int(os.getenv("VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS", "0"))
-    ),
-    # If set to 1, use the FlashInfer
-    # BF16 (activation) x MXFP4 (weight) MoE backend.
-    "VLLM_USE_FLASHINFER_MOE_MXFP4_BF16": lambda: bool(
-        int(os.getenv("VLLM_USE_FLASHINFER_MOE_MXFP4_BF16", "0"))
-    ),
-    # Kernel selection for MXFP4 MoE benchmarking.
-    # Options: "auto", "marlin", "gemm", "gemv"
-    # - auto: Use automatic selection (default)
-    # - marlin: Force Marlin backend
-    # - gemm: Force CUTLASS grouped GEMM (SM12x native)
-    # - gemv: Force DP4A GEMV kernel (experimental)
-    "VLLM_MXFP4_MOE_KERNEL": lambda: os.getenv(
-        "VLLM_MXFP4_MOE_KERNEL", "auto"
-    ).lower(),
     # Control the cache sized used by the xgrammar compiler. The default
     # of 512 MB should be enough for roughly 1000 JSON schemas.
     # It can be changed with this variable if needed for some reason.

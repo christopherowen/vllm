@@ -223,6 +223,47 @@ def has_flashinfer_cutlass_fused_moe() -> bool:
 
 
 @functools.cache
+def has_flashinfer_sm12x_cutlass_moe() -> bool:
+    """Return `True` if FlashInfer SM12x CUTLASS MoE is available.
+    
+    This checks for SM12x-specific CUTLASS kernel support which requires:
+    1. FlashInfer with CUTLASS MoE support
+    2. SM12x-specific block-scaled kernel dispatch
+    3. Current GPU is SM12x (major=12)
+    
+    SM12x (GB10, Thor) uses native FP8×FP4 block-scaled MMA which requires
+    specialized CUTLASS kernels compiled with SM12x support.
+    """
+    if not has_flashinfer_cutlass_fused_moe():
+        return False
+    
+    # Check if current GPU is SM12x
+    capability = current_platform.get_device_capability()
+    if capability is None or capability.major != 12:
+        return False
+    
+    # Check for SM12x-specific functions
+    # The MXFP4 path on SM12x requires:
+    #   1. cutlass_fused_moe (already checked above)
+    #   2. mxfp8_quantize for BF16→FP8 activation quantization
+    #   3. mxfp4_quantize for weight quantization (usually done offline)
+    required_sm12x_functions = [
+        ("flashinfer", "mxfp8_quantize"),  # BF16→FP8 activation quantization
+        ("flashinfer", "mxfp4_quantize"),  # FP4 weight quantization
+    ]
+    
+    for module_name, attr_name in required_sm12x_functions:
+        mod = _get_submodule(module_name)
+        if not mod or not hasattr(mod, attr_name):
+            logger.debug_once(
+                f"SM12x CUTLASS MoE unavailable: {module_name}.{attr_name} not found"
+            )
+            return False
+    
+    return True
+
+
+@functools.cache
 def has_flashinfer_cutedsl_grouped_gemm_nt_masked() -> bool:
     """Return ``True`` if FlashInfer CUTLASS fused MoE is available."""
     if not has_flashinfer_cutedsl():

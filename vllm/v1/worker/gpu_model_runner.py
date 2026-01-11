@@ -4452,6 +4452,10 @@ class GPUModelRunner(
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,
+                    extra_forward_kwargs={
+                        "vllm_dummy_run": True,
+                        "vllm_profile_run": bool(is_profile),
+                    },
                 ),
             ):
                 outputs = self.model(

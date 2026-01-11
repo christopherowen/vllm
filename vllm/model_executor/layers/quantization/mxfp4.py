@@ -126,11 +126,6 @@ def get_mxfp4_backend_with_lora() -> Mxfp4Backend:
         # SM120 needs this fix: https://github.com/triton-lang/triton/pull/8498
         and (9, 0) <= current_platform.get_device_capability() < (11, 0)
     )
-    
-    # Legacy flag support (deprecated)
-    if envs.VLLM_MXFP4_USE_MARLIN is False and triton_kernels_supported:
-        logger.info_once("[MXFP4+LoRA] Auto-selected: Triton")
-        return Mxfp4Backend.TRITON
 
     logger.info_once("[MXFP4+LoRA] Auto-selected: Marlin")
     return Mxfp4Backend.MARLIN
@@ -138,9 +133,13 @@ def get_mxfp4_backend_with_lora() -> Mxfp4Backend:
 
 def _check_legacy_mxfp4_flags() -> Mxfp4Backend | None:
     """Check legacy MXFP4 env vars and return backend if set, with deprecation warnings."""
-    # Check legacy kernel override
-    kernel = envs.VLLM_MXFP4_MOE_KERNEL
-    if kernel != "auto":
+    import os as _os
+
+    # Check legacy kernel override (only if explicitly set)
+    kernel = _os.environ.get("VLLM_MXFP4_MOE_KERNEL", None)
+    if kernel is not None and kernel.lower() != "auto":
+        kernel = kernel.lower()
+
         logger.warning_once(
             f"[MXFP4] VLLM_MXFP4_MOE_KERNEL is deprecated. "
             f"Use VLLM_MXFP4_BACKEND instead. "
@@ -154,28 +153,28 @@ def _check_legacy_mxfp4_flags() -> Mxfp4Backend | None:
             return Mxfp4Backend.TRITON
 
     # Check legacy boolean flags
-    if envs.VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS:
+    if _os.environ.get("VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS") is not None and _os.getenv("VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS", "0") != "0":
         logger.warning_once(
             "[MXFP4] VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS is deprecated. "
             "Use VLLM_MXFP4_BACKEND=CUTLASS instead."
         )
         return Mxfp4Backend.CUTLASS_BLACKWELL_FP4FP8
 
-    if envs.VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8:
+    if _os.environ.get("VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8") is not None and _os.getenv("VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8", "0") != "0":
         logger.warning_once(
             "[MXFP4] VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8 is deprecated. "
             "Use VLLM_MXFP4_BACKEND=TRTLLM_MXFP8 instead."
         )
         return Mxfp4Backend.TRTLLM_SM100_FP4FP8
 
-    if envs.VLLM_USE_FLASHINFER_MOE_MXFP4_BF16:
+    if _os.environ.get("VLLM_USE_FLASHINFER_MOE_MXFP4_BF16") is not None and _os.getenv("VLLM_USE_FLASHINFER_MOE_MXFP4_BF16", "0") != "0":
         logger.warning_once(
             "[MXFP4] VLLM_USE_FLASHINFER_MOE_MXFP4_BF16 is deprecated. "
             "Use VLLM_MXFP4_BACKEND=TRTLLM instead."
         )
         return Mxfp4Backend.TRTLLM_SM100_FP4BF16
 
-    if envs.VLLM_MXFP4_USE_MARLIN:
+    if _os.environ.get("VLLM_MXFP4_USE_MARLIN") is not None and _os.getenv("VLLM_MXFP4_USE_MARLIN", "0") != "0":
         logger.warning_once(
             "[MXFP4] VLLM_MXFP4_USE_MARLIN is deprecated. "
             "Use VLLM_MXFP4_BACKEND=MARLIN instead."

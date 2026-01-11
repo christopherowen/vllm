@@ -187,6 +187,14 @@ class ModelConfig:
     `quantization_config` attribute in the model config file. If that is
     `None`, we assume the model weights are not quantized and use `dtype` to
     determine the data type of the weights."""
+    mxfp4_backend: str = "auto"
+    """Backend for MXFP4 quantized MoE layers:\n
+    - "auto": Hardware-based auto-selection (default)\n
+    - "marlin": Marlin dequant→BF16 (works on all GPUs)\n
+    - "cutlass": FlashInfer CUTLASS FP8×FP4 (SM12x/SM100 native)\n
+    - "triton": OpenAI Triton (SM90-SM100)\n
+    - "trtllm": TRT-LLM BF16×FP4 (SM100 only)\n
+    - "trtllm-mxfp8": TRT-LLM FP8×FP4 (SM100 only)"""
     enforce_eager: bool = False
     """Whether to always use eager-mode PyTorch. If True, we will disable CUDA
     graph and always execute the model in eager mode. If False, we will use
