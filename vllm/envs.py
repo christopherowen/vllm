@@ -1150,7 +1150,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MXFP4_MOE_KERNEL": lambda: os.environ.get(
         "VLLM_MXFP4_MOE_KERNEL", "auto"
     ).lower(),
-    # Ignore sink validation - allows models with sinks to load on backends without native sink support
     # Control attention sinks: auto (use model config), true (force enable), false (force disable)
     "VLLM_ATTENTION_SINKS": lambda: os.getenv("VLLM_ATTENTION_SINKS", "auto").lower(),
     # The activation dtype for marlin kernel
