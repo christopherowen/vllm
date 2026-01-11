@@ -146,12 +146,17 @@ def apply_fp4_marlin_linear(
 def prepare_fp4_layer_for_marlin(
     layer: torch.nn.Module, input_dtype: torch.dtype | None = None
 ) -> None:
-    logger.warning_once(
-        "Your GPU does not have native support for FP4 computation but "
-        "FP4 quantization is being used. Weight-only FP4 compression will "
-        "be used leveraging the Marlin kernel. This may degrade "
-        "performance for compute-heavy workloads."
-    )
+    # Only warn on GPUs that truly lack native FP4 support
+    # SM12x (Blackwell) and SM100 have native FP4 MMA, so Marlin is a
+    # software fallback for compatibility, not a hardware limitation
+    capability = current_platform.get_device_capability()
+    if capability is not None and capability[0] < 10:
+        logger.warning_once(
+            "Your GPU does not have native support for FP4 computation but "
+            "FP4 quantization is being used. Weight-only FP4 compression will "
+            "be used leveraging the Marlin kernel. This may degrade "
+            "performance for compute-heavy workloads."
+        )
 
     is_nvfp4 = hasattr(layer, "weight_scale_2")
     if input_dtype is not None and input_dtype.itemsize == 1:
