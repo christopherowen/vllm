@@ -497,9 +497,16 @@ def _support_torch_compile(
 
         # Prepare inductor config patches
         # assume_32bit_indexing is only available in torch 2.10.0.dev+
+        # Note: NGC PyTorch 2.10.0a0 may not have this config despite version check
         inductor_config_patches = {}
         if is_torch_equal_or_newer("2.10.0.dev"):
-            inductor_config_patches["assume_32bit_indexing"] = True
+            try:
+                # Verify the config actually exists (NGC builds may lack it)
+                _ = torch._inductor.config.assume_32bit_indexing
+                inductor_config_patches["assume_32bit_indexing"] = True
+            except AttributeError:
+                logger.debug("assume_32bit_indexing config not available in this "
+                           "PyTorch build (NGC container compatibility)")
 
         with (
             patch.object(
