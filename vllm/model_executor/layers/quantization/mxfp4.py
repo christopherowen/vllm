@@ -143,9 +143,15 @@ def get_mxfp4_backend_with_lora() -> Mxfp4Backend:
 
 
 def _check_legacy_mxfp4_flags() -> Mxfp4Backend | None:
-    """Check legacy MXFP4 env vars and return backend if set, with deprecation warnings."""
+    """Check legacy MXFP4 env vars and return backend if set, with deprecation warnings.
+    
+    Note: Legacy env vars have been removed from envs.py. This function checks
+    os.environ directly for backward compatibility warnings only.
+    """
+    import os
+    
     # Check legacy kernel override
-    kernel = envs.VLLM_MXFP4_MOE_KERNEL
+    kernel = os.environ.get("VLLM_MXFP4_MOE_KERNEL", "auto").lower()
     if kernel != "auto":
         logger.warning_once(
             f"[MXFP4] VLLM_MXFP4_MOE_KERNEL is deprecated. "
@@ -160,28 +166,28 @@ def _check_legacy_mxfp4_flags() -> Mxfp4Backend | None:
             return Mxfp4Backend.TRITON
 
     # Check legacy boolean flags
-    if envs.VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS:
+    if os.environ.get("VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS", "0") == "1":
         logger.warning_once(
             "[MXFP4] VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS is deprecated. "
             "Use VLLM_MXFP4_BACKEND=CUTLASS instead."
         )
         return Mxfp4Backend.CUTLASS_BLACKWELL_FP4FP8
 
-    if envs.VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8:
+    if os.environ.get("VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8", "0") == "1":
         logger.warning_once(
             "[MXFP4] VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8 is deprecated. "
             "Use VLLM_MXFP4_BACKEND=TRTLLM_MXFP8 instead."
         )
         return Mxfp4Backend.TRTLLM_SM100_FP4FP8
 
-    if envs.VLLM_USE_FLASHINFER_MOE_MXFP4_BF16:
+    if os.environ.get("VLLM_USE_FLASHINFER_MOE_MXFP4_BF16", "0") == "1":
         logger.warning_once(
             "[MXFP4] VLLM_USE_FLASHINFER_MOE_MXFP4_BF16 is deprecated. "
             "Use VLLM_MXFP4_BACKEND=TRTLLM instead."
         )
         return Mxfp4Backend.TRTLLM_SM100_FP4BF16
 
-    if envs.VLLM_MXFP4_USE_MARLIN:
+    if os.environ.get("VLLM_MXFP4_USE_MARLIN", "0") == "1":
         logger.warning_once(
             "[MXFP4] VLLM_MXFP4_USE_MARLIN is deprecated. "
             "Use VLLM_MXFP4_BACKEND=MARLIN instead."
