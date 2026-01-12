@@ -37,6 +37,9 @@ from vllm.model_executor.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
 )
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.utils import replace_parameter
 from vllm.model_executor.layers.quantization import QuantizationMethods
@@ -376,17 +379,19 @@ class Mxfp4Config(QuantizationConfig):
                 fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedLinearMethod()
-            # MXFP4 linear is ONLY applied to lm_head on Blackwell
-            # Other linear layers (attention, MLP, etc.) remain unquantized
-            # to preserve model quality - only lm_head is the decode bottleneck
+            # All linear layers use BF16 (unquantized)
+            return UnquantizedLinearMethod()
+        elif isinstance(layer, VocabParallelEmbedding):
+            # MXFP4 quantization for ParallelLMHead (output logits layer) on Blackwell
+            # This layer uses VocabParallelEmbedding but is used for lm_head GEMM
             is_lm_head = "lm_head" in prefix or prefix.endswith(".lm_head")
             if is_lm_head and current_platform.is_cuda() and current_platform.is_blackwell_class():
                 logger.info_once(
-                    f"Using Mxfp4LinearMethod for lm_head ({prefix}) on Blackwell.",
+                    f"Using Mxfp4LMHeadMethod for lm_head ({prefix}) on Blackwell.",
                 )
-                return Mxfp4LinearMethod()
-            # All other linear layers use BF16 (unquantized)
-            return UnquantizedLinearMethod()
+                return Mxfp4LMHeadMethod()
+            # Other embeddings remain unquantized
+            return None
         elif isinstance(layer, FusedMoE):
             if current_platform.is_xpu():
                 return IpexMxfp4MoEMethod(layer.moe_config)
@@ -511,6 +516,120 @@ class Mxfp4LinearMethod(LinearMethodBase):
             size_n=layer.output_size_per_partition,
             size_k=layer.input_size_per_partition,
             bias=bias,
+        )
+
+
+class Mxfp4LMHeadMethod(QuantizeMethodBase):
+    """MXFP4 quantization method for ParallelLMHead (VocabParallelEmbedding).
+    
+    For models that use VocabParallelEmbedding for lm_head instead of LinearBase.
+    Uses the Marlin kernel for fused dequant+GEMM, same as Mxfp4LinearMethod.
+    
+    MXFP4 format (OCP MX specification):
+    - 4-bit E2M1 values packed as uint8 (2 values per byte)
+    - E8M0 block scales (1 byte per 32 elements)
+    - Block size: 32
+    """
+
+    def __init__(self):
+        pass
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        """Create BF16 weights that will be quantized after loading.
+        
+        Note: VocabParallelEmbedding uses (vocab_size, embed_dim) shape,
+        which is transposed from LinearBase's (output, input) convention.
+        """
+        output_size_per_partition = sum(output_partition_sizes)
+        
+        # Store dimensions for Marlin kernel
+        # For lm_head: input_size = hidden_dim, output_size = vocab_size
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+        layer.params_dtype = params_dtype
+        
+        # Create BF16 weight parameter - will be quantized after loading
+        # VocabParallelEmbedding expects (num_embeddings, embedding_dim)
+        weight = torch.nn.Parameter(
+            torch.empty(
+                output_size_per_partition,
+                input_size_per_partition,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
+        layer.register_parameter("weight", weight)
+        set_weight_attrs(weight, extra_weight_attrs)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Quantize BF16 weights to MXFP4 and prepare for Marlin kernel."""
+        from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
+            mxfp4_e2m1_quantize,
+        )
+        from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+            prepare_fp4_layer_for_marlin,
+        )
+
+        # Get the original BF16 weights
+        weight_bf16 = layer.weight.data
+
+        # Quantize to MXFP4 (E2M1 packed + E8M0 scales)
+        weight_fp4, weight_scale = mxfp4_e2m1_quantize(weight_bf16)
+
+        # Replace BF16 weight with packed FP4 weight
+        replace_parameter(layer, "weight", weight_fp4)
+
+        # Register the scale parameter
+        layer.register_buffer("weight_scale", weight_scale)
+
+        # Prepare weights for Marlin (repacking, scale permutation)
+        prepare_fp4_layer_for_marlin(layer, input_dtype=layer.params_dtype)
+        
+        logger.info_once(
+            f"[MXFP4] lm_head quantized: {weight_bf16.shape} BF16 "
+            f"-> {weight_fp4.shape} FP4 (4x smaller)",
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply MXFP4 lm_head using Marlin fused dequant+GEMM kernel.
+        
+        All on GPU, no CPU round-trip.
+        """
+        from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+            apply_fp4_marlin_linear,
+        )
+
+        return apply_fp4_marlin_linear(
+            input=x,
+            weight=layer.weight,
+            weight_scale=layer.weight_scale,
+            weight_scale_2=None,  # MXFP4 uses single scale, not NVFP4
+            workspace=layer.workspace,
+            size_n=layer.output_size_per_partition,
+            size_k=layer.input_size_per_partition,
+            bias=bias,
+        )
+
+    def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        """Embedding is not supported for MXFP4 lm_head - it uses apply() for GEMM."""
+        raise NotImplementedError(
+            "Mxfp4LMHeadMethod does not support embedding(). "
+            "This method is for output logits GEMM via apply()."
         )
 
 
