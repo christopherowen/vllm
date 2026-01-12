@@ -384,8 +384,44 @@ class Mxfp4Config(QuantizationConfig):
         elif isinstance(layer, VocabParallelEmbedding):
             # MXFP4 quantization for ParallelLMHead (output logits layer) on Blackwell
             # This layer uses VocabParallelEmbedding but is used for lm_head GEMM
-            is_lm_head = "lm_head" in prefix or prefix.endswith(".lm_head")
+            # 
+            # Strict matching: only "lm_head" or "*.lm_head", NOT "lm_heads.0" (Medusa),
+            # "aux_lm_head", or other variants that contain "lm_head" as substring.
+            is_lm_head = prefix == "lm_head" or prefix.endswith(".lm_head")
             if is_lm_head and current_platform.is_cuda() and current_platform.is_blackwell_class():
+                try:
+                    vllm_config = get_current_vllm_config()
+                    hf_config = vllm_config.model_config.hf_config
+                    
+                    # Check 1: LoRA incompatibility
+                    # LoRA adapters expect to interact with unquantized weight representations.
+                    # FP4-packed weights are incompatible with LoRA's additive updates.
+                    if vllm_config.lora_config is not None:
+                        logger.warning_once(
+                            f"[MXFP4] Skipping MXFP4 quantization for lm_head ({prefix}) "
+                            "because LoRA is enabled. FP4-packed weights are incompatible "
+                            "with LoRA's weight modification. Using BF16 for lm_head instead."
+                        )
+                        return None
+                    
+                    # Check 2: Tied embeddings incompatibility
+                    # Quantizing lm_head.weight would also quantize embed_tokens.weight
+                    # (they're aliased), breaking embedding lookup (F.embedding on FP4 fails).
+                    if getattr(hf_config, "tie_word_embeddings", False):
+                        logger.warning_once(
+                            f"[MXFP4] Skipping MXFP4 quantization for lm_head ({prefix}) "
+                            "because tie_word_embeddings=True. Quantizing the lm_head weight "
+                            "would also quantize the tied embedding table, breaking "
+                            "embedding lookup. Using BF16 for lm_head instead."
+                        )
+                        return None
+                except Exception:
+                    # Config not available, conservatively skip quantization
+                    logger.debug(
+                        "Could not check LoRA/tie_word_embeddings, skipping MXFP4 for lm_head"
+                    )
+                    return None
+                
                 logger.info_once(
                     f"Using Mxfp4LMHeadMethod for lm_head ({prefix}) on Blackwell.",
                 )
@@ -523,12 +559,56 @@ class Mxfp4LMHeadMethod(QuantizeMethodBase):
     """MXFP4 quantization method for ParallelLMHead (VocabParallelEmbedding).
     
     For models that use VocabParallelEmbedding for lm_head instead of LinearBase.
-    Uses the Marlin kernel for fused dequant+GEMM, same as Mxfp4LinearMethod.
+    Uses the Marlin kernel for fused dequant+GEMM.
     
     MXFP4 format (OCP MX specification):
     - 4-bit E2M1 values packed as uint8 (2 values per byte)
     - E8M0 block scales (1 byte per 32 elements)
     - Block size: 32
+    
+    Compatibility Gates:
+        MXFP4 for lm_head is automatically DISABLED when:
+        
+        1. LoRA is enabled (`vllm_config.lora_config is not None`)
+           - LoRA adapters expect unquantized weight representations
+           - FP4-packed weights are incompatible with LoRA's additive updates
+           - Detected in get_quant_method()
+           - NOTE: This is a broad gate that disables MXFP4 for lm_head if ANY
+             LoRA is enabled, even if LoRA doesn't target lm_head specifically.
+             A more surgical check would require inspecting LoRA target modules,
+             but this conservative approach ensures correctness.
+        
+        2. Tied embeddings (`hf_config.tie_word_embeddings=True`)
+           - lm_head.weight and embed_tokens.weight share storage
+           - Quantizing would corrupt the embedding table
+           - Config check in get_quant_method()
+        
+        3. Weight storage replaced (detected via data_ptr comparison)
+           - Structural check in process_weights_after_loading()
+           - Compares data_ptr() from create_weights() vs after loading
+           - Triggers when tie_weights() or loader behavior replaces the weight
+           - Sets `layer._mxfp4_weight_replaced = True` for BF16 fallback
+           - Note: This detects "storage changed", not specifically "tied".
+             The inference that it's tied embeddings is usually correct but
+             not guaranteed. Either way, skipping quantization is safe.
+        
+        When any gate triggers, apply() falls back to BF16 F.linear() and
+        embedding() falls back to basic F.embedding() (which does NOT handle
+        VocabParallelEmbedding sharding - see embedding() docstring).
+    
+    Performance Note:
+        This is a PRAGMATIC INTERMEDIATE, not the endgame for SM12x.
+        
+        Marlin does: FP4 weights → dequant to BF16 → BF16 GEMM
+        Native path: FP8 activations × FP4 weights → FP8×FP4 MMA
+        
+        Marlin reduces memory bandwidth (4x smaller weights) but still uses
+        BF16 compute, not native FP8×FP4 tensor cores. For lm_head (only ~6%
+        of decode time), this is acceptable. The path to 52+ tok/s requires
+        optimizing MoE (34% of decode) and attention, not lm_head.
+        
+        A future small-M specialized FP8×FP4 kernel could improve lm_head
+        further, but it's not the priority bottleneck.
     """
 
     def __init__(self):
@@ -570,6 +650,16 @@ class Mxfp4LMHeadMethod(QuantizeMethodBase):
         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
+        
+        # Marker for structural tied-embedding detection using storage pointer.
+        # If tie_weights() replaces lm_head.weight with embed_tokens.weight,
+        # the data_ptr will change, and process_weights_after_loading()
+        # will detect the storage aliasing and skip quantization.
+        #
+        # Using data_ptr() instead of id() because:
+        # - id() checks Python object identity (can change for unrelated reasons)
+        # - data_ptr() checks actual tensor storage pointer (what we care about)
+        layer._mxfp4_weight_data_ptr = weight.data.data_ptr()
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Quantize BF16 weights to MXFP4 and prepare for Marlin kernel."""
@@ -579,6 +669,27 @@ class Mxfp4LMHeadMethod(QuantizeMethodBase):
         from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
             prepare_fp4_layer_for_marlin,
         )
+
+        # Structural check: detect if weight storage was replaced after create_weights().
+        # This typically happens when tie_weights() aliases lm_head.weight with
+        # embed_tokens.weight, but can also occur for other reasons (loader behavior,
+        # parameter recreation). In all cases, we skip quantization to be safe.
+        original_data_ptr = getattr(layer, "_mxfp4_weight_data_ptr", None)
+        if original_data_ptr is not None and layer.weight.data.data_ptr() != original_data_ptr:
+            logger.warning_once(
+                "[MXFP4] lm_head weight storage changed after creation "
+                "(likely tie_weights() or loader behavior). "
+                "Skipping MXFP4 quantization to avoid corrupting shared weights. "
+                "The lm_head will operate in BF16."
+            )
+            # Clean up the marker and set flag for BF16 fallback in apply()
+            delattr(layer, "_mxfp4_weight_data_ptr")
+            layer._mxfp4_weight_replaced = True  # Reflects what we detected, not inferred cause
+            return
+
+        # Clean up the marker now that we've verified
+        if hasattr(layer, "_mxfp4_weight_data_ptr"):
+            delattr(layer, "_mxfp4_weight_data_ptr")
 
         # Get the original BF16 weights
         weight_bf16 = layer.weight.data
@@ -609,7 +720,13 @@ class Mxfp4LMHeadMethod(QuantizeMethodBase):
         """Apply MXFP4 lm_head using Marlin fused dequant+GEMM kernel.
         
         All on GPU, no CPU round-trip.
+        Falls back to BF16 matmul if quantization was skipped due to tied embeddings.
         """
+        # Fallback for case where quantization was skipped (weight storage replaced)
+        if getattr(layer, "_mxfp4_weight_replaced", False):
+            output = torch.nn.functional.linear(x, layer.weight, bias)
+            return output
+        
         from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
             apply_fp4_marlin_linear,
         )
@@ -626,10 +743,34 @@ class Mxfp4LMHeadMethod(QuantizeMethodBase):
         )
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
-        """Embedding is not supported for MXFP4 lm_head - it uses apply() for GEMM."""
+        """Embedding lookup - only supported when quantization was skipped.
+        
+        MXFP4 quantization packs two FP4 values into each uint8 byte and stores
+        E8M0 block scales separately. This format is incompatible with 
+        F.embedding() which expects dense fp16/bf16 weights.
+        
+        However, if quantization was skipped (weight storage replaced, typically
+        due to tied embeddings), the weight remains in BF16 and we can use
+        basic F.embedding().
+        
+        WARNING: This fallback uses basic F.embedding() semantics and does NOT
+        handle VocabParallelEmbedding's sharding/masking behavior. This is
+        acceptable because:
+        1. This path only triggers when lm_head shares storage with embed_tokens
+        2. In that case, the actual embedding lookup goes through embed_tokens
+           (which has proper VocabParallelEmbedding handling), not lm_head
+        3. This fallback exists mainly for API completeness / edge cases
+        """
+        # If quantization was skipped (weight replaced), weight is still BF16
+        if getattr(layer, "_mxfp4_weight_replaced", False):
+            # Basic F.embedding - assumes layer.weight is dense BF16
+            # Does NOT handle VocabParallelEmbedding sharding (see docstring)
+            return torch.nn.functional.embedding(input_, layer.weight)
+        
         raise NotImplementedError(
             "Mxfp4LMHeadMethod does not support embedding(). "
-            "This method is for output logits GEMM via apply()."
+            "MXFP4-quantized weights are packed FP4+scales, incompatible with F.embedding(). "
+            "If this is a tied embedding model, ensure weight replacement is detected correctly."
         )
 
 

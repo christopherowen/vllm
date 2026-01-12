@@ -200,11 +200,15 @@ def mxfp4_e2m1_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     
     Args:
         x: Input tensor of shape [N, K] with dtype fp16/bf16.
+            Must already be on the target CUDA device.
         
     Returns:
         Tuple of:
             - Quantized tensor of shape [N, K/2] with dtype uint8 (packed FP4)
             - Scale factors tensor of shape [N, K/32] with dtype uint8 (E8M0)
+            
+    Note:
+        Output tensors are on the same device as input tensor x.
     """
     try:
         from flashinfer import fp4_quantize
@@ -215,17 +219,46 @@ def mxfp4_e2m1_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             "`pip install flashinfer`"
         ) from err
 
+    # Preserve input device for multi-GPU correctness
+    device = x.device
+    
     # Calculate global scale factor (same as mxfp4_quantize)
     # 448 * 6 = 2688 is the max representable value in E2M1 (6) * E8M0 max (448)
-    global_scale = (448 * 6) / x.float().abs().nan_to_num().max()
+    #
+    # Optimized path: compute max in native dtype (BF16/FP16) to avoid full FP32 copy
+    # Only convert the scalar result to FP32 for the division.
+    # For typical lm_head weights (vocab_size × hidden_dim), this saves ~2x memory
+    # and reduces startup latency.
+    max_val = x.abs().max()  # Native dtype reduction, no copy
+    
+    # Handle pathological cases (NaN/Inf in weights - shouldn't happen for valid models)
+    if not torch.isfinite(max_val):
+        # Fallback: use nan_to_num to handle NaN/Inf (creates FP32 copy, but rare)
+        max_val = x.float().abs().nan_to_num().max()
+    
+    # Convert scalar to FP32 for division (single value, not full tensor)
+    max_val_f32 = max_val.float()
+    
+    # Use epsilon large enough that (448*6)/eps stays within float32 range
+    # float32 max ≈ 3.4e38, so eps should be > 2688/3.4e38 ≈ 8e-36
+    # Use 1e-30 as a safe practical floor (any weight this small is effectively zero)
+    eps = 1e-30
+    max_val_clamped = torch.clamp(max_val_f32, min=eps)
+    global_scale = (448 * 6) / max_val_clamped
+    
+    # Ensure global_scale is a proper tensor on the correct device
+    if not isinstance(global_scale, torch.Tensor):
+        global_scale = torch.tensor(global_scale, dtype=torch.float32, device=device)
+    else:
+        global_scale = global_scale.to(device=device, dtype=torch.float32)
     
     # Use fp4_quantize with:
     # - sf_vec_size=32: MXFP4 block size
     # - sf_use_ue8m0=True: E8M0 scale format
     # - is_sf_swizzled_layout=False: Linear layout for Marlin compatibility
     x_q, x_scales = fp4_quantize(
-        x.cuda(),
-        global_scale.cuda(),
+        x,  # Already on correct device
+        global_scale,  # Already on correct device
         sf_vec_size=32,
         sf_use_ue8m0=True,
         is_sf_swizzled_layout=False,  # Critical: Marlin expects linear layout
