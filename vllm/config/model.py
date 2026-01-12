@@ -195,6 +195,14 @@ class ModelConfig:
     - "triton": OpenAI Triton (SM90-SM100)\n
     - "trtllm": TRT-LLM BF16×FP4 (SM100 only)\n
     - "trtllm-mxfp8": TRT-LLM FP8×FP4 (SM100 only)"""
+    mxfp4_layers: str = "moe"
+    """Comma-separated list of layer types to quantize with MXFP4:\n
+    - "moe": MoE expert weights only (default, backwards compatible)\n
+    - "qkv": Fused QKV projection (*.qkv_proj)\n
+    - "o": Attention output projection (*.o_proj)\n
+    - "lm_head": Output logits projection\n
+    - "all": Shorthand for moe,qkv,o,lm_head\n
+    Example: --mxfp4-layers moe,qkv,o,lm_head"""
     enforce_eager: bool = False
     """Whether to always use eager-mode PyTorch. If True, we will disable CUDA
     graph and always execute the model in eager mode. If False, we will use

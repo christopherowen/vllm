@@ -369,6 +369,55 @@ class Mxfp4Config(QuantizationConfig):
     def get_config_filenames(cls) -> list[str]:
         return []
 
+    # Valid tokens for --mxfp4-layers
+    _VALID_MXFP4_LAYER_TOKENS = {"moe", "qkv", "o", "lm_head", "all"}
+
+    def _parse_mxfp4_layers(self) -> set[str]:
+        """Parse mxfp4_layers config into a set of layer type tokens.
+        
+        Supported tokens: moe, qkv, o, lm_head, all
+        Default: {"moe"} (backwards compatible)
+        """
+        try:
+            vllm_config = get_current_vllm_config()
+            layers_str = vllm_config.model_config.mxfp4_layers
+        except Exception:
+            # Config not available, use default
+            return {"moe"}
+        
+        if not layers_str:
+            return {"moe"}
+        
+        # Parse comma-separated list, filter empty strings
+        raw_tokens = {s.strip().lower() for s in layers_str.split(",")}
+        raw_tokens.discard("")  # Remove empty strings from trailing commas etc.
+        
+        # Validate tokens and warn on unknown ones
+        valid_layers = set()
+        for token in raw_tokens:
+            if token in self._VALID_MXFP4_LAYER_TOKENS:
+                valid_layers.add(token)
+            else:
+                logger.warning_once(
+                    f"[MXFP4] Unknown token '{token}' in --mxfp4-layers. "
+                    f"Valid tokens: {sorted(self._VALID_MXFP4_LAYER_TOKENS)}. "
+                    f"This token will be ignored."
+                )
+        
+        # Expand "all" shorthand
+        if "all" in valid_layers:
+            valid_layers = {"moe", "qkv", "o", "lm_head"}
+        
+        # Ensure at least moe is enabled if nothing valid was specified
+        if not valid_layers:
+            logger.warning_once(
+                "[MXFP4] No valid layer tokens specified in --mxfp4-layers. "
+                "Defaulting to 'moe'."
+            )
+            return {"moe"}
+        
+        return valid_layers
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
@@ -379,7 +428,42 @@ class Mxfp4Config(QuantizationConfig):
                 fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedLinearMethod()
-            # All linear layers use BF16 (unquantized)
+            
+            # Check which layer types are enabled for MXFP4 quantization
+            mxfp4_layers = self._parse_mxfp4_layers()
+            
+            # Check if this is a QKV or O projection that should be quantized
+            is_qkv = prefix.endswith(".qkv_proj")
+            is_o = prefix.endswith(".o_proj")
+            
+            should_quantize = False
+            layer_type = None
+            if is_qkv and "qkv" in mxfp4_layers:
+                should_quantize = True
+                layer_type = "qkv_proj"
+            elif is_o and "o" in mxfp4_layers:
+                should_quantize = True
+                layer_type = "o_proj"
+            
+            if should_quantize:
+                # Check LoRA compatibility - MXFP4 weights are incompatible with LoRA
+                try:
+                    vllm_config = get_current_vllm_config()
+                    if vllm_config.lora_config is not None:
+                        logger.warning_once(
+                            f"[MXFP4] Skipping MXFP4 for {prefix} because LoRA is enabled. "
+                            "FP4-packed weights are incompatible with LoRA's additive updates."
+                        )
+                        return UnquantizedLinearMethod()
+                except Exception:
+                    pass
+                
+                logger.info_once(
+                    f"[MXFP4] Using Mxfp4LinearMethod for {layer_type} ({prefix})"
+                )
+                return Mxfp4LinearMethod()
+            
+            # Default: unquantized linear layers
             return UnquantizedLinearMethod()
         elif isinstance(layer, VocabParallelEmbedding):
             # MXFP4 quantization for ParallelLMHead (output logits layer) on Blackwell
@@ -388,7 +472,10 @@ class Mxfp4Config(QuantizationConfig):
             # Strict matching: only "lm_head" or "*.lm_head", NOT "lm_heads.0" (Medusa),
             # "aux_lm_head", or other variants that contain "lm_head" as substring.
             is_lm_head = prefix == "lm_head" or prefix.endswith(".lm_head")
-            if is_lm_head and current_platform.is_cuda() and current_platform.is_blackwell_class():
+            
+            # Check if lm_head is enabled in mxfp4_layers config
+            mxfp4_layers = self._parse_mxfp4_layers()
+            if is_lm_head and "lm_head" in mxfp4_layers and current_platform.is_cuda() and current_platform.is_blackwell_class():
                 try:
                     vllm_config = get_current_vllm_config()
                     hf_config = vllm_config.model_config.hf_config
@@ -423,7 +510,7 @@ class Mxfp4Config(QuantizationConfig):
                     return None
                 
                 logger.info_once(
-                    f"Using Mxfp4LMHeadMethod for lm_head ({prefix}) on Blackwell.",
+                    f"[MXFP4] Using Mxfp4LMHeadMethod for lm_head ({prefix}) on Blackwell.",
                 )
                 return Mxfp4LMHeadMethod()
             # Other embeddings remain unquantized
@@ -476,7 +563,14 @@ class Mxfp4LinearMethod(LinearMethodBase):
     ):
         """Create BF16 weights that will be quantized after loading."""
         output_size_per_partition = sum(output_partition_sizes)
-        weight_loader = extra_weight_attrs.get("weight_loader")
+        # Pop weight_loader to avoid setting it twice (ModelWeightParameter sets it)
+        weight_loader = extra_weight_attrs.pop("weight_loader", None)
+        if weight_loader is None:
+            raise ValueError(
+                "Mxfp4LinearMethod.create_weights() requires 'weight_loader' in "
+                "extra_weight_attrs. This is a bug - LinearBase should always "
+                "provide weight_loader when calling create_weights()."
+            )
 
         # Store dimensions for Marlin kernel
         layer.input_size_per_partition = input_size_per_partition
