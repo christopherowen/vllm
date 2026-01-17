@@ -591,11 +591,15 @@ class Mxfp4LinearMethod(LinearMethodBase):
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
 
+    def __init__(self):
+        # Check which backend to use based on global config
+        # Use GEMV for CUTLASS backends (both Blackwell FP4FP8 and SM90 FP4BF16)
+        backend = get_mxfp4_backend(with_lora_support=False)
+        self.use_gemv = backend in (Mxfp4Backend.CUTLASS_BLACKWELL_FP4FP8, 
+                                     Mxfp4Backend.CUTLASS_SM90_FP4BF16)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Quantize BF16 weights to MXFP4 and prepare for Marlin kernel."""
-        from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
-            prepare_fp4_layer_for_marlin,
-        )
+        """Quantize BF16 weights to MXFP4 and prepare for selected backend."""
         from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
             mxfp4_e2m1_quantize,
         )
@@ -609,15 +613,32 @@ class Mxfp4LinearMethod(LinearMethodBase):
         # Replace the BF16 weight with quantized FP4 weight
         replace_parameter(layer, "weight", weight_fp4)
 
-        # Register the weight scale as a new parameter
+        # Register the weight scale as a parameter
         layer.register_parameter(
             "weight_scale",
             torch.nn.Parameter(weight_scale, requires_grad=False),
         )
 
-        # Repack weights and scales for Marlin kernel
-        # This creates layer.workspace and repacks weight/weight_scale
-        prepare_fp4_layer_for_marlin(layer)
+        if self.use_gemv:
+            # CUTLASS/GEMV path: no Marlin repacking needed
+            logger.info_once(
+                f"[MXFP4] Dense layer quantized: {weight_bf16.shape} BF16 "
+                f"-> {weight_fp4.shape} FP4 (using GEMV)"
+            )
+        else:
+            # Marlin path: repack weights for Marlin kernel
+            from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+                prepare_fp4_layer_for_marlin,
+            )
+            prepare_fp4_layer_for_marlin(layer)
+            logger.info_once(
+                f"[MXFP4] Dense layer quantized: {weight_bf16.shape} BF16 "
+                f"-> {weight_fp4.shape} FP4 (using Marlin)"
+            )
+
+    # Threshold for dispatching to GEMV vs GEMM in CUTLASS mode
+    # For M <= this value, use GEMV (DP4A); for larger M, use CUTLASS
+    GEMV_M_THRESHOLD = 9999  # Use GEMV for all sizes initially
 
     def apply(
         self,
@@ -625,28 +646,46 @@ class Mxfp4LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Apply MXFP4 linear layer using Marlin fused dequant+GEMM kernel.
+        """Apply MXFP4 linear layer using selected backend.
         
-        The Marlin kernel:
-        1. Reads FP4 weights from memory (4x smaller than BF16)
-        2. Dequantizes on-the-fly in registers
-        3. Performs GEMM
-        All on GPU, no CPU round-trip.
+        CUTLASS backend: Uses DP4A GEMV with fused BF16->INT8 quantization
+        Marlin backend: Uses Marlin fused dequant+GEMM
         """
-        from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
-            apply_fp4_marlin_linear,
-        )
+        if self.use_gemv:
+            # GEMV path (for CUTLASS backend)
+            from flashinfer.gemv import gemv_mxfp4_dp4a
+            
+            x_2d = x.view(-1, x.shape[-1]) if x.dim() > 2 else x
+            
+            output = gemv_mxfp4_dp4a(
+                input=x_2d,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+            )
+            
+            if bias is not None:
+                output = output + bias
+            
+            if x.dim() > 2:
+                output = output.view(*x.shape[:-1], -1)
+            
+            return output
+        else:
+            # Marlin path
+            from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+                apply_fp4_marlin_linear,
+            )
 
-        return apply_fp4_marlin_linear(
-            input=x,
-            weight=layer.weight,
-            weight_scale=layer.weight_scale,
-            weight_scale_2=None,  # MXFP4 uses single scale, not NVFP4
-            workspace=layer.workspace,
-            size_n=layer.output_size_per_partition,
-            size_k=layer.input_size_per_partition,
-            bias=bias,
-        )
+            return apply_fp4_marlin_linear(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                weight_scale_2=None,
+                workspace=layer.workspace,
+                size_n=layer.output_size_per_partition,
+                size_k=layer.input_size_per_partition,
+                bias=bias,
+            )
 
 
 class Mxfp4LMHeadMethod(QuantizeMethodBase):
@@ -760,9 +799,6 @@ class Mxfp4LMHeadMethod(QuantizeMethodBase):
         from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
             mxfp4_e2m1_quantize,
         )
-        from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
-            prepare_fp4_layer_for_marlin,
-        )
 
         # Structural check: detect if weight storage was replaced after create_weights().
         # This typically happens when tie_weights() aliases lm_head.weight with
@@ -797,13 +833,27 @@ class Mxfp4LMHeadMethod(QuantizeMethodBase):
         # Register the scale parameter
         layer.register_buffer("weight_scale", weight_scale)
 
-        # Prepare weights for Marlin (repacking, scale permutation)
-        prepare_fp4_layer_for_marlin(layer, input_dtype=layer.params_dtype)
-        
-        logger.info_once(
-            f"[MXFP4] lm_head quantized: {weight_bf16.shape} BF16 "
-            f"-> {weight_fp4.shape} FP4 (4x smaller)",
-        )
+        # Check which backend to use
+        backend = get_mxfp4_backend(with_lora_support=False)
+        use_gemv = backend in (Mxfp4Backend.CUTLASS_BLACKWELL_FP4FP8,
+                               Mxfp4Backend.CUTLASS_SM90_FP4BF16)
+        layer._use_gemv = use_gemv
+
+        if use_gemv:
+            logger.info_once(
+                f"[MXFP4] lm_head quantized: {weight_bf16.shape} BF16 "
+                f"-> {weight_fp4.shape} FP4 (using GEMV)",
+            )
+        else:
+            # Marlin path: repack weights
+            from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+                prepare_fp4_layer_for_marlin,
+            )
+            prepare_fp4_layer_for_marlin(layer, input_dtype=layer.params_dtype)
+            logger.info_once(
+                f"[MXFP4] lm_head quantized: {weight_bf16.shape} BF16 "
+                f"-> {weight_fp4.shape} FP4 (using Marlin)",
+            )
 
     def apply(
         self,
@@ -811,9 +861,8 @@ class Mxfp4LMHeadMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Apply MXFP4 lm_head using Marlin fused dequant+GEMM kernel.
+        """Apply MXFP4 lm_head using selected backend.
         
-        All on GPU, no CPU round-trip.
         Falls back to BF16 matmul if quantization was skipped due to tied embeddings.
         """
         # Fallback for case where quantization was skipped (weight storage replaced)
@@ -821,20 +870,41 @@ class Mxfp4LMHeadMethod(QuantizeMethodBase):
             output = torch.nn.functional.linear(x, layer.weight, bias)
             return output
         
-        from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
-            apply_fp4_marlin_linear,
-        )
+        if getattr(layer, "_use_gemv", False):
+            # GEMV path
+            from flashinfer.gemv import gemv_mxfp4_dp4a
+            
+            x_2d = x.view(-1, x.shape[-1]) if x.dim() > 2 else x
+            
+            output = gemv_mxfp4_dp4a(
+                input=x_2d,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+            )
+            
+            if bias is not None:
+                output = output + bias
+            
+            if x.dim() > 2:
+                output = output.view(*x.shape[:-1], -1)
+            
+            return output
+        else:
+            # Marlin path
+            from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+                apply_fp4_marlin_linear,
+            )
 
-        return apply_fp4_marlin_linear(
-            input=x,
-            weight=layer.weight,
-            weight_scale=layer.weight_scale,
-            weight_scale_2=None,  # MXFP4 uses single scale, not NVFP4
-            workspace=layer.workspace,
-            size_n=layer.output_size_per_partition,
-            size_k=layer.input_size_per_partition,
-            bias=bias,
-        )
+            return apply_fp4_marlin_linear(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                weight_scale_2=None,
+                workspace=layer.workspace,
+                size_n=layer.output_size_per_partition,
+                size_k=layer.input_size_per_partition,
+                bias=bias,
+            )
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
         """Embedding lookup - only supported when quantization was skipped.

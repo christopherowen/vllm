@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
 
 import numpy as np
 import torch
+import torch.cuda.nvtx as nvtx
 import torch.distributed
 import torch.nn as nn
 from tqdm import tqdm
@@ -3120,7 +3121,11 @@ class GPUModelRunner(
             )
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        # NVTX profiling marker
+        _n = len(scheduler_output.num_scheduled_tokens) if scheduler_output.num_scheduled_tokens else 1
+        _p = 'prefill' if (num_scheduled_tokens / max(_n, 1)) > 2 else 'decode'
         with (
+            nvtx.range(f'{_p}_reqs={_n}_tok={num_scheduled_tokens}'),
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
         ):
