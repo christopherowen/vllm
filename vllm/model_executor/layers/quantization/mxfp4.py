@@ -458,7 +458,7 @@ class Mxfp4Config(QuantizationConfig):
                 except Exception:
                     pass
                 
-                logger.info_once(
+                logger.debug(
                     f"[MXFP4] Using Mxfp4LinearMethod for {layer_type} ({prefix})"
                 )
                 return Mxfp4LinearMethod()
@@ -509,7 +509,7 @@ class Mxfp4Config(QuantizationConfig):
                     )
                     return None
                 
-                logger.info_once(
+                logger.debug(
                     f"[MXFP4] Using Mxfp4LMHeadMethod for lm_head ({prefix}) on Blackwell.",
                 )
                 return Mxfp4LMHeadMethod()
