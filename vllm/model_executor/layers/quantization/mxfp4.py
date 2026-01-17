@@ -908,6 +908,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         mxfp4_block = 32
 
+        # Save original dimensions before padding for input/output handling
+        self.original_hidden_size = hidden_size
+        self.original_intermediate_size = intermediate_size_per_partition
+
         intermediate_size_per_partition_after_pad = intermediate_size_per_partition
         if self.mxfp4_backend == Mxfp4Backend.MARLIN:
             # The moe marlin kernel requires that for each linear
@@ -1702,6 +1706,26 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             if self.mxfp4_backend == Mxfp4Backend.CUTLASS_BLACKWELL_FP4FP8:
                 from flashinfer import mxfp8_quantize
 
+                # Pad input to match weight dimensions (aligned to 128)
+                # Weights are created with padded hidden_size, input must match
+                x_padded = x
+                if self.hidden_size != self.original_hidden_size:
+                    pad_size = self.hidden_size - x.size(-1)
+                    if pad_size > 0:
+                        x_padded = torch.nn.functional.pad(x, (0, pad_size))
+
+                # Debug: log dimensions once
+                import os as _debug_os
+                if _debug_os.environ.get("VLLM_MXFP4_DEBUG", "0") == "1":
+                    logger.info(
+                        f"[MXFP4 DEBUG] x.shape={tuple(x.shape)}, "
+                        f"x_padded.shape={tuple(x_padded.shape)}, "
+                        f"original_hidden={self.original_hidden_size}, "
+                        f"padded_hidden={self.hidden_size}, "
+                        f"w13.shape={tuple(layer.w13_weight.shape)}, "
+                        f"w2.shape={tuple(layer.w2_weight.shape)}"
+                    )
+
                 import os as _os
                 if _os.environ.get("VLLM_MXFP8_QUANT_LOG", "0") == "1":
                     import json as _json
@@ -1720,12 +1744,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         }
 
                     # NOTE: torch reductions will synchronize; only use in debug.
-                    x_f = x.float()
+                    x_f = x_padded.float()
                     payload = {
                         "event": "vllm_mxfp8_quantize_input",
                         "pid": _os.getpid(),
                         "time": _time.time(),
-                        "x": _tmeta(x),
+                        "x": _tmeta(x_padded),
                         "x_stats": {
                             "amin": float(x_f.amin().item()),
                             "amax": float(x_f.amax().item()),
@@ -1735,7 +1759,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     }
                     _os.write(2, (_json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"))
 
-                x_quant, x_scale = mxfp8_quantize(x, True, 32)
+                x_quant, x_scale = mxfp8_quantize(x_padded, True, 32)
 
                 if _os.environ.get("VLLM_MXFP8_QUANT_LOG", "0") == "1":
                     import json as _json
@@ -1772,6 +1796,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     fake_input_scale,
                 ]
 
+                if _os.environ.get("VLLM_MXFP4_DEBUG", "0") == "1":
+                    logger.info(
+                        f"[MXFP4 DEBUG] x_padded.shape={tuple(x_padded.shape)}, "
+                        f"x_quant.shape={tuple(x_quant.shape)}, "
+                        f"x_scale.shape={tuple(x_scale.shape)}, "
+                        f"w13.shape={tuple(layer.w13_weight.shape)}, "
+                        f"w2.shape={tuple(layer.w2_weight.shape)}, "
+                        f"w13_scale.shape={tuple(layer.w13_weight_scale.shape)}, "
+                        f"w2_scale.shape={tuple(layer.w2_weight_scale.shape)}, "
+                        f"hidden_size={self.hidden_size}, "
+                        f"intermediate_size={self.intermediate_size}"
+                    )
+
                 fi_input = x_quant
                 extra_kwargs = dict(
                     use_mxfp8_act_scaling=True,
@@ -1794,7 +1831,50 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     fc2_expert_weights=layer.w2_weight,
                 )
 
-            output = torch.empty_like(x, dtype=torch.bfloat16)
+            # Output tensor needs to match padded dimensions
+            output_shape = list(fi_input.shape)
+            output_shape[-1] = self.hidden_size  # Use padded hidden size
+            output = torch.empty(output_shape, device=x.device, dtype=torch.bfloat16)
+
+            # Capture call for replay debugging (set VLLM_CAPTURE_MOE_CALL=1)
+            # Light mode (VLLM_CAPTURE_MOE_LIGHT=1) saves only dynamic inputs (~25MB)
+            # Full mode saves weights too (~1.7GB) - use for first capture only
+            import os as _capture_os
+            if _capture_os.environ.get("VLLM_CAPTURE_MOE_CALL", "0") == "1":
+                import time as _capture_time
+                ts = int(_capture_time.time()*1000)
+                light_mode = _capture_os.environ.get("VLLM_CAPTURE_MOE_LIGHT", "1") == "1"
+                
+                # Always save dynamic inputs (small)
+                input_path = f"/tmp/moe_input_{ts}.pt"
+                torch.save({
+                    "fi_input": fi_input.cpu(),
+                    "topk_ids": topk_ids.cpu(),
+                    "topk_weights": topk_weights.cpu(),
+                    "input_sf": extra_kwargs.get("input_sf").cpu() if extra_kwargs.get("input_sf") is not None else None,
+                    "hidden_size": self.hidden_size,
+                    "original_hidden_size": self.original_hidden_size,
+                    "intermediate_size": self.intermediate_size,
+                    "num_experts": self.num_experts,
+                    "use_mxfp8_act_scaling": extra_kwargs.get("use_mxfp8_act_scaling", False),
+                }, input_path)
+                logger.info(f"[MXFP4] Captured MoE input to {input_path}")
+                
+                # Save weights only once (large, but static)
+                weights_path = "/tmp/moe_weights.pt"
+                if not light_mode or not _capture_os.path.exists(weights_path):
+                    torch.save({
+                        "quant_scales": [qs.cpu() for qs in quant_scales],
+                        "fc1_expert_weights": extra_kwargs["fc1_expert_weights"].cpu(),
+                        "fc2_expert_weights": extra_kwargs["fc2_expert_weights"].cpu(),
+                        "fc1_expert_biases": layer.w13_bias.cpu() if layer.w13_bias is not None else None,
+                        "fc2_expert_biases": layer.w2_bias.cpu() if layer.w2_bias is not None else None,
+                    }, weights_path)
+                    logger.info(f"[MXFP4] Captured MoE weights to {weights_path}")
+                
+                # Only capture once
+                _capture_os.environ["VLLM_CAPTURE_MOE_CALL"] = "0"
+
             _ = flashinfer_cutlass_fused_moe(
                 input=fi_input,
                 token_selected_experts=topk_ids.to(torch.int).contiguous(),
@@ -1817,6 +1897,29 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 tune_max_num_tokens=max(self.max_capture_size, int(fi_input.shape[0]), 1),
                 **extra_kwargs,
             )
+
+            # Debug: log input/output stats (set VLLM_MOE_DEBUG=1)
+            import os as _debug_os
+            if _debug_os.environ.get("VLLM_MOE_DEBUG", "0") == "1":
+                # Log input stats
+                in_f = fi_input.float()
+                logger.info(
+                    f"[MOE DEBUG] INPUT: shape={tuple(fi_input.shape)}, "
+                    f"min={in_f.min().item():.4f}, max={in_f.max().item():.4f}, "
+                    f"mean={in_f.mean().item():.4f}"
+                )
+                # Log output stats
+                out_f = output.float()
+                logger.info(
+                    f"[MOE DEBUG] OUTPUT: shape={tuple(output.shape)}, "
+                    f"min={out_f.min().item():.4f}, max={out_f.max().item():.4f}, "
+                    f"mean={out_f.mean().item():.4f}, "
+                    f"nan={torch.isnan(output).any()}, inf={torch.isinf(output).any()}"
+                )
+
+            # Slice output back to original (unpadded) hidden size
+            if self.hidden_size != self.original_hidden_size:
+                output = output[..., :self.original_hidden_size].contiguous()
 
             return output
         elif self.mxfp4_backend == Mxfp4Backend.TRITON:
