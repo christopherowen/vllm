@@ -637,8 +637,9 @@ class Mxfp4LinearMethod(LinearMethodBase):
             )
 
     # Threshold for dispatching to GEMV vs GEMM in CUTLASS mode
-    # For M <= this value, use GEMV (DP4A); for larger M, use CUTLASS
-    GEMV_M_THRESHOLD = 9999  # Use GEMV for all sizes initially
+    # For M < this value, use GEMV (DP4A); for larger M, use Marlin GEMM
+    # GEMV is optimized for decode (M=1-7), Marlin is better for prefill
+    GEMV_M_THRESHOLD = 8
 
     def apply(
         self,
@@ -653,11 +654,12 @@ class Mxfp4LinearMethod(LinearMethodBase):
         """
         if self.use_gemv:
             # GEMV path (for CUTLASS backend)
-            from flashinfer.gemv import gemv_mxfp4_dp4a
+            # Use lazy wrapper for torch.compile compatibility (same as MoE)
+            from vllm.utils.flashinfer import flashinfer_gemv_mxfp4_dp4a
             
             x_2d = x.view(-1, x.shape[-1]) if x.dim() > 2 else x
             
-            output = gemv_mxfp4_dp4a(
+            output = flashinfer_gemv_mxfp4_dp4a(
                 input=x_2d,
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
@@ -872,11 +874,12 @@ class Mxfp4LMHeadMethod(QuantizeMethodBase):
         
         if getattr(layer, "_use_gemv", False):
             # GEMV path
-            from flashinfer.gemv import gemv_mxfp4_dp4a
+            # Use lazy wrapper for torch.compile compatibility (same as MoE)
+            from vllm.utils.flashinfer import flashinfer_gemv_mxfp4_dp4a
             
             x_2d = x.view(-1, x.shape[-1]) if x.dim() > 2 else x
             
-            output = gemv_mxfp4_dp4a(
+            output = flashinfer_gemv_mxfp4_dp4a(
                 input=x_2d,
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,

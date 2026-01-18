@@ -82,18 +82,37 @@ def _get_submodule(module_name: str) -> Any | None:
         return None
 
 
+# `find_spec` is not torch.compile compatible.
+# Call has_flashinfer() at module import time and store result in a constant.
+# This ensures find_spec() is called during module import, not during
+# torch.compile tracing where find_spec() causes graph breaks.
+# See vllm/_aiter_ops.py for the same pattern with IS_AITER_FOUND.
+HAS_FLASHINFER = has_flashinfer()
+
+
 # General lazy import wrapper
 def _lazy_import_wrapper(
     module_name: str, attr_name: str, fallback_fn: Callable[..., Any] = _missing
 ):
-    """Create a lazy import wrapper for a specific function."""
+    """Create a lazy import wrapper for a specific function.
+    
+    Uses module-level HAS_FLASHINFER constant instead of calling has_flashinfer()
+    to avoid torch.compile graph breaks from find_spec() calls.
+    
+    NOTE: This wrapper is NOT suitable for functions called during torch.compile
+    fullgraph mode. Such functions must be registered as custom_ops (see below).
+    """
+    # Cache the implementation - populated on first call
+    _impl_cache: list[Any] = []
 
-    @functools.cache
     def _get_impl():
-        if not has_flashinfer():
-            return None
-        mod = _get_submodule(module_name)
-        return getattr(mod, attr_name, None) if mod else None
+        if not _impl_cache:
+            if not HAS_FLASHINFER:
+                _impl_cache.append(None)
+            else:
+                mod = _get_submodule(module_name)
+                _impl_cache.append(getattr(mod, attr_name, None) if mod else None)
+        return _impl_cache[0]
 
     def wrapper(*args, **kwargs):
         impl = _get_impl()
@@ -131,6 +150,20 @@ nvfp4_block_scale_interleave = _lazy_import_wrapper(
 trtllm_fp4_block_scale_moe = _lazy_import_wrapper(
     "flashinfer", "trtllm_fp4_block_scale_moe"
 )
+
+# GEMV for dense layers (MXFP4 decode optimization)
+# This uses the registered custom_op for torch.compile compatibility
+def flashinfer_gemv_mxfp4_dp4a(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """MXFP4 GEMV using DP4A - calls registered custom_op for torch.compile."""
+    if not HAS_FLASHINFER:
+        raise RuntimeError(
+            "FlashInfer is not available. Cannot use MXFP4 GEMV."
+        )
+    return torch.ops.vllm.gemv_mxfp4_dp4a(input, weight, weight_scale)
 
 # Special case for autotune since it returns a context manager
 autotune = _lazy_import_wrapper(
@@ -535,6 +568,35 @@ if has_flashinfer():
             A.shape[0], A.shape[1], B.shape[2], dtype=dtype, device=A.device
         )
 
+    # GEMV for MXFP4 dense layers (decode optimization)
+    # Registered as custom_op for torch.compile fullgraph compatibility
+    @torch.library.custom_op(
+        "vllm::gemv_mxfp4_dp4a",
+        mutates_args=[],
+        device_types="cuda",
+    )
+    def gemv_mxfp4_dp4a(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        from flashinfer.gemv import gemv_mxfp4_dp4a as gemv_mxfp4_dp4a_
+
+        return gemv_mxfp4_dp4a_(input, weight, weight_scale)
+
+    @torch.library.register_fake(
+        "vllm::gemv_mxfp4_dp4a",
+    )
+    def gemv_mxfp4_dp4a_fake(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        # Output shape: [M, N] where M = input.shape[0], N = weight.shape[0]
+        return torch.empty(
+            input.shape[0], weight.shape[0], dtype=torch.bfloat16, device=input.device
+        )
+
 
 def flashinfer_scaled_fp4_mm(
     a: torch.Tensor,
@@ -650,10 +712,12 @@ def should_use_flashinfer_for_blockscale_fp8_gemm(
 
 __all__ = [
     "has_flashinfer",
+    "HAS_FLASHINFER",
     "flashinfer_trtllm_fp8_block_scale_moe",
     "flashinfer_cutlass_fused_moe",
     "flashinfer_cutedsl_grouped_gemm_nt_masked",
     "flashinfer_fp4_quantize",
+    "flashinfer_gemv_mxfp4_dp4a",
     "silu_and_mul_scaled_nvfp4_experts_quantize",
     "scaled_fp4_grouped_quantize",
     "nvfp4_block_scale_interleave",
