@@ -51,6 +51,8 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     get_marlin_input_dtype,
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+    apply_fp4_marlin_linear,
+    prepare_fp4_layer_for_marlin,
     prepare_moe_fp4_layer_for_marlin,
 )
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
@@ -600,9 +602,6 @@ class Mxfp4LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Quantize BF16 weights to MXFP4 and prepare for Marlin kernel."""
-        from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
-            prepare_fp4_layer_for_marlin,
-        )
         from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
             mxfp4_e2m1_quantize,
         )
@@ -664,10 +663,6 @@ class Mxfp4LinearMethod(LinearMethodBase):
         3. Performs GEMM
         All on GPU, no CPU round-trip.
         """
-        from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
-            apply_fp4_marlin_linear,
-        )
-
         # Pad input if dimensions were padded during weight creation
         # This is needed for TP>1 where sharded dimensions may not be aligned
         if layer.needs_input_padding:
@@ -685,8 +680,10 @@ class Mxfp4LinearMethod(LinearMethodBase):
         )
 
         # Slice output back to original size if dimensions were padded
+        # Call .contiguous() because slicing creates a non-contiguous view,
+        # which may cause issues with downstream collective ops (all_gather, etc.)
         if layer.needs_output_slice:
-            output = output[..., :layer.original_output_size]
+            output = output[..., :layer.original_output_size].contiguous()
 
         return output
 
@@ -723,7 +720,7 @@ class Mxfp4LMHeadMethod(QuantizeMethodBase):
            - Structural check in process_weights_after_loading()
            - Compares data_ptr() from create_weights() vs after loading
            - Triggers when tie_weights() or loader behavior replaces the weight
-           - Sets `layer._mxfp4_weight_replaced = True` for BF16 fallback
+           - Sets `layer._mxfp4_use_bf16_fallback = True` for BF16 fallback
            - Note: This detects "storage changed", not specifically "tied".
              The inference that it's tied embeddings is usually correct but
              not guaranteed. Either way, skipping quantization is safe.
@@ -808,9 +805,6 @@ class Mxfp4LMHeadMethod(QuantizeMethodBase):
         from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
             mxfp4_e2m1_quantize,
         )
-        from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
-            prepare_fp4_layer_for_marlin,
-        )
 
         # Structural check: detect if weight storage was replaced after create_weights().
         # This typically happens when tie_weights() aliases lm_head.weight with
@@ -824,14 +818,17 @@ class Mxfp4LMHeadMethod(QuantizeMethodBase):
                 "Skipping MXFP4 quantization to avoid corrupting shared weights. "
                 "The lm_head will operate in BF16."
             )
-            # Clean up the marker and set flag for BF16 fallback in apply()
+            # Clean up the marker and set cached flag for fast BF16 fallback in apply()
             delattr(layer, "_mxfp4_weight_data_ptr")
-            layer._mxfp4_weight_replaced = True  # Reflects what we detected, not inferred cause
+            layer._mxfp4_use_bf16_fallback = True
             return
 
         # Clean up the marker now that we've verified
         if hasattr(layer, "_mxfp4_weight_data_ptr"):
             delattr(layer, "_mxfp4_weight_data_ptr")
+        
+        # Set fast-path flag: MXFP4 quantization will be used
+        layer._mxfp4_use_bf16_fallback = False
 
         # Get the original BF16 weights
         weight_bf16 = layer.weight.data
@@ -889,13 +886,9 @@ class Mxfp4LMHeadMethod(QuantizeMethodBase):
         Falls back to BF16 matmul if quantization was skipped due to tied embeddings.
         """
         # Fallback for case where quantization was skipped (weight storage replaced)
-        if getattr(layer, "_mxfp4_weight_replaced", False):
-            output = torch.nn.functional.linear(x, layer.weight, bias)
-            return output
-        
-        from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
-            apply_fp4_marlin_linear,
-        )
+        # Use cached flag set during process_weights_after_loading() for fast path
+        if layer._mxfp4_use_bf16_fallback:
+            return torch.nn.functional.linear(x, layer.weight, bias)
 
         # Pad input if dimensions were padded during weight creation
         # This is needed for TP>1 where sharded dimensions may not be aligned
@@ -914,8 +907,11 @@ class Mxfp4LMHeadMethod(QuantizeMethodBase):
         )
 
         # Slice output back to original size if dimensions were padded
+        # Must call .contiguous() because slicing creates a non-contiguous view,
+        # and tensor_model_parallel_all_gather (used by logits_processor for TP>1)
+        # requires contiguous tensors for NCCL collectives.
         if layer.needs_output_slice:
-            output = output[..., :layer.original_output_size]
+            output = output[..., :layer.original_output_size].contiguous()
 
         return output
 
@@ -939,7 +935,8 @@ class Mxfp4LMHeadMethod(QuantizeMethodBase):
         3. This fallback exists mainly for API completeness / edge cases
         """
         # If quantization was skipped (weight replaced), weight is still BF16
-        if getattr(layer, "_mxfp4_weight_replaced", False):
+        # Use cached flag set during process_weights_after_loading() for fast path
+        if layer._mxfp4_use_bf16_fallback:
             # Basic F.embedding - assumes layer.weight is dense BF16
             # Does NOT handle VocabParallelEmbedding sharding (see docstring)
             return torch.nn.functional.embedding(input_, layer.weight)
