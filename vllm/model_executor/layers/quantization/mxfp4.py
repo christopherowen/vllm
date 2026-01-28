@@ -572,16 +572,23 @@ class Mxfp4LinearMethod(LinearMethodBase):
                 "provide weight_loader when calling create_weights()."
             )
 
-        # Store dimensions for Marlin kernel
-        layer.input_size_per_partition = input_size_per_partition
-        layer.output_size_per_partition = output_size_per_partition
+        # Store original dimensions for weight loading (checkpoint has unpadded dims)
+        layer.original_input_size = input_size_per_partition
+        layer.original_output_size = output_size_per_partition
+
+        # Compute padded dimensions for Marlin kernel requirements:
+        # K (input) must be divisible by 64, N (output) must be divisible by 128
+        # Padding is applied in process_weights_after_loading(), not here
+        layer.input_size_per_partition = round_up(input_size_per_partition, 64)
+        layer.output_size_per_partition = round_up(output_size_per_partition, 128)
         layer.params_dtype = params_dtype
 
-        # Create BF16 weight parameter - will be quantized after loading
+        # Create BF16 weight parameter with ORIGINAL dimensions for weight loading
+        # Padding is applied in process_weights_after_loading() after loading
         weight = ModelWeightParameter(
             data=torch.empty(
-                output_size_per_partition,
-                input_size_per_partition,
+                output_size_per_partition,  # original, not padded
+                input_size_per_partition,   # original, not padded
                 dtype=params_dtype,
             ),
             input_dim=1,
@@ -602,6 +609,25 @@ class Mxfp4LinearMethod(LinearMethodBase):
 
         # Get the BF16 weight
         weight_bf16 = layer.weight.data
+
+        # Pad weight to meet Marlin kernel requirements if needed
+        # This is needed for TP>1 where sharded dimensions may not be aligned
+        orig_out, orig_in = weight_bf16.shape
+        pad_out = layer.output_size_per_partition - orig_out
+        pad_in = layer.input_size_per_partition - orig_in
+        if pad_out > 0 or pad_in > 0:
+            # Pad with zeros: (left, right, top, bottom) for 2D tensor
+            # For [out, in] tensor: pad_in on right, pad_out on bottom
+            weight_bf16 = torch.nn.functional.pad(
+                weight_bf16, (0, pad_in, 0, pad_out)
+            )
+
+        # Pad bias if it exists and output was padded
+        if pad_out > 0 and hasattr(layer, "bias") and layer.bias is not None:
+            layer.bias = torch.nn.Parameter(
+                torch.nn.functional.pad(layer.bias.data, (0, pad_out)),
+                requires_grad=False,
+            )
 
         # Quantize to MXFP4: weight_fp4 is [out, in/2] uint8, weight_scale is [out, in/32] uint8
         weight_fp4, weight_scale = mxfp4_e2m1_quantize(weight_bf16)
@@ -637,7 +663,14 @@ class Mxfp4LinearMethod(LinearMethodBase):
             apply_fp4_marlin_linear,
         )
 
-        return apply_fp4_marlin_linear(
+        # Pad input if dimensions were padded during weight creation
+        # This is needed for TP>1 where sharded dimensions may not be aligned
+        if layer.input_size_per_partition != layer.original_input_size:
+            pad_size = layer.input_size_per_partition - x.size(-1)
+            if pad_size > 0:
+                x = torch.nn.functional.pad(x, (0, pad_size))
+
+        output = apply_fp4_marlin_linear(
             input=x,
             weight=layer.weight,
             weight_scale=layer.weight_scale,
@@ -647,6 +680,12 @@ class Mxfp4LinearMethod(LinearMethodBase):
             size_k=layer.input_size_per_partition,
             bias=bias,
         )
+
+        # Slice output back to original size if dimensions were padded
+        if layer.output_size_per_partition != layer.original_output_size:
+            output = output[..., :layer.original_output_size].contiguous()
+
+        return output
 
 
 class Mxfp4LMHeadMethod(QuantizeMethodBase):
@@ -725,18 +764,24 @@ class Mxfp4LMHeadMethod(QuantizeMethodBase):
         """
         output_size_per_partition = sum(output_partition_sizes)
         
-        # Store dimensions for Marlin kernel
-        # For lm_head: input_size = hidden_dim, output_size = vocab_size
-        layer.input_size_per_partition = input_size_per_partition
-        layer.output_size_per_partition = output_size_per_partition
+        # Store original dimensions for weight loading (checkpoint has unpadded dims)
+        layer.original_input_size = input_size_per_partition
+        layer.original_output_size = output_size_per_partition
+
+        # Compute padded dimensions for Marlin kernel requirements:
+        # K (input) must be divisible by 64, N (output) must be divisible by 128
+        # Padding is applied in process_weights_after_loading(), not here
+        layer.input_size_per_partition = round_up(input_size_per_partition, 64)
+        layer.output_size_per_partition = round_up(output_size_per_partition, 128)
         layer.params_dtype = params_dtype
         
-        # Create BF16 weight parameter - will be quantized after loading
+        # Create BF16 weight parameter with ORIGINAL dimensions for weight loading
+        # Padding is applied in process_weights_after_loading() after loading
         # VocabParallelEmbedding expects (num_embeddings, embedding_dim)
         weight = torch.nn.Parameter(
             torch.empty(
-                output_size_per_partition,
-                input_size_per_partition,
+                output_size_per_partition,  # original, not padded
+                input_size_per_partition,   # original, not padded
                 dtype=params_dtype,
             ),
             requires_grad=False,
@@ -788,6 +833,25 @@ class Mxfp4LMHeadMethod(QuantizeMethodBase):
         # Get the original BF16 weights
         weight_bf16 = layer.weight.data
 
+        # Pad weight to meet Marlin kernel requirements if needed
+        # This is needed for TP>1 where sharded vocab_size may not be aligned
+        orig_out, orig_in = weight_bf16.shape
+        pad_out = layer.output_size_per_partition - orig_out
+        pad_in = layer.input_size_per_partition - orig_in
+        if pad_out > 0 or pad_in > 0:
+            # Pad with zeros: (left, right, top, bottom) for 2D tensor
+            # For [out, in] tensor: pad_in on right, pad_out on bottom
+            weight_bf16 = torch.nn.functional.pad(
+                weight_bf16, (0, pad_in, 0, pad_out)
+            )
+
+        # Pad bias if it exists and output was padded
+        if pad_out > 0 and hasattr(layer, "bias") and layer.bias is not None:
+            layer.bias = torch.nn.Parameter(
+                torch.nn.functional.pad(layer.bias.data, (0, pad_out)),
+                requires_grad=False,
+            )
+
         # Quantize to MXFP4 (E2M1 packed + E8M0 scales)
         weight_fp4, weight_scale = mxfp4_e2m1_quantize(weight_bf16)
 
@@ -825,7 +889,14 @@ class Mxfp4LMHeadMethod(QuantizeMethodBase):
             apply_fp4_marlin_linear,
         )
 
-        return apply_fp4_marlin_linear(
+        # Pad input if dimensions were padded during weight creation
+        # This is needed for TP>1 where sharded dimensions may not be aligned
+        if layer.input_size_per_partition != layer.original_input_size:
+            pad_size = layer.input_size_per_partition - x.size(-1)
+            if pad_size > 0:
+                x = torch.nn.functional.pad(x, (0, pad_size))
+
+        output = apply_fp4_marlin_linear(
             input=x,
             weight=layer.weight,
             weight_scale=layer.weight_scale,
@@ -835,6 +906,12 @@ class Mxfp4LMHeadMethod(QuantizeMethodBase):
             size_k=layer.input_size_per_partition,
             bias=bias,
         )
+
+        # Slice output back to original size if dimensions were padded
+        if layer.output_size_per_partition != layer.original_output_size:
+            output = output[..., :layer.original_output_size].contiguous()
+
+        return output
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
         """Embedding lookup - only supported when quantization was skipped.
