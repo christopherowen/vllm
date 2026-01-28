@@ -806,7 +806,8 @@ def fastsafetensors_weights_iterator(
         for i in range(0, len(hf_weights_files), pg.size())
     ]
 
-    nogds = False
+    # Check environment variable to skip GDS attempt (avoids warning on platforms without GDS)
+    nogds = os.environ.get("VLLM_FASTSAFETENSORS_NOGDS", "0").lower() in ("1", "true")
 
     for f_list in tqdm(
         weight_files_sub_lists,
