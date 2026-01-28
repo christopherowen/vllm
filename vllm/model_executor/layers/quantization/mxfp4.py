@@ -645,6 +645,11 @@ class Mxfp4LinearMethod(LinearMethodBase):
         # This creates layer.workspace and repacks weight/weight_scale
         prepare_fp4_layer_for_marlin(layer)
 
+        # Cache flags for fast path in apply() - avoids runtime comparisons
+        layer.needs_input_padding = (layer.input_size_per_partition != layer.original_input_size)
+        layer.needs_output_slice = (layer.output_size_per_partition != layer.original_output_size)
+        layer.input_pad_size = layer.input_size_per_partition - layer.original_input_size
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -665,10 +670,8 @@ class Mxfp4LinearMethod(LinearMethodBase):
 
         # Pad input if dimensions were padded during weight creation
         # This is needed for TP>1 where sharded dimensions may not be aligned
-        if layer.input_size_per_partition != layer.original_input_size:
-            pad_size = layer.input_size_per_partition - x.size(-1)
-            if pad_size > 0:
-                x = torch.nn.functional.pad(x, (0, pad_size))
+        if layer.needs_input_padding:
+            x = torch.nn.functional.pad(x, (0, layer.input_pad_size))
 
         output = apply_fp4_marlin_linear(
             input=x,
@@ -682,8 +685,8 @@ class Mxfp4LinearMethod(LinearMethodBase):
         )
 
         # Slice output back to original size if dimensions were padded
-        if layer.output_size_per_partition != layer.original_output_size:
-            output = output[..., :layer.original_output_size].contiguous()
+        if layer.needs_output_slice:
+            output = output[..., :layer.original_output_size]
 
         return output
 
@@ -863,6 +866,11 @@ class Mxfp4LMHeadMethod(QuantizeMethodBase):
 
         # Prepare weights for Marlin (repacking, scale permutation)
         prepare_fp4_layer_for_marlin(layer, input_dtype=layer.params_dtype)
+
+        # Cache flags for fast path in apply() - avoids runtime comparisons
+        layer.needs_input_padding = (layer.input_size_per_partition != layer.original_input_size)
+        layer.needs_output_slice = (layer.output_size_per_partition != layer.original_output_size)
+        layer.input_pad_size = layer.input_size_per_partition - layer.original_input_size
         
         logger.info_once(
             f"[MXFP4] lm_head quantized: {weight_bf16.shape} BF16 "
@@ -891,10 +899,8 @@ class Mxfp4LMHeadMethod(QuantizeMethodBase):
 
         # Pad input if dimensions were padded during weight creation
         # This is needed for TP>1 where sharded dimensions may not be aligned
-        if layer.input_size_per_partition != layer.original_input_size:
-            pad_size = layer.input_size_per_partition - x.size(-1)
-            if pad_size > 0:
-                x = torch.nn.functional.pad(x, (0, pad_size))
+        if layer.needs_input_padding:
+            x = torch.nn.functional.pad(x, (0, layer.input_pad_size))
 
         output = apply_fp4_marlin_linear(
             input=x,
@@ -908,8 +914,8 @@ class Mxfp4LMHeadMethod(QuantizeMethodBase):
         )
 
         # Slice output back to original size if dimensions were padded
-        if layer.output_size_per_partition != layer.original_output_size:
-            output = output[..., :layer.original_output_size].contiguous()
+        if layer.needs_output_slice:
+            output = output[..., :layer.original_output_size]
 
         return output
 
