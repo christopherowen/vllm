@@ -3,6 +3,7 @@
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
@@ -74,6 +75,13 @@ class FlashInferExperts(mk.FusedMoEPermuteExpertsUnpermute):
         # - pass per-block weight scales to the kernel
         # - skip input activation quantization (kernel applies scaling)
         self.use_deepseek_fp8_block_scale = use_deepseek_fp8_block_scale
+        # Fused gated FC1: use dual-accumulator GEMM with inline SwigluBias
+        # instead of separate GEMM + doGatedActivation kernel.
+        # Set VLLM_MXFP4_FUSE_GATED_FC1=1 to enable.
+        self.fuse_gated_fc1 = envs.VLLM_MXFP4_FUSE_GATED_FC1
+        if self.fuse_gated_fc1:
+            logger.info("Fused gated FC1 kernel enabled via "
+                        "VLLM_MXFP4_FUSE_GATED_FC1")
 
     @property
     def activation_formats(
@@ -224,6 +232,7 @@ class FlashInferExperts(mk.FusedMoEPermuteExpertsUnpermute):
             activation_type=activation_str_to_value_map[activation],
             # Informs FlashInfer to use the block-scale decoding path when True
             use_deepseek_fp8_block_scale=self.use_deepseek_fp8_block_scale,
+            fuse_gated_fc1=self.fuse_gated_fc1,
         )
 
 

@@ -19,9 +19,17 @@ from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import Annotated, Any
 
-import model_hosting_container_standards.sagemaker as sagemaker_standards
+try:
+    import model_hosting_container_standards.sagemaker as sagemaker_standards
+except ModuleNotFoundError:
+    # Optional dependency. vLLM's OpenAI server should still be usable in
+    # non-SageMaker environments (e.g. dev containers) without this package.
+    sagemaker_standards = None
 import pydantic
-import uvloop
+try:
+    import uvloop
+except ModuleNotFoundError:
+    uvloop = None
 from fastapi import APIRouter, Depends, FastAPI, Form, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -879,9 +887,14 @@ def build_app(args: Namespace) -> FastAPI:
 
     register_vllm_serve_api_routers(app)
 
-    from vllm.entrypoints.sagemaker.routes import register_sagemaker_routes
+    # SageMaker integration is optional and should not prevent server startup.
+    try:
+        from vllm.entrypoints.sagemaker.routes import register_sagemaker_routes
+    except ModuleNotFoundError:
+        register_sagemaker_routes = None
 
-    register_sagemaker_routes(router)
+    if register_sagemaker_routes is not None:
+        register_sagemaker_routes(router)
     app.include_router(router)
 
     app.root_path = args.root_path
@@ -986,7 +999,8 @@ def build_app(args: Namespace) -> FastAPI:
                 f"Invalid middleware {middleware}. Must be a function or a class."
             )
 
-    app = sagemaker_standards.bootstrap(app)
+    if sagemaker_standards is not None:
+        app = sagemaker_standards.bootstrap(app)
 
     return app
 
@@ -1393,4 +1407,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     validate_parsed_serve_args(args)
 
-    uvloop.run(run_server(args))
+    if uvloop is not None:
+        uvloop.run(run_server(args))
+    else:
+        asyncio.run(run_server(args))

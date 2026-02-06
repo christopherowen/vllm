@@ -1924,6 +1924,24 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 import time as _capture_time
                 ts = int(_capture_time.time()*1000)
                 light_mode = _capture_os.environ.get("VLLM_CAPTURE_MOE_LIGHT", "1") == "1"
+
+                # Best-effort metadata to allow *non-circular* offline validation:
+                # we can map packed weights back to original checkpoint tensors using
+                # layer indices / weight loader hints.
+                _layer_idx = (
+                    getattr(layer, "layer_idx", None)
+                    or getattr(layer, "layer_id", None)
+                    or getattr(layer, "idx", None)
+                )
+                _w13_loader = getattr(getattr(layer, "w13_weight", None), "weight_loader", None)
+                _w2_loader = getattr(getattr(layer, "w2_weight", None), "weight_loader", None)
+                _layer_name = getattr(layer, "layer_name", None)
+                _expert_mapping = getattr(layer, "expert_mapping", None)
+                try:
+                    from vllm.config import get_current_vllm_config as _get_vllm_cfg
+                    _model_hint = getattr(_get_vllm_cfg().model_config, "model", None)
+                except Exception:
+                    _model_hint = None
                 
                 # Always save dynamic inputs (small)
                 input_path = f"/tmp/moe_input_{ts}.pt"
@@ -1937,6 +1955,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     "intermediate_size": self.intermediate_size,
                     "num_experts": self.num_experts,
                     "use_mxfp8_act_scaling": extra_kwargs.get("use_mxfp8_act_scaling", False),
+                    # Metadata for mapping back to checkpoint weights.
+                    "model_hint": _model_hint,
+                    "layer_class": type(layer).__name__,
+                    "layer_idx": _layer_idx,
+                    "layer_name": _layer_name,
+                    "expert_mapping": _expert_mapping,
+                    "w13_weight_loader_repr": repr(_w13_loader),
+                    "w2_weight_loader_repr": repr(_w2_loader),
                 }, input_path)
                 logger.info(f"[MXFP4] Captured MoE input to {input_path}")
                 
@@ -1975,6 +2001,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 # It must be >= the actual number of tokens passed at runtime, otherwise
                 # CUTLASS/runner initialization may fail internally for larger shapes.
                 tune_max_num_tokens=max(self.max_capture_size, int(fi_input.shape[0]), 1),
+                fuse_gated_fc1=envs.VLLM_MXFP4_FUSE_GATED_FC1,
                 **extra_kwargs,
             )
 

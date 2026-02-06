@@ -1388,6 +1388,12 @@ class OpenAIServingChat(OpenAIServing):
 
             if self.use_harmony:
                 reasoning, content, _ = parse_chat_output(token_ids)
+                # Harmony parsing can yield content=None if the model output does not
+                # conform to the expected Harmony message format. In that case,
+                # fall back to the raw decoded text so chat completions don't return
+                # an empty (null) message.
+                if content is None:
+                    content = output.text
                 if not request.include_reasoning:
                     reasoning = None
 

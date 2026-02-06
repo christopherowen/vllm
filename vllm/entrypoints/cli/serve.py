@@ -2,9 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import asyncio
 import signal
 
-import uvloop
+try:
+    import uvloop
+except ModuleNotFoundError:
+    uvloop = None
 
 import vllm
 import vllm.envs as envs
@@ -57,7 +61,10 @@ class ServeSubcommand(CLISubcommand):
                 run_multi_api_server(args)
             else:
                 # Single API server (this process).
-                uvloop.run(run_server(args))
+                if uvloop is not None:
+                    uvloop.run(run_server(args))
+                else:
+                    asyncio.run(run_server(args))
 
     def validate(self, args: argparse.Namespace) -> None:
         validate_parsed_serve_args(args)
@@ -248,6 +255,11 @@ def run_api_server_worker_proc(
     set_process_title("APIServer", str(server_index))
     decorate_logs()
 
-    uvloop.run(
-        run_server_worker(listen_address, sock, args, client_config, **uvicorn_kwargs)
-    )
+    if uvloop is not None:
+        uvloop.run(
+            run_server_worker(listen_address, sock, args, client_config, **uvicorn_kwargs)
+        )
+    else:
+        asyncio.run(
+            run_server_worker(listen_address, sock, args, client_config, **uvicorn_kwargs)
+        )

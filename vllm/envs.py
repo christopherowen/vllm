@@ -158,6 +158,9 @@ if TYPE_CHECKING:
     VLLM_MXFP4_BACKEND: str = "auto"
     # MXFP4 activation / internal representation selector (work in progress).
     VLLM_MXFP4_ACTIVATION: str = "auto"
+    # Fused gated FC1: dual-accumulator GEMM with inline SwigluBias.
+    # Eliminates separate doGatedActivation kernel. SM12x only.
+    VLLM_MXFP4_FUSE_GATED_FC1: bool = False
     VLLM_ATTENTION_SINKS: str = "auto"
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
@@ -1149,6 +1152,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MXFP4_BACKEND": lambda: os.getenv("VLLM_MXFP4_BACKEND", "auto").lower(),
     # MXFP4 activation / internal representation selector (work in progress).
     "VLLM_MXFP4_ACTIVATION": lambda: os.getenv("VLLM_MXFP4_ACTIVATION", "auto").lower(),
+    # Fused gated FC1: dual-accumulator GEMM with inline SwigluBias (SM12x).
+    "VLLM_MXFP4_FUSE_GATED_FC1": lambda: bool(
+        int(os.getenv("VLLM_MXFP4_FUSE_GATED_FC1", "0"))
+    ),
     # Whether to use DeepEPLL kernels for NVFP4 quantization and dispatch method
     # only supported on Blackwell GPUs and with
     # https://github.com/deepseek-ai/DeepEP/pull/341

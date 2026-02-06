@@ -332,8 +332,7 @@ def supports_trtllm_attention() -> bool:
     # SM120/SM121 cannot use TRT-LLM cubins - use native FlashInfer attention
     if capability.major == 12:
         logger.info_once(
-            "SM12x detected - using native FlashInfer CUTLASS attention instead "
-            "of TRT-LLM attention (cubins not available for SM12x)"
+            "SM12x detected - using native FlashInfer CUTLASS attention"
         )
         return False
 
