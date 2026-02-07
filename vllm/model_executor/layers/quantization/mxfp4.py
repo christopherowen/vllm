@@ -2001,7 +2001,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 # It must be >= the actual number of tokens passed at runtime, otherwise
                 # CUTLASS/runner initialization may fail internally for larger shapes.
                 tune_max_num_tokens=max(self.max_capture_size, int(fi_input.shape[0]), 1),
-                fuse_gated_fc1=envs.VLLM_MXFP4_FUSE_GATED_FC1,
+                fuse_activation=envs.VLLM_MXFP4_FUSE_ACTIVATION,
                 **extra_kwargs,
             )
 

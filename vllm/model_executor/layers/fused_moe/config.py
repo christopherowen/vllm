@@ -30,9 +30,8 @@ if has_triton_kernels():
     try:
         from triton_kernels.matmul_ogs import PrecisionConfig
     except (ImportError, AttributeError) as e:
-        logger.error(
-            "Failed to import Triton kernels. Please make sure your triton "
-            "version is compatible. Error: %s",
+        logger.debug(
+            "Triton kernels (triton_kernels package) not available: %s",
             e,
         )
 

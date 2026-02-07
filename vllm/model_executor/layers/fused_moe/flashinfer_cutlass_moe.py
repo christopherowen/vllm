@@ -75,13 +75,13 @@ class FlashInferExperts(mk.FusedMoEPermuteExpertsUnpermute):
         # - pass per-block weight scales to the kernel
         # - skip input activation quantization (kernel applies scaling)
         self.use_deepseek_fp8_block_scale = use_deepseek_fp8_block_scale
-        # Fused gated FC1: use dual-accumulator GEMM with inline SwigluBias
+        # Fused activation: use dual-accumulator GEMM with inline SwigluBias
         # instead of separate GEMM + doGatedActivation kernel.
-        # Set VLLM_MXFP4_FUSE_GATED_FC1=1 to enable.
-        self.fuse_gated_fc1 = envs.VLLM_MXFP4_FUSE_GATED_FC1
-        if self.fuse_gated_fc1:
-            logger.info("Fused gated FC1 kernel enabled via "
-                        "VLLM_MXFP4_FUSE_GATED_FC1")
+        # Set VLLM_MXFP4_FUSE_ACTIVATION=1 to enable.
+        self.fuse_activation = envs.VLLM_MXFP4_FUSE_ACTIVATION
+        if self.fuse_activation:
+            logger.info("Fused activation kernel enabled via "
+                        "VLLM_MXFP4_FUSE_ACTIVATION")
 
     @property
     def activation_formats(
@@ -232,7 +232,7 @@ class FlashInferExperts(mk.FusedMoEPermuteExpertsUnpermute):
             activation_type=activation_str_to_value_map[activation],
             # Informs FlashInfer to use the block-scale decoding path when True
             use_deepseek_fp8_block_scale=self.use_deepseek_fp8_block_scale,
-            fuse_gated_fc1=self.fuse_gated_fc1,
+            fuse_activation=self.fuse_activation,
         )
 
 
