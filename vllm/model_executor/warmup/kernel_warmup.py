@@ -40,6 +40,17 @@ def kernel_warmup(worker: "Worker"):
     if has_flashinfer() and current_platform.has_device_capability(90):
         flashinfer_autotune(worker.model_runner)
 
+    # FlashInfer MoE tile warmup for SM12x.
+    # JIT-compiles decode + prefill tile variants for the active activation
+    # mode.  Skips when .so files already exist (AOT or cached).
+    if has_flashinfer() and current_platform.has_device_capability(120):
+        try:
+            from flashinfer.fused_moe import prewarm_moe_tiles
+            prewarm_moe_tiles(fuse_activation=envs.VLLM_MXFP4_FUSE_ACTIVATION)
+        except Exception:
+            logger.warning("Failed to prewarm FlashInfer MoE tiles",
+                           exc_info=True)
+
     # FlashInfer attention warmup
     # Only warmup if the model has FlashInfer attention groups
     # and is not a pooling model
