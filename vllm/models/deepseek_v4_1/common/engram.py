@@ -30,6 +30,42 @@ from vllm.utils.b12x import (
 )
 from vllm.v1.worker.workspace import retain_cuda_graph_capture_resource
 
+
+_FP8_BLOCK_ROWS = 32
+
+
+class _PaddedColumnParallelLinear(ColumnParallelLinear):
+    """Column-parallel linear whose output need not divide by the TP size.
+
+    The output is padded to a multiple of tp_size x 32 rows so every rank owns
+    whole block-FP8 scale blocks. The last rank's missing checkpoint rows are
+    zero-filled through the loader's existing ``allow_tp_padding`` path (a
+    narrowed copy the B12X checkpoint loader supports), so the padded rows
+    compute exactly zero, and the gathered output is sliced back to the
+    logical width.
+    """
+
+    def __init__(self, input_size, output_size, **kwargs):
+        from vllm.distributed import get_tensor_model_parallel_world_size
+
+        tp_size = get_tensor_model_parallel_world_size()
+        quantum = tp_size * _FP8_BLOCK_ROWS
+        padded = -(-output_size // quantum) * quantum
+        self.logical_output_size = output_size
+        self.padded_output_size = padded
+        super().__init__(input_size, padded, **kwargs)
+        if padded != output_size:
+            for name in ("weight", "weight_scale_inv", "weight_scale"):
+                param = getattr(self, name, None)
+                if param is not None:
+                    param.allow_tp_padding = True
+
+    def forward(self, input_):
+        output = super().forward(input_)
+        if self.padded_output_size == self.logical_output_size:
+            return output
+        return output[..., : self.logical_output_size].contiguous()
+
 logger = init_logger(__name__)
 DEAD_ID = -1
 
@@ -645,7 +681,9 @@ class Engram(nn.Module):
         self._disk_prepared = False
         self._disk_prepared_tokens = 0
         projection_tp = getattr(layout, "projection_tp", False)
-        projection_cls = ColumnParallelLinear if projection_tp else ReplicatedLinear
+        projection_cls = (
+            _PaddedColumnParallelLinear if projection_tp else ReplicatedLinear
+        )
         self.wkv = projection_cls(
             6144,
             self.dim * (self.hc_mult + 1),
