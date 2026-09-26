@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Adaptive verification for DSpark speculative decoding."""
 
+import hashlib
+import json
+import os
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING
@@ -25,6 +28,10 @@ from vllm.v1.worker.gpu.attn_utils import (
 
 logger = init_logger(__name__)
 _PROFILE_REPLAYS = 5
+# Directory of pinned cost curves: rank 0 saves the first profile of a shape
+# set, and later boots with the same shapes read it instead of profiling, so
+# the draft budget does not depend on one boot's startup timing noise.
+_COST_DIR = os.environ.get("SPARK3_DSPARK_COST_DIR") or None
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -251,7 +258,25 @@ class AdaptiveVerificationManager:
         capture_sizes: list[int],
         full_batch_shapes: list[tuple[int, int]],
     ) -> None:
-        """Warm every shape, then sample rounds to limit startup/order bias."""
+        """Price the shapes from pinned curves, or profile them.
+
+        A profile warms every shape, then samples rounds to limit startup and
+        order bias. Pinned curves for the shape set skip it; the shapes past
+        the capture limit, which run without graphs, still run once so their
+        kernels compile before the first long prefill does.
+        """
+        key = self._pin_key(capture_sizes, full_batch_shapes)
+        pinned = self._load_pinned_curves(key)
+        if pinned is not None:
+            for batch in self.batches_to_profile(capture_sizes, [], replays=1):
+                run_dummy(**batch)
+            draft_curve, verify_curve, verify_curves_by_num_reqs = pinned
+            self.set_cost_curves(
+                draft_curve,
+                verify_curve,
+                verify_curves_by_num_reqs=verify_curves_by_num_reqs,
+            )
+            return
         for batch in self.batches_to_profile(
             capture_sizes, full_batch_shapes, replays=1
         ):
@@ -259,9 +284,11 @@ class AdaptiveVerificationManager:
         with step_timing.collect() as timings:
             for batch in self.batches_to_profile(capture_sizes, full_batch_shapes):
                 run_dummy(**batch)
-        self.set_initial_cost_curves(timings)
+        self.set_initial_cost_curves(timings, pin_key=key)
 
-    def set_initial_cost_curves(self, samples: list[StepTimingSample]) -> None:
+    def set_initial_cost_curves(
+        self, samples: list[StepTimingSample], pin_key: dict | None = None
+    ) -> None:
         def median_curve(
             points: Iterable[tuple[int, float]],
         ) -> list[tuple[int, float]]:
@@ -288,11 +315,138 @@ class AdaptiveVerificationManager:
             )
             for num_reqs in sorted({s.num_reqs for s in samples if s.full_cudagraph})
         }
+        if pin_key is not None:
+            self._save_pinned_curves(
+                pin_key, draft_curve, verify_curve, verify_curves_by_num_reqs
+            )
         self.set_cost_curves(
             draft_curve,
             verify_curve,
             verify_curves_by_num_reqs=verify_curves_by_num_reqs,
         )
+
+    def _pin_key(
+        self,
+        capture_sizes: list[int],
+        full_batch_shapes: list[tuple[int, int]],
+    ) -> dict | None:
+        """The pinned-curve key of a shape set, or None without a cost directory.
+
+        Configuration only, so a boot looks its curves up before profiling:
+        TP size, draft count, request and token limits, capture limit, profile
+        context length, and the shapes a profile would time, listed as its
+        curves list them (drafter by FULL graph request count, verification by
+        token count, FULL graph token counts by request count).
+        """
+        if _COST_DIR is None or not full_batch_shapes:
+            return None
+        tokens_by_num_reqs: defaultdict[int, list[int]] = defaultdict(list)
+        for num_tokens, num_reqs in sorted(full_batch_shapes):
+            tokens_by_num_reqs[num_reqs].append(num_tokens)
+        max_num_tokens = self.req_states.max_num_batched_tokens
+        tail = preparation_tail_sizes(capture_sizes, max_num_tokens)
+        return {
+            "tp": get_tp_group().world_size,
+            "num_speculative_steps": self.num_speculative_steps,
+            "max_num_reqs": self.req_states.max_num_reqs,
+            "max_num_batched_tokens": max_num_tokens,
+            "cudagraph_limit": capture_sizes[-1] if capture_sizes else 0,
+            "profile_context_len": envs.VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN,
+            "draft_sizes": sorted(tokens_by_num_reqs),
+            "verify_sizes": sorted({n for n, _ in full_batch_shapes} | set(tail)),
+            "full_shapes": {
+                str(n): tokens for n, tokens in sorted(tokens_by_num_reqs.items())
+            },
+        }
+
+    @staticmethod
+    def _pin_path(key: dict) -> str:
+        assert _COST_DIR is not None
+        digest = hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()
+        return os.path.join(_COST_DIR, f"dspark-costs-{digest[:16]}.json")
+
+    def _load_pinned_curves(
+        self, key: dict | None
+    ) -> (
+        tuple[
+            list[tuple[int, float]],
+            list[tuple[int, float]],
+            dict[int, list[tuple[int, float]]],
+        ]
+        | None
+    ):
+        """Rank 0's pinned curves for this key, or None to profile.
+
+        Rank 0 reads the file and broadcasts the answer, so every rank either
+        profiles or skips the profile, and their collectives match.
+        """
+        if key is None:
+            return None
+        tp_group = get_tp_group()
+        pinned = None
+        if tp_group.rank_in_group == 0:
+            path = self._pin_path(key)
+            if os.path.exists(path):
+                with open(path) as f:
+                    saved = json.load(f)
+                if saved.get("key") == key:
+                    logger.info("Using pinned DSpark cost curves from %s", path)
+                    pinned = (
+                        saved["draft_curve"],
+                        saved["verify_curve"],
+                        saved["verify_curves_by_num_reqs"],
+                    )
+                else:
+                    logger.warning(
+                        "Ignoring pinned DSpark cost curves with another key: %s", path
+                    )
+        pinned = tp_group.broadcast_object(pinned, src=0)
+        if pinned is None:
+            return None
+        draft_curve, verify_curve, verify_curves_by_num_reqs = pinned
+        return (
+            [tuple(p) for p in draft_curve],
+            [tuple(p) for p in verify_curve],
+            {
+                int(n): [tuple(p) for p in curve]
+                for n, curve in verify_curves_by_num_reqs.items()
+            },
+        )
+
+    def _save_pinned_curves(
+        self,
+        key: dict,
+        draft_curve: list[tuple[int, float]],
+        verify_curve: list[tuple[int, float]],
+        verify_curves_by_num_reqs: Mapping[int, list[tuple[int, float]]],
+    ) -> None:
+        """Pin rank 0's profile for later boots with the same shape set."""
+        if get_tp_group().rank_in_group != 0:
+            return
+
+        def plain(curve: list[tuple[int, float]]) -> list[list[int | float]]:
+            return [[int(x), float(y)] for x, y in curve]
+
+        path = self._pin_path(key)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(
+                {
+                    "key": key,
+                    "profile_replays": _PROFILE_REPLAYS,
+                    "draft_curve": plain(draft_curve),
+                    "verify_curve": plain(verify_curve),
+                    "verify_curves_by_num_reqs": {
+                        str(n): plain(curve)
+                        for n, curve in verify_curves_by_num_reqs.items()
+                    },
+                },
+                f,
+                indent=1,
+            )
+        os.replace(tmp, path)
+        logger.info("Pinned DSpark cost curves to %s", path)
 
     def set_cost_curves(
         self,

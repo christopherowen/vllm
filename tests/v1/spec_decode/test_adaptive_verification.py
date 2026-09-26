@@ -675,3 +675,120 @@ def test_budget_probes_after_steps_without_drafts():
         manager.get_num_tokens({"low": 3}, {"low": [1, 2]})
         budgets.append(manager._batch_budget[2])
     assert budgets == ([0] * (idle - 1) + [1]) * 2
+
+
+def _pinning_manager() -> AdaptiveVerificationManager:
+    manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
+    manager.num_speculative_steps = 3
+    manager.req_states = SimpleNamespace(max_num_reqs=8, max_num_batched_tokens=64)
+    manager.curves = {}
+    manager.set_cost_curves = lambda draft, verify, **kwargs: manager.curves.update(
+        draft=draft, verify=verify, **kwargs
+    )
+    return manager
+
+
+def _tp_group(rank: int, answer=lambda value: value):
+    return SimpleNamespace(
+        rank_in_group=rank,
+        world_size=3,
+        broadcast_object=lambda value, src: answer(value),
+    )
+
+
+_CAPTURE_SIZES = [1, 2, 8]
+_FULL_SHAPES = [(1, 1), (2, 1), (8, 1), (8, 2)]
+
+
+def _profile(manager: AdaptiveVerificationManager, cost: float = 1.0):
+    """profile_costs on fake dummy runs; returns (shape, timed) per run."""
+    runs = []
+
+    class TimingCollector:
+        samples = None
+
+        @contextmanager
+        def collect(self):
+            self.samples = []
+            try:
+                yield self.samples
+            finally:
+                self.samples = None
+
+    timing = TimingCollector()
+
+    def run_dummy(num_tokens, context_len, profile_num_reqs=None):
+        runs.append(((num_tokens, profile_num_reqs), timing.samples is not None))
+        if timing.samples is not None:
+            num_reqs = profile_num_reqs or min(num_tokens, 8)
+            timing.samples.append(
+                StepTimingSample(
+                    cost * num_tokens,
+                    cost,
+                    num_tokens,
+                    num_reqs,
+                    full_cudagraph=profile_num_reqs is not None,
+                )
+            )
+
+    manager.profile_costs(run_dummy, timing, _CAPTURE_SIZES, _FULL_SHAPES)
+    return runs
+
+
+def test_pinned_cost_curves_skip_the_profile(monkeypatch, tmp_path):
+    monkeypatch.setattr(adaptive_module, "_COST_DIR", str(tmp_path))
+    monkeypatch.setattr(adaptive_module, "get_tp_group", lambda: _tp_group(0))
+    first = _pinning_manager()
+    runs = _profile(first)
+    assert any(timed for _, timed in runs)
+    assert len(list(tmp_path.glob("dspark-costs-*.json"))) == 1
+
+    # A later boot with the same shapes reads the first profile and times
+    # nothing; only the shapes past the capture limit run, once.
+    second = _pinning_manager()
+    runs = _profile(second, cost=9.0)
+    assert runs == [((n, None), False) for n in (12, 16, 32, 64)]
+    assert second.curves == first.curves
+
+    # Other shapes get their own profile and file.
+    third = _pinning_manager()
+    third.req_states.max_num_batched_tokens = 128
+    assert any(timed for _, timed in _profile(third))
+    assert len(list(tmp_path.glob("dspark-costs-*.json"))) == 2
+
+
+def test_pin_key_names_the_profiled_shapes(monkeypatch, tmp_path):
+    """The key computed before profiling is the one the curves imply, so
+    tables pinned from a profile keep matching."""
+    monkeypatch.setattr(adaptive_module, "_COST_DIR", str(tmp_path))
+    monkeypatch.setattr(adaptive_module, "get_tp_group", lambda: _tp_group(0))
+    manager = _pinning_manager()
+    _profile(manager)
+    key = manager._pin_key(_CAPTURE_SIZES, _FULL_SHAPES)
+    curves = manager.curves
+    assert key["draft_sizes"] == [x for x, _ in curves["draft"]]
+    assert key["verify_sizes"] == [x for x, _ in curves["verify"]]
+    assert key["full_shapes"] == {
+        str(n): [x for x, _ in curve]
+        for n, curve in sorted(curves["verify_curves_by_num_reqs"].items())
+    }
+
+
+def test_pinned_cost_curves_only_from_rank_zero(monkeypatch, tmp_path):
+    monkeypatch.setattr(adaptive_module, "_COST_DIR", str(tmp_path))
+    # Without rank 0's curves, rank 1 profiles but never writes.
+    monkeypatch.setattr(
+        adaptive_module, "get_tp_group", lambda: _tp_group(1, lambda value: None)
+    )
+    assert any(timed for _, timed in _profile(_pinning_manager()))
+    assert not list(tmp_path.iterdir())
+
+    # With them, it skips the profile like rank 0, whatever it holds itself.
+    pinned = ([[1, 2.0]], [[4, 40.0]], {"1": [[4, 40.0]]})
+    monkeypatch.setattr(
+        adaptive_module, "get_tp_group", lambda: _tp_group(1, lambda value: pinned)
+    )
+    manager = _pinning_manager()
+    assert not any(timed for _, timed in _profile(manager))
+    assert manager.curves["draft"] == [(1, 2.0)]
+    assert manager.curves["verify_curves_by_num_reqs"] == {1: [(4, 40.0)]}
