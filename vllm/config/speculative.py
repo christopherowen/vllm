@@ -1660,15 +1660,15 @@ class SpeculativeConfig:
                                 "dspark_draft_topk must be between 1 and the "
                                 f"draft vocabulary size ({draft_vocab_size})"
                             )
-                        if (
-                            "Qwen3DSparkModel"
-                            not in self.draft_model_config.architectures
-                            and _QWEN3_OMNI_DSPARK_ARCHITECTURE
-                            not in self.draft_model_config.architectures
-                        ):
+                        if not {
+                            "Qwen3DSparkModel",
+                            _QWEN3_OMNI_DSPARK_ARCHITECTURE,
+                            "DSparkV41DraftModel",
+                        } & set(self.draft_model_config.architectures):
                             raise ValueError(
                                 "dspark_draft_topk is only supported by "
-                                "Qwen3DSparkModel and Qwen3OmniDSparkModel"
+                                "Qwen3DSparkModel, Qwen3OmniDSparkModel and "
+                                "DSparkV41DraftModel"
                             )
                         hf_config.dspark_draft_topk = dspark_draft_topk
 

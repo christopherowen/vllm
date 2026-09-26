@@ -605,6 +605,28 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
 
+    def apply_markov_bias_gathered(
+        self,
+        markov_embed: torch.Tensor,
+        logits: torch.Tensor,
+        values: torch.Tensor,
+        index: torch.Tensor,
+    ) -> torch.Tensor:
+        """Add the Markov bias to the top-k base-logit candidates only.
+
+        Reads k rows of the replicated ``markov_w2`` per request instead of
+        the whole vocabulary projection at every draft position. ``logits``
+        is the caller's ``-inf``-filled buffer; the corrected candidates are
+        scattered into it. The target still verifies every draft, so this
+        can change acceptance but not the output.
+        """
+        weight = self.model.markov_head.markov_w2.weight[index]
+        bias = torch.bmm(weight, markov_embed.to(weight.dtype).unsqueeze(-1))
+        bias = bias.squeeze(-1).to(values.dtype)
+        if self.logits_processor.scale != 1.0:
+            bias = bias * self.logits_processor.scale
+        return logits.scatter_(1, index, (values + bias).to(logits.dtype))
+
     def compute_confidence(
         self, head_hidden: torch.Tensor, markov_embed: torch.Tensor
     ) -> torch.Tensor:
