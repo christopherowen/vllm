@@ -1326,13 +1326,34 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 "V4.1 attention metadata is not prepared"
             )
         sp_rows = sp_prefill.current()
-        if sp_rows is not None:
-            # Sequence-parallel prefill: attention runs on every row.
-            hidden_states = sp_rows.gather(hidden_states)
-        rows = hidden_states.shape[0]
-        qr_kv, _ = self.fused_wqa_wkv(hidden_states)
-        qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
-        qr, kv = self.q_norm(qr), self.kv_norm(kv)
+        index_weights = None
+        if sp_rows is not None and self.compressor is None:
+            # Sequence-parallel prefill without a compressor: the row-wise front
+            # (projection, norms, index weights) runs on this rank's rows, and
+            # its product, narrower than the hidden state, is gathered.
+            qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+            qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
+            parts = [self.q_norm(qr), self.kv_norm(kv)]
+            if self.indexer is not None:
+                parts.append(self.indexer.weights_proj(hidden_states))
+            if len({part.dtype for part in parts}) == 1:
+                widths = [part.shape[-1] for part in parts]
+                parts = sp_rows.gather(torch.cat(parts, dim=-1)).split(widths, dim=-1)
+            else:
+                parts = [sp_rows.gather(part) for part in parts]
+            qr, kv = parts[0].contiguous(), parts[1].contiguous()
+            if self.indexer is not None:
+                index_weights = parts[2].contiguous()
+            hidden_states = None
+            rows = sp_rows.num_tokens
+        else:
+            if sp_rows is not None:
+                # Sequence-parallel prefill: attention runs on every row.
+                hidden_states = sp_rows.gather(hidden_states)
+            rows = hidden_states.shape[0]
+            qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+            qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
+            qr, kv = self.q_norm(qr), self.kv_norm(kv)
         q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
         l2_prefetch.issue(self._l2pf_wo, rows)
         q = _rotated(
@@ -1355,7 +1376,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             swa = self._query_metadata(original_swa)
             is_prefill = not swa.is_decode
             self._cache_context_kv(kv, positions)
-            if swa is original_swa:
+            if swa is original_swa and hidden_states is not None:
                 self._prepare_global_kv(positions, hidden_states)
             index_query = None
             if self.indexer is not None:
@@ -1379,7 +1400,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                         q_mxfp4=iq_data[offset:end],
                         q_scales=iq_scale[offset:end],
                     )
-                weights = self.indexer.weights_proj(hidden_states)
+                weights = (
+                    index_weights
+                    if index_weights is not None
+                    else self.indexer.weights_proj(hidden_states)
+                )
                 iw = torch.empty_like(weights)
                 weight_scale.scale_index_weights(
                     weights,

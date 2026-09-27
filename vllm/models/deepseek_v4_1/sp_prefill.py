@@ -37,9 +37,12 @@ decoder's global KV from every row and then compacts.
 
 - Local rows (L): the residual carry, mHC pre / post / post_pre / collapse,
   attn_norm, ffn_norm, the Engram gate (``run_engram_mix``) and the final norm.
-- Gathered rows (T): the Engram lookup reduction and ``wkv``, attention (q/kv
-  projections, ``wq_b``, indexer, compressor, KV cache writes, sparse MLA,
-  WO), and the MoE gate, top-k, routed and shared experts.
+- Gathered rows (T): the Engram lookup reduction and ``wkv``, attention
+  (``wq_b``, indexer, compressor, KV cache writes, sparse MLA, WO), and the
+  MoE gate, top-k, routed and shared experts.
+- In attention layers without a compressor, the row-wise front
+  (``fused_wqa_wkv``, the q/kv norms and the index weights) runs on local
+  rows and its narrower product is gathered instead of the hidden state.
 
 Per decoder layer: all-gather before attention (inside
 ``DeepseekV4Attention._forward``, behind the opaque attention op, which reads
