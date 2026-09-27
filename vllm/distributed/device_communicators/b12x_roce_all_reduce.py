@@ -264,6 +264,11 @@ class B12xRoceAllReduce:
         if not self.disabled and self._runtime is not None:
             self._runtime.check_health()
 
+    @property
+    def all_reduce_max_bytes(self) -> int:
+        """The largest message ``should_custom_ar`` accepts; 0 when disabled."""
+        return 0 if self.disabled else int(self._runtime.max_size)
+
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
         return not self.disabled and self._runtime.should_allreduce(inp)
 

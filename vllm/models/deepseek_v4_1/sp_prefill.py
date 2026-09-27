@@ -13,16 +13,23 @@ exactly as in ordinary TP; nothing is replicated. The static
 ``_use_sequence_parallel`` construction flag stays off: this mode changes no
 module.
 
-Enable with ``SPARK3_DS41_PREFILL_SP_MIN_ROWS=<rows>``; unset or 0 keeps it
-off. ``DeepseekV4Model.forward`` decides per forward from the token count T,
-which every rank shares, so no agreement between ranks is needed. The
-threshold is raised above the decode token counts (CUDA graph sizes and
-``max_num_seqs * (1 + num_speculative_tokens)``), so decode never uses SP. SP
-is off for pipeline parallelism, static sequence parallelism and request
-boundary checkpoints. With CED compaction, only the encoder layers before
-``ced_decoder_start`` run on every row: SP covers those, and the carried rows
-are gathered back in full before the boundary layer, which builds the
-decoder's global KV from every row and then compacts.
+SP trades two all-gathers per layer for reduce-scatters that split the
+row-wise work across the ranks, so a forward runs sequence-parallel exactly
+when that trade can pay; there is no setting. It must be prompt processing:
+decode forwards (at most the largest CUDA graph capture size, and at most
+``max_num_seqs * (1 + num_speculative_tokens)`` tokens) replay captured
+graphs and keep full rows. And its reduce-scatter must really scatter: a
+hidden-state message that the TP group's one-shot RoCE all-reduce accepts
+costs that all-reduce either way, and rows that few keep the row-wise
+kernels latency-bound, so SP there would only add the gathers.
+``DeepseekV4Model.forward`` decides per forward from the token count T,
+which every rank shares, so no agreement between ranks is needed. SP is off
+only where it cannot apply: tensor parallel size 1, pipeline parallelism,
+static sequence parallelism and request boundary checkpoints. With CED
+compaction, only the encoder layers before ``ced_decoder_start`` run on
+every row: SP covers those, and the carried rows are gathered back in full
+before the boundary layer, which builds the decoder's global KV from every
+row and then compacts.
 
 ## Rows
 
@@ -57,7 +64,6 @@ states only, so its pre-collapse MTP buffer is not filled under SP; other
 drafters gather it.
 """
 
-import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -66,6 +72,8 @@ from dataclasses import dataclass
 import torch
 
 from vllm.distributed import (
+    get_tp_group,
+    model_parallel_is_initialized,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_reduce_scatter,
 )
@@ -73,23 +81,29 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-MIN_ROWS_ENV = "SPARK3_DS41_PREFILL_SP_MIN_ROWS"
+
+def _one_shot_all_reduce_max_bytes() -> int:
+    """The largest message the TP group's RoCE all-reduce takes; 0 if none."""
+    if not model_parallel_is_initialized():
+        return 0
+    comm = getattr(get_tp_group().device_communicator, "b12x_ar_comm", None)
+    return int(getattr(comm, "all_reduce_max_bytes", 0)) if comm is not None else 0
 
 
-def min_rows_from_env() -> int:
-    """The requested SP threshold in tokens; unset, empty or 0 is off."""
-    raw = os.environ.get(MIN_ROWS_ENV, "").strip()
-    rows = int(raw) if raw else 0
-    if rows < 0:
-        raise ValueError(f"{MIN_ROWS_ENV} must be >= 0, got {rows}")
-    return rows
+def rows_above_bytes(limit: int, row_bytes: int, world_size: int) -> int:
+    """The fewest tokens T whose ``Tp``-row message exceeds ``limit`` bytes."""
+    padded = -(-(limit // row_bytes + 1) // world_size) * world_size
+    return padded - world_size + 1
 
 
 def resolve_min_rows(vllm_config, *, static_sequence_parallel: bool = False) -> int:
-    """The effective SP threshold for this model instance; 0 is off."""
-    requested = min_rows_from_env()
-    if requested <= 0:
-        return 0
+    """The smallest forward, in tokens, that runs sequence-parallel; 0 is never.
+
+    The larger of: one token more than any decode forward (the largest CUDA
+    graph capture size, ``max_num_seqs * (1 + num_speculative_tokens)``), and
+    the fewest tokens whose padded hidden-state message the one-shot RoCE
+    all-reduce refuses, so that the reduce-scatter really scatters.
+    """
     parallel = vllm_config.parallel_config
     reason = None
     if parallel.tensor_parallel_size <= 1:
@@ -101,7 +115,7 @@ def resolve_min_rows(vllm_config, *, static_sequence_parallel: bool = False) -> 
     elif vllm_config.use_request_boundary_checkpoints:
         reason = "request boundary checkpoints are enabled"
     if reason is not None:
-        logger.warning("%s=%d ignored: %s", MIN_ROWS_ENV, requested, reason)
+        logger.info("DeepSeek V4.1 prefill sequence parallelism off: %s", reason)
         return 0
     spec = vllm_config.speculative_config
     decode_rows = max(
@@ -110,15 +124,13 @@ def resolve_min_rows(vllm_config, *, static_sequence_parallel: bool = False) -> 
         * (1 + (spec.num_speculative_tokens if spec is not None else 0)),
         parallel.tensor_parallel_size,
     )
-    rows = max(requested, decode_rows + 1)
-    if rows != requested:
-        logger.warning(
-            "%s=%d raised to %d: decode forwards of up to %d tokens never use it",
-            MIN_ROWS_ENV,
-            requested,
-            rows,
-            decode_rows,
-        )
+    rows = decode_rows + 1
+    limit = _one_shot_all_reduce_max_bytes()
+    if limit > 0:
+        model = vllm_config.model_config
+        row_bytes = model.get_hidden_size() * model.dtype.itemsize
+        tp = parallel.tensor_parallel_size
+        rows = max(rows, rows_above_bytes(limit, row_bytes, tp))
     logger.info("DeepSeek V4.1 prefill sequence parallelism from %d tokens", rows)
     return rows
 

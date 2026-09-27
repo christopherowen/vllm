@@ -21,23 +21,6 @@ WORLD_SIZES = (2, 3, 4)
 TOKEN_COUNTS = (1, 2, 4, 7, 4095, 4096, 4097, 4098)
 
 
-@pytest.mark.parametrize(
-    ("raw", "rows"), [(None, 0), ("", 0), (" ", 0), ("0", 0), ("2048", 2048)]
-)
-def test_min_rows_from_env(monkeypatch, raw, rows):
-    if raw is None:
-        monkeypatch.delenv(sp_prefill.MIN_ROWS_ENV, raising=False)
-    else:
-        monkeypatch.setenv(sp_prefill.MIN_ROWS_ENV, raw)
-    assert sp_prefill.min_rows_from_env() == rows
-
-
-def test_min_rows_from_env_rejects_negative(monkeypatch):
-    monkeypatch.setenv(sp_prefill.MIN_ROWS_ENV, "-1")
-    with pytest.raises(ValueError):
-        sp_prefill.min_rows_from_env()
-
-
 @pytest.mark.parametrize("world_size", WORLD_SIZES)
 @pytest.mark.parametrize("num_tokens", TOKEN_COUNTS)
 def test_row_layout_partitions_real_rows(world_size, num_tokens):
@@ -88,8 +71,12 @@ def _config(
     seqs=8,
     spec_tokens=5,
     boundary=False,
+    hidden=5120,
 ):
     return SimpleNamespace(
+        model_config=SimpleNamespace(
+            get_hidden_size=lambda: hidden, dtype=torch.bfloat16
+        ),
         parallel_config=SimpleNamespace(
             tensor_parallel_size=tp, pipeline_parallel_size=pp
         ),
@@ -104,26 +91,42 @@ def _config(
     )
 
 
+@pytest.mark.parametrize("world_size", WORLD_SIZES)
+@pytest.mark.parametrize("limit", (1, 10_239, 10_240, 2 * 1024 * 1024, 2_088_960))
+def test_rows_above_bytes_is_the_first_scattering_forward(world_size, limit):
+    rows = sp_prefill.rows_above_bytes(limit, 10_240, world_size)
+    for num_tokens in range(max(1, rows - 2 * world_size), rows + 2 * world_size):
+        padded = sp_prefill.SPRows(num_tokens, world_size, 0).padded_rows
+        assert (padded * 10_240 > limit) == (num_tokens >= rows), num_tokens
+
+
+def test_resolve_min_rows_follows_the_one_shot_all_reduce(monkeypatch):
+    # A 2 MiB RoCE all-reduce takes 204 rows of 5120 bf16; T = 205 pads to a
+    # 207-row message at TP 3, the first one it refuses.
+    monkeypatch.setattr(
+        sp_prefill, "_one_shot_all_reduce_max_bytes", lambda: 2 * 1024 * 1024
+    )
+    assert sp_prefill.resolve_min_rows(_config()) == 205
+    assert sp_prefill.resolve_min_rows(_config(tp=2)) == 205
+    assert sp_prefill.resolve_min_rows(_config(hidden=4096)) == 256
+    # The decode sizes still bound it from below.
+    assert sp_prefill.resolve_min_rows(_config(capture=512)) == 513
+
+
 def test_resolve_min_rows(monkeypatch):
-    monkeypatch.delenv(sp_prefill.MIN_ROWS_ENV, raising=False)
-    # Off needs no configuration at all.
-    assert sp_prefill.resolve_min_rows(None) == 0
-    monkeypatch.setenv(sp_prefill.MIN_ROWS_ENV, "1024")
-    assert sp_prefill.resolve_min_rows(_config()) == 1024
-    # Raised above every decode forward: graphs and max_num_seqs * (1 + k).
-    monkeypatch.setenv(sp_prefill.MIN_ROWS_ENV, "16")
+    monkeypatch.setattr(sp_prefill, "_one_shot_all_reduce_max_bytes", lambda: 0)
+    # Without a one-shot all-reduce every reduce-scatter scatters: SP starts
+    # above the decode sizes, graphs and max_num_seqs * (1 + k).
     assert sp_prefill.resolve_min_rows(_config()) == 49
     assert sp_prefill.resolve_min_rows(_config(capture=512)) == 513
-    assert sp_prefill.resolve_min_rows(_config(capture=None, spec_tokens=None)) == 16
+    assert sp_prefill.resolve_min_rows(_config(capture=None, spec_tokens=None)) == 9
     for disabled in (
         _config(tp=1),
         _config(pp=2),
         _config(boundary=True),
     ):
         assert sp_prefill.resolve_min_rows(disabled) == 0
-    assert (
-        sp_prefill.resolve_min_rows(_config(), static_sequence_parallel=True) == 0
-    )
+    assert sp_prefill.resolve_min_rows(_config(), static_sequence_parallel=True) == 0
 
 
 def _simulate_reduce_scatter(monkeypatch, layouts, contributions):
@@ -156,8 +159,7 @@ def test_reduce_scatter_then_gather_round_trips(monkeypatch, num_tokens):
         contributions.append(padded)
     _simulate_reduce_scatter(monkeypatch, layouts, contributions)
     local = [
-        layout.reduce_scatter(padded)
-        for layout, padded in zip(layouts, contributions)
+        layout.reduce_scatter(padded) for layout, padded in zip(layouts, contributions)
     ]
     for layout, rows in zip(layouts, local):
         assert rows.shape == (layout.local_rows, 2)
@@ -216,9 +218,7 @@ def test_embedding_reduce_scatter_has_one_owner_per_token(monkeypatch):
                 embedding=lambda _, local_ids, rows=rows: rows[local_ids].clone()
             ),
         )
-        embedding.VocabParallelEmbedding.forward_reduce_scatter(
-            layer, ids, padded_rows
-        )
+        embedding.VocabParallelEmbedding.forward_reduce_scatter(layer, ids, padded_rows)
     expected = torch.zeros(padded_rows, width)
     expected[: ids.numel()] = table[ids]
     torch.testing.assert_close(sum(buffers), expected, rtol=0, atol=0)
