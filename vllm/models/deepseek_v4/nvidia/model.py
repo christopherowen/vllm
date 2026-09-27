@@ -1035,8 +1035,18 @@ class DeepseekV4MoE(nn.Module):
         self.n_local_experts = self.n_local_physical_experts
 
     def forward(
-        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        *,
+        reduce_scatter_rows: int | None = None,
     ) -> torch.Tensor:
+        """Route ``hidden_states`` through the experts.
+
+        ``reduce_scatter_rows`` (sequence parallelism) replaces the final TP
+        all-reduce with a dim-0 reduce-scatter of the output padded to that
+        many rows; the result holds this rank's rows only.
+        """
         if self.gate.tid2eid is not None and input_ids is None:
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
         # getattr for test doubles that fake the gate module.
@@ -1045,7 +1055,11 @@ class DeepseekV4MoE(nn.Module):
             raise ValueError("DeepSeek V4 vision MoE routing requires input_ids.")
 
         if not self.use_mega_moe:
-            return self._forward_fused_moe(hidden_states, input_ids)
+            return self._forward_fused_moe(
+                hidden_states, input_ids, reduce_scatter_rows
+            )
+        if reduce_scatter_rows is not None:
+            raise NotImplementedError("DeepSeek V4 MegaMoE output reduce-scatter")
 
         org_shape = hidden_states.shape
         router_logits, _ = self.gate(hidden_states)
@@ -1085,9 +1099,19 @@ class DeepseekV4MoE(nn.Module):
         return final_hidden_states.view(org_shape)
 
     def _forward_fused_moe(
-        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        reduce_scatter_rows: int | None = None,
     ) -> torch.Tensor:
         org_shape = hidden_states.shape
+        if reduce_scatter_rows is not None:
+            return self.experts(
+                hidden_states=hidden_states,
+                router_logits=hidden_states,
+                input_ids=input_ids,
+                reduce_scatter_rows=reduce_scatter_rows,
+            ).to(hidden_states.dtype)
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             router_logits=hidden_states,

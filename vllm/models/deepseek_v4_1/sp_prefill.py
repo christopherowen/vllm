@@ -30,15 +30,31 @@ parallelism and request boundary checkpoints.
 - The last rank's local rows can include pad rows. They stay finite and are
   never read back into real outputs.
 
-## Stage 1
+## Where each op runs
 
-Only the embedding is sequence-parallel: its all-reduce becomes a
-reduce-scatter (each token has one owning vocabulary shard, so the sum is
-exact) that is immediately all-gathered back to T rows. Everything else runs
-on full rows as without SP, so logits are bit-identical with SP on or off.
+- Local rows (L): the residual carry, mHC pre / post / post_pre / collapse,
+  attn_norm, ffn_norm, the Engram gate (``run_engram_mix``) and the final norm.
+- Gathered rows (T): the Engram lookup reduction and ``wkv``, attention (q/kv
+  projections, ``wq_b``, indexer, compressor, KV cache writes, sparse MLA,
+  WO), and the MoE gate, top-k, routed and shared experts.
+
+Per decoder layer: all-gather before attention (inside
+``DeepseekV4Attention._forward``, behind the opaque attention op, which reads
+the rows from ``current()``), reduce-scatter after WO instead of the
+all-reduce, all-gather before the MoE, and reduce-scatter of the MoE output
+(shared + routed) instead of the runner's final all-reduce. The embedding
+reduce-scatters its masked partial rows (each token has one owning
+vocabulary shard, so the sum is exact); ``inputs_embeds`` are sliced. After
+the final collapse and norm, and for every aux hidden state a drafter
+consumes, the rows are gathered back to T. DSpark drafts from the aux hidden
+states only, so its pre-collapse MTP buffer is not filled under SP; other
+drafters gather it.
 """
 
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 
 import torch
@@ -151,6 +167,18 @@ class SPRows:
         padded[self.num_tokens :].zero_()
         return padded
 
+    def local_slice(self, x: torch.Tensor) -> torch.Tensor:
+        """This rank's L rows of a T-row tensor; pad rows are zero."""
+        if x.shape[0] != self.num_tokens:
+            raise ValueError(f"SP slice expects {self.num_tokens} rows, got {x.shape}")
+        real = self.real_rows
+        rows = x[self.start : self.start + real]
+        if real == self.local_rows:
+            return rows
+        local = x.new_zeros((self.local_rows, *x.shape[1:]))
+        local[:real].copy_(rows)
+        return local
+
 
 def plan_rows(
     num_tokens: int, min_rows: int, world_size: int, rank: int
@@ -161,3 +189,21 @@ def plan_rows(
     if not 0 <= rank < world_size:
         raise ValueError(f"TP rank {rank} is outside world size {world_size}")
     return SPRows(num_tokens, world_size, rank)
+
+
+_ROWS: ContextVar[SPRows | None] = ContextVar("ds41_prefill_sp_rows", default=None)
+
+
+def current() -> SPRows | None:
+    """The SP rows of the attention call in progress, if any."""
+    return _ROWS.get()
+
+
+@contextmanager
+def activate(rows: SPRows) -> Iterator[None]:
+    """Expose ``rows`` across the opaque attention op boundary."""
+    token = _ROWS.set(rows)
+    try:
+        yield
+    finally:
+        _ROWS.reset(token)

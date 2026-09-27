@@ -2,14 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Prefill sequence parallelism: row layout, threshold and CPU collectives.
 
-The collectives are simulated in one process: every rank's contribution is
-computed first, then each rank's collective result is assembled from them.
+The collectives are simulated in one process, either by computing every
+rank's contribution first or by running the ranks in lockstep threads.
 """
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import nn
 
 from vllm.models.deepseek_v4_1 import sp_prefill
 
@@ -221,3 +224,346 @@ def test_embedding_reduce_scatter_has_one_owner_per_token(monkeypatch):
     torch.testing.assert_close(sum(buffers), expected, rtol=0, atol=0)
     with pytest.raises(ValueError):
         embedding.VocabParallelEmbedding.forward_reduce_scatter(layer, ids, 8)
+
+
+@pytest.mark.parametrize("num_tokens", (9, 10, 11))
+def test_local_slice_zero_pads_the_last_rank(num_tokens):
+    full = torch.arange(num_tokens * 2, dtype=torch.float32).reshape(num_tokens, 2)
+    full += 1
+    for rank in range(3):
+        layout = sp_prefill.SPRows(num_tokens, 3, rank)
+        local = layout.local_slice(full)
+        real = layout.real_rows
+        assert local.shape == (layout.local_rows, 2)
+        torch.testing.assert_close(
+            local[:real], full[layout.start : layout.start + real], rtol=0, atol=0
+        )
+        assert not local[real:].any()
+    with pytest.raises(ValueError):
+        sp_prefill.SPRows(num_tokens, 3, 0).local_slice(full[1:])
+
+
+def test_activate_scopes_the_rows():
+    outer, inner = sp_prefill.SPRows(9, 3, 0), sp_prefill.SPRows(12, 3, 1)
+    assert sp_prefill.current() is None
+    with sp_prefill.activate(outer):
+        assert sp_prefill.current() is outer
+        with pytest.raises(RuntimeError), sp_prefill.activate(inner):
+            assert sp_prefill.current() is inner
+            raise RuntimeError
+        assert sp_prefill.current() is outer
+    assert sp_prefill.current() is None
+
+
+def test_moe_reduce_scatter_sums_shared_and_routed_before_the_scatter(monkeypatch):
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner
+
+    events = []
+
+    def reduce_scatter(states, dim):
+        events.append(("reduce_scatter", states.clone(), dim))
+        return states.chunk(3)[1]
+
+    monkeypatch.setattr(
+        moe_runner, "tensor_model_parallel_reduce_scatter", reduce_scatter
+    )
+    runner = SimpleNamespace(
+        moe_config=SimpleNamespace(
+            is_sequence_parallel=False, skip_final_all_reduce=False
+        ),
+        router=object(),
+        _l2_prefetch_pre_reduce_hook=lambda rows: events.append(("hook", rows)),
+    )
+    shared = torch.arange(20, dtype=torch.float32).reshape(10, 2)
+    fused = torch.full((10, 2), 0.5)
+    output = moe_runner.MoERunner._reduce_scatter_final_output(
+        runner, shared, fused, 12, None, False
+    )
+    assert events[0] == ("hook", 10)
+    _, states, dim = events[1]
+    assert dim == 0 and states.shape == (12, 2)
+    torch.testing.assert_close(states[:10], shared + fused, rtol=0, atol=0)
+    assert not states[10:].any()
+    torch.testing.assert_close(output, states[4:8], rtol=0, atol=0)
+    with pytest.raises(NotImplementedError):
+        moe_runner.MoERunner._reduce_scatter_final_output(
+            runner, shared, fused, 12, None, True
+        )
+
+
+def test_engram_gates_only_the_real_local_rows(monkeypatch):
+    pytest.importorskip("b12x")
+    from vllm.models.deepseek_v4_1.common import engram as engram_ops
+
+    tokens, streams, width = 10, 2, 4
+
+    def mix(state, kv, norm_weights, *, eps, plan, out, token_mask=None):
+        assert kv.shape[0] == state.shape[0] == out.shape[0]
+        gate = kv[:, : state.shape[1]]
+        if token_mask is not None:
+            assert token_mask.shape == (state.shape[0],)
+            gate = gate * token_mask[:, None]
+        return out.copy_(state + gate)
+
+    monkeypatch.setattr(engram_ops.hyperconnection, "run_engram_mix", mix)
+    monkeypatch.setattr(engram_ops, "tensor_model_parallel_all_reduce", lambda x: x)
+    staged = torch.randn(tokens, 6)
+    engram = SimpleNamespace(
+        embed_tokens=SimpleNamespace(table_memory="device"),
+        overlap_epochs=None,
+        staged_rows=staged,
+        wkv=lambda rows: rows.repeat(1, 2),
+        norm_weights=None,
+        eps=1e-6,
+        mix_plans={False: None, True: None},
+    )
+    hidden = torch.randn(tokens, streams, width)
+    hash_ids = torch.zeros(tokens, 24, dtype=torch.int64)
+    mask = torch.arange(tokens) % 3 != 1
+    full = engram_ops.Engram.forward(engram, hidden, hash_ids, mask)
+    for rank in range(3):
+        layout = sp_prefill.SPRows(tokens, 3, rank)
+        local = layout.local_slice(hidden)
+        output = engram_ops.Engram.forward(
+            engram, local, hash_ids, mask, sp_rows=layout
+        )
+        real = layout.real_rows
+        assert output.shape == local.shape
+        torch.testing.assert_close(
+            output[:real], full[layout.start : layout.start + real], rtol=0, atol=0
+        )
+        torch.testing.assert_close(output[real:], local[real:], rtol=0, atol=0)
+
+
+# --- Whole-model dataflow on lockstep CPU ranks -----------------------------
+
+# Rank shares of every TP partial sum; the shares sum to one.
+_SHARES = (0.5, 0.25, 0.25)
+
+
+class _World:
+    """Lockstep all-gather and reduce-scatter for ranks run in threads."""
+
+    def __init__(self, size):
+        self.size = size
+        self.barrier = threading.Barrier(size, timeout=60)
+        self.slots = [None] * size
+        self.local = threading.local()
+
+    @property
+    def rank(self):
+        return self.local.rank
+
+    def _exchange(self, x):
+        self.slots[self.rank] = x
+        self.barrier.wait()
+        values = list(self.slots)
+        self.barrier.wait()
+        return values
+
+    def all_gather(self, x, dim):
+        assert dim == 0
+        return torch.cat(self._exchange(x), dim=0)
+
+    def reduce_scatter(self, x, dim):
+        assert dim == 0
+        return sum(self._exchange(x)).chunk(self.size)[self.rank].clone()
+
+    def run(self, fn):
+        def rank_main(rank):
+            self.local.rank = rank
+            return fn(rank)
+
+        with ThreadPoolExecutor(self.size) as pool:
+            futures = [pool.submit(rank_main, rank) for rank in range(self.size)]
+            return [future.result() for future in futures]
+
+
+class _Mix:
+    """Row-wise stand-in for the native mHC kernels."""
+
+    def collapse(self, hidden, mix=None):
+        if mix is None:
+            return hidden.mean(dim=1)
+        return (hidden * mix[:, :, None]).sum(dim=1)
+
+    def post(self, x, residual, post, comb):
+        return residual + x[:, None, :] * 0.25
+
+    def pre(self, residual, fn, scale, base, norm, pre, **previous):
+        if previous.get("previous_output") is not None:
+            residual = self.post(previous["previous_output"], residual, None, None)
+        if residual.ndim == 2:
+            residual = residual[:, None, :].expand(-1, 4, -1).clone()
+        rows = residual.shape[0]
+        mix = residual.new_zeros((rows, 4))
+        mix[:, 0] = 0.75
+        mix[:, 1] = 0.25
+        return (
+            residual,
+            residual.new_full((rows, 4), 0.25),
+            torch.eye(4).expand(rows, 4, 4),
+            residual[:, 0, :] * 0.5 + residual[:, 1, :] * 0.5,
+            mix,
+        )
+
+    def post_pre(self, x, residual, post, comb, fn, scale, base, norm, pre):
+        return self.pre(self.post(x, residual, post, comb), fn, scale, base, norm, pre)
+
+
+def _partial(world, rows, result):
+    """This rank's zero-padded TP share of ``result``, reduce-scattered."""
+    padded = result.new_zeros((rows, *result.shape[1:]))
+    padded[: result.shape[0]] = result * _SHARES[world.rank]
+    return world.reduce_scatter(padded, 0)
+
+
+class _Attention(nn.Module):
+    """Honors the SP contract of DeepseekV4Attention._forward."""
+
+    def __init__(self, index, world, local_rows):
+        super().__init__()
+        self.index, self.world, self.local_rows = index, world, local_rows
+
+    def forward(self, positions, hidden, scaling, *, global_kv_ready=None):
+        rows = sp_prefill.current()
+        if rows is not None:
+            self.local_rows.append(hidden.shape[0])
+            hidden = rows.gather(hidden)
+        # The cross-row term shows whether attention saw every row.
+        result = (
+            hidden * 0.5
+            + hidden.mean(dim=0)
+            + positions[:, None].float() * 0.01
+            + self.index
+        )
+        if rows is None:
+            return result
+        return _partial(self.world, rows.padded_rows, result)
+
+
+class _Experts(nn.Module):
+    def __init__(self, world):
+        super().__init__()
+        self.world = world
+
+    def forward(self, hidden, ids, *, reduce_scatter_rows=None):
+        result = hidden * 0.25 + hidden.sum(dim=0) * 0.01 + ids[:, None].float() * 0.02
+        if reduce_scatter_rows is None:
+            return result
+        return _partial(self.world, reduce_scatter_rows, result)
+
+
+class _Layer(nn.Module):
+    def __init__(self, index, world, local_rows):
+        super().__init__()
+        self.engram = None
+        self.hc_mult = 4
+        self._b12x_mhc = _Mix()
+        self.attn = _Attention(index, world, local_rows)
+        self.ffn = _Experts(world)
+        for name in (
+            "hc_attn_fn_broadcast",
+            "hc_attn_fn",
+            "hc_attn_scale",
+            "hc_attn_base",
+            "hc_ffn_fn",
+            "hc_ffn_scale",
+            "hc_ffn_base",
+        ):
+            setattr(self, name, torch.ones(1))
+        self.attn_norm = self.ffn_norm = SimpleNamespace(weight=torch.ones(2))
+
+    def forward(self, *args, **kwargs):
+        from vllm.models.deepseek_v4_1.nvidia import model as native
+
+        return native.DeepseekV4DecoderLayer.forward(self, *args, **kwargs)
+
+
+class _Embedding:
+    """Vocabulary-parallel embedding: rank r owns ids with id % N == r."""
+
+    def __init__(self, table, world):
+        self.table, self.world = table, world
+
+    def forward_reduce_scatter(self, ids, padded_rows):
+        owned = (ids % self.world.size == self.world.rank)[:, None]
+        padded = self.table.new_zeros((padded_rows, self.table.shape[1]))
+        padded[: ids.numel()] = self.table[ids] * owned
+        return self.world.reduce_scatter(padded, 0)
+
+
+@pytest.mark.parametrize("num_tokens", (9, 10, 11))
+@pytest.mark.parametrize("use_embeds", (False, True))
+@pytest.mark.parametrize("skip_mtp_buffer", (False, True))
+def test_model_forward_matches_full_rows(
+    monkeypatch, num_tokens, use_embeds, skip_mtp_buffer
+):
+    pytest.importorskip("b12x")
+    from vllm.models.deepseek_v4_1.nvidia import model as native
+
+    world = _World(3)
+    monkeypatch.setattr(
+        native,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(native, "get_tensor_model_parallel_world_size", lambda: 3)
+    monkeypatch.setattr(native, "get_tensor_model_parallel_rank", lambda: world.rank)
+    monkeypatch.setattr(native.l2_prefetch, "ENABLED", False)
+    monkeypatch.setattr(
+        sp_prefill, "tensor_model_parallel_all_gather", world.all_gather
+    )
+    monkeypatch.setattr(
+        sp_prefill, "tensor_model_parallel_reduce_scatter", world.reduce_scatter
+    )
+    # Float64 keeps the reordered TP partial sums well inside the tolerance.
+    table = torch.randn(16, 2, dtype=torch.float64)
+    ids = (torch.arange(num_tokens) * 7) % 16
+    positions = torch.arange(100, 100 + num_tokens)
+
+    def run(min_rows, local_rows):
+        buffer = torch.full((16, 8), -7.0, dtype=torch.float64)
+        target = SimpleNamespace(
+            embed_input_ids=lambda input_ids: table[input_ids],
+            embed_tokens=_Embedding(table, world),
+            use_mega_moe=False,
+            use_sequence_parallel=False,
+            prefill_sp_min_rows=min_rows,
+            prefill_sp_skips_mtp_buffer=skip_mtp_buffer,
+            disk_engram=False,
+            engram_hash=None,
+            start_layer=0,
+            end_layer=3,
+            ced_decoder_start=None,
+            layers=nn.ModuleList(_Layer(i, world, local_rows) for i in range(3)),
+            aux_hidden_state_layers={2, 3},
+            _mtp_hidden_buffer=buffer,
+            # L2 prefetch is on by default on SM121; its plans are built.
+            _l2pf_ready=True,
+            norm=lambda hidden: hidden * 2,
+        )
+        output, aux = native.DeepseekV4Model.forward(
+            target,
+            ids,
+            positions,
+            None,
+            inputs_embeds=table[ids] if use_embeds else None,
+        )
+        return output, aux, buffer
+
+    expected, expected_aux, expected_buffer = run(0, [])
+    local_rows = [[] for _ in range(3)]
+    results = world.run(lambda rank: run(4, local_rows[rank]))
+    layout = sp_prefill.SPRows(num_tokens, 3, 0)
+    for rank, (output, aux, buffer) in enumerate(results):
+        # Attention received only this rank's rows in every layer.
+        assert local_rows[rank] == [layout.local_rows] * 3
+        torch.testing.assert_close(output, expected, rtol=1e-9, atol=1e-9)
+        assert len(aux) == len(expected_aux) == 2
+        for actual, value in zip(aux, expected_aux):
+            torch.testing.assert_close(actual, value, rtol=1e-9, atol=1e-9)
+        if skip_mtp_buffer:
+            assert (buffer == -7).all()
+        else:
+            torch.testing.assert_close(buffer, expected_buffer, rtol=1e-9, atol=1e-9)

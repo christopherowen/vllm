@@ -29,7 +29,7 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.models.deepseek_v4_1 import l2_prefetch
+from vllm.models.deepseek_v4_1 import l2_prefetch, sp_prefill
 from vllm.models.deepseek_v4_1.b12x_layers import (
     B12xFP8LinearMethod,
     B12xLinearMethod,
@@ -1325,6 +1325,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             raise PreparationResourceUnavailableError(
                 "V4.1 attention metadata is not prepared"
             )
+        sp_rows = sp_prefill.current()
+        if sp_rows is not None:
+            # Sequence-parallel prefill: attention runs on every row.
+            hidden_states = sp_rows.gather(hidden_states)
         rows = hidden_states.shape[0]
         qr_kv, _ = self.fused_wqa_wkv(hidden_states)
         qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
@@ -1384,7 +1388,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 )
                 index_query = (iq_data, iq_scale, iw)
             self.forward_mqa(q, kv, positions, output, index_query=index_query)
-        return self._o_proj(output, positions, is_prefill=is_prefill)
+        return self._o_proj(output, positions, is_prefill=is_prefill, sp_rows=sp_rows)
 
     @eager_break_during_capture
     def forward_mqa(self, q, kv, positions, output, *, index_query=None):
@@ -1740,7 +1744,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             )
         return self._wo_plans[key]
 
-    def _o_proj(self, o, positions, *, is_prefill=False):
+    def _o_proj(self, o, positions, *, is_prefill=False, sp_rows=None):
         from b12x.preparation import require_prepared
 
         rows = o.shape[0]
@@ -1766,12 +1770,21 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             rope_dim=self.rope_head_dim,
         )
         # The custom attention result must outlive reuse of the workspace arena.
-        output = torch.empty_strided(
-            (rows, weights.hidden, 1),
-            (weights.hidden, 1, rows * weights.hidden),
-            dtype=torch.bfloat16,
-            device=o.device,
-        )
+        if sp_rows is None:
+            output = torch.empty_strided(
+                (rows, weights.hidden, 1),
+                (weights.hidden, 1, rows * weights.hidden),
+                dtype=torch.bfloat16,
+                device=o.device,
+            )
+        else:
+            if rows != sp_rows.num_tokens:
+                raise ValueError(f"V4.1 SP WO expects {sp_rows.num_tokens} rows")
+            # Leading rows of the zero-padded buffer the reduce-scatter reads.
+            padded = sp_rows.empty_padded((weights.hidden,), torch.bfloat16, o.device)
+            output = padded.as_strided(
+                (rows, weights.hidden, 1), (weights.hidden, 1, rows * weights.hidden)
+            )
         binding = replace(binding, output=output)
         # The model owns the plan and weights; graph pools manage activation
         # lifetimes. Keep only the borrowed workspace, not layer activations.
@@ -1784,6 +1797,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         if local.dtype != torch.bfloat16:
             raise TypeError("V4.1 WO projection must return BF16")
         l2_prefetch.issue(self._l2pf_ffn, rows)
+        if sp_rows is not None:
+            if local.data_ptr() != padded.data_ptr():
+                raise RuntimeError("V4.1 WO projection ignored its padded output")
+            return sp_rows.reduce_scatter(padded)
         if get_tensor_model_parallel_world_size() > 1:
             local = get_tp_group().all_reduce(local)
         return local

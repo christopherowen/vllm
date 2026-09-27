@@ -1150,7 +1150,13 @@ class Engram(nn.Module):
             if ENGRAM_ASYNC_TRACE:
                 logger.info("engram-async dummy tokens=%d", num_tokens)
 
-    def forward(self, hidden_states, hash_ids, token_mask=None):
+    def forward(self, hidden_states, hash_ids, token_mask=None, sp_rows=None):
+        """Gate ``hidden_states`` with this layer's Engram rows.
+
+        With ``sp_rows`` (prefill sequence parallelism) ``hidden_states`` holds
+        this rank's rows while ``hash_ids`` and ``token_mask`` cover every
+        token; the lookup and projection still run on every row.
+        """
         if (
             self.embed_tokens.table_memory == "disk"
             and not torch.compiler.is_compiling()
@@ -1166,13 +1172,24 @@ class Engram(nn.Module):
         kv = self.wkv(rows)
         state = hidden_states.flatten(1)
         out = torch.empty_like(state)
+        mix_out = out
+        if sp_rows is not None:
+            # Gate the real local rows; the trailing pad rows pass through.
+            start, real = sp_rows.start, sp_rows.real_rows
+            if real < state.shape[0]:
+                out[real:].copy_(state[real:])
+            if real == 0:
+                return out.view_as(hidden_states)
+            state, mix_out, kv = state[:real], out[:real], kv[start : start + real]
+            if token_mask is not None:
+                token_mask = token_mask[start : start + real]
         hyperconnection.run_engram_mix(
             state,
             kv,
             self.norm_weights,
             eps=self.eps,
             plan=self.mix_plans[token_mask is not None],
-            out=out,
+            out=mix_out,
             token_mask=token_mask,
         )
         return out.view_as(hidden_states)

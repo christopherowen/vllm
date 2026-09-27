@@ -13,6 +13,7 @@ from vllm.distributed import (
     get_ep_group,
     get_pcp_group,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_reduce_scatter,
 )
 from vllm.distributed.communication_op import tensor_model_parallel_all_reduce_in_place
 from vllm.distributed.eplb.eplb_state import EplbLayerState
@@ -533,6 +534,48 @@ class MoERunner(MoERunnerInterface):
 
         return states[..., :trunc_size] if trunc_size is not None else states
 
+    def _reduce_scatter_final_output(
+        self,
+        shared_output: torch.Tensor | None,
+        fused_output: torch.Tensor,
+        padded_rows: int,
+        trunc_size: int | None,
+        output_is_reduced: bool,
+    ) -> torch.Tensor:
+        """Sequence-parallel replacement for the late all-reduce.
+
+        The combined output is written into a ``padded_rows`` buffer whose
+        trailing rows are zero and reduce-scattered along dim 0, so TP rank r
+        receives rows ``[r * padded_rows // tp, (r + 1) * padded_rows // tp)``.
+        """
+        if (
+            output_is_reduced
+            or self.moe_config.is_sequence_parallel
+            or self.moe_config.skip_final_all_reduce
+            or isinstance(self.router, ZeroExpertRouter)
+        ):
+            raise NotImplementedError("MoE reduce-scatter needs an unreduced output")
+        rows = fused_output.shape[0]
+        dtype = (
+            fused_output.dtype
+            if shared_output is None
+            else torch.result_type(shared_output, fused_output)
+        )
+        states = fused_output.new_empty(
+            (padded_rows, *fused_output.shape[1:]), dtype=dtype
+        )
+        states[rows:].zero_()
+        if shared_output is None:
+            states[:rows].copy_(fused_output)
+        else:
+            torch.add(shared_output, fused_output, out=states[:rows])
+        # The same model-installed callback the all-reduce path fires.
+        _hook = getattr(self, "_l2_prefetch_pre_reduce_hook", None)
+        if _hook is not None:
+            _hook(rows)
+        states = tensor_model_parallel_reduce_scatter(states, dim=0)
+        return states[..., :trunc_size] if trunc_size is not None else states
+
     def _encode_layer_name(self) -> str | LayerName:
         if _USE_LAYERNAME:
             return LayerName(self.layer_name)
@@ -733,15 +776,19 @@ class MoERunner(MoERunnerInterface):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
         shared_experts_input: torch.Tensor | None = None,
+        *,
+        reduce_scatter_rows: int | None = None,
     ) -> torch.Tensor:
         """Invoke the fused moe layer.
 
         Input:
         - hidden_states
         - router_logits
+        - reduce_scatter_rows: sequence parallelism; reduce-scatter the output,
+          zero-padded to this many rows, along dim 0 instead of all-reducing
 
         Output:
-        - The new hidden_states.
+        - The new hidden_states (this rank's rows with reduce_scatter_rows).
 
         Calling sequence
         - forward
@@ -861,6 +908,14 @@ class MoERunner(MoERunnerInterface):
         if output_transform_is_tp_partial:
             fused_output_is_reduced = False
 
+        if reduce_scatter_rows is not None:
+            return self._reduce_scatter_final_output(
+                shared_output,
+                fused_output,
+                reduce_scatter_rows,
+                og_hidden_dim_post_xform,
+                fused_output_is_reduced,
+            )
         if shared_output is not None:
             result = (
                 fused_output.add_(shared_output)

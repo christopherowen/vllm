@@ -272,6 +272,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         engram_hashes: torch.Tensor | None = None,
         engram_mask: torch.Tensor | None = None,
         ced_indices: torch.Tensor | None = None,
+        sp_rows: sp_prefill.SPRows | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         previous_output = x if residual is not None else None
         apply_engram = self.engram is not None and engram_hashes is not None
@@ -287,7 +288,10 @@ class DeepseekV4DecoderLayer(nn.Module):
                     residual[:, None, :].expand(-1, self.hc_mult, -1).contiguous()
                 )
             residual = self.engram(
-                residual, engram_hashes[:, self.engram.layer_hash_index], engram_mask
+                residual,
+                engram_hashes[:, self.engram.layer_hash_index],
+                engram_mask,
+                sp_rows=sp_rows,
             )
         fn = self.hc_attn_fn_broadcast if residual.ndim == 2 else self.hc_attn_fn
         residual, post_mix, res_mix, x, attn_pre = self._b12x_mhc.pre(
@@ -314,7 +318,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             positions = gather_rows(positions, ced_indices)
             if input_ids is not None:
                 input_ids = gather_rows(input_ids, ced_indices)
-        x = self.attn(positions, x, None, global_kv_ready=global_kv_ready)
+        if sp_rows is None:
+            x = self.attn(positions, x, None, global_kv_ready=global_kv_ready)
+        else:
+            # SP: attention gathers every row and reduce-scatters its output.
+            with sp_prefill.activate(sp_rows):
+                x = self.attn(positions, x, None, global_kv_ready=global_kv_ready)
         residual, post_mix, res_mix, x, ffn_pre = self._b12x_mhc.post_pre(
             x,
             residual,
@@ -326,7 +335,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.ffn_norm.weight,
             attn_pre,
         )
-        x = self.ffn(x, input_ids)
+        if sp_rows is None:
+            x = self.ffn(x, input_ids)
+        else:
+            # SP: route every row; the TP partial sum is reduce-scattered.
+            x = self.ffn(
+                sp_rows.gather(x), input_ids, reduce_scatter_rows=sp_rows.padded_rows
+            )
         return x, residual, post_mix, res_mix, ffn_pre
 
 
@@ -487,6 +502,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
         else:
             self._mtp_hidden_buffer = None
+        # DSpark drafts from the aux hidden states only; SP leaves this buffer.
+        self.prefill_sp_skips_mtp_buffer = (
+            spec_config is not None and spec_config.use_dspark()
+        )
 
     def _engram_reader(self):
         """One reader thread and side stream for asynchronous disk Engram rows."""
@@ -647,13 +666,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
-                hidden_states = inputs_embeds
+                hidden_states = (
+                    inputs_embeds if sp is None else sp.local_slice(inputs_embeds)
+                )
             elif sp is not None:
-                # Stage 1: the exact embedding reduce-scatter, gathered back.
-                hidden_states = sp.gather(
-                    self.embed_tokens.forward_reduce_scatter(
-                        input_ids, sp.padded_rows
-                    )
+                # One vocabulary shard owns each token: the reduce-scatter is
+                # exact and leaves this rank's rows.
+                hidden_states = self.embed_tokens.forward_reduce_scatter(
+                    input_ids, sp.padded_rows
                 )
             else:
                 hidden_states = self.embed_input_ids(input_ids)
@@ -755,6 +775,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 engram_hashes,
                 engram_mask,
                 ced_indices=boundary_indices,
+                sp_rows=sp,
             )
             if boundary_indices is not None:
                 positions = gather_rows(positions, ced_indices)
@@ -769,6 +790,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 aux_hidden_state = layer._b12x_mhc.collapse(aux_recon)
                 if self.use_sequence_parallel:
                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
+                elif sp is not None:
+                    aux_hidden_state = sp.gather(aux_hidden_state)
                 if decoder_compacted:
                     aux_hidden_state = scatter_rows(
                         aux_hidden_state, ced_indices, full_num_tokens
@@ -797,10 +820,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         # MTP needs full HC states; otherwise collapse and normalize locally
         # before gathering to reduce communication.
-        if self._mtp_hidden_buffer is not None:
+        if self._mtp_hidden_buffer is not None and not (
+            sp is not None and self.prefill_sp_skips_mtp_buffer
+        ):
             if self.use_sequence_parallel:
                 hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
                 pre_mix = sp_all_gather(pre_mix)[:full_num_tokens]
+            elif sp is not None:
+                hidden_states, pre_mix = sp.gather(hidden_states), sp.gather(pre_mix)
+                sp = None  # every row from here on
             buffer_states = (
                 scatter_rows(hidden_states, ced_indices, full_num_tokens)
                 if decoder_compacted
@@ -816,6 +844,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if self.use_sequence_parallel and self._mtp_hidden_buffer is None:
             # Without MTP, gather only the collapsed and normalized hidden states.
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+        if sp is not None:
+            hidden_states = sp.gather(hidden_states)
         if decoder_compacted:
             hidden_states = scatter_rows(hidden_states, ced_indices, full_num_tokens)
         if len(aux_hidden_states) > 0:
