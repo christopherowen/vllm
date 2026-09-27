@@ -33,6 +33,7 @@ from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.models.deepseek_v4_1.common.engram import _PaddedColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -350,13 +351,22 @@ class DSparkDeepseekV4Model(nn.Module):
         # unused vocabulary allocation while loading the draft checkpoint.
         self.embed_tokens: nn.Module | None = None
 
-        self.main_proj = ReplicatedLinear(
+        # SPARK3_DSPARK_MAIN_PROJ_TP=1 column-shards the projection of the
+        # target's auxiliary hidden states (replicated otherwise, so every rank
+        # streams the whole weight) and gathers the output: same arithmetic.
+        main_proj_tp = (
+            os.environ.get("SPARK3_DSPARK_MAIN_PROJ_TP", "0") == "1"
+            and get_tensor_model_parallel_world_size() > 1
+        )
+        main_proj_cls = _PaddedColumnParallelLinear if main_proj_tp else ReplicatedLinear
+        self.main_proj = main_proj_cls(
             config.hidden_size * len(self.target_layer_ids),
             config.hidden_size,
             bias=False,
             return_bias=False,
             quant_config=vllm_config.quant_config,
             prefix=maybe_prefix(prefix, "main_proj"),
+            **({"gather_output": True} if main_proj_tp else {}),
         )
         self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
