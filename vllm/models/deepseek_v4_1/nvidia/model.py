@@ -484,11 +484,45 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             self._mtp_hidden_buffer = None
 
+    def _engram_reader(self):
+        """One reader thread and side stream for asynchronous disk Engram rows."""
+        if getattr(self, "_engram_executor", None) is None:
+            import concurrent.futures
+
+            device = torch.cuda.current_device()
+            self._engram_rows_stream = torch.cuda.Stream(device=device)
+            self._engram_executor = concurrent.futures.ThreadPoolExecutor(
+                1,
+                thread_name_prefix="engram-rows",
+                initializer=torch.cuda.set_device,
+                initargs=(device,),
+            )
+        return self._engram_executor
+
+    def _read_engram_rows(self, jobs):
+        """Reader thread: host work only (no kernel launches, no CUDA waits)."""
+        failure = None
+        for engram, job in jobs:
+            try:
+                engram.read_disk_async(job)
+            except BaseException as error:  # every gate is released regardless
+                failure = failure or error
+        if failure is not None:
+            raise failure
+
+    def join_engram_reader(self):
+        future = getattr(self, "_engram_reader_future", None)
+        self._engram_reader_future = None
+        if future is not None:
+            # The reader itself times out on its row IDs; this bounds the rest.
+            future.result(timeout=60)
+
     def prepare_disk_engram(self, input_ids, query_start_loc, lookback_token_ids):
         if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "Disk Engram preparation must run outside compile/capture"
             )
+        self.join_engram_reader()
         engrams = tuple(
             layer.engram
             for layer in islice(self.layers, self.start_layer, self.end_layer)
@@ -507,6 +541,23 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 lookback_token_ids,
                 hashes,
             )
+            if engrams and all(engram.async_rows for engram in engrams):
+                self._engram_reader()
+                jobs = [
+                    (
+                        engram,
+                        engram.stage_disk_async(
+                            hashes[:, engram.layer_hash_index],
+                            self.engram_hash.num_tokens,
+                            self._engram_rows_stream,
+                        ),
+                    )
+                    for engram in engrams
+                ]
+                self._engram_reader_future = self._engram_reader().submit(
+                    self._read_engram_rows, jobs
+                )
+                return
             # One batch lets the per-layer disk reads overlap on the host.
             bindings = [
                 engram.stage_disk(
@@ -533,6 +584,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             raise RuntimeError(
                 "Disk Engram preparation must run outside compile/capture"
             )
+        self.join_engram_reader()
         self.prepared_engram_hashes.fill_(-1)
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             if getattr(layer, "engram", None) is not None:
