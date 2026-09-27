@@ -1,0 +1,163 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Prefill sequence parallelism (SP) for DeepSeek V4.1 tensor parallelism.
+
+## Mode
+
+At tensor parallel size N every rank repeats the row-wise work of a decoder
+layer (mHC mixes, norms, the Engram gate, the residual carry) on every token.
+For a long prefill forward, SP turns the per-layer all-reduces into dim-0
+reduce-scatters so that each rank owns 1/N of the rows for that work, and
+all-gathers the rows back before the ops that need all of them. Weights stay
+exactly as in ordinary TP; nothing is replicated. The static
+``_use_sequence_parallel`` construction flag stays off: this mode changes no
+module.
+
+Enable with ``SPARK3_DS41_PREFILL_SP_MIN_ROWS=<rows>``; unset or 0 keeps it
+off. ``DeepseekV4Model.forward`` decides per forward from the token count T,
+which every rank shares, so no agreement between ranks is needed. The
+threshold is raised above the decode token counts (CUDA graph sizes and
+``max_num_seqs * (1 + num_speculative_tokens)``), so decode never uses SP. SP
+is also off for CED compaction, pipeline parallelism, static sequence
+parallelism and request boundary checkpoints.
+
+## Rows
+
+- Collectives see ``Tp = N * ceil(T / N)`` rows; each rank owns ``L = Tp / N``
+  rows, rank r the padded rows ``[r * L, (r + 1) * L)``.
+- Kernels never see more than T rows: gathered tensors are used as ``[:T]``.
+- Reduce-scatter inputs are Tp-row buffers whose pad rows are zero.
+- The last rank's local rows can include pad rows. They stay finite and are
+  never read back into real outputs.
+
+## Stage 1
+
+Only the embedding is sequence-parallel: its all-reduce becomes a
+reduce-scatter (each token has one owning vocabulary shard, so the sum is
+exact) that is immediately all-gathered back to T rows. Everything else runs
+on full rows as without SP, so logits are bit-identical with SP on or off.
+"""
+
+import os
+from dataclasses import dataclass
+
+import torch
+
+from vllm.distributed import (
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_reduce_scatter,
+)
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+MIN_ROWS_ENV = "SPARK3_DS41_PREFILL_SP_MIN_ROWS"
+
+
+def min_rows_from_env() -> int:
+    """The requested SP threshold in tokens; unset, empty or 0 is off."""
+    raw = os.environ.get(MIN_ROWS_ENV, "").strip()
+    rows = int(raw) if raw else 0
+    if rows < 0:
+        raise ValueError(f"{MIN_ROWS_ENV} must be >= 0, got {rows}")
+    return rows
+
+
+def resolve_min_rows(vllm_config, *, static_sequence_parallel: bool = False) -> int:
+    """The effective SP threshold for this model instance; 0 is off."""
+    requested = min_rows_from_env()
+    if requested <= 0:
+        return 0
+    parallel = vllm_config.parallel_config
+    reason = None
+    if parallel.tensor_parallel_size <= 1:
+        reason = "tensor parallel size is 1"
+    elif parallel.pipeline_parallel_size != 1:
+        reason = "pipeline parallelism keeps full-row intermediate tensors"
+    elif static_sequence_parallel:
+        reason = "static sequence parallelism is enabled"
+    elif vllm_config.use_request_boundary_checkpoints:
+        reason = "request boundary checkpoints are enabled"
+    if reason is not None:
+        logger.warning("%s=%d ignored: %s", MIN_ROWS_ENV, requested, reason)
+        return 0
+    spec = vllm_config.speculative_config
+    decode_rows = max(
+        vllm_config.compilation_config.max_cudagraph_capture_size or 0,
+        vllm_config.scheduler_config.max_num_seqs
+        * (1 + (spec.num_speculative_tokens if spec is not None else 0)),
+        parallel.tensor_parallel_size,
+    )
+    rows = max(requested, decode_rows + 1)
+    if rows != requested:
+        logger.warning(
+            "%s=%d raised to %d: decode forwards of up to %d tokens never use it",
+            MIN_ROWS_ENV,
+            requested,
+            rows,
+            decode_rows,
+        )
+    logger.info("DeepSeek V4.1 prefill sequence parallelism from %d tokens", rows)
+    return rows
+
+
+@dataclass(frozen=True)
+class SPRows:
+    """Row layout of one sequence-parallel forward on one TP rank."""
+
+    num_tokens: int
+    world_size: int
+    rank: int
+
+    @property
+    def padded_rows(self) -> int:
+        """Tp: rows seen by collectives, T rounded up to a multiple of N."""
+        return -(-self.num_tokens // self.world_size) * self.world_size
+
+    @property
+    def local_rows(self) -> int:
+        """L: rows this rank owns between collectives."""
+        return self.padded_rows // self.world_size
+
+    @property
+    def start(self) -> int:
+        """First padded row owned by this rank."""
+        return self.rank * self.local_rows
+
+    @property
+    def real_rows(self) -> int:
+        """Leading local rows that are real tokens; the rest are padding."""
+        return max(0, min(self.local_rows, self.num_tokens - self.start))
+
+    def gather(self, x: torch.Tensor) -> torch.Tensor:
+        """All-gather this rank's L rows into the first T rows."""
+        if x.shape[0] != self.local_rows:
+            raise ValueError(f"SP gather expects {self.local_rows} rows, got {x.shape}")
+        return tensor_model_parallel_all_gather(x, dim=0)[: self.num_tokens]
+
+    def reduce_scatter(self, padded: torch.Tensor) -> torch.Tensor:
+        """Sum a zero-padded Tp-row buffer over the ranks into this rank's rows."""
+        if padded.shape[0] != self.padded_rows:
+            raise ValueError(
+                f"SP reduce-scatter expects {self.padded_rows} rows, got {padded.shape}"
+            )
+        return tensor_model_parallel_reduce_scatter(padded, dim=0)
+
+    def empty_padded(
+        self, row_shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
+    ) -> torch.Tensor:
+        """A Tp-row buffer whose pad rows (T and beyond) are zero."""
+        padded = torch.empty((self.padded_rows, *row_shape), dtype=dtype, device=device)
+        padded[self.num_tokens :].zero_()
+        return padded
+
+
+def plan_rows(
+    num_tokens: int, min_rows: int, world_size: int, rank: int
+) -> SPRows | None:
+    """The SP row layout for a forward of ``num_tokens`` tokens, or None."""
+    if min_rows <= 0 or world_size <= 1 or num_tokens < min_rows:
+        return None
+    if not 0 <= rank < world_size:
+        raise ValueError(f"TP rank {rank} is outside world size {world_size}")
+    return SPRows(num_tokens, world_size, rank)

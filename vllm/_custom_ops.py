@@ -255,6 +255,7 @@ def vocab_parallel_embedding(
     num_org_vocab_padding: int,
     added_vocab_start_index: int,
     added_vocab_end_index: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Gather the embedding rows owned by this rank, zeros for the others.
 
@@ -265,16 +266,18 @@ def vocab_parallel_embedding(
     Args:
         input_ids: ``[num_tokens]`` int32 or int64 token ids.
         weight: ``[num_embeddings_per_partition, embedding_dim]`` shard.
+        out: optional contiguous ``[num_tokens, embedding_dim]`` destination.
 
     Returns:
         ``[num_tokens, embedding_dim]`` partial embeddings.
     """
-    out = torch.empty(
-        input_ids.shape[0],
-        weight.shape[1],
-        dtype=weight.dtype,
-        device=weight.device,
-    )
+    if out is None:
+        out = torch.empty(
+            input_ids.shape[0],
+            weight.shape[1],
+            dtype=weight.dtype,
+            device=weight.device,
+        )
     torch.ops._C.vocab_parallel_embedding(
         out,
         input_ids,

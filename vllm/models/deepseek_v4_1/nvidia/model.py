@@ -63,7 +63,7 @@ from vllm.utils.b12x import (
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
-from .. import l2_prefetch
+from .. import l2_prefetch, sp_prefill
 from ..b12x_layers import B12xLinearMethod, B12xMHC
 from ..b12x_layers import B12xRMSNorm as RMSNorm
 from ..ced import ced_decoder_start, gather_rows, scatter_rows
@@ -363,6 +363,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.parallel_config = vllm_config.parallel_config
         self.use_mega_moe = False
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
+        # Per-forward prefill sequence parallelism (0 = off); see sp_prefill.
+        self.prefill_sp_min_rows = sp_prefill.resolve_min_rows(
+            vllm_config, static_sequence_parallel=self.use_sequence_parallel
+        )
         if vllm_config.parallel_config.use_ubatching:
             raise ValueError(
                 "V4.1 fixed native layer buffers require ubatching/DBO disabled"
@@ -633,9 +637,24 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         lookback_token_ids: torch.Tensor | None = None,
         ced_indices: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        sp = None
+        if self.prefill_sp_min_rows and ced_indices is None:
+            sp = sp_prefill.plan_rows(
+                positions.shape[0],
+                self.prefill_sp_min_rows,
+                get_tensor_model_parallel_world_size(),
+                get_tensor_model_parallel_rank(),
+            )
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
+            elif sp is not None:
+                # Stage 1: the exact embedding reduce-scatter, gathered back.
+                hidden_states = sp.gather(
+                    self.embed_tokens.forward_reduce_scatter(
+                        input_ids, sp.padded_rows
+                    )
+                )
             else:
                 hidden_states = self.embed_input_ids(input_ids)
         else:

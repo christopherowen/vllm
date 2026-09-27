@@ -18,6 +18,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_reduce_scatter,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
@@ -691,6 +692,63 @@ class VocabParallelEmbedding(PluggableLayer):
         if self.parallel_group is not None:
             return self.parallel_group.all_reduce(output_parallel)
         return tensor_model_parallel_all_reduce(output_parallel)
+
+    def forward_reduce_scatter(
+        self, input_: torch.Tensor, padded_rows: int
+    ) -> torch.Tensor:
+        """Embed ``input_`` and reduce-scatter the rows over the TP group.
+
+        For sequence parallelism: the partial embeddings are written into a
+        ``padded_rows`` buffer whose trailing rows are zero, and rank r
+        receives rows ``[r * padded_rows // tp_size, (r + 1) * ...)`` of the
+        full embeddings. Each token has one owning shard, so the reduction is
+        exact, as in :meth:`forward`.
+        """
+        rows = input_.shape[0]
+        if (
+            self.tp_size == 1
+            or self.parallel_group is not None
+            or input_.ndim != 1
+            or padded_rows < rows
+            or padded_rows % self.tp_size
+        ):
+            raise ValueError(
+                "Embedding reduce-scatter needs 1-D ids, the default TP group "
+                f"and padded rows divisible by it (rows={rows}, "
+                f"padded_rows={padded_rows}, tp_size={self.tp_size})"
+            )
+        if self.use_fused_embedding:
+            output_parallel = torch.empty(
+                (padded_rows, self.weight.shape[1]),
+                dtype=self.weight.dtype,
+                device=self.weight.device,
+            )
+            ops.vocab_parallel_embedding(
+                input_,
+                self.weight,
+                self.shard_indices.org_vocab_start_index,
+                self.shard_indices.org_vocab_end_index,
+                self.shard_indices.num_org_vocab_padding,
+                self.shard_indices.added_vocab_start_index,
+                self.shard_indices.added_vocab_end_index,
+                out=output_parallel[:rows],
+            )
+        else:
+            masked_input, input_mask = get_masked_input_and_mask(
+                input_,
+                self.shard_indices.org_vocab_start_index,
+                self.shard_indices.org_vocab_end_index,
+                self.shard_indices.num_org_vocab_padding,
+                self.shard_indices.added_vocab_start_index,
+                self.shard_indices.added_vocab_end_index,
+            )
+            local = self.quant_method.embedding(self, masked_input.long())
+            if local.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                raise NotImplementedError("FP8 embedding reduce-scatter")
+            output_parallel = local.new_empty((padded_rows, *local.shape[1:]))
+            output_parallel[:rows].copy_(local.masked_fill_(input_mask[:, None], 0))
+        output_parallel[rows:].zero_()
+        return tensor_model_parallel_reduce_scatter(output_parallel, dim=0)
 
     def extra_repr(self) -> str:
         s = f"num_embeddings={self.num_embeddings}"
