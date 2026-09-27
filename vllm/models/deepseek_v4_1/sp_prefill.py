@@ -18,8 +18,11 @@ off. ``DeepseekV4Model.forward`` decides per forward from the token count T,
 which every rank shares, so no agreement between ranks is needed. The
 threshold is raised above the decode token counts (CUDA graph sizes and
 ``max_num_seqs * (1 + num_speculative_tokens)``), so decode never uses SP. SP
-is also off for CED compaction, pipeline parallelism, static sequence
-parallelism and request boundary checkpoints.
+is off for pipeline parallelism, static sequence parallelism and request
+boundary checkpoints. With CED compaction, only the encoder layers before
+``ced_decoder_start`` run on every row: SP covers those, and the carried rows
+are gathered back in full before the boundary layer, which builds the
+decoder's global KV from every row and then compacts.
 
 ## Rows
 

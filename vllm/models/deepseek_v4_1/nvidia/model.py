@@ -657,7 +657,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         ced_indices: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         sp = None
-        if self.prefill_sp_min_rows and ced_indices is None:
+        # With CED the encoder layers (before ced_decoder_start) still run on
+        # every row; SP covers them and hands full rows to the boundary layer.
+        sp_layers_available = ced_indices is None or (
+            self.ced_decoder_start is not None
+            and self.start_layer < self.ced_decoder_start
+        )
+        if self.prefill_sp_min_rows and sp_layers_available:
             sp = sp_prefill.plan_rows(
                 positions.shape[0],
                 self.prefill_sp_min_rows,
@@ -764,6 +770,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             start=self.start_layer,
         ):
             boundary_indices = ced_indices if idx == self.ced_decoder_start else None
+            if sp is not None and boundary_indices is not None:
+                # The CED boundary layer builds the decoder's global KV from every
+                # encoder row, then compacts; gather the carried rows first.
+                hidden_states, residual, post_mix, res_mix, pre_mix = (
+                    None if t is None else sp.gather(t)
+                    for t in (hidden_states, residual, post_mix, res_mix, pre_mix)
+                )
+                sp = None
             hidden_states, residual, post_mix, res_mix, pre_mix = layer(
                 hidden_states,
                 positions,
