@@ -1603,6 +1603,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
 
+        # Dead verification rows (SPARK3_DSPARK_DEAD_ROWS_TAU) are marked inside
+        # the draft combine; sample() clamps committed tokens to live rows.
+        dead_rows = None
+        if adaptive_verification is not None and self.batch_sharder is None:
+            dead_rows = adaptive_verification.dead_row_args(
+                self.input_buffers.is_padding, num_reqs
+            )
+        self._dead_row_cut = dead_rows.cut if dead_rows is not None else None
+
         # Some input token ids are directly read from the last sampled tokens
         # and draft tokens. Also, get the logits indices to sample tokens from.
         logits_indices = combine_sampled_and_draft_tokens(
@@ -1616,6 +1625,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cu_num_logits,
             total_num_logits,
             self.model_state.num_new_sampled_tokens_per_step,
+            dead_rows=dead_rows,
         )
 
         fast_prefill = None
@@ -1785,6 +1795,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch,
                 # Draft logits are needed for probabilistic rejection sampling.
                 self.speculator.draft_logits,
+                dead_row_cut=(
+                    getattr(self, "_dead_row_cut", None)
+                    if shard_metadata is None
+                    else None
+                ),
             )
 
         if shard_metadata is not None:

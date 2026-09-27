@@ -25,6 +25,7 @@ from vllm.v1.worker.gpu.attn_utils import (
     get_attn_cg_support,
     get_query_lens_mismatch_unsupported_backend,
 )
+from vllm.v1.worker.gpu.input_batch import DeadRows
 
 logger = init_logger(__name__)
 _PROFILE_REPLAYS = 5
@@ -32,6 +33,12 @@ _PROFILE_REPLAYS = 5
 # set, and later boots with the same shapes read it instead of profiling, so
 # the draft budget does not depend on one boot's startup timing noise.
 _COST_DIR = os.environ.get("SPARK3_DSPARK_COST_DIR") or None
+# Dead rows: verification rows past the first draft whose survival (running
+# product of this step's confidences) falls below this threshold are marked
+# as padding, so routed MoE skips them, and the request commits at most one
+# token past its last live row. Decided on device, inside the draft combine,
+# from the current drafts' confidences; the batch shape is unchanged. 0 = off.
+_DEAD_ROWS_TAU = float(os.environ.get("SPARK3_DSPARK_DEAD_ROWS_TAU", "0"))
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -172,6 +179,14 @@ class AdaptiveVerificationManager:
         # address the compacted layout, so the budget must fit one chunk.
         self._max_total_logits = max_total_logits
         self.cost_scale = cost_scale
+        self.dead_rows_tau = _DEAD_ROWS_TAU
+        self._dead_row_cut = torch.empty(
+            req_states.max_num_reqs, dtype=torch.int32, device=device
+        )
+        if self.dead_rows_tau > 0:
+            logger.info(
+                "DSpark dead verification rows below survival %.3g", self.dead_rows_tau
+            )
         self.query_start_loc = query_start_loc
         self.cost_tables: tuple[np.ndarray, np.ndarray] | None = None
         # Largest cudagraph-captured token count; above it nothing pads.
@@ -680,6 +695,21 @@ class AdaptiveVerificationManager:
         draft_lens_cpu[:num_verification_reqs] = draft_budget // num_verification_reqs
         draft_lens_cpu[: draft_budget % num_verification_reqs] += 1
         return num_non_draft_tokens + draft_lens_cpu, cu_num_logits_np
+
+    def dead_row_args(self, is_padding: torch.Tensor, num_reqs: int) -> DeadRows | None:
+        """Arguments for the fused dead-row marking, or None when disabled.
+
+        The confidences are the current drafts', broadcast from rank 0, so
+        every rank marks the same rows.
+        """
+        if self.dead_rows_tau <= 0:
+            return None
+        return DeadRows(
+            self._confidence_probs,
+            is_padding,
+            self._dead_row_cut[:num_reqs],
+            float(np.log(self.dead_rows_tau)),
+        )
 
     def get_verified_draft_counts(self, num_reqs: int) -> torch.Tensor:
         """Return the device-selected draft count for each request."""

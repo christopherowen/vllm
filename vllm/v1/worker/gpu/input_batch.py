@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 import torch
@@ -419,11 +419,20 @@ def _combine_sampled_and_draft_tokens_kernel(
     draft_tokens_stride,
     cu_num_logits_ptr,
     logits_indices_ptr,
+    confidence_ptr,
+    confidence_stride,
+    is_padding_ptr,
+    dead_cut_ptr,
+    log_tau,
     BLOCK_SIZE: tl.constexpr,
     NUM_NEW_SAMPLED_TOKENS: tl.constexpr = 1,
+    DEAD_ROWS: tl.constexpr = False,
 ):
     batch_idx = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + batch_idx)
+    if DEAD_ROWS:
+        # Requests without drafts are never clamped.
+        tl.store(dead_cut_ptr + batch_idx, BLOCK_SIZE + 1)
 
     # Get the number of logits and draft tokens.
     cu_num_logits_start = tl.load(cu_num_logits_ptr + batch_idx)
@@ -466,6 +475,39 @@ def _combine_sampled_and_draft_tokens_kernel(
             draft_tokens,
             mask=mask,
         )
+        if DEAD_ROWS:
+            # Dead rows: the drafts' survival is the running product of this
+            # step's confidences. Rows past the first draft below the
+            # threshold become padding, which routed MoE skips; the sampled
+            # fix-up then commits at most one token past the last live row.
+            confidence = tl.load(
+                confidence_ptr + req_state_idx * confidence_stride + block,
+                mask=mask,
+                other=1.0,
+            )
+            log_survival = tl.cumsum(tl.log(confidence), axis=0)
+            cut = tl.sum(((log_survival >= log_tau) & mask).to(tl.int32), axis=0)
+            tl.store(dead_cut_ptr + batch_idx, cut)
+            tl.store(
+                is_padding_ptr + query_end - num_draft_tokens + block,
+                tl.full([BLOCK_SIZE], 1, tl.uint8),
+                mask=mask & (block >= cut),
+            )
+
+
+class DeadRows(NamedTuple):
+    """Verification rows to leave out of routed MoE, decided on device.
+
+    confidence: per-slot draft confidences, [max_num_reqs, num_steps].
+    is_padding: the batch's padding flags; dead rows are set in place.
+    cut: per-request output, the number of live drafts.
+    log_tau: log of the survival threshold below which a row is dead.
+    """
+
+    confidence: torch.Tensor
+    is_padding: torch.Tensor
+    cut: torch.Tensor
+    log_tau: float
 
 
 def combine_sampled_and_draft_tokens(
@@ -479,7 +521,9 @@ def combine_sampled_and_draft_tokens(
     cu_num_logits: torch.Tensor,
     num_logits: int,
     num_new_sampled_tokens: int = 1,  # excl accepted draft tokens, a.k.a bonus tokens
+    dead_rows: "DeadRows | None" = None,
 ) -> torch.Tensor:
+    """``dead_rows`` marks low-survival draft rows as padding (see DeadRows)."""
     assert num_new_sampled_tokens in (0, 1), (
         f"num_new_sampled_tokens must be 0 or 1, got {num_new_sampled_tokens}"
     )
@@ -503,7 +547,19 @@ def combine_sampled_and_draft_tokens(
         draft_tokens.stride(0),
         cu_num_logits,
         logits_indices,
+        *(
+            (
+                dead_rows.confidence,
+                dead_rows.confidence.stride(0),
+                dead_rows.is_padding.view(torch.uint8),
+                dead_rows.cut,
+                dead_rows.log_tau,
+            )
+            if dead_rows is not None
+            else (input_ids, 0, input_ids, input_ids, 0.0)
+        ),
         NUM_NEW_SAMPLED_TOKENS=num_new_sampled_tokens,
+        DEAD_ROWS=dead_rows is not None,
         # NOTE(woosuk): Add num_new_sampled_tokens to ensure the block covers the
         # last sampled token in addition to all draft tokens.
         BLOCK_SIZE=triton.next_power_of_2(
@@ -521,6 +577,8 @@ def _get_num_sampled_and_rejected_kernel(
     cu_num_logits_ptr,
     idx_mapping_ptr,
     prefill_len_ptr,
+    dead_cut_ptr,
+    DEAD_ROWS: tl.constexpr = False,
 ):
     batch_idx = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + batch_idx)
@@ -530,6 +588,9 @@ def _get_num_sampled_and_rejected_kernel(
     is_chunked_prefilling = seq_len < prefill_len
 
     num_sampled = tl.load(num_sampled_ptr + batch_idx)
+    if DEAD_ROWS:
+        # Commit only tokens predicted by live rows.
+        num_sampled = tl.minimum(num_sampled, tl.load(dead_cut_ptr + batch_idx) + 1)
     num_sampled = tl.where(is_chunked_prefilling, 0, num_sampled)
     tl.store(num_sampled_ptr + batch_idx, num_sampled)
 
@@ -548,6 +609,7 @@ def get_num_sampled_and_rejected(
     cu_num_logits: torch.Tensor,
     idx_mapping: torch.Tensor,
     prefill_len: torch.Tensor,
+    dead_row_cut: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_reqs = idx_mapping.shape[0]
     num_rejected = torch.empty_like(num_sampled)
@@ -558,6 +620,8 @@ def get_num_sampled_and_rejected(
         cu_num_logits,
         idx_mapping,
         prefill_len,
+        dead_row_cut if dead_row_cut is not None else num_sampled,
+        DEAD_ROWS=dead_row_cut is not None,
     )
     return num_sampled, num_rejected
 

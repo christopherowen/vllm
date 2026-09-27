@@ -176,6 +176,7 @@ class RejectionSampler:
         idx_mapping_np: np.ndarray,
         expanded_idx_mapping: torch.Tensor,
         expanded_local_pos: torch.Tensor,
+        max_sampled: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         processed_logits = self.sampler.apply_sampling_params(
             logits,
@@ -205,6 +206,8 @@ class RejectionSampler:
                 draft_sampled, expanded_idx_mapping, expanded_local_pos
             ),
         )
+        if max_sampled is not None:
+            num_sampled = torch.minimum(num_sampled, max_sampled)
         return processed_logits, sampled, num_sampled
 
     def _verify_in_chunks(
@@ -216,6 +219,7 @@ class RejectionSampler:
         pos: torch.Tensor,
         max_chunk_logits: int,
         max_num_logprobs: int,
+        max_sampled: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, LogprobsTensors | None]:
         cu_num_logits_np = input_batch.cu_num_logits_np
         use_processed_logits = self.sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
@@ -251,6 +255,7 @@ class RejectionSampler:
                 input_batch.idx_mapping_np[start:end],
                 input_batch.expanded_idx_mapping[lo:hi],
                 input_batch.expanded_local_pos[lo:hi],
+                None if max_sampled is None else max_sampled[start:end],
             )
             chunk_logprobs = self._get_logprobs_tensors(
                 sampled,
@@ -289,6 +294,7 @@ class RejectionSampler:
         logits: torch.Tensor,
         input_batch: InputBatch,
         draft_logits: torch.Tensor | None = None,
+        dead_row_cut: torch.Tensor | None = None,
     ) -> SamplerOutput:
         # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
         # that num_nans is computed before applying penalties and temperature.
@@ -309,6 +315,11 @@ class RejectionSampler:
             pos,
             chunk_logit_limit,
             max_num_logprobs,
+            # Logprobs take their token counts inside the chunks; clamp there
+            # too so they match the committed tokens.
+            dead_row_cut + 1
+            if dead_row_cut is not None and max_num_logprobs != NO_LOGPROBS
+            else None,
         )
 
         num_sampled, num_rejected = get_num_sampled_and_rejected(
@@ -317,6 +328,7 @@ class RejectionSampler:
             input_batch.cu_num_logits,
             input_batch.idx_mapping,
             self.sampler.req_states.prefill_len.gpu,
+            dead_row_cut=dead_row_cut,
         )
 
         return SamplerOutput(
