@@ -70,6 +70,7 @@ class DSparkMarkovHead(nn.Module):
         quant_config: QuantizationConfig | None = None,
         retain_weight_for_gather: bool = False,
         lm_head_quantization: Literal["mxfp8", "nvfp4"] | None = None,
+        vocab_parallel: bool = False,
     ) -> None:
         super().__init__()
         self.shard_across_tp = envs.VLLM_DSPARK_SHARD_MARKOV_HEAD
@@ -85,13 +86,15 @@ class DSparkMarkovHead(nn.Module):
             if self.shard_across_tp and not self.replicate_w1
             else nn.Embedding(vocab_size, markov_rank)
         )
+        # vocab_parallel shards the projection by vocabulary rows like the
+        # LM head, for callers that reduce the draft argmax across shards.
         self.markov_w2 = ParallelLMHead(
             draft_vocab_size,
             markov_rank,
             bias=False,
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "markov_w2"),
-            disable_tp=not self.shard_across_tp,
+            disable_tp=not (self.shard_across_tp or vocab_parallel),
             lm_head_quantization=lm_head_quantization,
         )
         self.markov_w2._retain_weight_for_gather = retain_weight_for_gather

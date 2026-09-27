@@ -11,6 +11,7 @@ include the future query tokens in the top-k indices for each query token.
 """
 
 import copy
+import os
 from bisect import bisect_left
 from collections.abc import Iterable
 
@@ -74,6 +75,15 @@ from .model import (
 )
 
 logger = init_logger(__name__)
+
+
+def _vocab_parallel_greedy() -> bool:
+    """SPARK3_DSPARK_VOCAB_PARALLEL=1: shard the Markov projection by
+    vocabulary and reduce greedy drafts across ranks (see
+    DSparkDeepseekV4ForCausalLM.vocab_parallel_greedy)."""
+    if os.environ.get("SPARK3_DSPARK_VOCAB_PARALLEL", "0") != "1":
+        return False
+    return get_tensor_model_parallel_world_size() > 1
 
 # MoE expert scale suffix differs by expert dtype (mirrors deepseek_v4 loaders):
 # fp4 experts register ``.weight_scale``; block-fp8 experts ``.weight_scale_inv``.
@@ -386,6 +396,7 @@ class DSparkDeepseekV4Model(nn.Module):
             # An NVFP4 transition head fits the GB10 L2, so the sequential
             # draft positions after the first reread it from L2.
             lm_head_quantization="nvfp4" if envs.VLLM_DS41_MARKOV_NVFP4 else None,
+            vocab_parallel=_vocab_parallel_greedy(),
         )
         self.confidence_head: DSparkConfidenceHead | None = None
         if getattr(config, "enable_confidence_head", True):
@@ -604,6 +615,44 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
+
+    # --- Vocabulary-parallel greedy drafting (SPARK3_DSPARK_VOCAB_PARALLEL) ---
+    # Each rank keeps its vocabulary shard of the draft logits and Markov bias
+    # and reduces only (max, index) pairs across ranks: exact greedy drafts
+    # without the draft-logits all-gather or a replicated Markov projection.
+
+    @property
+    def vocab_parallel_greedy(self) -> bool:
+        return not self.model.markov_head.markov_w2.disable_tp
+
+    @property
+    def draft_vocab_shard(self) -> tuple[int, int]:
+        """(first global vocabulary index, real entries) of this rank's shard.
+
+        The draft head is bound only after loading, so the check that it and
+        the Markov projection share one partition runs here, on first use.
+        """
+        assert self.lm_head is not None
+        head = self.lm_head.shard_indices
+        markov = self.model.markov_head.markov_w2.shard_indices
+        shard = head.org_vocab_start_index, head.num_org_elements
+        if shard != (markov.org_vocab_start_index, markov.num_org_elements):
+            raise RuntimeError(
+                "SPARK3_DSPARK_VOCAB_PARALLEL needs the draft head and Markov "
+                f"projection sharded alike: {head} != {markov}"
+            )
+        return shard
+
+    def compute_draft_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        assert self.lm_head is not None
+        return self.logits_processor(
+            self.lm_head, self.model.norm(hidden_states), skip_gather=True
+        )
+
+    def markov_bias_local(self, markov_embed: torch.Tensor) -> torch.Tensor:
+        return self.logits_processor(
+            self.model.markov_head.markov_w2, markov_embed, skip_gather=True
+        )
 
     def apply_markov_bias_gathered(
         self,

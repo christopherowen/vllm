@@ -64,6 +64,103 @@ def _finish_argmax(
     tl.store(output + row * output_stride, result)
 
 
+@triton.jit
+def _finish_argmax_pair(
+    values,
+    indices,
+    pairs,
+    vocab_start,
+    PARTS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    part = tl.arange(0, BLOCK)
+    value = tl.load(values + row * PARTS + part, part < PARTS, other=-float("inf"))
+    index = tl.load(indices + row * PARTS + part, part < PARTS, other=2147483647)
+    best, result = tl.reduce((value, index), 0, _first_argmax)
+    tl.store(pairs + row * 2, best)
+    tl.store(pairs + row * 2 + 1, (result + vocab_start).to(tl.float32))
+
+
+@triton.jit
+def _select_first_argmax(
+    pairs,
+    output,
+    output_stride,
+    RANKS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    rank = tl.arange(0, BLOCK)
+    value = tl.load(pairs + row * 2 * RANKS + 2 * rank, rank < RANKS, other=-float("inf"))
+    index = tl.load(pairs + row * 2 * RANKS + 2 * rank + 1, rank < RANKS, other=1073741824.0)
+    _, result = tl.reduce((value, index.to(tl.int32)), 0, _first_argmax)
+    tl.store(output + row * output_stride, result)
+
+
+def greedy_markov_shard_pair(
+    base_logits: torch.Tensor,
+    markov_bias: torch.Tensor,
+    vocab_start: int,
+    pairs: torch.Tensor,
+    partial_values: torch.Tensor,
+    partial_indices: torch.Tensor,
+) -> None:
+    """Write each row's ``(max, global index)`` of ``base_logits + markov_bias``
+    over one vocabulary shard into FP32 ``pairs`` ([rows, 2]).
+
+    The value keeps the materialized sum's rounding, and the index is the
+    shard-local first maximum offset by ``vocab_start`` (exact in FP32 below
+    2**24). All-gathering the pairs across shards and passing them to
+    ``select_first_argmax`` reproduces the full-vocabulary argmax, ties and
+    NaNs included, because shards hold ascending index ranges.
+    """
+    if base_logits.shape != markov_bias.shape:
+        raise ValueError(
+            "DSpark greedy base logits and Markov bias must have identical shapes: "
+            f"{tuple(base_logits.shape)} != {tuple(markov_bias.shape)}"
+        )
+    rows, vocab = base_logits.shape
+    if vocab_start + vocab > 1 << 24:
+        raise ValueError("vocabulary indices must stay exact in FP32")
+    parts = triton.cdiv(vocab, _BLOCK)
+    if min(partial_values.numel(), partial_indices.numel()) < rows * parts:
+        raise ValueError("DSpark greedy scratch is smaller than the logits require")
+    _partial_argmax[(rows, parts)](
+        base_logits,
+        markov_bias,
+        partial_values,
+        partial_indices,
+        base_logits.stride(0),
+        markov_bias.stride(0),
+        vocab,
+        parts,
+        _BLOCK,
+    )
+    _finish_argmax_pair[(rows,)](
+        partial_values,
+        partial_indices,
+        pairs,
+        vocab_start,
+        parts,
+        triton.next_power_of_2(parts),
+    )
+
+
+def select_first_argmax(pairs: torch.Tensor, output: torch.Tensor) -> None:
+    """Reduce all-gathered shard pairs ([rows, 2 * ranks], FP32) to the first
+    maximum's global index, written to ``output`` (one per row)."""
+    rows, width = pairs.shape
+    ranks = width // 2
+    _select_first_argmax[(rows,)](
+        pairs,
+        output,
+        output.stride(0),
+        ranks,
+        triton.next_power_of_2(ranks),
+    )
+
+
 def scratch_shape(max_requests: int, vocabulary_size: int) -> tuple[int, int]:
     return max_requests, triton.cdiv(vocabulary_size, _BLOCK)
 

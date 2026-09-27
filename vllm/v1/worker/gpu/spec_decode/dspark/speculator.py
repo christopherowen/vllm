@@ -32,7 +32,10 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
+    greedy_markov_shard_pair,
+    select_first_argmax,
     sample_greedy_markov,
     scratch_shape,
 )
@@ -94,6 +97,11 @@ class DSparkSpeculator(DFlashSpeculator):
         )
         self._greedy_partial_indices = torch.empty(
             shape, dtype=torch.int32, device=device
+        )
+        # Per-request (max, global index) of this rank's vocabulary shard,
+        # for vocabulary-parallel greedy drafts.
+        self._greedy_shard_pairs = torch.empty(
+            (self.max_num_reqs, 2), dtype=torch.float32, device=device
         )
 
     @property
@@ -205,11 +213,22 @@ class DSparkSpeculator(DFlashSpeculator):
         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
         # Draft-vocab logits; sampled ids are remapped to target vocab below.
         local_head = getattr(self.model, "supports_local_draft_argmax", lambda: False)()
-        base_logits = (
-            self.model.compute_local_draft_logits(sample_hidden)
-            if local_head
-            else self.model.compute_draft_logits(sample_hidden)
+        # Greedy drafts over full target vocabularies can stay sharded: each
+        # rank reduces its shard and only (max, index) pairs are gathered.
+        vocab_parallel = (
+            not local_head
+            and getattr(self.model, "vocab_parallel_greedy", False)
+            and self.draft_logits is None
+            and self.model.draft_id_to_target_id is None
+            and self.acceptance_estimator is None
         )
+        if local_head:
+            base_logits = self.model.compute_local_draft_logits(sample_hidden)
+        elif vocab_parallel:
+            vocab_start, shard_vocab = self.model.draft_vocab_shard
+            base_logits = self.model.compute_draft_logits_local(sample_hidden)
+        else:
+            base_logits = self.model.compute_draft_logits(sample_hidden)
         vocab_size = base_logits.shape[-1]
         base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
 
@@ -240,6 +259,23 @@ class DSparkSpeculator(DFlashSpeculator):
                         logits_i, idx_map[:, i], sample_pos[:, i], i
                     )
                 self.draft_tokens[:num_reqs, i] = draft_sampled_i
+                prev = draft_sampled_i
+                continue
+            if vocab_parallel:
+                bias = self.model.markov_bias_local(markov_embed)
+                pairs = self._greedy_shard_pairs[:num_reqs]
+                greedy_markov_shard_pair(
+                    base_logits[:, i, :shard_vocab],
+                    bias[:, :shard_vocab],
+                    vocab_start,
+                    pairs,
+                    self._greedy_partial_values,
+                    self._greedy_partial_indices,
+                )
+                draft_sampled_i = self.draft_tokens[:num_reqs, i]
+                select_first_argmax(
+                    tensor_model_parallel_all_gather(pairs, dim=-1), draft_sampled_i
+                )
                 prev = draft_sampled_i
                 continue
             bias = self.model.markov_bias(markov_embed)
