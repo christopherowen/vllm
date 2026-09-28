@@ -921,6 +921,43 @@ def _patch_inductor_fallback_allow_list() -> None:
 _patch_inductor_fallback_allow_list()
 
 # ============================================================
+# torch custom-op fill_defaults: one read of the schema
+# ============================================================
+# The ADInplaceOrView kernel that torch.library.custom_op registers for ops
+# with mutates_args calls torch._library.utils.fill_defaults on every eager
+# call. It reads schema.arguments, a property that builds a new list of every
+# argument, once per argument: quadratic in the argument count. A 64-argument
+# mutating op (B12X's dynamic MoE launch) spends about 0.8 ms of host time per
+# call there, which leaves the GPU idle through short prefills. PyTorch main
+# still reads it in the loop; remove this once upstream reads it once.
+
+
+def _fill_defaults_one_read(schema, args, kwargs):
+    """torch._library.utils.fill_defaults, reading ``schema.arguments`` once."""
+    new_args = []
+    new_kwargs = {}
+    for i, info in enumerate(schema.arguments):
+        if info.kwarg_only:
+            if info.name in kwargs:
+                new_kwargs[info.name] = kwargs[info.name]
+            else:
+                new_kwargs[info.name] = info.default_value
+        elif i < len(args):
+            new_args.append(args[i])
+        else:
+            new_args.append(info.default_value)
+    return tuple(new_args), new_kwargs
+
+
+def _patch_custom_op_fill_defaults() -> None:
+    import torch._library.utils as library_utils
+
+    library_utils.fill_defaults = _fill_defaults_one_read
+
+
+_patch_custom_op_fill_defaults()
+
+# ============================================================
 # Triton Autotuner determinism
 # ============================================================
 # Replace the Autotuner.run so it always pick the first running configuration.
