@@ -89,6 +89,7 @@ from vllm.v1.watermarking.spec_decode import (
     create_speculative_target_watermarker,
     speculative_target_watermark_key,
 )
+from vllm.v1.worker import display_carveout
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
@@ -450,6 +451,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     eplb_models_added = self.eplb.maybe_register_speculator(
                         self.speculator, self.speculative_config, load_dummy_weights
                     )
+            # Before any kernel plan or graph sees the weights; the drafter
+            # aliases the target's embedding and head, so both move together.
+            if display_carveout.required():
+                display_carveout.relocate_streamed_weights(self.model, self.device)
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory
