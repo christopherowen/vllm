@@ -70,7 +70,10 @@ def _tokens(
     seq = tl.load(Seq + lo, valid, other=0)
     pos = seq.to(tl.int64) - (end - start) + t - start
     input_slot = tl.load(InputSlots + t, t < nt, other=-1)
-    valid = valid & (pos >= 0) & (input_slot >= 0)
+    # A ring group takes no slot-mapping row (its spec opts out, so every entry
+    # is padding); its slot comes from the ring block below, and padded rows
+    # are excluded by the request range and block checks.
+    valid = valid & (pos >= 0) if CIRCULAR else valid & (pos >= 0) & (input_slot >= 0)
     logical = pos // RATIO
     page_col = tl.full((B,), 0, tl.int64) if CIRCULAR else logical // PAGE
     valid = valid & (page_col < table_width)
