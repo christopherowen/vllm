@@ -22,14 +22,33 @@ With ``SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1`` the worker moves those weights into
 the carve-out right after loading, before any kernel plan or graph captures
 them, and returns their ordinary memory to the allocator for the KV cache. It
 refuses to start if the carve-out cannot hold them.
+
+Nothing writes the weights after the copy, and nothing else can reach them:
+the DRM file and its buffer handle close right after the export, the dma-buf
+stays private to the worker, the display engine only scans out its own
+surfaces, and the scanout heap never hands out a range in use. A driver fault
+or GPU reset could still leave the mapping on memory that something else
+reuses, and the result would be wrong embeddings or logits with no error.
+
+For debugging such a fault, ``SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS`` above 0
+turns on an integrity check; production leaves it unset, which adds no work
+at all. The worker then checksums every moved weight before and after the
+copy and, from the end of graph capture, re-checks it from a background
+thread on a side stream at that interval (about 20 ms per check for the
+842.5 MiB of a DS4.1 rank). A mismatch is logged and kills the worker, which
+stops the engine; nothing runs in the serving loop.
 """
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import fcntl
 import os
+import signal
 import struct
+import threading
+import time
 
 import torch
 
@@ -39,6 +58,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmb
 logger = init_logger(__name__)
 
 _REQUIRED = os.environ.get("SPARK3_DISPLAY_CARVEOUT_WEIGHTS", "0") == "1"
+_CHECK_SECONDS = float(os.environ.get("SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS", "0"))
+# 16 MiB of 32-bit words per partial checksum (a 32 MiB int64 transient).
+_CHECK_CHUNK_WORDS = 1 << 22
 _DRM_NODE = "/dev/dri/card0"
 
 _DRM_IOCTL_MODE_CREATE_DUMB = 0xC02064B2
@@ -164,6 +186,110 @@ def required() -> bool:
     return _REQUIRED
 
 
+def _checksum(tensor: torch.Tensor) -> torch.Tensor:
+    """The sum of the tensor's 32-bit words in 64 bits: any flipped bit changes it.
+
+    Summed in chunks: a 64-bit sum casts its input first, which over a whole
+    421 MiB table would allocate 842 MiB, and the check stream's allocator
+    pool would keep it.
+    """
+    raw = tensor.detach().reshape(-1).view(torch.uint8)
+    words = raw.view(torch.int32) if raw.numel() % 4 == 0 else raw
+    parts = words.split(_CHECK_CHUNK_WORDS)
+    return torch.stack([part.sum(dtype=torch.int64) for part in parts]).sum()
+
+
+def _kill_worker(reason: str) -> None:
+    """Stop the engine from a background thread: its executor sees the worker die."""
+    logger.error("Stopping the worker: %s", reason)
+    os.kill(os.getpid(), signal.SIGKILL)
+
+
+class _IntegrityCheck:
+    """Periodic checksums of the weights held in the carve-out (debug mode)."""
+
+    def __init__(
+        self,
+        weights: list[tuple[str, torch.Tensor]],
+        expected: list[int],
+        device: torch.device,
+        interval: float,
+        on_failure=_kill_worker,
+    ):
+        self.weights = weights
+        self.expected = expected
+        self.device = device
+        self.interval = interval
+        self.on_failure = on_failure
+        self.failure: str | None = None
+        self.passed = 0
+        self._started = False
+        self._stream = torch.cuda.Stream(device) if device.type == "cuda" else None
+
+    def sums(self) -> list[int]:
+        stream = (
+            torch.cuda.stream(self._stream)
+            if self._stream is not None
+            else contextlib.nullcontext()
+        )
+        with stream:
+            return torch.stack(
+                [_checksum(weight) for _, weight in self.weights]
+            ).tolist()
+
+    def check(self) -> None:
+        changed = [
+            f"{name} (checksum {want:#x}, now {got:#x})"
+            for (name, _), want, got in zip(self.weights, self.expected, self.sums())
+            if want != got
+        ]
+        if changed:
+            self.failure = "display carve-out weights changed: " + "; ".join(changed)
+            logger.error("%s", self.failure)
+            return
+        self.passed += 1
+        if self.passed == 1 or self.passed % 12 == 0:
+            logger.info(
+                "Display carve-out integrity check %d passed (every %g s)",
+                self.passed,
+                self.interval,
+            )
+
+    def start(self) -> None:
+        if self._started or self.interval <= 0:
+            return
+        self._started = True
+        threading.Thread(
+            target=self._run, name="display-carveout-check", daemon=True
+        ).start()
+
+    def _run(self) -> None:
+        if self._stream is not None:
+            torch.cuda.set_device(self.device)
+        while self.failure is None:
+            time.sleep(self.interval)
+            try:
+                self.check()
+            except Exception as error:
+                # A check that cannot run must not pass silently either.
+                self.failure = f"display carve-out integrity check failed: {error!r}"
+                logger.exception("Display carve-out integrity check failed")
+        self.on_failure(self.failure)
+
+
+_integrity: _IntegrityCheck | None = None
+
+
+def start_checks() -> None:
+    """Start the debug-mode periodic check, if on; called once after graph capture.
+
+    Starting after the last capture keeps the check's side-stream work away
+    from graph captures.
+    """
+    if _integrity is not None:
+        _integrity.start()
+
+
 def _nbytes(tensor: torch.Tensor) -> int:
     return tensor.numel() * tensor.element_size()
 
@@ -213,20 +339,35 @@ def relocate_streamed_weights(model: torch.nn.Module, device: torch.device) -> N
     backing = torch.as_tensor(carveout, device=device)
     assert backing.data_ptr() == carveout.pointer.value
     free_before = torch.cuda.mem_get_info(device)[0]
+    checking = _CHECK_SECONDS > 0
+    if checking:
+        expected = [int(_checksum(weight.data)) for _, weight in weights]
+    held: list[tuple[str, torch.Tensor]] = []
     offset = 0
-    for (_, weight), span in zip(weights, spans):
+    for (name, weight), span in zip(weights, spans):
         moved = backing[offset : offset + _nbytes(weight)].view(weight.dtype)
         moved = moved.view(weight.shape)
         moved.copy_(weight.data)
         weight.data = moved
+        held.append((name, moved))
         offset += span
     torch.cuda.synchronize(device)
+    if checking:
+        global _integrity
+        _integrity = _IntegrityCheck(held, expected, device, _CHECK_SECONDS)
+        _integrity.check()
+        if _integrity.failure is not None:
+            raise RuntimeError(
+                f"copy into the display carve-out failed: {_integrity.failure}"
+            )
+        _integrity.passed = 0
     torch.cuda.empty_cache()
     freed = torch.cuda.mem_get_info(device)[0] - free_before
     logger.info(
         "Display carve-out holds %.1f MiB of streamed weights (%s); "
-        "ordinary memory freed: %.1f MiB",
+        "ordinary memory freed: %.1f MiB; debug integrity check %s",
         sum(_nbytes(weight) for _, weight in weights) / (1 << 20),
         ", ".join(name for name, _ in weights),
         freed / (1 << 20),
+        f"every {_CHECK_SECONDS:g} s" if checking else "off",
     )

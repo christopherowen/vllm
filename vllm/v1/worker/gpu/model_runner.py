@@ -1260,6 +1260,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Lock workspace to prevent resizing during execution. A resize after
             # capture frees the static cuda graph buffer.
             lock_workspace()
+            # Debug mode only: carve-out checks begin after the last capture.
+            display_carveout.start_checks()
 
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time
