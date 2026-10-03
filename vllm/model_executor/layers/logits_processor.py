@@ -116,13 +116,14 @@ class LogitsProcessor(PluggableLayer):
         self._b12x_vocab_plans: dict[int, dict[int, object]] = {}
         self._b12x_vocab_heads: dict[int, VocabParallelEmbedding] = {}
         self.use_b12x_vocab_projection = bool(
-            kernel_config.linear_backend == "b12x"
+            # DS4.1's TileLang family keeps B12X's BF16 vocabulary projection.
+            kernel_config.linear_backend in ("b12x", "tilelang")
             and self._b12x_vocab_projection is not None
             and self._b12x_vocab_projection.is_supported()
         )
         self._b12x_packed_vocab_projection = get_b12x_packed_bf16_vocab_projection()
         self.use_b12x_packed_vocab_projection = bool(
-            kernel_config.linear_backend == "b12x"
+            kernel_config.linear_backend in ("b12x", "tilelang")
             and self._b12x_packed_vocab_projection is not None
             and self._b12x_packed_vocab_projection.is_supported()
         )

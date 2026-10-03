@@ -31,14 +31,10 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.models.deepseek_v4_1 import l2_prefetch, sp_prefill
-from vllm.models.deepseek_v4_1.b12x_layers import (
-    B12xFP8LinearMethod,
-    B12xLinearMethod,
-    B12xRMSNorm,
-)
+from vllm.models.deepseek_v4_1 import kernels, l2_prefetch, sp_prefill
 from vllm.models.deepseek_v4_1.ced import CED_WINDOW, ced_decoder_start
 from vllm.models.deepseek_v4_1.compressor import DeepseekCompressor
+from vllm.models.deepseek_v4_1.quant_config import Block32FP8LinearMethod
 from vllm.models.deepseek_v4_1.sparse_mla import (
     DeepseekV41B12xBackend,
     DeepseekV41B12xMetadata,
@@ -73,12 +69,12 @@ def _source(prefix, layer):
 
 def _native_linear(layer):
     method = layer.quant_method
-    if isinstance(method, (B12xFP8LinearMethod, B12xLinearMethod)):
+    if kernels.is_native_linear_method(method):
         return
     if type(method) is UnquantizedLinearMethod:
-        layer.quant_method = B12xLinearMethod()
+        layer.quant_method = kernels.linear_method()
         return
-    raise ValueError("V4.1 attention only supports native b12x linear methods")
+    raise ValueError("V4.1 attention only supports native linear methods")
 
 
 def _scratch(plan):
@@ -313,7 +309,7 @@ class _WOProjectionWeightMethod(LinearMethodBase):
     """Keep checkpoint FP8 tensors unmodified for the fused WO projection."""
 
     def __init__(self, original):
-        if not isinstance(original, B12xFP8LinearMethod):
+        if not isinstance(original, Block32FP8LinearMethod):
             raise ValueError("V4.1 output projection requires block32 FP8 weights")
         self.original = original
 
@@ -357,7 +353,7 @@ class DeepseekV4Indexer(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.weights_proj",
         )
-        self.weights_proj.quant_method = B12xLinearMethod()
+        self.weights_proj.quant_method = kernels.linear_method()
         if owns_k:
             self.wk = ReplicatedLinear(
                 512,
@@ -367,8 +363,8 @@ class DeepseekV4Indexer(nn.Module):
                 quant_config=None,
                 prefix=f"{prefix}.wk",
             )
-            self.wk.quant_method = B12xLinearMethod()
-            self.k_norm = B12xRMSNorm(128, hf.rms_norm_eps)
+            self.wk.quant_method = kernels.linear_method()
+            self.k_norm = kernels.rms_norm(128, hf.rms_norm_eps)
         self.ratio = ratio
 
 
@@ -518,8 +514,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             disable_tp=True,
             prefix=f"{prefix}.fused_wqa_wkv",
         )
-        self.q_norm = B12xRMSNorm(hf.q_lora_rank, hf.rms_norm_eps)
-        self.kv_norm = B12xRMSNorm(512, hf.rms_norm_eps)
+        self.q_norm = kernels.rms_norm(hf.q_lora_rank, hf.rms_norm_eps)
+        self.kv_norm = kernels.rms_norm(512, hf.rms_norm_eps)
         self.wq_b = ColumnParallelLinear(
             hf.q_lora_rank,
             hf.num_attention_heads * 512,
@@ -639,37 +635,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
 
     def _declare_attention(self, device):
         """Describe native code and simultaneous metadata without allocating."""
-        from b12x._lib.scratch import ScratchBufferSpec
-        from b12x.preparation import MemoryRequirements
-
-        def descriptor(tensor, *, page_size, kind):
-            if tensor is None or tensor.numel() == 0:
-                width = mla.page_nbytes(
-                    page_size,
-                    cache_kind=kind,
-                    cache_format="deepseek_v41",
-                )
-                return {
-                    "shape": (1, width),
-                    "stride": (width, 1),
-                    "alignment": 16,
-                    "dtype": "uint8",
-                }
-            return {
-                "shape": tuple(tensor.shape),
-                "stride": tuple(tensor.stride()),
-                "alignment": min(16, tensor.data_ptr() & -tensor.data_ptr()),
-                "dtype": str(tensor.dtype).removeprefix("torch."),
-            }
-
-        self._main_page = self.config.cache_config.block_size // max(
-            self.compress_ratio, 1
-        )
-        self._main_width = (
-            self.max_model_len + self.config.cache_config.block_size - 1
-        ) // self.config.cache_config.block_size
-        self._index_page = self._main_page
-        self._index_width = self._main_width
+        # Page geometry stays as computed at construction, from the block size
+        # the caches were allocated with. The engine later lowers
+        # cache_config.block_size to its smallest prefix-cacheable group (the
+        # SWA block); re-reading it here would plan half-size main pages
+        # whenever the worker shares the engine's config (the uniproc executor).
         spec = self.config.speculative_config
         # Parallel drafting can admit two draft spans during verifier profiling.
         query_width = (
@@ -685,68 +655,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         )
         self._attention_workspace_specs = {}
         self._attention_declarations = {}
-        compute = envs.VLLM_DS41_ATTENTION_COMPUTE
+        self._decode_capacity = min(self.capacity, decode_rows)
         for mode, capacity in (
-            ("decode", min(self.capacity, decode_rows)),
+            ("decode", self._decode_capacity),
             ("extend", self.capacity),
         ):
-            # "reference" gives decode rows the single-pass kernel as well.
-            kernel_mode = "extend" if compute == "reference" else mode
-            caps = mla.Caps(
-                device=device,
-                num_q_heads=self.n_local_heads,
-                max_q_rows=capacity,
-                max_width=self.swa_width + (512 if self.compress_ratio else 0),
-                swa_width=self.swa_width,
-                indexed_width=512 if self.compress_ratio else 0,
-                swa_page_size=self.swa_cache_layer.block_size,
-                indexed_page_size=self._main_page,
-                max_page_table_width=self._main_width,
-                mode=kernel_mode,
-                # DSpark's two-span reservation can exceed the generic
-                # 256-row cutoff even when replaying a six-row C1 graph.
-                # Keep the entire reserved decode capacity on its decode
-                # split contract; prefill retains its separate plan.
-                decode_row_capacity=capacity if kernel_mode == "decode" else None,
-                cache_format="deepseek_v41",
-                use_cuda_graph=True,
-            )
-            swa_cache = getattr(self.swa_cache_layer, "kv_cache", None)
-            indexed_cache = (
-                getattr(self._owner(), "kv_cache", None)
-                if self.compress_ratio
-                else None
-            )
-            invocation = mla.invocation_from_descriptors(
-                q={
-                    "shape": (capacity, self.n_local_heads, 512),
-                    "stride": (self.n_local_heads * 512, 512, 1),
-                    "alignment": 16,
-                    "dtype": "bfloat16",
-                },
-                swa_cache=descriptor(
-                    swa_cache, page_size=self.swa_cache_layer.block_size, kind="swa"
-                ),
-                indexed_cache=(
-                    descriptor(indexed_cache, page_size=self._main_page, kind="indexed")
-                    if self.compress_ratio
-                    else None
-                ),
-                attn_sink_present=True,
-                output_mode="provided",
-            )
-            declaration = mla.plan(caps, invocation=invocation)
-            if compute != "auto":
-                # Pin BF16 arithmetic; the split/single-pass lowering stays the
-                # plan's own default for this query.
-                default = declaration.contract.default_config(declaration.query, None)
-                declaration = mla.plan(
-                    caps,
-                    invocation=invocation,
-                    override=replace(
-                        default, v41_compute_mode="bf16", v41_heads_per_block=16
-                    ),
-                )
             metadata_specs: tuple[tuple[tuple[int, ...], torch.dtype], ...] = (
                 ((capacity, self.swa_width), torch.int32),
                 ((capacity,), torch.int32),
@@ -755,35 +668,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             if self.compress_ratio:
                 metadata_specs += (((capacity, self._main_width), torch.int32),)
             self._attention_workspace_specs[mode] = metadata_specs
-
-            # These metadata views coexist with native scratch in one arena.
-            # Only integration-owned storage is added; launch policy stays native.
-            def memory(
-                config,
-                detected,
-                native=declaration._memory_requirements,
-                metadata_specs=metadata_specs,
-                mode=mode,
-            ):
-                requirement = native(config, detected)
-                metadata = tuple(
-                    ScratchBufferSpec(
-                        name=f"{mode}_metadata_{index}",
-                        shape=shape,
-                        dtype=dtype,
-                        device=torch.device("cuda", detected.ordinal),
-                    )
-                    for index, (shape, dtype) in enumerate(metadata_specs)
-                )
-                return MemoryRequirements(
-                    scratch=(*metadata, *requirement.scratch),
-                    persistent=requirement.persistent,
-                )
-
-            self._attention_declarations[mode] = replace(
-                declaration,
-                _memory_requirements=memory,
-            )
+            declaration = self._declare_mla(mode, capacity, metadata_specs, device)
+            if declaration is not None:
+                self._attention_declarations[mode] = declaration
         if not hasattr(self, "_owns_topk_indices"):
             self._owns_topk_indices = (
                 self.topk_indices_buffer is None and self.is_index_source
@@ -821,6 +708,108 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             self._short_index_shape = (short_rows, short_width)
             specs.append(("_short_index_pages", self._short_index_shape, torch.int32))
         self._staging_specs = tuple(specs)
+
+    def _declare_mla(self, mode: str, capacity: int, metadata_specs, device):
+        """Declare the native sparse-MLA plan for one mode, beside its metadata."""
+        from b12x._lib.scratch import ScratchBufferSpec
+        from b12x.preparation import MemoryRequirements
+
+        def descriptor(tensor, *, page_size, kind):
+            if tensor is None or tensor.numel() == 0:
+                width = mla.page_nbytes(
+                    page_size,
+                    cache_kind=kind,
+                    cache_format="deepseek_v41",
+                )
+                return {
+                    "shape": (1, width),
+                    "stride": (width, 1),
+                    "alignment": 16,
+                    "dtype": "uint8",
+                }
+            return {
+                "shape": tuple(tensor.shape),
+                "stride": tuple(tensor.stride()),
+                "alignment": min(16, tensor.data_ptr() & -tensor.data_ptr()),
+                "dtype": str(tensor.dtype).removeprefix("torch."),
+            }
+
+        compute = envs.VLLM_DS41_ATTENTION_COMPUTE
+        # "reference" gives decode rows the single-pass kernel as well.
+        kernel_mode = "extend" if compute == "reference" else mode
+        caps = mla.Caps(
+            device=device,
+            num_q_heads=self.n_local_heads,
+            max_q_rows=capacity,
+            max_width=self.swa_width + (512 if self.compress_ratio else 0),
+            swa_width=self.swa_width,
+            indexed_width=512 if self.compress_ratio else 0,
+            swa_page_size=self.swa_cache_layer.block_size,
+            indexed_page_size=self._main_page,
+            max_page_table_width=self._main_width,
+            mode=kernel_mode,
+            # DSpark's two-span reservation can exceed the generic
+            # 256-row cutoff even when replaying a six-row C1 graph.
+            # Keep the entire reserved decode capacity on its decode
+            # split contract; prefill retains its separate plan.
+            decode_row_capacity=capacity if kernel_mode == "decode" else None,
+            cache_format="deepseek_v41",
+            use_cuda_graph=True,
+        )
+        swa_cache = getattr(self.swa_cache_layer, "kv_cache", None)
+        indexed_cache = (
+            getattr(self._owner(), "kv_cache", None) if self.compress_ratio else None
+        )
+        invocation = mla.invocation_from_descriptors(
+            q={
+                "shape": (capacity, self.n_local_heads, 512),
+                "stride": (self.n_local_heads * 512, 512, 1),
+                "alignment": 16,
+                "dtype": "bfloat16",
+            },
+            swa_cache=descriptor(
+                swa_cache, page_size=self.swa_cache_layer.block_size, kind="swa"
+            ),
+            indexed_cache=(
+                descriptor(indexed_cache, page_size=self._main_page, kind="indexed")
+                if self.compress_ratio
+                else None
+            ),
+            attn_sink_present=True,
+            output_mode="provided",
+        )
+        declaration = mla.plan(caps, invocation=invocation)
+        if compute != "auto":
+            # Pin BF16 arithmetic; the split/single-pass lowering stays the
+            # plan's own default for this query.
+            default = declaration.contract.default_config(declaration.query, None)
+            declaration = mla.plan(
+                caps,
+                invocation=invocation,
+                override=replace(
+                    default, v41_compute_mode="bf16", v41_heads_per_block=16
+                ),
+            )
+
+        # These metadata views coexist with native scratch in one arena.
+        # Only integration-owned storage is added; launch policy stays native.
+        def memory(config, detected, native=declaration._memory_requirements):
+            requirement = native(config, detected)
+            metadata = tuple(
+                ScratchBufferSpec(
+                    name=f"{mode}_metadata_{index}",
+                    shape=shape,
+                    dtype=dtype,
+                    device=torch.device("cuda", detected.ordinal),
+                )
+                for index, (shape, dtype) in enumerate(metadata_specs)
+            )
+            return MemoryRequirements(
+                scratch=(*metadata, *requirement.scratch),
+                persistent=requirement.persistent,
+            )
+
+        return replace(declaration, _memory_requirements=memory)
 
     def _staging_memory(self):
         from b12x.preparation import MemoryRequirements, PersistentMemory
@@ -1297,14 +1286,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             plan=self._helper_plan("index_key"),
         )
         index_meta = cast(DeepseekV41B12xMetadata, metadata[indexer.k_cache.prefix])
-        for offset in range(0, rows, self.INDEX_CHUNK):
-            end = min(offset + self.INDEX_CHUNK, rows)
-            dsa_indexer.quantize_write_index_k_mxfp4(
-                self._index_plan("prefill", end - offset),
-                key[offset:end],
-                index_k_cache=indexer.k_cache.kv_cache,
-                slot_mapping=index_meta.slot_mapping[offset:end],
-            )
+        self._write_index_keys(key, index_meta.slot_mapping[:rows])
         latent = _rotated(
             latent,
             positions,
@@ -1421,16 +1403,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         )
         iq_data = torch.empty((rows, h, 64), dtype=torch.uint8, device=qr.device)
         iq_scale = torch.empty((rows, h, 4), dtype=torch.uint8, device=qr.device)
-        index_mode = "decode" if swa.is_decode else "prefill"
-        chunk_rows = self.DECODE_CHUNK if swa.is_decode else self.INDEX_CHUNK
-        for offset in range(0, rows, chunk_rows):
-            end = min(offset + chunk_rows, rows)
-            dsa_indexer.quantize_q_mxfp4(
-                self._index_plan(index_mode, end - offset),
-                iq[offset:end],
-                q_mxfp4=iq_data[offset:end],
-                q_scales=iq_scale[offset:end],
-            )
+        self._quantize_index_query(
+            "decode" if swa.is_decode else "prefill", iq, iq_data, iq_scale
+        )
         # The BF16 head-weight projection runs on every row: its GEMV rounds
         # differently at another row count, which would move top-k selections.
         # The FP8 wq_b quantizes per row and does not depend on the row count.
@@ -1524,15 +1499,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         )
         mode = "decode" if swa.is_decode else "extend"
         rows = q.shape[0]
-        from b12x.preparation import require_prepared
-
-        plan = self._attention_plan(mode)
-        state = require_prepared(plan, "attention.compressed_sparse_mla")
-        if rows > state.query.query_rows:
-            raise ValueError(
-                f"V4.1 {mode} rows {rows} exceed prepared capacity "
-                f"{state.query.query_rows}"
-            )
+        self._check_attention_rows(mode, rows)
         owner = (
             self._context[_source(self.prefix, self.index_source_layer_id)]
             if self.compress_ratio
@@ -1601,32 +1568,18 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                             candidate_indices=source._candidates[row:row_end],
                             candidate_lengths=source._candidate_lens[row:row_end],
                         )
-                    index_plan = self._index_plan(index_mode, count)
-                    scratch = current_workspace_manager().get_simultaneous(
-                        *(
-                            (spec.shape, spec.dtype)
-                            for spec in dsa_indexer.scratch_specs(
-                                index_plan, device=iq_data.device
-                            )
-                        )
-                    )
-                    binding = dsa_indexer.bind(
-                        index_plan,
-                        scratch=scratch,
+                    self._index_chunk(
+                        index_mode,
+                        count,
                         q_mxfp4=iq_data[offset:end],
                         q_scales=iq_scale[offset:end],
                         query_weights=iw[offset:end],
-                        index_k_cache=self.indexer.k_cache.kv_cache,
                         page_table=index_pages[:count],
                         cache_lengths=im.cache_lengths[row:row_end],
-                        active_width=self._active,
                         score_width=score_width,
                         output_indices=selected[offset:end],
                         **candidate_args,
                     )
-                    retain_cuda_graph_capture_resource(scratch)
-                    dsa_indexer.score(binding)
-                    dsa_indexer.select(binding)
 
             if split is None:
                 select_rows(query, 0, self.topk_indices_buffer)
@@ -1672,8 +1625,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         # metadata beside, not overlapping, the native attention scratch.
         metadata_specs = self._attention_workspace_specs[mode]
         arena = current_workspace_manager().get_simultaneous(
-            *metadata_specs,
-            *((spec.shape, spec.dtype) for spec in state.scratch_plan.scratch_specs()),
+            *metadata_specs, *self._attention_scratch_specs(mode, rows)
         )
         buffers = arena
         metadata_count = len(metadata_specs)
@@ -1711,20 +1663,97 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 indexed_lengths=top_lengths[:rows],
                 indexed_page_table=buffers[3][:rows],
             )
-        binding = mla.bind(
-            plan,
+        # Keep the borrowed arena, not aliases of the transient query storage.
+        retain_cuda_graph_capture_resource(arena)
+        self._attend(
+            mode,
+            q,
+            output,
             scratch=buffers[metadata_count:],
-            q=q,
             swa_indices=swa_indices[:rows],
             swa_lengths=swa_lengths[:rows],
             **kwargs,
         )
-        # Keep the borrowed arena, not aliases of the transient query storage.
-        retain_cuda_graph_capture_resource(arena)
+
+    def _quantize_index_query(self, mode: str, iq, iq_data, iq_scale) -> None:
+        """MXFP4-quantize ``[rows, heads, 128]`` index queries into the outputs."""
+        chunk_rows = self.DECODE_CHUNK if mode == "decode" else self.INDEX_CHUNK
+        for offset in range(0, iq.shape[0], chunk_rows):
+            end = min(offset + chunk_rows, iq.shape[0])
+            dsa_indexer.quantize_q_mxfp4(
+                self._index_plan(mode, end - offset),
+                iq[offset:end],
+                q_mxfp4=iq_data[offset:end],
+                q_scales=iq_scale[offset:end],
+            )
+
+    def _write_index_keys(self, key, slot_mapping) -> None:
+        """MXFP4-quantize ``[rows, 128]`` index keys into the index K cache."""
+        for offset in range(0, key.shape[0], self.INDEX_CHUNK):
+            end = min(offset + self.INDEX_CHUNK, key.shape[0])
+            dsa_indexer.quantize_write_index_k_mxfp4(
+                self._index_plan("prefill", end - offset),
+                key[offset:end],
+                index_k_cache=self.indexer.k_cache.kv_cache,
+                slot_mapping=slot_mapping[offset:end],
+            )
+
+    def _check_attention_rows(self, mode: str, rows: int) -> None:
+        """Reject a batch beyond the prepared attention capacity."""
+        from b12x.preparation import require_prepared
+
+        state = require_prepared(
+            self._attention_plan(mode), "attention.compressed_sparse_mla"
+        )
+        if rows > state.query.query_rows:
+            raise ValueError(
+                f"V4.1 {mode} rows {rows} exceed prepared capacity "
+                f"{state.query.query_rows}"
+            )
+
+    def _attention_scratch_specs(self, mode: str, rows: int):
+        """Native attention scratch, borrowed beside the metadata arena."""
+        from b12x.preparation import require_prepared
+
+        state = require_prepared(
+            self._attention_plan(mode), "attention.compressed_sparse_mla"
+        )
+        return tuple(
+            (spec.shape, spec.dtype) for spec in state.scratch_plan.scratch_specs()
+        )
+
+    def _index_chunk(self, mode: str, rows: int, *, output_indices, **tensors):
+        """Score and select one chunk of index rows into `output_indices`."""
+        index_plan = self._index_plan(mode, rows)
+        scratch = current_workspace_manager().get_simultaneous(
+            *(
+                (spec.shape, spec.dtype)
+                for spec in dsa_indexer.scratch_specs(
+                    index_plan, device=tensors["q_mxfp4"].device
+                )
+            )
+        )
+        binding = dsa_indexer.bind(
+            index_plan,
+            scratch=scratch,
+            index_k_cache=self.indexer.k_cache.kv_cache,
+            active_width=self._active,
+            output_indices=output_indices,
+            **tensors,
+        )
+        retain_cuda_graph_capture_resource(scratch)
+        dsa_indexer.score(binding)
+        dsa_indexer.select(binding)
+
+    def _attend(self, mode: str, q, output, *, scratch, **indices):
+        """Sparse MLA over the SWA and (compressed layers) indexed caches."""
+        binding = mla.bind(self._attention_plan(mode), scratch=scratch, q=q, **indices)
         mla.run(
             binding=binding,
             swa_k_cache=self.swa_cache_layer.kv_cache,
-            indexed_k_cache=self._owner().kv_cache if main is not None else None,
+            indexed_k_cache=self._owner().kv_cache
+            if "indexed_indices" in indices
+            else None,
             swa_page_size=self.swa_cache_layer.block_size,
             indexed_page_size=self._main_page,
             sm_scale=512**-0.5,
@@ -1852,7 +1881,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             )
 
         requests = []
-        decode_rows = self._attention_declarations["decode"].query.query_rows
+        decode_rows = self._decode_capacity
         token_counts = tuple(
             sorted(
                 {

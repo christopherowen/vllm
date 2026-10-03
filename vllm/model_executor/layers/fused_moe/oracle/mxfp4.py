@@ -104,6 +104,8 @@ class Mxfp4MoeBackend(Enum):
     # b12x backends
     B12X_MXFP4_MXFP8 = "B12X_MXFP4_MXFP8"
     B12X_MXFP4_BF16 = "B12X_MXFP4_BF16"
+    # TileLang backend (SM12x, DeepSeek V4.1)
+    TILELANG_MXFP4_MXFP8 = "TILELANG_MXFP4_MXFP8"
     # DeepGEMM FP8xFP4 backend (SM100+)
     DEEPGEMM_MXFP4 = "DEEPGEMM_MXFP4"
     # FlashInfer TRTLLM backends
@@ -163,6 +165,11 @@ def backend_to_kernel_cls(
         from vllm.model_executor.layers.fused_moe.b12x import B12xExperts
 
         return [B12xExperts]
+
+    elif backend == Mxfp4MoeBackend.TILELANG_MXFP4_MXFP8:
+        from vllm.model_executor.layers.fused_moe.tilelang import TileLangExperts
+
+        return [TileLangExperts]
 
     elif backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
         from vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe import (
@@ -293,6 +300,7 @@ def map_mxfp4_backend(runner_backend: MoEBackend) -> list[Mxfp4MoeBackend]:
     """
     mapping: dict[str, list[Mxfp4MoeBackend]] = {
         "b12x": list(B12X_BACKENDS),
+        "tilelang": [Mxfp4MoeBackend.TILELANG_MXFP4_MXFP8],
         "deep_gemm": [Mxfp4MoeBackend.DEEPGEMM_MXFP4],
         "flashinfer_trtllm": [
             Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
@@ -385,7 +393,10 @@ def _backend_activation_key(backend: Mxfp4MoeBackend) -> QuantKey | None:
     """Map backend to its activation key (FP8, MXFP8, or None for BF16)."""
     if backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
         return kFp8Dynamic128Sym
-    if backend == Mxfp4MoeBackend.B12X_MXFP4_MXFP8:
+    if backend in (
+        Mxfp4MoeBackend.B12X_MXFP4_MXFP8,
+        Mxfp4MoeBackend.TILELANG_MXFP4_MXFP8,
+    ):
         return kMxfp8Dynamic
     if backend in (
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
@@ -727,9 +738,9 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
     activation: MoEActivation | None = None,
 ) -> tuple[int, int]:
     """Round up hidden_size and intermediate_size based on backend requirements."""
-    if backend in B12X_BACKENDS:
-        # b12x plans for the exact model dimensions. B12xExperts validates the
-        # required MXFP4 block alignment before selecting the backend.
+    if backend in (*B12X_BACKENDS, Mxfp4MoeBackend.TILELANG_MXFP4_MXFP8):
+        # b12x and TileLang plan for the exact model dimensions; their experts
+        # validate the required block alignment before the backend is selected.
         return hidden_size, intermediate_size
     if backend == Mxfp4MoeBackend.EMULATION:
         # Emulation has no kernel tile; it only needs OCP MX block alignment so the
@@ -1383,7 +1394,7 @@ def convert_weight_to_mxfp4_moe_kernel_format(
 
         is_gfx1250 = on_gfx1250()
 
-    if mxfp4_backend in B12X_BACKENDS:
+    if mxfp4_backend in (*B12X_BACKENDS, Mxfp4MoeBackend.TILELANG_MXFP4_MXFP8):
         return (
             w13_weight.data,
             w2_weight.data,
@@ -1853,7 +1864,10 @@ def make_mxfp4_moe_quant_config(
     layer: "RoutedExperts | None" = None,
 ) -> FusedMoEQuantConfig | None:
     """Create a FusedMoEQuantConfig for the given MXFP4 backend."""
-    if mxfp4_backend == Mxfp4MoeBackend.B12X_MXFP4_MXFP8:
+    if mxfp4_backend in (
+        Mxfp4MoeBackend.B12X_MXFP4_MXFP8,
+        Mxfp4MoeBackend.TILELANG_MXFP4_MXFP8,
+    ):
         return mxfp4_mxfp8_moe_quant_config(
             w1_bias=w1_bias,
             w2_bias=w2_bias,

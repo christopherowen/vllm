@@ -252,6 +252,9 @@ def _get_linear_backend(*, quantization: str) -> str:
 
 # Kernel classes covered by each --linear-backend value.
 _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
+    # DS4.1's TileLang family runs its projections as DS4.1 linear methods;
+    # the online-quantized vocabulary heads keep B12X's shared kernels.
+    "tilelang": {B12xMxfp8LinearKernel, B12xNvFp4LinearKernel},
     "b12x": {
         B12xFp8BlockScaledMMKernel,
         B12xMxFp4LinearKernel,

@@ -542,6 +542,7 @@ class DeepseekV41ForCausalLMConfig(VerifyAndUpdateConfig):
 
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        from vllm import envs
         from vllm.platforms import current_platform
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -550,10 +551,37 @@ class DeepseekV41ForCausalLMConfig(VerifyAndUpdateConfig):
             and current_platform.is_device_capability_family(120)
         ):
             return
-        backend = AttentionBackendEnum.B12X
-        if vllm_config.attention_config.backend not in (None, backend):
-            raise ValueError("DeepSeek V4.1 requires B12X.")
+        # One kernel family runs the whole model, drafter included; explicit
+        # per-component backends must name the same family.
+        family = envs.VLLM_DS41_KERNEL_BACKEND
+        backend = (
+            AttentionBackendEnum.TILELANG
+            if family == "tilelang"
+            else AttentionBackendEnum.B12X
+        )
+        requested = {"attention backend": vllm_config.attention_config.backend}
+        kernel = vllm_config.kernel_config
+        components = {"linear backend": kernel.linear_backend}
+        components["MoE backend"] = kernel.moe_backend
+        spec = vllm_config.speculative_config
+        if spec is not None:
+            requested["speculative attention backend"] = spec.attention_backend
+            components["speculative MoE backend"] = spec.moe_backend
+        for name, value in requested.items():
+            if value not in (None, backend):
+                raise ValueError(
+                    f"DeepSeek V4.1 with VLLM_DS41_KERNEL_BACKEND={family} requires "
+                    f"the {backend.name} {name}, got {value.name}."
+                )
+        for name, value in components.items():
+            if value not in (None, "auto", family):
+                raise ValueError(
+                    f"DeepSeek V4.1 with VLLM_DS41_KERNEL_BACKEND={family} requires "
+                    f"the {family} {name}, got {value}."
+                )
         vllm_config.attention_config.backend = backend
+        if family == "tilelang":
+            kernel.linear_backend = kernel.moe_backend = family
 
 
 class Glm5NextForCausalLMConfig(VerifyAndUpdateConfig):

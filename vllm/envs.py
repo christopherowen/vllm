@@ -222,6 +222,7 @@ if TYPE_CHECKING:
     VLLM_DS41_DRAFT_NVFP4_HEAD: bool = False
     VLLM_DS41_PACKED_BF16_LM_HEAD: bool = False
     VLLM_DS41_ATTENTION_COMPUTE: Literal["bf16", "reference", "auto"] = "bf16"
+    VLLM_DS41_KERNEL_BACKEND: Literal["b12x", "tilelang"] = "b12x"
     VLLM_DS41_ENGRAM_OVERLAP: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_HC_TP: bool = True
@@ -1892,6 +1893,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_DS41_ATTENTION_COMPUTE",
         "bf16",
         ["bf16", "reference", "auto"],
+    ),
+    # DeepSeek V4.1 kernel family on SM12x: "b12x" or "tilelang". It selects
+    # the attention, linear and MoE backends; explicit flags must agree.
+    "VLLM_DS41_KERNEL_BACKEND": env_with_choices(
+        "VLLM_DS41_KERNEL_BACKEND",
+        "b12x",
+        ["b12x", "tilelang"],
     ),
     # Read DeepSeek V4.1 disk Engram rows while the target graph starts.
     "VLLM_DS41_ENGRAM_OVERLAP": lambda: bool(

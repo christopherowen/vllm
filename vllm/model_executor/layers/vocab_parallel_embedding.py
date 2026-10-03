@@ -85,7 +85,8 @@ def _supports_default_lm_head_quantization(
         or params_dtype != torch.bfloat16
         or input_size % 128
         or output_size % 8
-        or config.kernel_config.linear_backend not in ("auto", "b12x")
+        # DS4.1's TileLang family keeps B12X's NVFP4 and MXFP8 head kernels.
+        or config.kernel_config.linear_backend not in ("auto", "b12x", "tilelang")
         or not current_platform.is_cuda()
         or not current_platform.is_device_capability_family(120)
     ):
@@ -415,15 +416,17 @@ class VocabParallelEmbedding(PluggableLayer):
                 raise ValueError(
                     "A packed BF16 LM head needs an untied, unquantized checkpoint head"
                 )
-            if config.kernel_config.linear_backend != "b12x" or not (
-                packed_bf16_supported(
-                    embedding_dim, params_dtype or torch.get_default_dtype()
-                )
+            # DS4.1's TileLang family keeps B12X's vocabulary projections.
+            if config.kernel_config.linear_backend not in (
+                "b12x",
+                "tilelang",
+            ) or not packed_bf16_supported(
+                embedding_dim, params_dtype or torch.get_default_dtype()
             ):
                 raise ValueError(
                     "A packed BF16 LM head needs B12X's packed vocabulary "
-                    "projection: linear backend b12x, BF16 weights and K "
-                    "divisible by 128"
+                    "projection: linear backend b12x or tilelang, BF16 weights "
+                    "and K divisible by 128"
                 )
             quant_method = PackedBf16LmHeadMethod()
             self.runtime_lm_head_quantization = "packed_bf16"

@@ -15,15 +15,11 @@ from b12x.preparation import FrozenMapping, PreparedCall, plan_from_handle
 from torch import nn
 
 from vllm.config import get_current_vllm_config
-from vllm.model_executor.layers.linear import LinearMethodBase, UnquantizedLinearMethod
-from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-    create_fp8_scale_parameter,
-    create_fp8_weight_parameter,
-)
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
 )
-from vllm.model_executor.parameter import BlockQuantScaleParameter
+from vllm.models.deepseek_v4_1.quant_config import Block32FP8LinearMethod
 from vllm.utils.b12x import (
     B12xPreparationUnit,
     B12xWorkload,
@@ -301,46 +297,8 @@ class B12xLinearMethod(UnquantizedLinearMethod):
         )
 
 
-class B12xFP8LinearMethod(LinearMethodBase):
+class B12xFP8LinearMethod(Block32FP8LinearMethod):
     """Checkpoint block32 FP8, without a foreign kernel selection phase."""
-
-    def __init__(self, quant_config):
-        if quant_config.weight_block_size != [32, 32]:
-            raise ValueError("V4.1 requires checkpoint block32 FP8 linears")
-
-    def create_weights(
-        self,
-        layer,
-        input_size_per_partition,
-        output_partition_sizes,
-        input_size,
-        output_size,
-        params_dtype,
-        **extra_weight_attrs,
-    ):
-        loader = extra_weight_attrs.get("weight_loader")
-        layer.logical_widths = output_partition_sizes
-        layer.input_size_per_partition = input_size_per_partition
-        layer.output_size_per_partition = sum(output_partition_sizes)
-        layer.orig_dtype = params_dtype
-        layer.weight_block_size = [32, 32]
-        layer.register_parameter(
-            "weight",
-            create_fp8_weight_parameter(
-                sum(output_partition_sizes), input_size_per_partition, loader
-            ),
-        )
-        layer.register_parameter(
-            "weight_scale_inv",
-            create_fp8_scale_parameter(
-                BlockQuantScaleParameter,
-                output_partition_sizes,
-                input_size_per_partition,
-                [32, 32],
-                loader,
-                scale_dtype=torch.float8_e8m0fnu,
-            ),
-        )
 
     def process_weights_after_loading(self, layer):
         layer.b12x_weight = block_fp8_linear.pack_weight(

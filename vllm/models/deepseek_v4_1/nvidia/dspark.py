@@ -63,8 +63,7 @@ from vllm.v1.worker.workspace import (
     retain_cuda_graph_capture_resource,
 )
 
-from .. import l2_prefetch
-from ..b12x_layers import B12xRMSNorm as RMSNorm
+from .. import kernels, l2_prefetch
 from ..b12x_layers import (
     _execution_capacities,
 )
@@ -368,7 +367,7 @@ class DSparkDeepseekV4Model(nn.Module):
             prefix=maybe_prefix(prefix, "main_proj"),
             **({"gather_output": True} if main_proj_tp else {}),
         )
-        self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.main_norm = kernels.rms_norm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.topk_indices_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
@@ -394,7 +393,7 @@ class DSparkDeepseekV4Model(nn.Module):
         # checkpoint. v4.1 has no learned hc_head: the hc copies are
         # collapsed with a pre-mix derived from the last layer's hc_ffn
         # projection at the end of forward().
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = kernels.rms_norm(config.hidden_size, eps=config.rms_norm_eps)
         draft_vocab_size = (
             getattr(config, "draft_vocab_size", None) or config.vocab_size
         )

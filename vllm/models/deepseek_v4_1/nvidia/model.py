@@ -63,9 +63,9 @@ from vllm.utils.b12x import (
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
-from .. import l2_prefetch, sp_prefill
-from ..b12x_layers import B12xLinearMethod, B12xMHC
-from ..b12x_layers import B12xRMSNorm as RMSNorm
+from .. import kernels, l2_prefetch, sp_prefill
+from ..attention import DeepseekV4Attention
+from ..b12x_layers import B12xMHC
 from ..ced import ced_decoder_start, gather_rows, scatter_rows
 from ..common.engram import Engram, EngramLayout, NgramHashState
 from .b12x_attention import DeepseekV41B12xAttention
@@ -78,8 +78,14 @@ logger = init_logger(__name__)
 
 def _select_dsv4_attn_cls(vllm_config):
     backend = vllm_config.attention_config.backend
+    if backend == AttentionBackendEnum.TILELANG:
+        from ..tilelang.attention import DeepseekV41TileLangAttention
+
+        return DeepseekV41TileLangAttention
     if backend not in (None, AttentionBackendEnum.B12X):
-        raise ValueError("DeepSeek V4.1 requires B12X")
+        raise ValueError(
+            "DeepSeek V4.1 requires the B12X or TILELANG attention backend"
+        )
     return DeepseekV41B12xAttention
 
 
@@ -149,7 +155,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             bias=False,
             prefix=f"{prefix}.ffn.gate",
         )
-        gate.quant_method = B12xLinearMethod()
+        gate.quant_method = kernels.linear_method()
         gate.out_dtype = torch.float32
         self.ffn = DeepseekV4MoE(
             moe_config,
@@ -160,8 +166,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             image_sentinel_count=1,
         )
 
-        self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
-        self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
+        self.attn_norm = kernels.rms_norm(self.hidden_size, self.rms_norm_eps)
+        self.ffn_norm = kernels.rms_norm(self.hidden_size, self.rms_norm_eps)
         self.hc_mult = config.hc_mult
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_eps = config.hc_eps
@@ -486,7 +492,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
 
         if get_pp_group().is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, self.rms_norm_eps)
+            self.norm = kernels.rms_norm(config.hidden_size, self.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
 
@@ -1110,7 +1116,7 @@ class DeepseekV41LLMForCausalLM(UpstreamDeepseekV41LLMForCausalLM):
                 name = b12x_layer_prefix(module)
                 register_b12x_layer(name, module)
                 module._b12x_mhc.bind_layer_name(name)
-            if isinstance(module, DeepseekV41B12xAttention):
+            if isinstance(module, DeepseekV4Attention):
                 module.setup_wo_projection()
             if isinstance(module, Engram):
                 module.process_weights_after_loading()

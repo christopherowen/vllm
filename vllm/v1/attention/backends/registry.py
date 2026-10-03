@@ -115,6 +115,9 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
         "DeepseekV4FlashInferMLASparseBackend"
     )
     B12X = "vllm.v1.attention.backends.b12x.B12xPagedAttentionBackend"
+    # DeepSeek V4.1 TileLang sparse MLA (model-driven; selected via the V4.1
+    # layer when VLLM_DS41_KERNEL_BACKEND=tilelang).
+    TILELANG = "vllm.models.deepseek_v4_1.tilelang.attention.DeepseekV41TileLangBackend"
     FLASH_ATTN_MLA = "vllm.v1.attention.backends.mla.flashattn_mla.FlashAttnMLABackend"
     FLASH_ATTN_MLA_SPARSE = (
         "vllm.v1.attention.backends.mla.flashattn_mla_sparse.FlashAttnMLASparseBackend"

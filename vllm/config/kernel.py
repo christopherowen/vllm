@@ -135,6 +135,7 @@ MoEBackend = Literal[
     "flashinfer_cutedsl",
     "flashinfer_b12x",
     "b12x",
+    "tilelang",
     "flashinfer_moe_ep_mega_deep_gemm",
     "flashinfer_moe_ep_mega_cutedsl",
     "marlin",
@@ -208,6 +209,7 @@ LinearBackend = Literal[
     "flashinfer_cudnn",
     "flashinfer_b12x",
     "b12x",
+    "tilelang",
     "marlin",
     "humming",
     "triton",
@@ -274,6 +276,7 @@ class KernelConfig:
     - "flashinfer_b12x": Use FlashInfer CuteDSL fused MoE for SM12x
       (RTX Pro 6000 / DGX Spark)
     - "b12x": Use b12x FP4 and MXFP8 MoE kernels on SM12x
+    - "tilelang": Use TileLang FP8 x FP4 MoE kernels on SM12x (DeepSeek V4.1)
     - "flashinfer_moe_ep_mega_deep_gemm": Use the FlashInfer moe_ep
       expert-parallel mega-MoE with the DeepGEMM megakernel, which consumes an
       MXFP4 checkpoint verbatim (Blackwell, requires expert parallel;
@@ -325,6 +328,8 @@ class KernelConfig:
     - "flashinfer_cudnn": Use FlashInfer with cuDNN kernels
     - "flashinfer_b12x": Use FlashInfer b12x CuteDSL NVFP4 GEMM (SM120+)
     - "b12x": Use native B12X FP8 and FP4 linear kernels on SM12x
+    - "tilelang": Use TileLang MXFP8 and BF16 linear kernels on SM12x
+      (DeepSeek V4.1)
     - "marlin": Use Marlin kernels
     - "triton": Use Triton-based kernels
     - "deep_gemm": Use DeepGEMM kernels

@@ -114,7 +114,7 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
     ) -> torch.Tensor:
         raise RuntimeError(
             "A packed BF16 LM head runs only through the logits processor's "
-            "prepared B12X projection (linear backend b12x, no bias)."
+            "prepared B12X projection (linear backend b12x or tilelang, no bias)."
         )
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
