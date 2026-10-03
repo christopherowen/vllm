@@ -334,7 +334,7 @@ class VocabParallelEmbedding(PluggableLayer):
         disable_tp: bool = False,
         quant_method: QuantizeMethodBase | None = None,
         parallel_group: GroupCoordinator | None = None,
-        lm_head_quantization: Literal["mxfp8", "nvfp4"] | None = None,
+        lm_head_quantization: Literal["mxfp8", "nvfp4", "packed_bf16"] | None = None,
     ):
         super().__init__()
 
@@ -385,7 +385,43 @@ class VocabParallelEmbedding(PluggableLayer):
         head_quantization = lm_head_quantization
         if head_quantization is None and envs.VLLM_MXFP8_LM_HEAD:
             head_quantization = "mxfp8"
-        self.runtime_lm_head_quantization: Literal["mxfp8", "nvfp4"] | None = None
+        self.runtime_lm_head_quantization: (
+            Literal["mxfp8", "nvfp4", "packed_bf16"] | None
+        ) = None
+        if not is_embedding_layer and head_quantization == "packed_bf16":
+            # Lossless: the BF16 head is packed exactly, never re-quantized.
+            from vllm.config import get_current_vllm_config
+            from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+            from vllm.model_executor.layers.quantization.online.packed_bf16 import (
+                PackedBf16LmHeadMethod,
+                packed_bf16_supported,
+            )
+
+            config = get_current_vllm_config()
+            tied = getattr(
+                getattr(config.model_config, "hf_text_config", None),
+                "tie_word_embeddings",
+                False,
+            )
+            if tied or not isinstance(
+                quant_method, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)
+            ):
+                raise ValueError(
+                    "A packed BF16 LM head needs an untied, unquantized checkpoint head"
+                )
+            if config.kernel_config.linear_backend != "b12x" or not (
+                packed_bf16_supported(
+                    embedding_dim, params_dtype or torch.get_default_dtype()
+                )
+            ):
+                raise ValueError(
+                    "A packed BF16 LM head needs B12X's packed vocabulary "
+                    "projection: linear backend b12x, BF16 weights and K "
+                    "divisible by 128"
+                )
+            quant_method = PackedBf16LmHeadMethod()
+            self.runtime_lm_head_quantization = "packed_bf16"
+            head_quantization = None
         if not is_embedding_layer and head_quantization is not None:
             from vllm.config import get_current_vllm_config
             from vllm.model_executor.layers.linear import UnquantizedLinearMethod
@@ -793,7 +829,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         prefix: str = "",
         *,
         disable_tp: bool = False,
-        lm_head_quantization: Literal["mxfp8", "nvfp4"] | None = None,
+        lm_head_quantization: Literal["mxfp8", "nvfp4", "packed_bf16"] | None = None,
     ):
         super().__init__(
             num_embeddings,

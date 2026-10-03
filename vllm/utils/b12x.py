@@ -316,6 +316,7 @@ _B12X_SUBMODULES = {
         "b12x.gemm.bf16_vocab_projection",
         "b12x.gemm.blockscaled",
         "b12x.gemm.mla_query_projection",
+        "b12x.gemm.packed_bf16_vocab_projection",
         "b12x.gemm.wo_projection",
         "b12x.norm.mhc",
         # TODO: Remove once B12X exposes the scale-swizzle API publicly.
@@ -354,6 +355,10 @@ def get_b12x_bf16_gemv() -> ModuleType | None:
 
 def get_b12x_bf16_vocab_projection() -> ModuleType | None:
     return _get_submodule("b12x.gemm.bf16_vocab_projection")
+
+
+def get_b12x_packed_bf16_vocab_projection() -> ModuleType | None:
+    return _get_submodule("b12x.gemm.packed_bf16_vocab_projection")
 
 
 def get_b12x_mla_query_projection() -> ModuleType | None:

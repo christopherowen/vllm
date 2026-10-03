@@ -1100,6 +1100,9 @@ class DeepseekV41LLMForCausalLM(
                 config.vocab_size,
                 config.hidden_size,
                 prefix=maybe_prefix(prefix, "lm_head"),
+                lm_head_quantization=(
+                    "packed_bf16" if envs.VLLM_DS41_PACKED_BF16_LM_HEAD else None
+                ),
             )
         else:
             self.lm_head = PPMissingLayer()

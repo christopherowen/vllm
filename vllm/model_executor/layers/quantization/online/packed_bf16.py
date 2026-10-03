@@ -1,0 +1,117 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Vocabulary heads stored in B12X's exact 12-bit packed BF16 form.
+
+The checkpoint's BF16 head loads unchanged; after loading it is packed, in
+its own storage, into one sign-and-mantissa byte plus a 4-bit exponent code
+per value, with the rare out-of-window values kept exactly in a per-row
+exception list. Packing
+verifies that every bit round-trips and refuses otherwise, so the served head
+is the checkpoint tensor in 75% of the bytes, not an approximation.
+
+The packed head runs only through the logits processor's prepared B12X
+projection, which reads the packed bytes directly.
+"""
+
+import torch
+from torch.nn import Parameter
+
+from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+from vllm.utils.b12x import get_b12x_packed_bf16_vocab_projection
+
+logger = init_logger(__name__)
+
+
+def packed_bf16_supported(input_size: int, params_dtype: torch.dtype) -> bool:
+    projection = get_b12x_packed_bf16_vocab_projection()
+    return (
+        projection is not None
+        and projection.is_supported()
+        and params_dtype == torch.bfloat16
+        and input_size % 128 == 0
+    )
+
+
+class PackedBf16LmHeadMethod(QuantizeMethodBase):
+    """A BF16 LM head served from its exact 12-bit packed form."""
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        weight = Parameter(
+            torch.empty(
+                sum(output_partition_sizes),
+                input_size_per_partition,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
+        layer.register_parameter("weight", weight)
+        set_weight_attrs(weight, extra_weight_attrs)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+        projection = get_b12x_packed_bf16_vocab_projection()
+        assert projection is not None
+        weight = layer.weight.data
+        in_features = int(weight.shape[1])
+        # In place: the packed rows take the first three quarters of the BF16
+        # head's own storage, so loading frees nothing the BF16 head would not.
+        # On GB10 freed memory stays charged to the process, so an extra
+        # allocation and free here would cost host memory for good.
+        packed = projection.pack(weight, in_place=True)
+        del weight
+        replace_parameter(layer, "weight", packed.values)
+        replace_parameter(layer, "weight_exception_rows", packed.exception_rows)
+        replace_parameter(layer, "weight_exception_entries", packed.exception_entries)
+        replace_parameter(layer, "weight_row_offsets", packed.row_offsets)
+        layer.packed_bf16_in_features = in_features
+        layer.packed_bf16_exponent_base = packed.exponent_base
+        layer.packed_bf16_exceptions = packed.exceptions
+        layer._already_called_process_weights_after_loading = True
+        logger.info_once(
+            "Packed the BF16 LM head exactly into 12 bits per weight: "
+            "exponents %d..%d, %d out-of-window values kept exactly per shard.",
+            packed.exponent_base,
+            packed.exponent_base + 14,
+            packed.exceptions,
+        )
+
+    @staticmethod
+    def packed_weight(layer: torch.nn.Module):
+        """The layer's current packed tensors (after any relocation)."""
+        projection = get_b12x_packed_bf16_vocab_projection()
+        assert projection is not None
+        return projection.PackedBf16Weight(
+            layer.weight,
+            layer.packed_bf16_exponent_base,
+            layer.weight_exception_rows,
+            layer.weight_exception_entries,
+            layer.weight_row_offsets,
+            layer.packed_bf16_exceptions,
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        raise RuntimeError(
+            "A packed BF16 LM head runs only through the logits processor's "
+            "prepared B12X projection (linear backend b12x, no bias)."
+        )
+
+    def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        raise RuntimeError("A packed BF16 LM head is not an input embedding.")

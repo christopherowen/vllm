@@ -25,6 +25,7 @@ from vllm.utils.b12x import (
     B12xPreparationUnit,
     B12xWorkload,
     get_b12x_bf16_vocab_projection,
+    get_b12x_packed_bf16_vocab_projection,
     set_b12x_preparation_provider,
 )
 from vllm.utils.flashinfer import has_flashinfer
@@ -60,6 +61,14 @@ def _topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 # --8<-- [start:logits_processor]
+def _is_packed_head(head: torch.nn.Module) -> bool:
+    from vllm.model_executor.layers.quantization.online.packed_bf16 import (
+        PackedBf16LmHeadMethod,
+    )
+
+    return isinstance(getattr(head, "quant_method", None), PackedBf16LmHeadMethod)
+
+
 @PluggableLayer.register("logits_processor")
 class LogitsProcessor(PluggableLayer):
     """Process logits and apply logits processors from sampling metadata.
@@ -111,6 +120,12 @@ class LogitsProcessor(PluggableLayer):
             and self._b12x_vocab_projection is not None
             and self._b12x_vocab_projection.is_supported()
         )
+        self._b12x_packed_vocab_projection = get_b12x_packed_bf16_vocab_projection()
+        self.use_b12x_packed_vocab_projection = bool(
+            kernel_config.linear_backend == "b12x"
+            and self._b12x_packed_vocab_projection is not None
+            and self._b12x_packed_vocab_projection.is_supported()
+        )
         if lm_head is not None:
             self.prepare_b12x_vocab_projection(lm_head)
 
@@ -119,7 +134,14 @@ class LogitsProcessor(PluggableLayer):
         lm_head: torch.nn.Module,
     ) -> None:
         """Register the loaded LM head; preparation happens in worker lifecycle."""
-        if (
+        if _is_packed_head(lm_head):
+            if (
+                not self.use_b12x_packed_vocab_projection
+                or not hasattr(lm_head, "packed_bf16_exponent_base")
+                or not lm_head.weight.is_cuda
+            ):
+                return
+        elif (
             not self.use_b12x_vocab_projection
             or not isinstance(lm_head, VocabParallelEmbedding)
             or not isinstance(
@@ -150,6 +172,17 @@ class LogitsProcessor(PluggableLayer):
         return f"logits.vocab.{id(self):x}.{id(head):x}.m{tokens}"
 
     def _declare_b12x_vocab_plan(self, head: VocabParallelEmbedding, rows: int):
+        if _is_packed_head(head):
+            packed = self._b12x_packed_vocab_projection
+            assert packed is not None
+            return packed.plan(
+                packed.Caps(
+                    device=head.weight.device,
+                    max_tokens=rows,
+                    in_features=head.packed_bf16_in_features,
+                    out_features=int(head.weight.shape[0]),
+                )
+            )
         projection = self._b12x_vocab_projection
         assert head is not None and projection is not None
         out_features, in_features = map(int, head.weight.shape)
@@ -163,7 +196,10 @@ class LogitsProcessor(PluggableLayer):
         )
 
     def _b12x_vocab_call(self, head: VocabParallelEmbedding, rows: int):
-        in_features = int(head.weight.shape[1])
+        packed = _is_packed_head(head)
+        in_features = (
+            head.packed_bf16_in_features if packed else int(head.weight.shape[1])
+        )
 
         def call(state):
             from b12x.preparation import PreparedCall
@@ -184,6 +220,25 @@ class LogitsProcessor(PluggableLayer):
                 ).reshape_as(source)
                 source.copy_((indices.remainder(53).sub_(26)).mul_(1 / 32))
 
+            if packed:
+                weight = head.quant_method.packed_weight(head)
+                return PreparedCall(
+                    run=lambda: state.run(
+                        source,
+                        weight.values,
+                        weight.exception_rows,
+                        weight.exception_entries,
+                        weight.row_offsets,
+                        weight.exponent_base,
+                    ),
+                    produce=produce,
+                    owners=(
+                        weight.values,
+                        weight.exception_rows,
+                        weight.exception_entries,
+                        weight.row_offsets,
+                    ),
+                )
             return PreparedCall(
                 run=lambda: state.run(source, head.weight),
                 produce=produce,
@@ -292,6 +347,23 @@ class LogitsProcessor(PluggableLayer):
     ) -> torch.Tensor:
         """Project hidden states through the lm_head, honoring head_dtype."""
         if self.head_dtype is None or self.head_dtype == hidden_states.dtype:
+            if (
+                _is_packed_head(lm_head)
+                and self.use_b12x_packed_vocab_projection
+                and embedding_bias is None
+            ):
+                # The packed head's bytes are its only copy of the weights.
+                flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+                plan = self._b12x_vocab_plan_for(lm_head, int(flat.shape[0]))
+                packed = self._b12x_packed_vocab_projection
+                assert packed is not None
+                binding = packed.bind(
+                    plan,
+                    source=flat,
+                    weight=lm_head.quant_method.packed_weight(lm_head),
+                )
+                logits = packed.run(binding)
+                return logits.reshape(*hidden_states.shape[:-1], -1)
             if (
                 self.use_b12x_vocab_projection
                 and embedding_bias is None

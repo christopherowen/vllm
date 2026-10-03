@@ -220,6 +220,7 @@ if TYPE_CHECKING:
     VLLM_MTP_NVFP4_LM_HEAD: bool = True
     VLLM_DS41_MARKOV_NVFP4: bool = False
     VLLM_DS41_DRAFT_NVFP4_HEAD: bool = False
+    VLLM_DS41_PACKED_BF16_LM_HEAD: bool = False
     VLLM_DS41_ATTENTION_COMPUTE: Literal["bf16", "reference", "auto"] = "bf16"
     VLLM_DS41_ENGRAM_OVERLAP: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
@@ -1873,6 +1874,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Give the DeepSeek V4.1 DSpark drafter its own NVFP4 vocabulary head.
     "VLLM_DS41_DRAFT_NVFP4_HEAD": lambda: bool(
         int(os.getenv("VLLM_DS41_DRAFT_NVFP4_HEAD", "0"))
+    ),
+    # Store the DeepSeek V4/V4.1 target vocabulary head (which the DSpark
+    # drafter shares when it has no head of its own) in B12X's exact 12-bit
+    # packed BF16 form: every weight bit is kept, in 75% of the bytes.
+    "VLLM_DS41_PACKED_BF16_LM_HEAD": lambda: bool(
+        int(os.getenv("VLLM_DS41_PACKED_BF16_LM_HEAD", "0"))
     ),
     # Arithmetic of the DeepSeek V4.1 b12x sparse attention. "bf16" computes
     # like DeepSeek's reference sparse_attn (BF16 Q, KV dequantized to BF16,
