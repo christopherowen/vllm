@@ -132,6 +132,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 and envs.VLLM_ENABLE_PCIE_ALLREDUCE
                 and envs.VLLM_PCIE_ALLREDUCE_BACKEND == "b12x"
             )
+            if envs.VLLM_ENABLE_ROCE_ALLREDUCE and not use_custom_allreduce:
+                raise ValueError(
+                    "RoCEnante was requested but custom all-reduce is disabled"
+                )
             use_roce_allreduce = (
                 use_custom_allreduce and envs.VLLM_ENABLE_ROCE_ALLREDUCE
             )
@@ -180,6 +184,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.aiter_ar_comm: AiterCustomAllreduce | None = None
         self.use_aiter_ag_rs: bool = False
         self.b12x_ar_comm = None
+        self._roce_policy = False
+
+        if self.use_b12x_allreduce and self.use_roce_allreduce:
+            raise ValueError("Select either PCIe or RoCEnante collectives, not both")
 
         if self.use_b12x_allreduce and self.world_size > 1:
             from .b12x_pcie_all_reduce import B12xPcieAllReduce
@@ -200,7 +208,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 device_group=self.device_group,
                 device=self.device,
                 global_ranks=self.ranks,
+                nccl_available=(
+                    self.pynccl_comm is not None and not self.pynccl_comm.disabled
+                ),
             )
+            self._roce_policy = not self.b12x_ar_comm.disabled
+            if self._roce_policy:
+                # Multi-node RoCE is an explicit two-backend policy. Do not
+                # allocate or consider unrelated single-node accelerators.
+                use_torch_symm_mem = self.use_torch_symm_mem = False
+                self.use_flashinfer_pcie_ipc_allreduce = False
+                self.use_aiter_allreduce = False
 
         if use_torch_symm_mem and current_platform.is_cuda():
             self.symm_mem_comm = SymmMemCommunicator(
@@ -354,6 +372,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
         chosen at dispatch time for this group; the actual per-call choice
         depends on the input tensor.
         """
+        if self._roce_policy:
+            logger.info_once(
+                "Collective policy for group '%s': B12X_ROCENANTE for eligible "
+                "all-reduce/all-gather; PYNCCL for other inputs, reduce-scatter "
+                "and variable collectives. No backend-error fallback.",
+                self.unique_name or "<unnamed>",
+                scope="global",
+            )
+            return
         all_potential_ar_backends = [
             "FLASHINFER_PCIE_IPC",
             "B12X_PCIE",
@@ -426,7 +453,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
             scope="global",
         )
 
+    def _require_roce_policy(self) -> None:
+        """A selected policy cannot silently become a different backend."""
+        if not self._roce_policy:
+            return
+        if self.b12x_ar_comm is None or self.b12x_ar_comm.disabled:
+            raise RuntimeError("RoCEnante policy lost its RoCE communicator")
+        if self.pynccl_comm is None or self.pynccl_comm.disabled:
+            raise RuntimeError("RoCEnante policy lost its PyNCCL communicator")
+
     def all_reduce(self, input_):
+        self._require_roce_policy()
         b12x_ar_comm = self.b12x_ar_comm
         if (
             b12x_ar_comm is not None
@@ -434,7 +471,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and b12x_ar_comm.should_custom_ar(input_)
         ):
             out = b12x_ar_comm.custom_all_reduce(input_)
-            assert out is not None
+            if out is None:
+                raise RuntimeError("Selected B12X all-reduce returned None")
+            return out
+
+        if self._roce_policy:
+            out = self.pynccl_comm.all_reduce(input_)
+            if out is None:
+                raise RuntimeError("RoCEnante policy: PyNCCL all-reduce returned None")
             return out
 
         fi_ar_comm = self.fi_ar_comm
@@ -535,6 +579,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         return ca_comm.custom_reduce_scatter(input_.contiguous())
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        self._require_roce_policy()
         # Route uniform dim-0 all-gathers through NVLS symmetric memory when
         # enabled (mirrors reduce_scatter); otherwise fall back to the
         # PyNccl/base-class all-gather. Sequence parallelism's
@@ -554,7 +599,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ):
             assert all_gather is not None
             return all_gather(input_, dim)
-        if dim == 0 and should_nccl_symm_mem_ag_rs():
+        if not self._roce_policy and dim == 0 and should_nccl_symm_mem_ag_rs():
             return self._all_gather_symm_mem(input_.contiguous())
 
         pynccl_comm = self.pynccl_comm
@@ -584,6 +629,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
+        self._require_roce_policy()
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
         assert pynccl_comm is not None
@@ -599,7 +645,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         chunk_size = input_tensor.shape[0] // world_size
         output_shape = (chunk_size,) + input_tensor.shape[1:]
 
-        if should_nccl_symm_mem_ag_rs():
+        if not self._roce_policy and should_nccl_symm_mem_ag_rs():
             output = self._reduce_scatter_symm_mem(input_tensor)
         else:
             output = torch.empty(
@@ -613,6 +659,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
     ):
+        self._require_roce_policy()
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
         assert pynccl_comm is not None
@@ -638,7 +685,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             chunk_size = input_tensor.shape[0] // world_size
         output_shape = (chunk_size,) + input_tensor.shape[1:]
 
-        if self._can_use_aiter_ag_rs(sizes):
+        if not self._roce_policy and self._can_use_aiter_ag_rs(sizes):
             aiter_comm = self.aiter_ar_comm
             assert aiter_comm is not None
             if aiter_comm.should_custom_rs(input_tensor, dim=0):
@@ -651,7 +698,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # Symmetric memory is only used when all ranks have uniform sizes.
         # ncclCommWindowRegister is collective: asymmetric pool allocations
         # from variable per-rank sizes cause deadlocks.
-        use_symm_mem = sizes is None and should_nccl_symm_mem_ag_rs()
+        use_symm_mem = (
+            not self._roce_policy and sizes is None and should_nccl_symm_mem_ag_rs()
+        )
         if use_symm_mem:
             output = self._reduce_scatter_symm_mem(input_tensor)
         else:
@@ -749,6 +798,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
     def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
         """Sends a tensor to the destination rank in a blocking way"""
         """NOTE: `dst` is the local rank of the destination rank."""
+        self._require_roce_policy()
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size
 
@@ -763,6 +813,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
     ) -> torch.Tensor:
         """Receives a tensor from the source rank."""
         """NOTE: `src` is the local rank of the source rank."""
+        self._require_roce_policy()
         if src is None:
             src = (self.rank_in_group - 1) % self.world_size
 
@@ -869,6 +920,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         dim: int = 0,
         sizes: list[int] | None = None,
     ):
+        self._require_roce_policy()
         if dim != 0:
             raise NotImplementedError("only dim 0 all-gatherv is supported")
         world_size = self.world_size
@@ -878,7 +930,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if sizes is not None and all(s == sizes[0] for s in sizes):
             sizes = None
 
-        if self._can_use_aiter_ag_rs(sizes):
+        if not self._roce_policy and self._can_use_aiter_ag_rs(sizes):
             aiter_comm = self.aiter_ar_comm
             assert aiter_comm is not None
             if isinstance(input_, torch.Tensor):
@@ -897,7 +949,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # Symmetric memory is only used when all ranks have uniform sizes.
         # ncclCommWindowRegister is collective: asymmetric pool allocations
         # from variable per-rank sizes cause deadlocks.
-        if sizes is None and should_nccl_symm_mem_ag_rs():
+        if not self._roce_policy and sizes is None and should_nccl_symm_mem_ag_rs():
             if isinstance(input_, torch.Tensor):
                 return self._all_gather_symm_mem(input_)
             return self._all_gather_batched_symm_mem(input_)

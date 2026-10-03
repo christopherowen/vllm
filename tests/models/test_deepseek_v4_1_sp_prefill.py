@@ -104,7 +104,7 @@ def test_resolve_min_rows_follows_the_one_shot_all_reduce(monkeypatch):
     # A 2 MiB RoCE all-reduce takes 204 rows of 5120 bf16; T = 205 pads to a
     # 207-row message at TP 3, the first one it refuses.
     monkeypatch.setattr(
-        sp_prefill, "_one_shot_all_reduce_max_bytes", lambda: 2 * 1024 * 1024
+        sp_prefill, "_prefill_sp_capacity_bytes", lambda: 2 * 1024 * 1024
     )
     assert sp_prefill.resolve_min_rows(_config()) == 205
     assert sp_prefill.resolve_min_rows(_config(tp=2)) == 205
@@ -114,7 +114,7 @@ def test_resolve_min_rows_follows_the_one_shot_all_reduce(monkeypatch):
 
 
 def test_resolve_min_rows(monkeypatch):
-    monkeypatch.setattr(sp_prefill, "_one_shot_all_reduce_max_bytes", lambda: 0)
+    monkeypatch.setattr(sp_prefill, "_prefill_sp_capacity_bytes", lambda: 0)
     # Without a one-shot all-reduce every reduce-scatter scatters: SP starts
     # above the decode sizes, graphs and max_num_seqs * (1 + k).
     assert sp_prefill.resolve_min_rows(_config()) == 49

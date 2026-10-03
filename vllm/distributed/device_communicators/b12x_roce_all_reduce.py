@@ -13,8 +13,9 @@ Contract with the runtime (``b12x.comm.roce.API_VERSION`` ==
 - Every rank parses the size limits and checks the API version before the
   vote; the parsed limits are exchanged and must be identical, and the
   runtime itself refuses ranks whose ABI, HCA count, slot geometry, spin
-  limit or launch geometry differ.  Any rank that cannot take part disables
-  the backend on every rank, at initialization only.
+  limit or launch geometry differ.  Any rank that cannot take part aborts
+  initialization on every rank. Explicit multi-node selection is required,
+  not a request to try other backends on failure.
 - Dispatch is rank-invariant: eligibility depends on dtype, shape, contiguity
   and size, never on pointer values, so all ranks route the same collective.
 - Failures are fail-stop, never a fallback: a wait that times out freezes the
@@ -65,6 +66,7 @@ class B12xRoceAllReduce:
         device: torch.device,
         *,
         global_ranks: Sequence[int] | None = None,
+        nccl_available: bool = True,
     ) -> None:
         self.disabled = True
         self.group = group
@@ -86,22 +88,22 @@ class B12xRoceAllReduce:
         self._plan = None
 
         if device_group is None:
-            logger.warning("RoCEnante requires a CUDA process group.")
-            return
+            raise RuntimeError("RoCEnante requires a CUDA process group.")
         if all(in_the_same_node_as(group, source_rank=0)):
             logger.info("RoCEnante skipped: group is single-node.")
             return
 
         # Vote before the collective constructor so a rank that cannot take
         # part (missing package, wrong API version, unsupported device, or an
-        # unparsable limit) disables the backend on every rank instead of
+        # unparsable limit) fails initialization on every rank instead of
         # leaving peers in the runtime's setup exchange.  The parsed limits
         # travel with the vote and must be identical everywhere.
         reason, limits = self._local_capability()
+        if not nccl_available:
+            reason = "RoCEnante policy requires an available PyNCCL communicator"
         verdict = self._exchange_vote(reason, limits)
         if verdict is not None:
-            logger.warning("RoCEnante disabled on every rank: %s", verdict)
-            return
+            raise RuntimeError(f"RoCEnante policy unavailable: {verdict}")
         max_size, max_gather = limits
 
         from b12x.comm import roce
@@ -117,18 +119,20 @@ class B12xRoceAllReduce:
                 max_gather_bytes=max_gather,
             )
         except Exception as exc:  # noqa: BLE001 - the runtime already coordinated ranks
-            logger.warning("RoCEnante initialization failed: %s", exc)
-            return
+            raise RuntimeError("RoCEnante policy initialization failed") from exc
         self.disabled = False
         register_b12x_unit_provider(self)
         if self.rank == 0:
             logger.info(
                 "Using RoCEnante (b12x one-shot RoCE collectives): world=%d, hcas=%s, "
-                "all-reduce max=%d bytes, all-gather shard max=%d bytes.",
+                "all-reduce dispatch <=%d bytes, registered all-reduce capacity=%d "
+                "bytes, all-gather input shard <=%d bytes. NCCL handles "
+                "ineligible inputs and reduce-scatter; backend failures are fatal.",
                 self.world_size,
                 ",".join(self._runtime.hca_names),
-                max_size,
-                max_gather,
+                self.all_reduce_max_bytes,
+                self.all_reduce_capacity_bytes,
+                self.all_gather_max_bytes,
             )
 
     def _local_capability(self) -> tuple[str | None, tuple[int, int] | None]:
@@ -267,7 +271,17 @@ class B12xRoceAllReduce:
     @property
     def all_reduce_max_bytes(self) -> int:
         """The largest message ``should_custom_ar`` accepts; 0 when disabled."""
+        return 0 if self.disabled else int(self._runtime.dispatch_max_bytes)
+
+    @property
+    def all_reduce_capacity_bytes(self) -> int:
+        """Registered/primed capacity, independent of the dispatch cutoff."""
         return 0 if self.disabled else int(self._runtime.max_size)
+
+    @property
+    def all_gather_max_bytes(self) -> int:
+        """Largest eligible input shard, not the gathered output size."""
+        return 0 if self.disabled else int(self._runtime.max_gather_bytes)
 
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
         return not self.disabled and self._runtime.should_allreduce(inp)
@@ -281,10 +295,11 @@ class B12xRoceAllReduce:
             log = logger.info if self.rank == 0 else logger.debug
             log(
                 "RoCEnante all-reduce is live: first routed all-reduce is %d bytes "
-                "(%s); NCCL remains the fallback above %s.",
+                "(%s); dispatch limit=%d bytes, registered capacity=%d bytes.",
                 inp.numel() * inp.element_size(),
                 str(inp.dtype).replace("torch.", ""),
-                envs.VLLM_ROCE_ALLREDUCE_MAX_SIZE,
+                self.all_reduce_max_bytes,
+                self.all_reduce_capacity_bytes,
             )
         return self._runtime.all_reduce(inp, plan=self._prepared_plan())
 
@@ -299,10 +314,11 @@ class B12xRoceAllReduce:
             log = logger.info if self.rank == 0 else logger.debug
             log(
                 "RoCEnante all-gather is live: first routed shard is %s %s "
-                "along dim %d.",
+                "along dim %d; input shard dispatch limit=%d bytes.",
                 tuple(inp.shape),
                 str(inp.dtype).replace("torch.", ""),
                 dim,
+                self.all_gather_max_bytes,
             )
         return self._runtime.all_gather(inp, dim=dim, plan=self._prepared_plan())
 

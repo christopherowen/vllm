@@ -19,9 +19,10 @@ when that trade can pay; there is no setting. It must be prompt processing:
 decode forwards (at most the largest CUDA graph capture size, and at most
 ``max_num_seqs * (1 + num_speculative_tokens)`` tokens) replay captured
 graphs and keep full rows. And its reduce-scatter must really scatter: a
-hidden-state message that the TP group's one-shot RoCE all-reduce accepts
-costs that all-reduce either way, and rows that few keep the row-wise
-kernels latency-bound, so SP there would only add the gathers.
+conservative hidden-state byte threshold comes from the TP group's
+registered one-shot RoCE capacity. This preserves the qualified SP boundary
+when transport dispatch is tuned independently below that capacity. It is
+a performance policy, not a claim that every smaller message uses RoCE.
 ``DeepseekV4Model.forward`` decides per forward from the token count T,
 which every rank shares, so no agreement between ranks is needed. SP is off
 only where it cannot apply: tensor parallel size 1, pipeline parallelism,
@@ -82,12 +83,12 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
-def _one_shot_all_reduce_max_bytes() -> int:
-    """The largest message the TP group's RoCE all-reduce takes; 0 if none."""
+def _prefill_sp_capacity_bytes() -> int:
+    """Registered RoCE capacity used as the conservative SP floor; 0 if none."""
     if not model_parallel_is_initialized():
         return 0
     comm = getattr(get_tp_group().device_communicator, "b12x_ar_comm", None)
-    return int(getattr(comm, "all_reduce_max_bytes", 0)) if comm is not None else 0
+    return int(getattr(comm, "all_reduce_capacity_bytes", 0)) if comm is not None else 0
 
 
 def rows_above_bytes(limit: int, row_bytes: int, world_size: int) -> int:
@@ -101,8 +102,8 @@ def resolve_min_rows(vllm_config, *, static_sequence_parallel: bool = False) -> 
 
     The larger of: one token more than any decode forward (the largest CUDA
     graph capture size, ``max_num_seqs * (1 + num_speculative_tokens)``), and
-    the fewest tokens whose padded hidden-state message the one-shot RoCE
-    all-reduce refuses, so that the reduce-scatter really scatters.
+    the fewest tokens whose padded hidden-state message exceeds the
+    registered RoCE capacity. Dispatch tuning must not also retune SP.
     """
     parallel = vllm_config.parallel_config
     reason = None
@@ -125,13 +126,18 @@ def resolve_min_rows(vllm_config, *, static_sequence_parallel: bool = False) -> 
         parallel.tensor_parallel_size,
     )
     rows = decode_rows + 1
-    limit = _one_shot_all_reduce_max_bytes()
+    limit = _prefill_sp_capacity_bytes()
     if limit > 0:
         model = vllm_config.model_config
         row_bytes = model.get_hidden_size() * model.dtype.itemsize
         tp = parallel.tensor_parallel_size
         rows = max(rows, rows_above_bytes(limit, row_bytes, tp))
-    logger.info("DeepSeek V4.1 prefill sequence parallelism from %d tokens", rows)
+    logger.info(
+        "DeepSeek V4.1 prefill sequence parallelism from %d tokens "
+        "(capacity floor=%d bytes; independent of all-reduce dispatch)",
+        rows,
+        limit,
+    )
     return rows
 
 
