@@ -217,7 +217,7 @@ class _Layer(nn.Module):
         super().__init__()
         self.engram = None
         self.hc_mult = 4
-        self._b12x_mhc = _Mix()
+        self.mhc = _Mix()
         self.attn = _Attention(index, shared, rows)
         self.ffn = _Experts(index, rows)
         for name in (

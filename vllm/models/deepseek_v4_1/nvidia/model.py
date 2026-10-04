@@ -65,7 +65,6 @@ from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 from .. import kernels, l2_prefetch, sp_prefill
 from ..attention import DeepseekV4Attention
-from ..b12x_layers import B12xMHC
 from ..ced import ced_decoder_start, gather_rows, scatter_rows
 from ..common.engram import Engram, EngramLayout, NgramHashState
 from .b12x_attention import DeepseekV41B12xAttention
@@ -173,7 +172,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_eps = config.hc_eps
         self.hc_post_alpha = 2.0
-        self._b12x_mhc = B12xMHC(config)
+        self.mhc = kernels.mhc(config)
         mix_hc = (2 + self.hc_mult) * self.hc_mult
         hc_dim = self.hc_mult * self.hidden_size
         self.hc_attn_fn = nn.Parameter(
@@ -287,7 +286,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             residual = x
         elif apply_engram:
             # Engram mutates the reconstructed residual; do not fuse across it.
-            residual = self._b12x_mhc.post(x, residual, post_mix, res_mix)
+            residual = self.mhc.post(x, residual, post_mix, res_mix)
             previous_output = None
         if apply_engram:
             if residual.ndim == 2:
@@ -301,7 +300,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 sp_rows=sp_rows,
             )
         fn = self.hc_attn_fn_broadcast if residual.ndim == 2 else self.hc_attn_fn
-        residual, post_mix, res_mix, x, attn_pre = self._b12x_mhc.pre(
+        residual, post_mix, res_mix, x, attn_pre = self.mhc.pre(
             residual,
             fn,
             self.hc_attn_scale,
@@ -331,7 +330,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             # SP: attention gathers every row and reduce-scatters its output.
             with sp_prefill.activate(sp_rows):
                 x = self.attn(positions, x, None, global_kv_ready=global_kv_ready)
-        residual, post_mix, res_mix, x, ffn_pre = self._b12x_mhc.post_pre(
+        residual, post_mix, res_mix, x, ffn_pre = self.mhc.post_pre(
             x,
             residual,
             post_mix,
@@ -805,10 +804,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 decoder_compacted = True
             if idx + 1 in self.aux_hidden_state_layers:
                 # Reconstruct the aux hidden state for draft models
-                aux_recon = layer._b12x_mhc.post(
-                    hidden_states, residual, post_mix, res_mix
-                )
-                aux_hidden_state = layer._b12x_mhc.collapse(aux_recon)
+                aux_recon = layer.mhc.post(hidden_states, residual, post_mix, res_mix)
+                aux_hidden_state = layer.mhc.collapse(aux_recon)
                 if self.use_sequence_parallel:
                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
                 elif sp is not None:
@@ -825,7 +822,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if self.end_layer in self.aux_hidden_state_layers:
                 hidden_states = final_aux_recon
             else:
-                hidden_states = layer._b12x_mhc.post(
+                hidden_states = layer.mhc.post(
                     hidden_states, residual, post_mix, res_mix
                 )
 
@@ -860,7 +857,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # Collapse the hc copies with the pre-mix from the last layer's FFN
         # mixes — the mix the reference applies via
         # ``last_layer.hc_pre(h, pre_mix)`` (v4.1 has no learned hc_head).
-        hidden_states = layer._b12x_mhc.collapse(hidden_states, pre_mix)
+        hidden_states = layer.mhc.collapse(hidden_states, pre_mix)
         hidden_states = self.norm(hidden_states)
         if self.use_sequence_parallel and self._mtp_hidden_buffer is None:
             # Without MTP, gather only the collapsed and normalized hidden states.
@@ -1113,10 +1110,11 @@ class DeepseekV41LLMForCausalLM(UpstreamDeepseekV41LLMForCausalLM):
         self.model.finalize_mhc_broadcast_weights()
         for module in self.modules():
             if isinstance(module, DeepseekV4DecoderLayer):
-                set_b12x_preparation_provider(module, module._b12x_mhc)
                 name = b12x_layer_prefix(module)
                 register_b12x_layer(name, module)
-                module._b12x_mhc.bind_layer_name(name)
+                if not kernels.uses_tilelang():
+                    set_b12x_preparation_provider(module, module.mhc)
+                    module.mhc.bind_layer_name(name)
             if isinstance(module, DeepseekV4Attention):
                 module.setup_wo_projection()
             if isinstance(module, Engram):

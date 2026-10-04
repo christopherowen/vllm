@@ -527,7 +527,7 @@ def _mhc_pre(
     previous_post: torch.Tensor | None = None,
     previous_comb: torch.Tensor | None = None,
 ) -> None:
-    mhc_module = b12x_layer(_resolve_layer_name(layer_name))._b12x_mhc
+    mhc_module = b12x_layer(_resolve_layer_name(layer_name)).mhc
     operation = "pre" if previous_output is None else "post_pre"
     plan = mhc_module._plan_for(operation, int(residual.shape[0]))
     scratch = current_workspace_manager().get_simultaneous(
@@ -614,7 +614,7 @@ def _mhc_post(
     out: torch.Tensor,
     layer_name: LayerNameType,
 ) -> None:
-    mhc_module = b12x_layer(_resolve_layer_name(layer_name))._b12x_mhc
+    mhc_module = b12x_layer(_resolve_layer_name(layer_name)).mhc
     plan = mhc_module._plan_for("post", int(residual.shape[0]))
     mhc.run_post(x, residual, post, comb, plan=plan, out=out)
 

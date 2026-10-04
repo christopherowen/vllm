@@ -60,6 +60,17 @@ def moe_router_class():
     return None
 
 
+def mhc(config) -> nn.Module:
+    """A decoder layer's lagged mHC: pre, post_pre, post and collapse."""
+    if uses_tilelang():
+        from .tilelang.mhc import TileKernelsMHC
+
+        return TileKernelsMHC(config)
+    from .b12x_layers import B12xMHC
+
+    return B12xMHC(config)
+
+
 def rms_norm(hidden_size: int, eps: float = 1e-6) -> nn.Module:
     if uses_tilelang():
         from .tilelang.norm import TileLangRMSNorm

@@ -493,7 +493,7 @@ class DSparkDeepseekV4Model(nn.Module):
                 residual,
             )
         l2_prefetch.join()
-        hidden_states = layer._b12x_mhc.post(hidden_states, residual, post_mix, res_mix)
+        hidden_states = layer.mhc.post(hidden_states, residual, post_mix, res_mix)
         if self.use_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
             pre_mix = sp_all_gather(pre_mix)[:full_num_tokens]
@@ -502,7 +502,7 @@ class DSparkDeepseekV4Model(nn.Module):
         # last block's ffn pre-mix). Return the PRE-norm head hidden;
         # compute_logits applies self.norm.
         assert pre_mix is not None
-        hidden_states = layer._b12x_mhc.collapse(hidden_states, pre_mix)
+        hidden_states = layer.mhc.collapse(hidden_states, pre_mix)
         return hidden_states
 
 
@@ -837,12 +837,13 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         else:
             first_layer.hc_attn_fn_broadcast.copy_(broadcast)
         for layer in self.model.layers:
-            mhc = getattr(layer, "_b12x_mhc", None)
+            mhc = getattr(layer, "mhc", None)
             if mhc is not None:
-                set_b12x_preparation_provider(layer, mhc)
                 name = b12x_layer_prefix(layer)
                 register_b12x_layer(name, layer)
-                mhc.bind_layer_name(name)
+                if not kernels.uses_tilelang():
+                    set_b12x_preparation_provider(layer, mhc)
+                    mhc.bind_layer_name(name)
 
     def _remap_dspark_name(self, name: str) -> str | None:
         """Map a checkpoint ``mtp.{i}.*`` name to this model's parameter path.
