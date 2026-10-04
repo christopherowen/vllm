@@ -21,8 +21,10 @@ that reading them once matters. Two TileLang kernels make each entry:
   (writing the updated streams), the projection's split partials on TF32
   tensor cores (DeepGEMM's precision) with the streams' sum of squares, and
   the streams collapsed with the incoming pre-mix in BF16, with its sum of
-  squares. The split is fixed and every row tile accumulates in the same
-  order, so a token's results do not depend on the batch.
+  squares. Each thread folds and accumulates one token's columns in
+  registers; the GEMM reads the folded streams from shared memory. The split
+  is fixed and every token tile accumulates in the same order, so a token's
+  results do not depend on the batch.
 - ``finalize``: per token, TileKernels' fused reduce, RMS, mix split and
   Sinkhorn (``mhc_pre_big_fuse``), emitting the new pre-mix, beside the
   collapse's RMSNorm with the sublayer's weight.
@@ -58,7 +60,6 @@ def project_streams(
     mode: str,
     block_M: int = 16,
     block_H: int = BLOCK_H,
-    threads: int = 128,
 ):
     """The streams' projection partials and their collapse, for one hidden block.
 
@@ -68,15 +69,22 @@ def project_streams(
     four copies (the first layer, whose ``fn`` is the stream blocks summed).
 
     Each CTA owns ``block_H`` hidden columns of every stream, a K split of the
-    projection: it accumulates ``P = streams @ fn^T`` on TF32 tensor cores
-    (DeepGEMM's precision) with the streams' sum of squares ``S``, and the
-    streams collapsed with the incoming pre-mix, rounded to BF16, with that
-    collapse's sum of squares ``Q``.
+    projection, for ``block_M`` tokens. Each thread owns one token's
+    ``block_H / 8`` contiguous columns: it loads them for every stream into
+    registers, folds the previous output in, writes the updated streams, and
+    keeps its share of the streams' sum of squares ``S`` and of the collapse
+    with the incoming pre-mix. The projection ``P = streams @ fn^T`` runs on
+    TF32 tensor cores (DeepGEMM's precision), one stream at a time. The
+    collapse is rounded to BF16, with its sum of squares ``Q``.
     """
     assert hidden_size % block_H == 0 and mode in ("pre", "post_pre", "broadcast")
     splits = hidden_size // block_H
-    K = hidden_size if mode == "broadcast" else MULT * hidden_size
+    streams = 1 if mode == "broadcast" else MULT
+    K = streams * hidden_size
     N = 32  # the 24 mixes, padded
+    LANES = 8  # threads per token: adjacent lanes of one warp
+    COLS = block_H // LANES  # contiguous columns per thread
+    threads = block_M * LANES
     H = hidden_size
     M = T.dynamic("M")
 
@@ -96,99 +104,112 @@ def project_streams(
     ):
         with T.Kernel(splits, T.ceildiv(M, block_M), threads=threads) as (sp, by):
             h0 = sp * block_H
-            X_shared = T.alloc_shared((block_M, block_H), T.bfloat16)
-            R_shared = T.alloc_shared((MULT * block_M, block_H), T.bfloat16)
-            R_new = T.alloc_shared((block_M, block_H), T.bfloat16)
             A_shared = T.alloc_shared((block_M, block_H), T.float32)
             F_shared = T.alloc_shared((N, block_H), T.float32)
-            post_shared = T.alloc_shared((block_M, MULT), T.float32)
-            comb_shared = T.alloc_shared((block_M, MULT * MULT), T.float32)
-            pre_shared = T.alloc_shared((block_M, MULT), T.float32)
             C_local = T.alloc_fragment((block_M, N), T.float32)
-            values = T.alloc_fragment((block_M, block_H), T.float32)
-            squares = T.alloc_fragment((block_M, block_H), T.float32)
-            collapsed = T.alloc_fragment((block_M, block_H), T.float32)
-            row_sum = T.alloc_fragment((block_M,), T.float32)
+            xv = T.alloc_local((COLS,), T.bfloat16)
+            rv = T.alloc_local((MULT * COLS,), T.bfloat16)
+            nv = T.alloc_local((COLS,), T.bfloat16)
+            av = T.alloc_local((COLS,), T.float32)
+            sq = T.alloc_local((COLS,), T.float32)
+            col = T.alloc_local((COLS,), T.float32)
+            coef = T.alloc_local((2 * MULT + MULT * MULT,), T.float32)
+            red = T.alloc_local((1,), T.float32)
+            tx = T.get_thread_binding()
+            row = tx // LANES
+            c0 = (tx % LANES) * COLS
+            token = by * block_M + row
+            src = T.min(token, M - 1)
             T.clear(C_local)
-            T.clear(squares)
-            T.clear(collapsed)
             # The padding mixes stay zero; each stream's copy fills the rest.
             for i, j in T.Parallel(N - MIXES, block_H):
                 F_shared[MIXES + i, j] = 0.0
-            for i, n in T.Parallel(block_M, MULT):
-                pre_shared[i, n] = pre_in[T.min(by * block_M + i, M - 1), n]
+            # This thread's token: its mixes, then its columns of x and the streams.
+            for k in T.unroll(MULT):
+                coef[k] = pre_in[src, k]
             if mode == "post_pre":
-                for i, n in T.Parallel(block_M, MULT):
-                    post_shared[i, n] = post[T.min(by * block_M + i, M - 1), n]
-                for i, k in T.Parallel(block_M, MULT * MULT):
-                    comb_shared[i, k] = comb[
-                        T.min(by * block_M + i, M - 1), k // MULT, k % MULT
-                    ]
+                for k in T.unroll(MULT):
+                    coef[MULT + k] = post[src, k]
+                for k in T.unroll(MULT * MULT):
+                    coef[2 * MULT + k] = comb[src, k // MULT, k % MULT]
             if mode != "pre":
-                T.copy(X[by * block_M, h0], X_shared)
+                for v in T.vectorized(COLS):
+                    xv[v] = X[src, h0 + c0 + v]
             if mode != "broadcast":
-                for m in T.serial(MULT):
-                    T.copy(
-                        R[by * block_M, m * H + h0],
-                        R_shared[m * block_M : (m + 1) * block_M, :],
-                    )
+                for m in T.unroll(MULT):
+                    for v in T.vectorized(COLS):
+                        rv[m * COLS + v] = R[src, m * H + h0 + c0 + v]
+            for v in T.unroll(COLS):
+                sq[v] = 0.0
+                col[v] = 0.0
 
             if mode == "broadcast":
-                # Four copies of the embedding; ``fn`` already sums the blocks.
+                # Four copies of the embedding; fn already sums the blocks.
+                for v in T.unroll(COLS):
+                    av[v] = T.Cast(T.float32, xv[v])
+                    A_shared[row, c0 + v] = av[v]
+                    sq[v] = av[v] * av[v]
+                for n in T.unroll(MULT):
+                    if token < M:
+                        for v in T.vectorized(COLS):
+                            R_out[token, n * H + h0 + c0 + v] = xv[v]
+                    for v in T.unroll(COLS):
+                        col[v] += coef[n] * av[v]
                 T.copy(Fn[0:MIXES, h0 : h0 + block_H], F_shared[0:MIXES, :])
-                for i, j in T.Parallel(block_M, block_H):
-                    A_shared[i, j] = T.Cast(T.float32, X_shared[i, j])
-                    squares[i, j] = A_shared[i, j] * A_shared[i, j]
+                T.sync_threads()
                 T.gemm(A_shared, F_shared, C_local, transpose_B=True)
-                for n in T.serial(MULT):
-                    T.copy(X_shared, R_out[by * block_M, n * H + h0])
-                    for i, j in T.Parallel(block_M, block_H):
-                        collapsed[i, j] += pre_shared[i, n] * A_shared[i, j]
             else:
-                for n in T.serial(MULT):
+                for n in T.unroll(MULT):
+                    if mode == "post_pre":
+                        # post[n] * x + sum_m comb[m, n] * streams[m], in FP32.
+                        for v in T.unroll(COLS):
+                            av[v] = coef[MULT + n] * T.Cast(T.float32, xv[v])
+                            for m in T.unroll(MULT):
+                                av[v] += coef[2 * MULT + m * MULT + n] * T.Cast(
+                                    T.float32, rv[m * COLS + v]
+                                )
+                            nv[v] = T.Cast(T.bfloat16, av[v])
+                        if token < M:
+                            for v in T.vectorized(COLS):
+                                R_out[token, n * H + h0 + c0 + v] = nv[v]
+                    else:
+                        for v in T.unroll(COLS):
+                            nv[v] = rv[n * COLS + v]
+                    for v in T.unroll(COLS):
+                        av[v] = T.Cast(T.float32, nv[v])
+                        A_shared[row, c0 + v] = av[v]
+                        sq[v] += av[v] * av[v]
+                        col[v] += coef[n] * av[v]
                     T.copy(
                         Fn[0:MIXES, n * H + h0 : n * H + h0 + block_H],
                         F_shared[0:MIXES, :],
                     )
-                    if mode == "post_pre":
-                        # post[n] * x + sum_m comb[m, n] * streams[m], in FP32.
-                        for i, j in T.Parallel(block_M, block_H):
-                            values[i, j] = post_shared[i, n] * T.Cast(
-                                T.float32, X_shared[i, j]
-                            )
-                            for m in T.serial(MULT):
-                                values[i, j] += comb_shared[i, m * MULT + n] * T.Cast(
-                                    T.float32, R_shared[m * block_M + i, j]
-                                )
-                            R_new[i, j] = T.Cast(T.bfloat16, values[i, j])
-                        T.copy(R_new, R_out[by * block_M, n * H + h0])
-                        for i, j in T.Parallel(block_M, block_H):
-                            A_shared[i, j] = T.Cast(T.float32, R_new[i, j])
-                    else:
-                        for i, j in T.Parallel(block_M, block_H):
-                            A_shared[i, j] = T.Cast(
-                                T.float32, R_shared[n * block_M + i, j]
-                            )
-                    for i, j in T.Parallel(block_M, block_H):
-                        squares[i, j] += A_shared[i, j] * A_shared[i, j]
-                        collapsed[i, j] += pre_shared[i, n] * A_shared[i, j]
+                    T.sync_threads()
                     T.gemm(A_shared, F_shared, C_local, transpose_B=True)
+                    T.sync_threads()
 
-            # The collapse in BF16, then the partial sums.
-            for i, j in T.Parallel(block_M, block_H):
-                R_new[i, j] = T.Cast(T.bfloat16, collapsed[i, j])
-            T.copy(R_new, C[by * block_M, h0])
-            for i, j in T.Parallel(block_M, block_H):
-                values[i, j] = T.Cast(T.float32, R_new[i, j])
-                values[i, j] = values[i, j] * values[i, j]
-            T.reduce_sum(values, row_sum, dim=1)
-            for i in T.Parallel(block_M):
-                if by * block_M + i < M:
-                    Q[sp, by * block_M + i] = row_sum[i]
-            T.reduce_sum(squares, row_sum, dim=1)
-            for i in T.Parallel(block_M):
-                if by * block_M + i < M:
-                    S[sp, by * block_M + i, 0] = row_sum[i]
+            # The collapse in BF16 and its sum of squares, then the streams'.
+            for v in T.unroll(COLS):
+                nv[v] = T.Cast(T.bfloat16, col[v])
+            if token < M:
+                for v in T.vectorized(COLS):
+                    C[token, h0 + c0 + v] = nv[v]
+            red[0] = 0.0
+            for v in T.unroll(COLS):
+                red[0] += T.Cast(T.float32, nv[v]) * T.Cast(T.float32, nv[v])
+            red[0] += T.shfl_xor(red[0], 4)
+            red[0] += T.shfl_xor(red[0], 2)
+            red[0] += T.shfl_xor(red[0], 1)
+            if tx % LANES == 0 and token < M:
+                Q[sp, token] = red[0]
+            red[0] = 0.0
+            for v in T.unroll(COLS):
+                red[0] += sq[v]
+            red[0] += T.shfl_xor(red[0], 4)
+            red[0] += T.shfl_xor(red[0], 2)
+            red[0] += T.shfl_xor(red[0], 1)
+            if tx % LANES == 0 and token < M:
+                S[sp, token, 0] = red[0]
             for i, j in T.Parallel(block_M, MIXES):
                 if by * block_M + i < M:
                     P[sp, by * block_M + i, 0, j] = C_local[i, j]
