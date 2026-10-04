@@ -63,6 +63,20 @@ def _activation_specs(rows: int, k: int):
     )
 
 
+# Row tiles of the split-K partials kernel. A 64-row tile computes one decode
+# row in twice the time of a 16-row tile; every height gives the same
+# partials bit for bit, so each row count takes the smallest tile that fits.
+PARTIAL_ROW_TILES = (16, 32, 64)
+
+
+def partials_kernel(layer: nn.Module, rows: int):
+    """The layer's split-K partials kernel with the smallest row tile for ``rows``."""
+    for block_M in PARTIAL_ROW_TILES:
+        if rows <= block_M:
+            return layer.tilelang_partials[block_M]
+    return layer.tilelang_partials[PARTIAL_ROW_TILES[-1]]
+
+
 def _partial_specs(layer: nn.Module, rows: int):
     """FP32 split-K partials of a BF16 projection's decode rows, if it splits."""
     shards = layer.tilelang_shards
@@ -151,7 +165,7 @@ def _bf16_linear(
     specs = _partial_specs(layer, rows)
     if specs:
         (partials,) = _scratch(specs, scratch)
-        layer.tilelang_partials(x, layer.weight, partials)
+        partials_kernel(layer, rows)(x, layer.weight, partials)
         layer.tilelang_reduce(partials, out)
     else:
         layer.tilelang_gemm(x, layer.weight, out)
@@ -205,7 +219,10 @@ class TileLangLinearMethod(UnquantizedLinearMethod):
         shards = layer.tilelang_shards = bf16_shards(n, k)
         layer.tilelang_gemm = bf16_gemm(n, k, out_dtype=out_dtype, shards=shards)
         if shards > 1:
-            layer.tilelang_partials = bf16_gemm_partials(n, k, shards)
+            layer.tilelang_partials = {
+                block_M: bf16_gemm_partials(n, k, shards, block_M=block_M)
+                for block_M in PARTIAL_ROW_TILES
+            }
             layer.tilelang_reduce = splitk_reduce(n, shards, out_dtype=out_dtype)
         layer.tilelang_key = id(layer)
         _LAYERS[layer.tilelang_key] = layer

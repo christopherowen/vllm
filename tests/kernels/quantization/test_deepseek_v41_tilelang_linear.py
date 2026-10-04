@@ -110,18 +110,30 @@ def test_bf16_gemm(n, k, out_dtype):
         full.float(), ref, rtol=1e-2, atol=1e-2 * ref.abs().max().item()
     )
     if shards > 1:
-        partials = bf16_gemm_partials(n, k, shards)
+        from vllm.models.deepseek_v4_1.tilelang.linear import PARTIAL_ROW_TILES
+
+        partials = {
+            block_M: bf16_gemm_partials(n, k, shards, block_M=block_M)
+            for block_M in PARTIAL_ROW_TILES
+        }
         reduce = splitk_reduce(n, shards, out_dtype=tl_dtype)
     for rows in ROWS:
         out = torch.empty((rows, n), dtype=out_dtype, device=DEVICE)
         if shards > 1 and rows <= DECODE_ROWS:
-            # Decode rows: split-K partials, reduced in shard order.
+            # Decode rows: split-K partials, reduced in shard order. Every row
+            # tile height gives the full batch's result bit for bit.
             p = torch.empty((shards, rows, n), dtype=torch.float32, device=DEVICE)
-            partials(x[:rows], weight, p)
-            reduce(p, out)
+            for block_M, kernel in partials.items():
+                kernel(x[:rows], weight, p)
+                reduce(p, out)
+                assert torch.equal(out, full[:rows]), (
+                    f"rows={rows} with {block_M}-row tiles differs from the full batch"
+                )
         else:
             gemm(x[:rows], weight, out)
-        assert torch.equal(out, full[:rows]), f"rows={rows} differs from the full batch"
+            assert torch.equal(out, full[:rows]), (
+                f"rows={rows} differs from the full batch"
+            )
 
 
 @pytest.mark.parametrize("hidden", [128, 512, 4096])
