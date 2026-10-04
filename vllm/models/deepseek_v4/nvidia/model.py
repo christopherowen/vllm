@@ -1015,9 +1015,15 @@ class DeepseekV4MoE(nn.Module):
         self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
 
         router = None
+        runner_gate = self.gate
         if self.router_cls is not None:
             if parallel_config.enable_eplb:
                 raise ValueError(f"{self.router_cls.__name__} does not support EPLB")
+            extra = {}
+            if getattr(self.router_cls, "routes_hidden_states", False):
+                # The router runs the gate itself; the runner passes it the
+                # hidden states in place of logits.
+                extra["gate"], runner_gate = self.gate, None
             router = self.router_cls(
                 top_k=self.n_activated_experts,
                 global_num_experts=self.n_routed_experts,
@@ -1029,10 +1035,11 @@ class DeepseekV4MoE(nn.Module):
                 bias_vl=getattr(self.gate, "bias_vl", None),
                 image_sentinel_lo=self.image_sentinel_lo,
                 image_sentinel_count=self.image_sentinel_count,
+                **extra,
             )
         self.experts = FusedMoEFactory(
             shared_experts=self.shared_experts,
-            gate=self.gate,
+            gate=runner_gate,
             router=router,
             num_experts=self.n_routed_experts,
             top_k=self.n_activated_experts,

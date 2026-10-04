@@ -54,9 +54,9 @@ def embedding_method():
 def moe_router_class():
     """Router class for the MoE layers; None keeps vLLM's for the config."""
     if uses_tilelang():
-        from .tilelang.router import TileKernelsRouter
+        from .tilelang.router import TileLangGateRouter
 
-        return TileKernelsRouter
+        return TileLangGateRouter
     return None
 
 

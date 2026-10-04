@@ -128,3 +128,95 @@ def test_matches_the_triton_router_it_replaces():
     triton_weights, triton_ids = dsv4_topk(logits, bias, torch.int64, SCALE)
     torch.testing.assert_close(ids, triton_ids, rtol=0, atol=0)
     torch.testing.assert_close(weights, triton_weights, rtol=1e-5, atol=0)
+
+
+class _Gate(torch.nn.Module):
+    """A V4.1 router gate on the TileLang BF16 projection, FP32 out."""
+
+    def __init__(self, experts, hidden=5120, seed=0):
+        from vllm.models.deepseek_v4_1.tilelang.linear import TileLangLinearMethod
+
+        super().__init__()
+        generator = torch.Generator(device="cuda").manual_seed(seed)
+        weight = torch.randn(experts, hidden, device="cuda", generator=generator) * 0.02
+        self.weight = torch.nn.Parameter(weight.to(torch.bfloat16), requires_grad=False)
+        self.out_dtype = torch.float32
+        self.quant_method = TileLangLinearMethod()
+        self.quant_method.process_weights_after_loading(self)
+
+    def forward(self, x):
+        return self.quant_method.apply(self, x), None
+
+
+@pytest.fixture
+def plain_scratch(monkeypatch):
+    from vllm.models.deepseek_v4_1.tilelang import linear
+
+    monkeypatch.setattr(
+        linear,
+        "_scratch",
+        lambda specs, scratch: [
+            torch.empty(s, dtype=d, device="cuda") for s, d in specs
+        ],
+    )
+
+
+@pytest.mark.parametrize("experts,topk", [(384, 6), (128, 3)])
+@pytest.mark.parametrize("rows", [1, 6, 17, 64, 65, 512])
+def test_gate_router_matches_the_gate_then_the_router(
+    plain_scratch, experts, topk, rows
+):
+    """Decode rows fuse the gate's split-K reduction into the router, bit for bit."""
+    gate = _Gate(experts, seed=experts)
+    assert gate.tilelang_shards > 1
+    generator = torch.Generator(device="cuda").manual_seed(rows)
+    x = torch.randn(rows, 5120, device="cuda", generator=generator).to(torch.bfloat16)
+    bias = torch.randn(experts, device="cuda", generator=generator) * 0.1
+    kwargs = dict(
+        top_k=topk,
+        global_num_experts=experts,
+        e_score_correction_bias=bias,
+        renormalize=True,
+        routed_scaling_factor=SCALE,
+        scoring_func="sqrtsoftplus",
+    )
+    fused = tilelang_router.TileLangGateRouter(gate=gate, **kwargs)
+    weights, ids = fused._compute_routing(None, x, None)
+    logits, _ = gate(x)
+    expected = tilelang_router.TileKernelsRouter(**kwargs)._compute_routing(
+        None, logits, None
+    )
+    assert torch.equal(ids, expected[1])
+    assert torch.equal(weights.view(torch.int32), expected[0].view(torch.int32))
+
+
+def test_gate_router_routes_image_tokens(plain_scratch):
+    gate = _Gate(384, seed=3)
+    generator = torch.Generator(device="cuda").manual_seed(5)
+    x = torch.randn(48, 5120, device="cuda", generator=generator).to(torch.bfloat16)
+    bias = torch.randn(384, device="cuda", generator=generator) * 0.1
+    bias_vl = torch.nn.Parameter(
+        torch.randn(384, device="cuda", generator=generator) * 0.1, requires_grad=False
+    )
+    input_ids = torch.randint(0, 1000, (48,), device="cuda", generator=generator)
+    input_ids[1::4] = LO
+    kwargs = dict(
+        top_k=6,
+        global_num_experts=384,
+        e_score_correction_bias=bias,
+        renormalize=True,
+        routed_scaling_factor=SCALE,
+        scoring_func="sqrtsoftplus",
+        bias_vl=bias_vl,
+        image_sentinel_lo=LO,
+        image_sentinel_count=1,
+    )
+    weights, ids = tilelang_router.TileLangGateRouter(
+        gate=gate, **kwargs
+    )._compute_routing(None, x, None, input_ids=input_ids)
+    logits, _ = gate(x)
+    expected = tilelang_router.TileKernelsRouter(**kwargs)._compute_routing(
+        None, logits, None, input_ids=input_ids
+    )
+    assert torch.equal(ids, expected[1])
+    assert torch.equal(weights.view(torch.int32), expected[0].view(torch.int32))
