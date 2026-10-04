@@ -220,3 +220,56 @@ def test_gate_router_routes_image_tokens(plain_scratch):
     )
     assert torch.equal(ids, expected[1])
     assert torch.equal(weights.view(torch.int32), expected[0].view(torch.int32))
+
+
+@pytest.fixture
+def padded_step(monkeypatch):
+    """A forward step whose last rows pad a CUDA graph's batch."""
+    context = type("Context", (), {})()
+    monkeypatch.setattr(tilelang_router, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(tilelang_router, "get_forward_context", lambda: context)
+
+    def pad(rows, padding):
+        context.is_padding = torch.zeros(rows, dtype=torch.bool, device="cuda")
+        context.is_padding[rows - padding :] = True
+        return context.is_padding
+
+    return pad
+
+
+@pytest.mark.parametrize("gate_router", [False, True])
+def test_padding_rows_are_not_routed(plain_scratch, padded_step, gate_router):
+    rows, padding = 6, 2
+    is_padding = padded_step(rows, padding)
+    generator = torch.Generator(device="cuda").manual_seed(13)
+    x = torch.randn(rows, 5120, device="cuda", generator=generator).to(torch.bfloat16)
+    bias = torch.randn(384, device="cuda", generator=generator) * 0.1
+    gate = _Gate(384, seed=13)
+    kwargs = dict(
+        top_k=6,
+        global_num_experts=384,
+        e_score_correction_bias=bias,
+        renormalize=True,
+        routed_scaling_factor=SCALE,
+        scoring_func="sqrtsoftplus",
+    )
+    logits, _ = gate(x)
+    if gate_router:
+        router = tilelang_router.TileLangGateRouter(gate=gate, **kwargs)
+        weights, ids = router._compute_routing(None, x, None)
+    else:
+        weights, ids = tilelang_router.TileKernelsRouter(**kwargs)._compute_routing(
+            None, logits, None
+        )
+    assert (ids[is_padding] == -1).all() and (weights[is_padding] == 0).all()
+    expected_weights, expected_ids = _reference(logits[~is_padding], bias, 6)
+    torch.testing.assert_close(ids[~is_padding], expected_ids, rtol=0, atol=0)
+    torch.testing.assert_close(
+        weights[~is_padding], expected_weights, rtol=2e-6, atol=0
+    )
+    if gate_router:
+        unfused = tilelang_router.TileKernelsRouter(**kwargs)._compute_routing(
+            None, logits, None
+        )
+        assert torch.equal(ids, unfused[1])
+        assert torch.equal(weights.view(torch.int32), unfused[0].view(torch.int32))

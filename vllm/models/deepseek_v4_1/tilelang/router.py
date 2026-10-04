@@ -15,7 +15,9 @@ routing:
   multiplied by the routed scaling factor.
 
 One warp routes one token. The kernel refuses NaN or infinite logits instead
-of routing on them. V4.1 has no hash-routed layers.
+of routing on them. Rows that pad a CUDA graph's batch are not routed: they
+get expert -1 and weight 0, which the dispatch skips (``VLLM_MOE_SKIP_PADDING``,
+on by default, as vLLM's routers do). V4.1 has no hash-routed layers.
 
 ``TileLangGateRouter`` also owns the gate projection. At decode the gate runs
 as split-K FP32 partials, and ``route_partials`` adds them in shard order,
@@ -29,6 +31,7 @@ import tilelang
 import tilelang.language as T
 import torch
 
+import vllm.envs as envs
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     FusedTopKBiasRouter,
@@ -45,6 +48,21 @@ def _image_token_mask(input_ids: torch.Tensor, lo: int, count: int) -> torch.Ten
     if context is not None:
         context._ds41_image_token_mask = (input_ids, mask)
     return mask
+
+
+def _routing_mask(rows: int) -> torch.Tensor | None:
+    """Rows to route this step (False pads a CUDA graph's batch), computed once."""
+    if not envs.VLLM_MOE_SKIP_PADDING or not is_forward_context_available():
+        return None
+    context = get_forward_context()
+    is_padding = context.is_padding
+    if is_padding is None:
+        return None
+    cached = getattr(context, "_ds41_routing_mask", None)
+    if cached is None or cached[0] is not is_padding:
+        cached = (is_padding, ~is_padding)
+        context._ds41_routing_mask = cached
+    return cached[1][:rows]
 
 
 class TileKernelsRouter(FusedTopKBiasRouter):
@@ -88,6 +106,7 @@ class TileKernelsRouter(FusedTopKBiasRouter):
             num_shared_experts=0,
             routed_scaling_factor=self.routed_scaling_factor,
             ep_rank=0,
+            mask=_routing_mask(router_logits.shape[0]),
             bias=self.e_score_correction_bias.data,
             image_bias=image_bias,
             image_token_mask=image_token_mask,
@@ -112,7 +131,12 @@ _VECTOR = 4
     },
 )
 def route_partials(
-    num_topk: int, num_experts: int, shards: int, image_mask: bool, warps: int = 2
+    num_topk: int,
+    num_experts: int,
+    shards: int,
+    image_mask: bool,
+    routing_mask: bool,
+    warps: int = 2,
 ):
     """Sum a gate's split-K partials in shard order and route each token.
 
@@ -121,7 +145,8 @@ def route_partials(
     inputs are the partials ``P[shards, rows, experts]``, added from shard 0
     as ``splitk_reduce`` adds them. Each round's warp-wide winner takes two
     integer reductions instead of TileKernels' ten shuffles. Non-finite
-    logits are refused once per lane, not once per logit.
+    logits are refused once per lane, not once per logit. Rows the routing
+    mask excludes get expert -1 and weight 0, as TileKernels gives them.
     """
     assert num_topk <= _WARP and num_experts % _VECTOR == 0
     per_lane = tilelang.cdiv(tilelang.cdiv(num_experts, _WARP), _VECTOR) * _VECTOR
@@ -133,6 +158,7 @@ def route_partials(
         bias: T.Tensor((num_experts,), T.float32),
         image_bias: T.Tensor((num_experts,), T.float32),
         image_token_mask: T.Tensor((rows,), T.bool),
+        route_mask: T.Tensor((rows,), T.bool),
         topk_idx: T.Tensor((rows, num_topk), T.int64),
         topk_weights: T.Tensor((rows, num_topk), T.float32),
         routed_scaling_factor: T.float32,
@@ -143,6 +169,11 @@ def route_partials(
             row = token + pid * warps
             lane = thread % _WARP
             if row >= rows:
+                T.thread_return()
+            if routing_mask and not route_mask[row]:
+                if lane < num_topk:
+                    topk_idx[row, lane] = -1
+                    topk_weights[row, lane] = 0.0
                 T.thread_return()
 
             unbiased = T.alloc_shared((warps, num_experts), T.float32)
@@ -242,7 +273,7 @@ class TileLangGateRouter(TileKernelsRouter):
     def __init__(self, *args, gate: torch.nn.Module, **kwargs):
         super().__init__(*args, **kwargs)
         self.gate = gate
-        self._kernels: dict[bool, object] = {}
+        self._kernels: dict[tuple[bool, bool], object] = {}
         # Text-only layers pass no image tokens; one all-false mask serves them.
         self._no_image = None
 
@@ -273,9 +304,11 @@ class TileLangGateRouter(TileKernelsRouter):
         image = self.bias_vl is not None and self.image_sentinel_lo > 0
         if image and input_ids is None:
             raise ValueError("DeepSeek V4.1 vision routing requires input_ids")
-        if image not in self._kernels:
-            self._kernels[image] = route_partials(
-                self.top_k, gate.weight.shape[0], gate.tilelang_shards, image
+        route_mask = _routing_mask(x.shape[0])
+        key = (image, route_mask is not None)
+        if key not in self._kernels:
+            self._kernels[key] = route_partials(
+                self.top_k, gate.weight.shape[0], gate.tilelang_shards, *key
             )
         rows = x.shape[0]
         topk_ids = torch.empty(rows, self.top_k, dtype=torch.int64, device=x.device)
@@ -296,11 +329,12 @@ class TileLangGateRouter(TileKernelsRouter):
                     DECODE_ROWS, dtype=torch.bool, device=x.device
                 )
             image_bias, mask = bias, self._no_image[:rows]
-        self._kernels[image](
+        self._kernels[key](
             partials,
             bias,
             image_bias,
             mask,
+            route_mask if route_mask is not None else mask,
             topk_ids,
             topk_weights,
             self.routed_scaling_factor,
