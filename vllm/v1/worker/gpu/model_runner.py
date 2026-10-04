@@ -452,9 +452,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.speculator, self.speculative_config, load_dummy_weights
                     )
             # Before any kernel plan or graph sees the weights; the drafter
-            # aliases the target's embedding and head, so both move together.
+            # aliases the target's embedding and head, which loaded in place.
             if display_carveout.required():
-                display_carveout.relocate_streamed_weights(self.model, self.device)
+                display_carveout.confirm_streamed_weights(self.model, self.device)
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory

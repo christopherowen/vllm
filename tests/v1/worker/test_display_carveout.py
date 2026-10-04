@@ -13,15 +13,21 @@ import torch
 from vllm.v1.worker import display_carveout
 
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+needs_drm = pytest.mark.skipif(
+    not os.access("/dev/dri/card0", os.R_OK | os.W_OK), reason="no DRM node"
+)
 
 
 class _Table(torch.nn.Module):
+    """A vocabulary layer: its weight comes from ``allocate`` when required."""
+
     def __init__(self, rows: int, width: int, device: str):
         super().__init__()
-        self.weight = torch.nn.Parameter(
-            torch.randn(rows, width, dtype=torch.bfloat16, device=device),
-            requires_grad=False,
-        )
+        data = display_carveout.allocate((rows, width), torch.bfloat16, device)
+        if data is None:
+            data = torch.empty(rows, width, dtype=torch.bfloat16, device=device)
+        data.copy_(torch.randn(rows, width, dtype=torch.bfloat16))  # "loading"
+        self.weight = torch.nn.Parameter(data, requires_grad=False)
 
 
 def _model(device: str) -> torch.nn.Module:
@@ -37,6 +43,14 @@ def _model(device: str) -> torch.nn.Module:
 @pytest.fixture
 def tables(monkeypatch):
     monkeypatch.setattr(display_carveout, "VocabParallelEmbedding", _Table)
+    monkeypatch.setattr(display_carveout, "_REQUIRED", False)
+    monkeypatch.setattr(display_carveout, "_carveouts", [])
+    monkeypatch.setattr(display_carveout, "_integrity", None)
+
+
+@pytest.fixture
+def required(tables, monkeypatch):
+    monkeypatch.setattr(display_carveout, "_REQUIRED", True)
 
 
 def test_checksum_sees_one_flipped_bit():
@@ -100,6 +114,20 @@ def test_struct_layouts_match_cuda_h():
     assert display_carveout._ExternalMemoryHandleDesc.size.offset == 24
 
 
+def test_allocate_is_off_unless_required(monkeypatch):
+    monkeypatch.setattr(display_carveout, "_REQUIRED", False)
+    monkeypatch.setattr(display_carveout, "_DRM_NODE", "/nonexistent/card0")
+    assert display_carveout.allocate((8192, 4096), torch.bfloat16, "cuda") is None
+
+
+def test_allocate_leaves_small_and_non_cuda_weights_alone(required, monkeypatch):
+    # Neither opens the DRM node, which does not exist here.
+    monkeypatch.setattr(display_carveout, "_DRM_NODE", "/nonexistent/card0")
+    assert display_carveout.allocate((16, 64), torch.bfloat16, "cuda:0") is None
+    assert display_carveout.allocate((8192, 4096), torch.bfloat16, "meta") is None
+    assert display_carveout._carveouts == []
+
+
 @needs_cuda
 def test_selects_large_tables_once(tables):
     names = [name for name, _ in display_carveout.streamed_weights(_model("cuda"))]
@@ -107,30 +135,31 @@ def test_selects_large_tables_once(tables):
 
 
 @needs_cuda
-def test_missing_drm_node_refuses(tables, monkeypatch):
+def test_missing_drm_node_refuses(required, monkeypatch):
     monkeypatch.setattr(display_carveout, "_DRM_NODE", "/nonexistent/card0")
     with pytest.raises(RuntimeError, match="display carve-out cannot hold"):
-        display_carveout.relocate_streamed_weights(_model("cuda"), torch.device("cuda"))
+        display_carveout.allocate((8192, 4096), torch.bfloat16, "cuda")
 
 
 @needs_cuda
-@pytest.mark.skipif(
-    not os.access("/dev/dri/card0", os.R_OK | os.W_OK), reason="no DRM node"
-)
-def test_relocation_preserves_values(tables, monkeypatch):
-    monkeypatch.setattr(display_carveout, "_integrity", None)
+@needs_drm
+def test_weights_load_in_place(required, monkeypatch):
     monkeypatch.setattr(display_carveout, "_CHECK_SECONDS", 300.0)
+    torch.cuda.synchronize()
+    free_before = torch.cuda.mem_get_info()[0]
     model = _model("cuda")
-    before = {
-        name: weight.detach().clone() for name, weight in model.named_parameters()
-    }
-    head_ptr = model.lm_head.weight.data_ptr()
-    display_carveout.relocate_streamed_weights(model, torch.device("cuda"))
-    assert model.lm_head.weight.data_ptr() != head_ptr
-    assert model.drafter.lm_head.weight.data_ptr() == model.lm_head.weight.data_ptr()
+    torch.cuda.synchronize()
+    # The 128 MiB of tables never touched ordinary memory (the small one did).
+    assert free_before - torch.cuda.mem_get_info()[0] < 32 << 20
+    assert len(display_carveout._carveouts) == 2
+    pointers = {name: p.data_ptr() for name, p in model.named_parameters()}
+    before = {name: p.detach().clone() for name, p in model.named_parameters()}
+    display_carveout.confirm_streamed_weights(model, torch.device("cuda"))
     for name, weight in model.named_parameters():
+        assert weight.data_ptr() == pointers[name], name
         assert torch.equal(weight, before[name]), name
-    # With the check on, its baseline covers both moved tables and still matches.
+    assert model.drafter.lm_head.weight.data_ptr() == model.lm_head.weight.data_ptr()
+    # With the check on, its baseline covers both tables and matches.
     check = display_carveout._integrity
     assert [name for name, _ in check.weights] == [
         "embed_tokens.weight",
@@ -145,12 +174,27 @@ def test_relocation_preserves_values(tables, monkeypatch):
 
 
 @needs_cuda
-@pytest.mark.skipif(
-    not os.access("/dev/dri/card0", os.R_OK | os.W_OK), reason="no DRM node"
-)
-def test_integrity_check_is_off_by_default(tables, monkeypatch):
-    monkeypatch.setattr(display_carveout, "_integrity", None)
+def test_weight_outside_the_carveout_refuses(tables):
+    # Built with the carve-out not required: ordinary memory.
+    model = _model("cuda")
+    with pytest.raises(RuntimeError, match="not created in the display carve-out"):
+        display_carveout.confirm_streamed_weights(model, torch.device("cuda"))
+
+
+@needs_cuda
+@needs_drm
+def test_dropped_layer_refuses(required):
+    model = _model("cuda")
+    model.drafter.embed_tokens = _Table(8192, 4096, "cuda")
+    del model.drafter.embed_tokens  # a placeholder replaced after loading
+    with pytest.raises(RuntimeError, match="1 display carve-out buffers"):
+        display_carveout.confirm_streamed_weights(model, torch.device("cuda"))
+
+
+@needs_cuda
+@needs_drm
+def test_integrity_check_is_off_by_default(required, monkeypatch):
     monkeypatch.setattr(display_carveout, "_CHECK_SECONDS", 0.0)
-    display_carveout.relocate_streamed_weights(_model("cuda"), torch.device("cuda"))
+    display_carveout.confirm_streamed_weights(_model("cuda"), torch.device("cuda"))
     assert display_carveout._integrity is None
     display_carveout.start_checks()

@@ -126,12 +126,18 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         **extra_weight_attrs,
     ):
         """Create weights for embedding layer."""
+        shape = (sum(output_partition_sizes), input_size_per_partition)
+        data = None
+        if isinstance(layer, VocabParallelEmbedding):
+            from vllm.v1.worker import display_carveout
+
+            # Vocabulary-sized tables go straight into the GB10 display
+            # carve-out when it is required, so loading streams into it.
+            data = display_carveout.allocate(
+                shape, params_dtype, torch.get_default_device()
+            )
         weight = Parameter(
-            torch.empty(
-                sum(output_partition_sizes),
-                input_size_per_partition,
-                dtype=params_dtype,
-            ),
+            data if data is not None else torch.empty(*shape, dtype=params_dtype),
             requires_grad=False,
         )
         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})

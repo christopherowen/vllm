@@ -18,12 +18,17 @@ slower. So only data read once per step belongs there. The embedding table
 prefill's sampled positions) qualify, while the KV cache, which attention
 gathers and re-reads, does not: holding it there cost 8% at eight streams.
 
-With ``SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1`` the worker moves those weights into
-the carve-out right after loading, before any kernel plan or graph captures
-them, and returns their ordinary memory to the allocator for the KV cache. It
-refuses to start if the carve-out cannot hold them.
+With ``SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1`` those weights are created in the
+carve-out when the model is built (``allocate``), so the checkpoint streams
+straight into it and they never occupy ordinary memory: on GB10, memory freed
+after loading stays charged to the process, so copying them in after loading
+and freeing the originals would cost host memory for good. Once loading is
+done, before any kernel plan or graph captures the weights, the worker confirms
+that every vocabulary-sized weight of the served model is in the carve-out and
+that no carve-out buffer was left behind by a layer the model dropped. It
+refuses to start otherwise, or when the carve-out cannot hold them.
 
-Nothing writes the weights after the copy, and nothing else can reach them:
+Nothing writes the weights after loading, and nothing else can reach them:
 the DRM file and its buffer handle close right after the export, the dma-buf
 stays private to the worker, the display engine only scans out its own
 surfaces, and the scanout heap never hands out a range in use. A driver fault
@@ -32,8 +37,8 @@ reuses, and the result would be wrong embeddings or logits with no error.
 
 For debugging such a fault, ``SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS`` above 0
 turns on an integrity check; production leaves it unset, which adds no work
-at all. The worker then checksums every moved weight before and after the
-copy and, from the end of graph capture, re-checks it from a background
+at all. The worker then checksums every carve-out weight once loading is
+done and, from the end of graph capture, re-checks it from a background
 thread on a side stream at that interval (about 20 ms per check for the
 842.5 MiB of a DS4.1 rank). A mismatch is logged and kills the worker, which
 stops the engine; nothing runs in the serving loop.
@@ -44,6 +49,7 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import fcntl
+import math
 import os
 import signal
 import struct
@@ -69,7 +75,6 @@ _DUMB_WIDTH = 4096
 _DUMB_BPP = 32
 _ROW_BYTES = _DUMB_WIDTH * _DUMB_BPP // 8
 _GRANULE = 16 << 20
-_ALIGN = 4096
 # Vocabulary-sized tables only; small embeddings stay where they are.
 _MIN_WEIGHT_BYTES = 64 << 20
 _CU_EXTERNAL_MEMORY_HANDLE_TYPE_DMABUF_FD = 9
@@ -179,11 +184,45 @@ def _check(cuda, status: int, what: str) -> None:
         raise RuntimeError(f"{what} failed: {detail}")
 
 
+# One buffer per weight, alive for the whole process.
 _carveouts: list[_Carveout] = []
 
 
 def required() -> bool:
     return _REQUIRED
+
+
+def allocate(
+    shape: tuple[int, ...], dtype: torch.dtype, device: torch.device | str
+) -> torch.Tensor | None:
+    """A vocabulary-sized weight created in its own carve-out buffer, or None.
+
+    Returns None unless the carve-out is required, the device is CUDA and the
+    weight reaches the vocabulary-sized threshold; the caller then allocates
+    ordinary memory as usual. Loading writes the checkpoint straight into the
+    returned tensor.
+    """
+    device = torch.device(device)
+    nbytes = math.prod(shape) * dtype.itemsize
+    if not _REQUIRED or device.type != "cuda" or nbytes < _MIN_WEIGHT_BYTES:
+        return None
+    rounded = -(-nbytes // _GRANULE) * _GRANULE
+    try:
+        carveout = _Carveout(rounded)
+    except OSError as error:
+        raise RuntimeError(
+            f"SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1 but the display carve-out cannot "
+            f"hold a {nbytes >> 20} MiB weight ({_DRM_NODE}: {error})"
+        ) from error
+    _carveouts.append(carveout)
+    backing = torch.as_tensor(carveout, device=device)
+    assert backing.data_ptr() == carveout.pointer.value
+    return backing[:nbytes].view(dtype).view(shape)
+
+
+def _holds(carveout: _Carveout, tensor: torch.Tensor) -> bool:
+    start = carveout.pointer.value
+    return start <= tensor.data_ptr() < start + carveout.nbytes
 
 
 def _checksum(tensor: torch.Tensor) -> torch.Tensor:
@@ -315,8 +354,12 @@ def streamed_weights(model: torch.nn.Module) -> list[tuple[str, torch.nn.Paramet
     return list(found.values())
 
 
-def relocate_streamed_weights(model: torch.nn.Module, device: torch.device) -> None:
-    """Move the embedding and output-head weights into the display carve-out."""
+def confirm_streamed_weights(model: torch.nn.Module, device: torch.device) -> None:
+    """Confirm the embedding and output-head weights loaded into the carve-out.
+
+    Every vocabulary-sized weight of the served model must sit in a buffer from
+    ``allocate``, and every such buffer must still hold one of them.
+    """
     assert ctypes.sizeof(_ExternalMemoryHandleDesc) == 104
     assert ctypes.sizeof(_ExternalMemoryBufferDesc) == 88
     weights = streamed_weights(model)
@@ -325,49 +368,42 @@ def relocate_streamed_weights(model: torch.nn.Module, device: torch.device) -> N
             "SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1 but the model has no "
             "vocabulary-sized embedding or output-head weights"
         )
-    spans = [-(-_nbytes(weight) // _ALIGN) * _ALIGN for _, weight in weights]
-    rounded = -(-sum(spans) // _GRANULE) * _GRANULE
-    torch.cuda.synchronize(device)
-    try:
-        carveout = _Carveout(rounded)
-    except OSError as error:
+    outside = [
+        name
+        for name, weight in weights
+        if not any(_holds(carveout, weight.data) for carveout in _carveouts)
+    ]
+    if outside:
         raise RuntimeError(
-            f"SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1 but the display carve-out cannot "
-            f"hold {rounded >> 20} MiB of weights ({_DRM_NODE}: {error})"
-        ) from error
-    _carveouts.append(carveout)
-    backing = torch.as_tensor(carveout, device=device)
-    assert backing.data_ptr() == carveout.pointer.value
-    free_before = torch.cuda.mem_get_info(device)[0]
+            "SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1 but these vocabulary-sized weights "
+            f"were not created in the display carve-out: {', '.join(outside)}"
+        )
+    orphaned = [
+        carveout
+        for carveout in _carveouts
+        if not any(_holds(carveout, weight.data) for _, weight in weights)
+    ]
+    if orphaned:
+        # A vocabulary-sized layer built and then dropped would hold carve-out
+        # space for nothing; placeholders the model replaces after loading
+        # belong on the meta device.
+        raise RuntimeError(
+            f"{len(orphaned)} display carve-out buffers "
+            f"({sum(c.nbytes for c in orphaned) >> 20} MiB) hold no weight of the "
+            "served model; build placeholder layers on the meta device"
+        )
     checking = _CHECK_SECONDS > 0
     if checking:
-        expected = [int(_checksum(weight.data)) for _, weight in weights]
-    held: list[tuple[str, torch.Tensor]] = []
-    offset = 0
-    for (name, weight), span in zip(weights, spans):
-        moved = backing[offset : offset + _nbytes(weight)].view(weight.dtype)
-        moved = moved.view(weight.shape)
-        moved.copy_(weight.data)
-        weight.data = moved
-        held.append((name, moved))
-        offset += span
-    torch.cuda.synchronize(device)
-    if checking:
         global _integrity
+        held = [(name, weight.data) for name, weight in weights]
+        torch.cuda.synchronize(device)
+        expected = [int(_checksum(weight)) for _, weight in held]
         _integrity = _IntegrityCheck(held, expected, device, _CHECK_SECONDS)
-        _integrity.check()
-        if _integrity.failure is not None:
-            raise RuntimeError(
-                f"copy into the display carve-out failed: {_integrity.failure}"
-            )
-        _integrity.passed = 0
-    torch.cuda.empty_cache()
-    freed = torch.cuda.mem_get_info(device)[0] - free_before
     logger.info(
-        "Display carve-out holds %.1f MiB of streamed weights (%s); "
-        "ordinary memory freed: %.1f MiB; debug integrity check %s",
+        "Display carve-out holds %.1f MiB of streamed weights in %d buffers, "
+        "loaded in place (%s); debug integrity check %s",
         sum(_nbytes(weight) for _, weight in weights) / (1 << 20),
+        len(_carveouts),
         ", ".join(name for name, _ in weights),
-        freed / (1 << 20),
         f"every {_CHECK_SECONDS:g} s" if checking else "off",
     )

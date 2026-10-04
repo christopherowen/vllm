@@ -47,12 +47,16 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        from vllm.v1.worker import display_carveout
+
+        shape = (sum(output_partition_sizes), input_size_per_partition)
+        # In the GB10 display carve-out when it is required: the checkpoint
+        # streams straight in and the head is then packed where it lies.
+        data = display_carveout.allocate(
+            shape, params_dtype, torch.get_default_device()
+        )
         weight = Parameter(
-            torch.empty(
-                sum(output_partition_sizes),
-                input_size_per_partition,
-                dtype=params_dtype,
-            ),
+            data if data is not None else torch.empty(*shape, dtype=params_dtype),
             requires_grad=False,
         )
         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
