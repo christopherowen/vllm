@@ -5,6 +5,7 @@
 import contextlib
 import gc
 import os
+import sys
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -1123,6 +1124,12 @@ class Worker(WorkerBase):
             mode=self.observability_config.jit_monitor_mode,
             verbose=self.observability_config.jit_monitor_verbose,
         )
+        if "sparknet.oneshot" in sys.modules:
+            # sparknet prepared its kernels before capture; one compiling now
+            # would stall a step, so it raises instead.
+            sys.modules["sparknet.oneshot"].freeze_kernel_resolution(
+                "vLLM warm-up is complete"
+            )
 
         # Freeze the worker heap so the GC won't scan static objects
         # (model weights, KV caches, CUDA graphs) during inference.

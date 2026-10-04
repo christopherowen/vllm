@@ -132,13 +132,27 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 and envs.VLLM_ENABLE_PCIE_ALLREDUCE
                 and envs.VLLM_PCIE_ALLREDUCE_BACKEND == "b12x"
             )
-            if envs.VLLM_ENABLE_ROCE_ALLREDUCE and not use_custom_allreduce:
-                raise ValueError(
-                    "RoCEnante was requested but custom all-reduce is disabled"
+            if envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
+                # DS4.1's TileLang family always runs sparknet's one-shot
+                # collectives; vLLM's RoCE switch is not read for it.
+                if envs.VLLM_ENABLE_ROCE_ALLREDUCE:
+                    raise ValueError(
+                        "VLLM_ENABLE_ROCE_ALLREDUCE does not apply to the TileLang "
+                        "kernel family, whose one-shot collectives are always on"
+                    )
+                if not use_custom_allreduce:
+                    raise ValueError(
+                        "sparknet's one-shot collectives need custom all-reduce"
+                    )
+                use_roce_allreduce = True
+            else:
+                if envs.VLLM_ENABLE_ROCE_ALLREDUCE and not use_custom_allreduce:
+                    raise ValueError(
+                        "RoCEnante was requested but custom all-reduce is disabled"
+                    )
+                use_roce_allreduce = (
+                    use_custom_allreduce and envs.VLLM_ENABLE_ROCE_ALLREDUCE
                 )
-            use_roce_allreduce = (
-                use_custom_allreduce and envs.VLLM_ENABLE_ROCE_ALLREDUCE
-            )
             if use_b12x_allreduce or use_roce_allreduce:
                 use_flashinfer_allreduce = False
 
@@ -199,11 +213,25 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 global_ranks=self.ranks,
             )
         elif self.use_roce_allreduce and self.world_size > 1:
-            # RoCEnante: multi-node DGX Spark one-shot RDMA collectives
-            # from b12x.comm.roce.
-            from .b12x_roce_all_reduce import B12xRoceAllReduce
+            # Multi-node DGX Spark one-shot RDMA collectives: sparknet's for
+            # DS4.1's TileLang kernel family (configured by its SPARKNET_ROCE_*
+            # settings), b12x.comm.roce's for B12X. Both carry the same
+            # protocol (B12X's with spark3's RoCE patches).
+            roce_options = {}
+            if envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
+                from sparknet.integration.vllm import (
+                    SparknetOneShotAllReduce as RoceAllReduce,
+                )
 
-            self.b12x_ar_comm = B12xRoceAllReduce(
+                from vllm.distributed.parallel_state import in_the_same_node_as
+
+                roce_options["in_the_same_node"] = in_the_same_node_as(
+                    self.cpu_group, source_rank=0
+                )
+            else:
+                from .b12x_roce_all_reduce import B12xRoceAllReduce as RoceAllReduce
+
+            self.b12x_ar_comm = RoceAllReduce(
                 group=self.cpu_group,
                 device_group=self.device_group,
                 device=self.device,
@@ -211,6 +239,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 nccl_available=(
                     self.pynccl_comm is not None and not self.pynccl_comm.disabled
                 ),
+                **roce_options,
             )
             self._roce_policy = not self.b12x_ar_comm.disabled
             if self._roce_policy:
@@ -374,10 +403,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
         """
         if self._roce_policy:
             logger.info_once(
-                "Collective policy for group '%s': B12X_ROCENANTE for eligible "
+                "Collective policy for group '%s': %s for eligible "
                 "all-reduce/all-gather; PYNCCL for other inputs, reduce-scatter "
                 "and variable collectives. No backend-error fallback.",
                 self.unique_name or "<unnamed>",
+                self.b12x_ar_comm.backend_name,
                 scope="global",
             )
             return
