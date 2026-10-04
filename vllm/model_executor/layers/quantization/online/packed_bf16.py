@@ -9,13 +9,15 @@ exception list. Packing
 verifies that every bit round-trips and refuses otherwise, so the served head
 is the checkpoint tensor in 75% of the bytes, not an approximation.
 
-The packed head runs only through the logits processor's prepared B12X
-projection, which reads the packed bytes directly.
+The packed head runs only through the logits processor's vocabulary
+projection, which reads the packed bytes directly: B12X's prepared projection,
+or TileLang's with the TileLang linear backend.
 """
 
 import torch
 from torch.nn import Parameter
 
+from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
@@ -36,6 +38,11 @@ def packed_bf16_supported(input_size: int, params_dtype: torch.dtype) -> bool:
 
 class PackedBf16LmHeadMethod(QuantizeMethodBase):
     """A BF16 LM head served from its exact 12-bit packed form."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        kernel_config = get_current_vllm_config().kernel_config
+        self.tilelang = kernel_config.linear_backend == "tilelang"
 
     def create_weights(
         self,
@@ -84,6 +91,10 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
         layer.packed_bf16_exponent_base = packed.exponent_base
         layer.packed_bf16_exceptions = packed.exceptions
         layer._already_called_process_weights_after_loading = True
+        if self.tilelang:
+            from vllm.models.deepseek_v4_1.tilelang.vocab import prepare_packed_head
+
+            prepare_packed_head(layer)
         logger.info_once(
             "Packed the BF16 LM head exactly into 12 bits per weight: "
             "exponents %d..%d, %d out-of-window values kept exactly per shard.",
@@ -114,7 +125,7 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
     ) -> torch.Tensor:
         raise RuntimeError(
             "A packed BF16 LM head runs only through the logits processor's "
-            "prepared B12X projection (linear backend b12x or tilelang, no bias)."
+            "vocabulary projection (linear backend b12x or tilelang, no bias)."
         )
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:

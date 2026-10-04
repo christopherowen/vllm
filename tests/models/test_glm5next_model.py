@@ -532,6 +532,7 @@ def test_b12x_vocab_projection_owner_is_not_a_child_module(monkeypatch) -> None:
 
     processor = LogitsProcessor.__new__(LogitsProcessor)
     torch.nn.Module.__init__(processor)
+    processor.use_tilelang_vocab_projection = False
     processor.use_b12x_vocab_projection = True
     processor._b12x_vocab_projection = SimpleNamespace(is_supported=lambda: True)
     processor._b12x_vocab_heads = {}

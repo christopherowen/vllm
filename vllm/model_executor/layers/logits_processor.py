@@ -69,6 +69,20 @@ def _is_packed_head(head: torch.nn.Module) -> bool:
     return isinstance(getattr(head, "quant_method", None), PackedBf16LmHeadMethod)
 
 
+def _is_plain_bf16_head(head: torch.nn.Module) -> bool:
+    """A loaded, unquantized, contiguous BF16 vocabulary head on the GPU."""
+    return (
+        isinstance(head, VocabParallelEmbedding)
+        and isinstance(
+            head.quant_method, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)
+        )
+        and head.weight.ndim == 2
+        and head.weight.dtype == torch.bfloat16
+        and head.weight.is_cuda
+        and head.weight.is_contiguous()
+    )
+
+
 @PluggableLayer.register("logits_processor")
 class LogitsProcessor(PluggableLayer):
     """Process logits and apply logits processors from sampling metadata.
@@ -112,18 +126,19 @@ class LogitsProcessor(PluggableLayer):
         model_config = get_current_vllm_config().model_config
         self.head_dtype = model_config.head_dtype if model_config is not None else None
         kernel_config = get_current_vllm_config().kernel_config
+        # DS4.1's TileLang family projects its vocabulary heads with TileLang.
+        self.use_tilelang_vocab_projection = kernel_config.linear_backend == "tilelang"
         self._b12x_vocab_projection = get_b12x_bf16_vocab_projection()
         self._b12x_vocab_plans: dict[int, dict[int, object]] = {}
         self._b12x_vocab_heads: dict[int, VocabParallelEmbedding] = {}
         self.use_b12x_vocab_projection = bool(
-            # DS4.1's TileLang family keeps B12X's BF16 vocabulary projection.
-            kernel_config.linear_backend in ("b12x", "tilelang")
+            kernel_config.linear_backend == "b12x"
             and self._b12x_vocab_projection is not None
             and self._b12x_vocab_projection.is_supported()
         )
         self._b12x_packed_vocab_projection = get_b12x_packed_bf16_vocab_projection()
         self.use_b12x_packed_vocab_projection = bool(
-            kernel_config.linear_backend in ("b12x", "tilelang")
+            kernel_config.linear_backend == "b12x"
             and self._b12x_packed_vocab_projection is not None
             and self._b12x_packed_vocab_projection.is_supported()
         )
@@ -134,7 +149,21 @@ class LogitsProcessor(PluggableLayer):
         self,
         lm_head: torch.nn.Module,
     ) -> None:
-        """Register the loaded LM head; preparation happens in worker lifecycle."""
+        """Register the loaded LM head; preparation happens in worker lifecycle.
+
+        With the TileLang backend, a BF16 head's kernels are compiled here; a
+        packed head's are compiled when it is packed.
+        """
+        if self.use_tilelang_vocab_projection:
+            if (
+                not _is_packed_head(lm_head)
+                and not hasattr(lm_head, "tilelang_vocab")
+                and _is_plain_bf16_head(lm_head)
+            ):
+                from vllm.models.deepseek_v4_1.tilelang.vocab import prepare_bf16_head
+
+                prepare_bf16_head(lm_head)
+            return
         if _is_packed_head(lm_head):
             if (
                 not self.use_b12x_packed_vocab_projection
@@ -142,18 +171,7 @@ class LogitsProcessor(PluggableLayer):
                 or not lm_head.weight.is_cuda
             ):
                 return
-        elif (
-            not self.use_b12x_vocab_projection
-            or not isinstance(lm_head, VocabParallelEmbedding)
-            or not isinstance(
-                lm_head.quant_method,
-                (UnquantizedEmbeddingMethod, UnquantizedLinearMethod),
-            )
-            or lm_head.weight.ndim != 2
-            or lm_head.weight.dtype != torch.bfloat16
-            or not lm_head.weight.is_cuda
-            or not lm_head.weight.is_contiguous()
-        ):
+        elif not self.use_b12x_vocab_projection or not _is_plain_bf16_head(lm_head):
             return
         owner = getattr(lm_head, "_b12x_vocab_projection_owner", None)
         if owner is not None:
@@ -348,6 +366,16 @@ class LogitsProcessor(PluggableLayer):
     ) -> torch.Tensor:
         """Project hidden states through the lm_head, honoring head_dtype."""
         if self.head_dtype is None or self.head_dtype == hidden_states.dtype:
+            if (
+                self.use_tilelang_vocab_projection
+                and embedding_bias is None
+                and hasattr(lm_head, "tilelang_vocab")
+            ):
+                from vllm.models.deepseek_v4_1.tilelang.vocab import project_head
+
+                flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+                logits = project_head(lm_head, flat)
+                return logits.reshape(*hidden_states.shape[:-1], -1)
             if (
                 _is_packed_head(lm_head)
                 and self.use_b12x_packed_vocab_projection
