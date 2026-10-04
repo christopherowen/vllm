@@ -791,10 +791,14 @@ class DeepseekV4MoE(nn.Module):
         gate: nn.Module | None = None,
         image_sentinel_lo: int | None = None,
         image_sentinel_count: int = 5,
+        router_cls: type | None = None,
     ):
         super().__init__()
 
         self.tp_size = get_tensor_model_parallel_world_size()
+        # A FusedTopKBiasRouter subclass that routes these experts instead of
+        # vLLM's choice for the config (the DS4.1 kernel family picks it).
+        self.router_cls = router_cls
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.prefix = prefix
@@ -802,6 +806,8 @@ class DeepseekV4MoE(nn.Module):
         moe_backend = vllm_config.kernel_config.moe_backend
         validate_fi_moe_ep_config(vllm_config)
         self.use_mega_moe = moe_backend in MEGA_MOE_BACKENDS
+        if self.use_mega_moe and router_cls is not None:
+            raise ValueError("MegaMoE routes in its own kernel; it takes no router")
         self.use_fi_mega_moe = is_fi_moe_ep_backend(moe_backend)
         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError(
@@ -1008,9 +1014,26 @@ class DeepseekV4MoE(nn.Module):
         self.n_logical_experts = self.n_routed_experts
         self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
 
+        router = None
+        if self.router_cls is not None:
+            if parallel_config.enable_eplb:
+                raise ValueError(f"{self.router_cls.__name__} does not support EPLB")
+            router = self.router_cls(
+                top_k=self.n_activated_experts,
+                global_num_experts=self.n_routed_experts,
+                e_score_correction_bias=self.gate.e_score_correction_bias,
+                renormalize=config.norm_topk_prob,
+                routed_scaling_factor=self.routed_scaling_factor,
+                scoring_func=self.scoring_func,
+                hash_indices_table=self.gate.tid2eid,
+                bias_vl=getattr(self.gate, "bias_vl", None),
+                image_sentinel_lo=self.image_sentinel_lo,
+                image_sentinel_count=self.image_sentinel_count,
+            )
         self.experts = FusedMoEFactory(
             shared_experts=self.shared_experts,
             gate=self.gate,
+            router=router,
             num_experts=self.n_routed_experts,
             top_k=self.n_activated_experts,
             hidden_size=config.hidden_size,

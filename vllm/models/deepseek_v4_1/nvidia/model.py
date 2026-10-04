@@ -164,6 +164,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             gate=gate,
             image_sentinel_lo=0 if is_draft else 129264,
             image_sentinel_count=1,
+            router_cls=kernels.moe_router_class(),
         )
 
         self.attn_norm = kernels.rms_norm(self.hidden_size, self.rms_norm_eps)

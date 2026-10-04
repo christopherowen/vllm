@@ -51,6 +51,15 @@ def embedding_method():
     return B12xEmbeddingMethod()
 
 
+def moe_router_class():
+    """Router class for the MoE layers; None keeps vLLM's for the config."""
+    if uses_tilelang():
+        from .tilelang.router import TileKernelsRouter
+
+        return TileKernelsRouter
+    return None
+
+
 def rms_norm(hidden_size: int, eps: float = 1e-6) -> nn.Module:
     if uses_tilelang():
         from .tilelang.norm import TileLangRMSNorm
