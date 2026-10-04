@@ -258,18 +258,33 @@ def set_dummy_context(
     input_batch.positions.copy_(torch.from_numpy(local_pos + context_len))
 
     seq_len = context_len + query_len
+    # Every KV cache group draws from one block pool and the groups overlay the
+    # same memory, so the allocator gives each block to one group and request
+    # at a time, and block 0 is the reserved null block. Fabricated spans keep
+    # that: each request of each group gets its own whole blocks, after the
+    # null block, so no span reads bytes another group wrote in its own
+    # format. They wrap and share only when the pool runs out.
+    usable = num_kv_blocks - 1
+    next_block = 0
     for block_table, block_size, bpk in zip(
         input_block_tables,
         block_tables.kernel_block_sizes,
         block_tables.blocks_per_kv_block,
     ):
         num_blocks = min(cdiv(seq_len, block_size), block_table.shape[1])
-        # Spans are disjoint until the pool runs out, then they wrap and share
-        # blocks: profiling only needs the reads to be realistic, not distinct.
-        block_ids = torch.arange(
-            num_reqs * num_blocks, dtype=block_table.dtype, device=block_table.device
-        ) % (num_kv_blocks * bpk)
-        block_table[:num_reqs, :num_blocks] = block_ids.view(num_reqs, num_blocks)
+        kv_blocks = cdiv(num_blocks, bpk)
+        device = block_table.device
+        kv_ids = (
+            next_block
+            + torch.arange(num_reqs * kv_blocks, dtype=torch.int64, device=device)
+        ) % usable + 1
+        next_block = (next_block + num_reqs * kv_blocks) % usable
+        kernel_ids = kv_ids.view(num_reqs, kv_blocks, 1) * bpk + torch.arange(
+            bpk, dtype=torch.int64, device=device
+        )
+        block_table[:num_reqs, :num_blocks] = kernel_ids.view(num_reqs, -1)[
+            :, :num_blocks
+        ].to(block_table.dtype)
 
 
 @triton.jit

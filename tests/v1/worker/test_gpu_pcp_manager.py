@@ -248,9 +248,51 @@ def test_dummy_context_updates_pcp_local_block_tables():
 
     torch.testing.assert_close(
         local_block_tables[0][:2, :2],
-        torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
+        torch.tensor([[1, 2], [3, 4]], dtype=torch.int32),
     )
     assert torch.all(global_block_table == -1)
+
+
+def test_dummy_context_gives_each_group_and_request_its_own_blocks():
+    # Two KV cache groups over one pool: 4-token kernel blocks two to a KV
+    # block, and 2-token blocks one to a KV block.
+    tables = (
+        torch.full((3, 8), -1, dtype=torch.int32),
+        torch.full((3, 8), -1, dtype=torch.int32),
+    )
+    block_tables = SimpleNamespace(
+        input_block_tables=tables,
+        kernel_block_sizes=(4, 2),
+        blocks_per_kv_block=(2, 1),
+    )
+    input_batch = InputBatch.make_dummy(
+        num_reqs=3,
+        num_tokens=3,
+        input_buffers=InputBuffers(3, 8, torch.device("cpu")),
+        max_query_len=1,
+    )
+
+    set_dummy_context(
+        input_batch,
+        block_tables,
+        context_len=10,
+        num_kv_blocks=64,
+        max_model_len=32,
+    )
+
+    owners = {}
+    for group, (table, bpk) in enumerate(zip(tables, (2, 1))):
+        num_blocks = 3 if group == 0 else 6  # 11 tokens of context and query
+        spans = table[:3, :num_blocks]
+        assert torch.all(spans > 0), "the null block is never handed out"
+        assert torch.all(table[:3, num_blocks:] == -1)
+        for request in range(3):
+            row = spans[request]
+            # Each request's kernel blocks run on through whole KV blocks.
+            assert torch.equal(row, row[0] + torch.arange(num_blocks, dtype=row.dtype))
+            assert int(row[0]) % bpk == 0
+            for kv_block in set((row // bpk).tolist()):
+                assert owners.setdefault(kv_block, (group, request)) == (group, request)
 
 
 def _rank_rows(
