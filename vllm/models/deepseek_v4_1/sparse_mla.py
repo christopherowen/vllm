@@ -168,6 +168,8 @@ class DeepseekV41B12xMetadata:
     max_seq_len: int
     decoder: "DeepseekV41B12xMetadata | None" = None
     swa_replay_start: torch.Tensor | None = None
+    # Rows the CED decoder's MoE routes (False for padding), in its compact layout.
+    routing_mask: torch.Tensor | None = None
 
 
 class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):

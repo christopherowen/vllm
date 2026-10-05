@@ -273,3 +273,73 @@ def test_padding_rows_are_not_routed(plain_scratch, padded_step, gate_router):
         )
         assert torch.equal(ids, unfused[1])
         assert torch.equal(weights.view(torch.int32), unfused[0].view(torch.int32))
+
+
+@pytest.fixture
+def ced_step(monkeypatch):
+    """A mixed step whose CED decoder batch is shorter than its CPU plan.
+
+    Five decode requests are scheduled 6 rows each and a prefill 331 rows,
+    3,328 of them cached: 361 rows. Adaptive verification shortens the decode
+    ranges to 22 rows, so the decoder keeps 22 decode rows and the prefill's
+    last 128, and the plan's 158 rows end in eight -1 indices. Rows 1, 7 and
+    20 are dead verification rows inside the batch.
+    """
+    from vllm.models.deepseek_v4_1.ced import CEDState, gather_rows
+
+    state = CEDState(6, 4096, (256, 512, 1024, 2048, 4096), "cuda")
+    starts = torch.tensor(
+        [0, 4, 8, 12, 16, 22, 353], dtype=torch.int32, device="cuda"
+    )
+    seq = torch.tensor([4000] * 5 + [3659], dtype=torch.int32, device="cuda")
+    state.stage(starts, seq, [6] * 5 + [331], [False] * 6, [0] * 5 + [3328])
+    indices = state.get_indices()
+    is_padding = torch.zeros(361, dtype=torch.bool, device="cuda")
+    is_padding[[1, 7, 20]] = True
+    is_padding[353:] = True
+    # What DeepseekV41ModelState.prepare_attn puts on the decoder metadata.
+    compact = (indices >= 0) & ~gather_rows(is_padding, indices)
+    decoder = type("Decoder", (), {"routing_mask": compact})()
+    layer = type("Layer", (), {"decoder": decoder})()
+    context = type("Context", (), {})()
+    context.is_padding = is_padding
+    context.attn_metadata = {"layer": layer}
+    monkeypatch.setattr(tilelang_router, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(tilelang_router, "get_forward_context", lambda: context)
+    return context, indices, compact
+
+
+def test_ced_decoder_routes_its_gathered_rows(ced_step):
+    context, indices, compact = ced_step
+    is_padding = context.is_padding
+    assert indices.tolist() == list(range(22)) + list(range(225, 353)) + [-1] * 8
+    expected = torch.ones(158, dtype=torch.bool, device="cuda")
+    expected[[1, 7, 20]] = False
+    expected[150:] = False
+    assert torch.equal(compact, expected)
+    # Truncating the step's mask, as before, keeps the wrong rows.
+    assert not torch.equal((~is_padding)[:158], expected)
+    assert torch.equal(tilelang_router._routing_mask(158, ced_decoder=True), expected)
+    # Encoder and draft routers keep the step's layout, even at the same size.
+    assert torch.equal(tilelang_router._routing_mask(361), ~is_padding)
+    assert torch.equal(tilelang_router._routing_mask(158), (~is_padding)[:158])
+
+
+def test_ced_decoder_skips_nan_padding_rows(ced_step):
+    _, _, expected = ced_step
+    bias = torch.zeros(384, device="cuda")
+    router = tilelang_router.TileKernelsRouter(
+        top_k=6,
+        global_num_experts=384,
+        e_score_correction_bias=bias,
+        renormalize=True,
+        routed_scaling_factor=1.0,
+        scoring_func="sqrtsoftplus",
+    )
+    router._ds41_is_ced_decoder = True
+    logits = torch.zeros(158, 384, device="cuda")
+    logits[~expected] = float("nan")  # what the gate leaves in padding rows
+    weights, ids = router._compute_routing(None, logits, None)
+    torch.cuda.synchronize()
+    assert (ids[~expected] == -1).all() and (weights[~expected] == 0).all()
+    assert (ids[expected] >= 0).all() and torch.isfinite(weights).all()

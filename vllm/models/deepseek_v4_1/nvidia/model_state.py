@@ -8,7 +8,9 @@ import torch.nn as nn
 from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
-from vllm.models.deepseek_v4_1.ced import CED_WINDOW, CEDState, ced_decoder_start
+from vllm.models.deepseek_v4_1.ced import (
+    CED_WINDOW, CEDState, ced_decoder_start, gather_rows,
+)
 from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadata
 from vllm.triton_utils import tl, triton
 from vllm.v1.core.sched.output import NewRequestData
@@ -222,6 +224,19 @@ class DeepseekV41ModelState(DefaultModelState):
         )
         state = self.ced_state
         if state is not None:
+            # The decoder's rows are the step's rows gathered by CED's indices.
+            # Adaptive verification marks dead rows inside the batch, and the
+            # plan's CPU upper bound leaves -1 indices at its end, so the
+            # step's padding mask is gathered, not truncated. The mask is a new
+            # tensor each step: CED steps must not replay a CUDA graph.
+            indices = state.get_indices()
+            routing_mask = None
+            if indices is not None:
+                if cudagraph_mode != CUDAGraphMode.NONE:
+                    raise RuntimeError("CED decoder routing requires eager execution")
+                routing_mask = (indices >= 0) & ~gather_rows(
+                    input_batch.is_padding, indices
+                )
             seen: set[int] = set()
             for value in metadata.values():
                 if isinstance(value, DeepseekV41B12xMetadata) and id(value) not in seen:
@@ -229,6 +244,7 @@ class DeepseekV41ModelState(DefaultModelState):
                     value.swa_replay_start = state.replay_start
                     if state.plan is not None:
                         value.decoder = state.decoder_metadata(value)
+                        value.decoder.routing_mask = routing_mask
         return metadata
 
     def prepare_inputs(

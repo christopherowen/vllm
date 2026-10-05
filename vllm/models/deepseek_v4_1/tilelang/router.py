@@ -50,11 +50,28 @@ def _image_token_mask(input_ids: torch.Tensor, lo: int, count: int) -> torch.Ten
     return mask
 
 
-def _routing_mask(rows: int) -> torch.Tensor | None:
-    """Rows to route this step (False pads a CUDA graph's batch), computed once."""
+def _routing_mask(rows: int, *, ced_decoder: bool = False) -> torch.Tensor | None:
+    """Rows to route this step (False pads the batch), computed once per layout."""
     if not envs.VLLM_MOE_SKIP_PADDING or not is_forward_context_available():
         return None
     context = get_forward_context()
+    # A CED decoder layer routes compact rows: its mask comes from the
+    # decoder metadata (gathered by the CED indices), not from the step's.
+    compact_masks = getattr(context, "_ds41_ced_routing_masks", None)
+    if compact_masks is None:
+        compact_masks = {}
+        metadata = context.attn_metadata
+        if isinstance(metadata, dict):
+            for value in metadata.values():
+                decoder = getattr(value, "decoder", None)
+                mask = getattr(decoder, "routing_mask", None)
+                if mask is not None:
+                    compact_masks[mask.numel()] = mask
+        context._ds41_ced_routing_masks = compact_masks
+    if ced_decoder and compact_masks:
+        if rows not in compact_masks:
+            raise RuntimeError("CED routing mask does not match the decoder rows")
+        return compact_masks[rows]
     is_padding = context.is_padding
     if is_padding is None:
         return None
@@ -106,7 +123,10 @@ class TileKernelsRouter(FusedTopKBiasRouter):
             num_shared_experts=0,
             routed_scaling_factor=self.routed_scaling_factor,
             ep_rank=0,
-            mask=_routing_mask(router_logits.shape[0]),
+            mask=_routing_mask(
+                router_logits.shape[0],
+                ced_decoder=getattr(self, "_ds41_is_ced_decoder", False),
+            ),
             bias=self.e_score_correction_bias.data,
             image_bias=image_bias,
             image_token_mask=image_token_mask,
@@ -304,7 +324,10 @@ class TileLangGateRouter(TileKernelsRouter):
         image = self.bias_vl is not None and self.image_sentinel_lo > 0
         if image and input_ids is None:
             raise ValueError("DeepSeek V4.1 vision routing requires input_ids")
-        route_mask = _routing_mask(x.shape[0])
+        route_mask = _routing_mask(
+            x.shape[0],
+            ced_decoder=getattr(self, "_ds41_is_ced_decoder", False),
+        )
         key = (image, route_mask is not None)
         if key not in self._kernels:
             self._kernels[key] = route_partials(

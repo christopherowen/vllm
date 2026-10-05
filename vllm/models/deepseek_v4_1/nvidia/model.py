@@ -166,6 +166,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             router_cls=kernels.moe_router_class(),
         )
 
+        # A CED decoder layer routes the compact decoder rows, whose padding
+        # mask differs from the step's. Tag its router by layer, never by the
+        # row count, which an encoder forward can share.
+        router = getattr(self.ffn.experts, "router", None)
+        if router is not None:
+            router._ds41_is_ced_decoder = self.attn.is_ced_decoder
+
         self.attn_norm = kernels.rms_norm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = kernels.rms_norm(self.hidden_size, self.rms_norm_eps)
         self.hc_mult = config.hc_mult
