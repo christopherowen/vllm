@@ -13,7 +13,12 @@ from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.worker.gpu import cp_utils as gpu_cp_utils
 from vllm.v1.worker.gpu import pcp_manager as pcp_manager_module
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
-from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers, set_dummy_context
+from vllm.v1.worker.gpu.input_batch import (
+    InputBatch,
+    InputBuffers,
+    assign_dummy_blocks,
+    set_dummy_context,
+)
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
 
 
@@ -545,3 +550,24 @@ def test_partition_defers_dcp_metadata_to_post_partition_batch():
     )
     assert local_batch.dcp_local_seq_lens is not None
     assert torch.equal(local_batch.dcp_local_seq_lens.cpu(), expected)
+
+
+def test_dummy_blocks_give_each_group_its_own_block_in_a_minimal_pool():
+    # The attention profile's minimal cache: one block per group plus the null
+    # block. Every position of a group's long request wraps inside its block.
+    tables = tuple(torch.full((1, 16), -1, dtype=torch.int32) for _ in range(3))
+    block_tables = SimpleNamespace(
+        input_block_tables=tables,
+        kernel_block_sizes=(256, 64, 128),
+        blocks_per_kv_block=(1, 4, 2),
+    )
+    assign_dummy_blocks(block_tables, tables, num_reqs=1, seq_len=4096, num_kv_blocks=4)
+    owners = {}
+    for group, (table, bpk) in enumerate(zip(tables, (1, 4, 2))):
+        row = table[0]
+        assert torch.all(row > 0)
+        kv_blocks = set((row // bpk).tolist())
+        assert len(kv_blocks) == 1, "a group's request stays inside its one block"
+        for kv_block in kv_blocks:
+            assert owners.setdefault(kv_block, group) == group
+    assert sorted(owners) == [1, 2, 3]

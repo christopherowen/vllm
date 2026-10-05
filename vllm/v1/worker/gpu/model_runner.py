@@ -135,6 +135,7 @@ from vllm.v1.worker.gpu.input_batch import (
     post_update_num_computed_tokens,
     prepare_pos_seq_lens,
     prepare_prefill_inputs,
+    assign_dummy_blocks,
     set_dummy_context,
 )
 from vllm.v1.worker.gpu.kv_connector import (
@@ -1116,8 +1117,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         }:
             return
 
+        from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+
+        # One block per KV cache group besides the null block: the groups
+        # overlay the same memory, so a block shared by every group would let
+        # one group read another's writes in its own format.
+        groups = get_kv_cache_groups(self.vllm_config, self.get_kv_cache_spec())
         try:
-            _init_minimal_kv_cache_for_profiling(self, num_blocks=1)
+            _init_minimal_kv_cache_for_profiling(self, num_blocks=1 + len(groups))
             if prepare_profile_state is not None:
                 prepare_profile_state()
             self._dummy_run(
@@ -2103,6 +2110,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.kv_cache_config.num_blocks,
                     self.max_model_len,
                     input_block_tables=block_tables,
+                )
+            elif not skip_attn_for_dummy_run and profile_all_kv_cache_groups:
+                # The attention profile's minimal cache has one block per group.
+                assert block_tables is not None
+                assign_dummy_blocks(
+                    self.block_tables,
+                    block_tables,
+                    input_batch.num_reqs,
+                    input_batch.max_query_len
+                    or int(input_batch.num_scheduled_tokens.max()),
+                    self.kv_cache_config.num_blocks,
                 )
 
         attn_metadata = None

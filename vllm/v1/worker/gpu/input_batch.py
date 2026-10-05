@@ -257,28 +257,44 @@ def set_dummy_context(
     )
     input_batch.positions.copy_(torch.from_numpy(local_pos + context_len))
 
-    seq_len = context_len + query_len
-    # Every KV cache group draws from one block pool and the groups overlay the
-    # same memory, so the allocator gives each block to one group and request
-    # at a time, and block 0 is the reserved null block. Fabricated spans keep
-    # that: each request of each group gets its own whole blocks, after the
-    # null block, so no span reads bytes another group wrote in its own
-    # format. They wrap and share only when the pool runs out.
+    assign_dummy_blocks(
+        block_tables, input_block_tables, num_reqs, context_len + query_len, num_kv_blocks
+    )
+
+
+def assign_dummy_blocks(
+    block_tables: "BlockTables",
+    input_block_tables: Sequence[torch.Tensor],
+    num_reqs: int,
+    seq_len: int,
+    num_kv_blocks: int,
+) -> None:
+    """Point each dummy request's block-table rows at blocks of its own.
+
+    Every KV cache group draws from one block pool and the groups overlay the
+    same memory, so the allocator gives a block to one group and request at a
+    time, and block 0 is the reserved null block. Dummy layouts keep that: each
+    group takes its own slice of the pool after the null block, and each request
+    of a group its own whole blocks within that slice, wrapping inside the slice
+    when it runs out. No group then reads bytes another group wrote in its own
+    format; groups share blocks only when the pool has fewer blocks than groups.
+    """
     usable = num_kv_blocks - 1
-    next_block = 0
-    for block_table, block_size, bpk in zip(
-        input_block_tables,
-        block_tables.kernel_block_sizes,
-        block_tables.blocks_per_kv_block,
+    if usable < 1:
+        raise ValueError("dummy block layouts need a block besides the null block")
+    share = max(usable // len(input_block_tables), 1)
+    for group, (block_table, block_size, bpk) in enumerate(
+        zip(
+            input_block_tables,
+            block_tables.kernel_block_sizes,
+            block_tables.blocks_per_kv_block,
+        )
     ):
         num_blocks = min(cdiv(seq_len, block_size), block_table.shape[1])
         kv_blocks = cdiv(num_blocks, bpk)
         device = block_table.device
-        kv_ids = (
-            next_block
-            + torch.arange(num_reqs * kv_blocks, dtype=torch.int64, device=device)
-        ) % usable + 1
-        next_block = (next_block + num_reqs * kv_blocks) % usable
+        offsets = torch.arange(num_reqs * kv_blocks, dtype=torch.int64, device=device)
+        kv_ids = (group * share + offsets % share) % usable + 1
         kernel_ids = kv_ids.view(num_reqs, kv_blocks, 1) * bpk + torch.arange(
             bpk, dtype=torch.int64, device=device
         )
