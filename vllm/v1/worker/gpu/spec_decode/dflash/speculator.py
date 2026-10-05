@@ -52,6 +52,12 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.hidden_states = torch.zeros(
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
         )
+        # Rows that pad the query batch, as the MoE routers read them from the
+        # forward context (VLLM_MOE_SKIP_PADDING). Every row starts as padding,
+        # so CUDA graph capture routes no dummy row; each step marks its live
+        # rows. Persistent: captured graphs read it on replay.
+        self._is_padding = torch.ones(self.max_num_tokens, dtype=torch.bool, device=device)
+        self._row_index = torch.arange(self.max_num_tokens, device=device)
 
         # Multimodal inputs not currently supported.
         self.supports_mm_inputs = False
@@ -156,6 +162,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.sample_pos.zero_()
         self.sample_idx_mapping.fill_(-1)
         assert self.query_cudagraph_manager is not None
+        # Capture runs dummy rows only: route none of them.
+        self._is_padding.fill_(True)
         self.query_cudagraph_manager.capture(
             self._generate_draft,
             self.input_buffers,
@@ -428,6 +436,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             num_tokens_across_dp=num_tokens_across_dp,
             slot_mapping=slot_mappings,
             batch_descriptor=batch_descriptor,
+            is_padding=self._is_padding[:num_tokens],
         ):
             last_hidden_states = self.model(
                 input_ids=self.input_buffers.input_ids[:num_tokens],
@@ -608,6 +617,8 @@ class DFlashSpeculator(DraftModelSpeculator):
             # DFlash processes all speculative tokens in one forward pass,
             # so the real token count is num_query_tokens.
             self._prepare_eplb_forward(num_query_tokens)
+            # A memory-profile batch is all padding, like the target's.
+            self._is_padding[:num_query_tokens].fill_(True)
             self._generate_draft(
                 num_reqs,
                 num_query_tokens,
@@ -740,6 +751,14 @@ class DFlashSpeculator(DraftModelSpeculator):
         # DFlash processes all speculative tokens in one forward pass,
         # so the real token count is num_query_tokens.
         self._prepare_eplb_forward(num_query_tokens)
+
+        # Rows past the live query rows pad the batch, and a dummy batch is all
+        # padding, like the target's. Written eagerly before the graph replays,
+        # so the routers skip exactly these rows.
+        live = 0 if dummy_run else num_query_tokens
+        self._is_padding[:num_tokens_padded].copy_(
+            self._row_index[:num_tokens_padded] >= live
+        )
 
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             assert self.query_cudagraph_manager is not None
