@@ -110,8 +110,16 @@ def linear_segments(name: str, linear: torch.nn.Module | None) -> list[Segment]:
     packed = getattr(linear, "b12x_weight", None)
     if packed is not None:
         return object_segments(f"{name}.b12x_weight", packed)
-    segment = _l2pf.tensor_segment(f"{name}.weight", getattr(linear, "weight", None))
-    return [segment] if segment is not None else []
+    segments = [
+        _l2pf.tensor_segment(f"{name}.weight", getattr(linear, "weight", None)),
+        # The TileLang block-32 projections read per-row scale words beside it.
+        _l2pf.tensor_segment(
+            f"{name}.tilelang_weight_sf",
+            getattr(linear, "tilelang_weight_sf", None),
+            min_bytes=0,
+        ),
+    ]
+    return [segment for segment in segments if segment is not None]
 
 
 def param_segments(name: str, owner: object, attrs: tuple[str, ...]) -> list[Segment]:
