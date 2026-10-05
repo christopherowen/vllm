@@ -17,18 +17,21 @@ tile_kernels = pytest.importorskip("tile_kernels")
 
 from vllm.models.deepseek_v4_1.tilelang.gemm import (  # noqa: E402
     DECODE_ROWS,
+    DECODE_TILE_ROWS,
     bf16_gemm,
     bf16_gemm_partials,
     bf16_shards,
-    default_config,
+    fp8_decode_config,
+    fp8_prefill_config,
     mxfp8_gemm,
+    mxfp8_gemm_decode,
     pack_scale_words,
     splitk_reduce,
 )
 from vllm.models.deepseek_v4_1.tilelang.norm import TileLangRMSNorm  # noqa: E402
 
 DEVICE = "cuda"
-ROWS = (1, 7, 64, 65, 200)
+ROWS = (1, 7, 16, 17, 32, 33, 64, 65, 200)
 
 
 def _gen(seed):
@@ -72,25 +75,63 @@ def test_mxfp8_gemm(n, k):
     xq, sf, x_values = _mxfp8(x)
     ref = x_values @ weight_values.T
     words = sf.contiguous().view(torch.uint32)
-    decode = mxfp8_gemm(n, k, **default_config(DECODE_ROWS, k), padded_rows=True)
-    large = mxfp8_gemm(n, k, **default_config(DECODE_ROWS + 1, k))
+    decode = {
+        block_M: mxfp8_gemm_decode(
+            n, k, **fp8_decode_config(n, k, block_M), padded_rows=True
+        )
+        for block_M in DECODE_TILE_ROWS
+    }
+    large = mxfp8_gemm(n, k, **fp8_prefill_config(n, k))
+    swizzled = mxfp8_gemm(n, k, **dict(fp8_prefill_config(n, k), swizzle_panel=2))
     outs = {}
     for rows in ROWS:
         out = torch.empty((rows, n), dtype=torch.bfloat16, device=DEVICE)
         if rows <= DECODE_ROWS:
-            # Decode rows read one whole 64-row tile; only live rows are stored.
-            decode(xq[:DECODE_ROWS], weight, words[:DECODE_ROWS], weight_sf, out)
+            # Decode rows read whole tiles of the padded workspace and store
+            # only live rows; every tile tall enough gives the same bits.
+            for block_M, kernel in decode.items():
+                if rows <= block_M:
+                    kernel(
+                        xq[:DECODE_ROWS], weight, words[:DECODE_ROWS], weight_sf, out
+                    )
+                    outs[rows, block_M] = out.clone()
         else:
             large(xq[:rows], weight, words[:rows], weight_sf, out)
-        torch.testing.assert_close(
-            out.float(), ref[:rows], rtol=1e-2, atol=1e-2 * ref.abs().max().item()
-        )
-        outs[rows] = out
+            outs[rows, "prefill"] = out.clone()
+            swizzled(xq[:rows], weight, words[:rows], weight_sf, out)
+            outs[rows, "swizzled"] = out.clone()
+    full = outs[max(ROWS), "prefill"]
+    torch.testing.assert_close(
+        full.float(), ref, rtol=1e-2, atol=1e-2 * ref.abs().max().item()
+    )
     # Rows agree bit for bit across batch sizes, padding and tile configurations.
-    for rows, out in outs.items():
-        assert torch.equal(out, outs[max(ROWS)][:rows]), (
-            f"rows={rows} differs from the full batch"
+    for (rows, tile), out in outs.items():
+        assert torch.equal(out, full[:rows]), (
+            f"rows={rows} on the {tile} tile differs from the full batch"
         )
+
+
+def test_mxfp8_decode_tile_repeats(n=2048, k=2048, runs=100):
+    """Narrow 16-row decode tiles give the same bits on every run.
+
+    With TileLang's warp-specialized pipeline, this tile's cp.async scale
+    staging raced on SM121 and returned wrong results; decode tiles run the
+    unspecialized pipeline.
+    """
+    weight, exps, _ = _block32_weight(n, k, 5)
+    weight_sf = pack_scale_words(exps, rows=n)
+    x = torch.randn((DECODE_ROWS, k), generator=_gen(6), device=DEVICE).bfloat16()
+    xq, sf, _ = _mxfp8(x)
+    words = sf.contiguous().view(torch.uint32)
+    tile = dict(block_M=16, block_N=32, block_K=128, num_stages=2, threads=128)
+    kernel = mxfp8_gemm_decode(n, k, **tile, padded_rows=True)
+    full = torch.empty((DECODE_ROWS, n), dtype=torch.bfloat16, device=DEVICE)
+    mxfp8_gemm(n, k, **fp8_prefill_config(n, k))(xq, weight, words, weight_sf, full)
+    want = full[:16]
+    out = torch.empty_like(want)
+    for run in range(runs):
+        kernel(xq, weight, words, weight_sf, out)
+        assert torch.equal(out, want), f"run {run} differs"
 
 
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])

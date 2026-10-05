@@ -4,11 +4,11 @@
 
 Block-32 FP8 projections quantize activations to MXFP8 with TileKernels'
 per-token cast (DeepSeek's E4M3, one UE8M0 scale per 32 elements) and run
-``mxfp8_gemm``; decode rows go through whole 64-row activation tiles from the
-padded workspace. Unquantized projections run ``bf16_gemm``; projections with
-few output tiles (the router) split K over the SMs for decode rows and reduce
-the FP32 partials in a fixed order. Every path keeps each row's accumulation
-order fixed, so results do not depend on the batch.
+``mxfp8_gemm``; decode rows go through whole 16-, 32- or 64-row activation
+tiles from the padded workspace. Unquantized projections run ``bf16_gemm``;
+projections with few output tiles (the router) split K over the SMs for
+decode rows and reduce the FP32 partials in a fixed order. Every path keeps
+each row's accumulation order fixed, so results do not depend on the batch.
 
 The kernels run inside custom ops, which keeps them opaque to torch.compile,
 and borrow activation scratch from vLLM's workspace.
@@ -29,12 +29,16 @@ from vllm.v1.worker.workspace import (
 
 from .gemm import (
     DECODE_ROWS,
+    DECODE_TILE_ROWS,
     SF_BLOCK,
     bf16_gemm,
     bf16_gemm_partials,
     bf16_shards,
-    default_config,
+    decode_tile_rows,
+    fp8_decode_config,
+    fp8_prefill_config,
     mxfp8_gemm,
+    mxfp8_gemm_decode,
     pack_scale_words,
     scale_words,
     splitk_reduce,
@@ -137,7 +141,10 @@ def _block32_linear(
         use_packed_ue8m0=True,
         out=(xq[:rows], sf[:rows]),
     )
-    gemm = layer.tilelang_gemms[0 if rows <= DECODE_ROWS else 1]
+    if rows > DECODE_ROWS:
+        gemm = layer.tilelang_prefill
+    else:
+        gemm = layer.tilelang_decode[decode_tile_rows(rows)]
     gemm(
         xq,
         layer.weight,
@@ -185,10 +192,13 @@ class TileLangFP8LinearMethod(Block32FP8LinearMethod):
         layer.tilelang_weight_sf = pack_scale_words(
             layer.weight_scale_inv.view(torch.uint8), rows=n
         )
-        layer.tilelang_gemms = (
-            mxfp8_gemm(n, k, **default_config(DECODE_ROWS, k), padded_rows=True),
-            mxfp8_gemm(n, k, **default_config(DECODE_ROWS + 1, k)),
-        )
+        layer.tilelang_decode = {
+            block_M: mxfp8_gemm_decode(
+                n, k, **fp8_decode_config(n, k, block_M), padded_rows=True
+            )
+            for block_M in DECODE_TILE_ROWS
+        }
+        layer.tilelang_prefill = mxfp8_gemm(n, k, **fp8_prefill_config(n, k))
         layer.tilelang_key = id(layer)
         _LAYERS[layer.tilelang_key] = layer
 

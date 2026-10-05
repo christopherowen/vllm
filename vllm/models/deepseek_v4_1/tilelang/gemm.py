@@ -45,8 +45,7 @@ def pick_block_K(K: int, widest: int = 192) -> int:
     raise ValueError(f"K={K} must be a multiple of 64")
 
 
-@tilelang.jit
-def mxfp8_gemm(
+def _mxfp8_gemm(
     N: int,
     K: int,
     block_M: int = 128,
@@ -56,6 +55,7 @@ def mxfp8_gemm(
     threads: int = 128,
     out_dtype: T.dtype = T.bfloat16,
     padded_rows: bool = False,
+    swizzle_panel: int = 0,
 ):
     """``C[M, N] = (A * SFA) @ (B * SFB)^T`` for MXFP8 ``A[M, K]``, ``B[N, K]``.
 
@@ -72,6 +72,9 @@ def mxfp8_gemm(
 
     Each output accumulates over K in the same order whatever the tile shape
     or padding, so a row's result does not depend on M or the configuration.
+    ``swizzle_panel`` rasterizes the CTAs in panels of that many N tiles, so a
+    weight larger than L2 is read once per panel rather than once per row of
+    tiles; it only changes the order tiles run in.
     """
     assert K % block_K == 0 and block_K % 64 == 0, (
         "block_K must divide K and be a multiple of 64"
@@ -95,6 +98,8 @@ def mxfp8_gemm(
         with T.Kernel(
             T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads
         ) as (bx, by):
+            if swizzle_panel:
+                T.use_swizzle(panel_size=swizzle_panel)
             A_shared = T.alloc_shared((block_M, block_K), in_dtype)
             B_shared = T.alloc_shared((block_N, block_K), in_dtype)
             SFA_shared = T.alloc_shared((block_M, block_words), T.uint32)
@@ -131,6 +136,18 @@ def mxfp8_gemm(
             T.copy(C_local, C[by * block_M, bx * block_N])
 
     return main
+
+
+# Prefill tiles use TileLang's warp-specialized pipeline (TMA producer warps,
+# up to 17% faster there). Decode tiles do not: with warp specialization the
+# cp.async scale staging races on SM121 at decode tile shapes (16-row tiles
+# returned wrong results in up to every run; 64-row tiles were not seen to),
+# while the unspecialized pipeline is race-free and as fast for decode. Both
+# run the same arithmetic, so their bits agree.
+mxfp8_gemm = tilelang.jit(_mxfp8_gemm)
+mxfp8_gemm_decode = tilelang.jit(
+    pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
+)(_mxfp8_gemm)
 
 
 @tilelang.jit
@@ -322,12 +339,87 @@ def bf16_shards(N: int, K: int, block_N: int = 64, block_K: int = 64) -> int:
     return best
 
 
+# Decode tile heights: rows up to DECODE_ROWS run on the shortest that holds
+# them (one stream's verified rows fit 16; 32 rows hold four streams').
+DECODE_TILE_ROWS = (16, 32, DECODE_ROWS)
+
+# Decode tiles of the block-32 FP8 projections by (N, K) and tile height, from
+# the kernel-lab sweep on GB10 at the TP4 serving shapes: whole calls with the
+# activation cast against B12X's block_fp8_linear, with the weight warm in L2,
+# cold, and racing its own L2 prefetch; each tile is the one whose worst ratio
+# to B12X over the three is lowest. Every field only changes speed: each tile
+# accumulates K in the same order, so a row's bits do not depend on the tile
+# or on prefill.
+DECODE_FP8_CONFIGS: dict[tuple[int, int], dict[int, dict]] = {
+    # TP4 attention: Q-B, indexer Q-B, fused Q-A/KV.
+    (8192, 1280): {
+        16: dict(block_N=128, block_K=128, num_stages=3),
+        32: dict(block_N=64, block_K=128, num_stages=3),
+        64: dict(block_N=64, block_K=256, num_stages=2),
+    },
+    (4096, 1280): {
+        16: dict(block_N=64, block_K=256, num_stages=4),
+        32: dict(block_N=128, block_K=128, num_stages=3),
+        64: dict(block_N=64, block_K=128, num_stages=2, threads=64),
+    },
+    (1792, 5120): {
+        16: dict(block_N=64, block_K=256, num_stages=2),
+        32: dict(block_N=64, block_K=256, num_stages=3),
+        64: dict(block_N=64, block_K=256, num_stages=2),
+    },
+    # TP4 shared expert: gate/up and down.
+    (1152, 5120): {
+        16: dict(block_N=32, block_K=256, num_stages=3),
+        32: dict(block_N=32, block_K=256, num_stages=3),
+        64: dict(block_N=64, block_K=256, num_stages=2),
+    },
+    (5120, 576): {
+        16: dict(block_N=128, block_K=64, num_stages=2, threads=64),
+        32: dict(block_N=128, block_K=64, num_stages=2),
+        64: dict(block_N=64, block_K=64, num_stages=2),
+    },
+    # TP4 DSpark main projection.
+    (6400, 6144): {
+        16: dict(block_N=32, block_K=256, num_stages=4, threads=64),
+        32: dict(block_N=32, block_K=256, num_stages=4, threads=64),
+        64: dict(block_N=64, block_K=256, num_stages=2),
+    },
+}
+
+
+def decode_tile_rows(rows: int) -> int:
+    """Height of the decode tile that serves ``rows`` (at most DECODE_ROWS)."""
+    return next(height for height in DECODE_TILE_ROWS if rows <= height)
+
+
+def fp8_decode_config(N: int, K: int, block_M: int = DECODE_ROWS) -> dict:
+    """Decode tile of an (N, K) block-32 FP8 projection, ``block_M`` rows tall."""
+    config = dict(
+        block_M=block_M, block_N=64, block_K=pick_block_K(K), num_stages=3, threads=128
+    )
+    config.update(DECODE_FP8_CONFIGS.get((N, K), {}).get(block_M, {}))
+    return config
+
+
+def fp8_prefill_config(N: int, K: int) -> dict:
+    """Prefill tile of an (N, K) block-32 FP8 projection.
+
+    A weight larger than L2 (the DSpark main projection, 39 MB at TP4) is
+    re-read from DRAM by every row of tiles in launch order; panels of eight N
+    tiles made a 33 MB projection's 4096-row GEMM three times faster. Smaller
+    weights stay in L2 either way and run fastest unswizzled.
+    """
+    device = torch.cuda.current_device()
+    l2_bytes = torch.cuda.get_device_properties(device).L2_cache_size
+    swizzle_panel = 8 if l2_bytes < N * K else 0
+    return dict(default_config(DECODE_ROWS + 1, K), swizzle_panel=swizzle_panel)
+
+
 def default_config(M: int, K: int) -> dict:
     """Tile choice by row count: decode needs more, smaller N tiles to fill the GPU.
 
-    Tiles stay at least 64 rows tall. On SM121, warp-specialized 32x64 tiles
-    with cp.async scale staging intermittently read stale scales. The large
-    tiles keep K blocks of 128 or 64 to stay within 99 KiB of shared memory.
+    The large tiles keep K blocks of 128 or 64 to stay within 99 KiB of
+    shared memory. Block-32 FP8 decode tiles come from ``fp8_decode_config``.
     """
     if M <= DECODE_ROWS:
         return dict(
