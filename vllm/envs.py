@@ -222,6 +222,7 @@ if TYPE_CHECKING:
     VLLM_DS41_DRAFT_NVFP4_HEAD: bool = False
     VLLM_DS41_PACKED_BF16_LM_HEAD: bool = False
     VLLM_DS41_ATTENTION_COMPUTE: Literal["bf16", "reference", "auto"] = "bf16"
+    VLLM_DS41_HEAD_DTYPE: Literal["float32", "model"] = "float32"
     VLLM_DS41_KERNEL_BACKEND: Literal["b12x", "tilelang"] = "b12x"
     VLLM_DS41_ENGRAM_OVERLAP: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
@@ -1893,6 +1894,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_DS41_ATTENTION_COMPUTE",
         "bf16",
         ["bf16", "reference", "auto"],
+    ),
+    # Default output-head dtype of DeepSeek V4.1 and its DSpark drafter when
+    # hf_overrides names none. "float32" computes the logits in FP32 like
+    # DeepSeek's reference head; "model" keeps the model dtype, which the exact
+    # packed BF16 and TileLang vocabulary projections require. The drafter
+    # takes no dict hf_overrides from the target, so this sets both.
+    "VLLM_DS41_HEAD_DTYPE": env_with_choices(
+        "VLLM_DS41_HEAD_DTYPE",
+        "float32",
+        ["float32", "model"],
     ),
     # DeepSeek V4.1 kernel family on SM12x: "b12x" or "tilelang". It selects
     # the attention, linear and MoE backends; explicit flags must agree.

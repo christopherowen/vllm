@@ -479,9 +479,12 @@ class DeepseekV41ForCausalLMConfig(VerifyAndUpdateConfig):
             ):
                 quant_config["quant_method"] = "deepseek_v41_fp8"
         # DeepSeek's reference head computes FP32 logits; a BF16 head rounds
-        # them to steps of up to 1/8. An explicit head_dtype override wins.
+        # them to steps of up to 1/8. An explicit head_dtype override wins;
+        # VLLM_DS41_HEAD_DTYPE sets the default for the target and its drafter.
         if getattr(model_config.hf_config, "head_dtype", None) is None:
-            model_config.hf_config.head_dtype = "float32"
+            from vllm import envs
+
+            model_config.hf_config.head_dtype = envs.VLLM_DS41_HEAD_DTYPE
 
     @staticmethod
     def update_model_config_for_parallelism(
