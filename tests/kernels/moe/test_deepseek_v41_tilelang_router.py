@@ -226,6 +226,7 @@ def test_gate_router_routes_image_tokens(plain_scratch):
 def padded_step(monkeypatch):
     """A forward step whose last rows pad a CUDA graph's batch."""
     context = type("Context", (), {})()
+    context.attn_metadata = None  # ForwardContext always has it; no CED plan here
     monkeypatch.setattr(tilelang_router, "is_forward_context_available", lambda: True)
     monkeypatch.setattr(tilelang_router, "get_forward_context", lambda: context)
 
