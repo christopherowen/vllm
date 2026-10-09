@@ -177,6 +177,50 @@ def test_bf16_gemm(n, k, out_dtype):
             )
 
 
+# The compressor's wkv (ratio 1, BF16 out) and wkv + wgate (ratio 2, FP32 out).
+@pytest.mark.parametrize("parts, out_dtype", [(1, torch.bfloat16), (2, torch.float32)])
+def test_split_linear(parts, out_dtype, k=5120):
+    from torch import nn
+
+    from vllm.models.deepseek_v4_1.tilelang.linear import (
+        TileLangSplitLinearMethod,
+        project_parts,
+    )
+    from vllm.v1.worker.workspace import use_preallocated_workspace
+
+    gen = _gen(5)
+    layer = nn.Module()
+    weight = torch.randn((512 * parts, k), generator=gen, device=DEVICE) * 0.02
+    layer.weight = nn.Parameter(weight.bfloat16(), requires_grad=False)
+    layer.out_dtype = out_dtype
+    method = TileLangSplitLinearMethod(parts)
+    method.process_weights_after_loading(layer)
+    x = torch.randn((max(ROWS), k), generator=gen, device=DEVICE).bfloat16()
+    scratch = torch.empty(
+        method.get_workspace_size(layer, DECODE_ROWS), dtype=torch.uint8, device=DEVICE
+    )
+
+    def project(rows):
+        outs = [
+            torch.full((max(ROWS), 512), float("nan"), dtype=out_dtype, device=DEVICE)
+            for _ in range(parts)
+        ]
+        with use_preallocated_workspace(scratch):
+            project_parts(layer, x[:rows], outs, rows)
+        return outs
+
+    full = project(max(ROWS))
+    for index, out in enumerate(full):
+        ref = x.float() @ layer.weight[index * 512 : (index + 1) * 512].float().T
+        torch.testing.assert_close(
+            out.float(), ref, rtol=1e-2, atol=1e-2 * ref.abs().max().item()
+        )
+    for rows in ROWS:
+        for out, whole in zip(project(rows), full):
+            assert torch.equal(out[:rows], whole[:rows]), f"rows={rows}"
+            assert out[rows:].isnan().all(), f"rows={rows} wrote past its rows"
+
+
 @pytest.mark.parametrize("hidden", [128, 512, 4096])
 def test_rmsnorm(hidden, rows=33, eps=1e-6):
     gen = _gen(4)

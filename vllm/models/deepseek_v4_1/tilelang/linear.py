@@ -257,4 +257,57 @@ class TileLangLinearMethod(UnquantizedLinearMethod):
         return _spec_bytes(_partial_specs(layer, num_tokens))
 
 
-__all__ = ["TileLangFP8LinearMethod", "TileLangLinearMethod"]
+class _Part:
+    """One row block of a split weight; weak-referenceable for ``_LAYERS``."""
+
+    def __init__(self, weight: torch.Tensor, out_dtype: torch.dtype):
+        self.weight = weight
+        self.out_dtype = out_dtype
+
+
+class TileLangSplitLinearMethod(UnquantizedLinearMethod):
+    """A BF16 weight made of equal row blocks (the compressor's wkv and wgate), each
+    projected into its own output by the BF16 GEMM of ``TileLangLinearMethod``."""
+
+    def __init__(self, parts: int):
+        super().__init__()
+        self.parts = parts
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        n = layer.weight.shape[0]
+        if n % self.parts:
+            raise ValueError(f"{n} rows do not split into {self.parts} parts")
+        rows = n // self.parts
+        out_dtype = getattr(layer, "out_dtype", torch.bfloat16)
+        layer.tilelang_parts = []
+        for index in range(self.parts):
+            part = _Part(
+                layer.weight.data[index * rows : (index + 1) * rows], out_dtype
+            )
+            TileLangLinearMethod().process_weights_after_loading(part)
+            layer.tilelang_parts.append(part)
+
+    def get_workspace_size(self, layer, num_tokens: int) -> int:
+        return max(
+            _spec_bytes(_partial_specs(part, num_tokens))
+            for part in layer.tilelang_parts
+        )
+
+
+def project_parts(layer: nn.Module, x: torch.Tensor, outputs, rows: int) -> None:
+    """Project ``x`` (rows x K) through each row block of a split layer into the
+    matching output's first ``rows`` rows."""
+    scratch = (
+        None if torch.compiler.is_compiling() else current_preallocated_workspace()
+    )
+    for part, out in zip(layer.tilelang_parts, outputs):
+        _bf16_linear(x, out[:rows], part.tilelang_key, scratch)
+
+
+__all__ = [
+    "TileLangFP8LinearMethod",
+    "TileLangLinearMethod",
+    "TileLangSplitLinearMethod",
+    "project_parts",
+]
