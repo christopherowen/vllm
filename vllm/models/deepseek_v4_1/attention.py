@@ -185,7 +185,8 @@ class _AttentionHelpers:
                     prepare_call=prepare,
                 )
             )
-        if attn.indexer is not None:
+        # The TileLang indexer folds the head-weight scale into its projection.
+        if attn.indexer is not None and not kernels.uses_tilelang():
             declaration = weight_scale.plan(
                 weight_scale.Query(max_elements=attn.capacity * attn.indexer.heads),
                 device=device,
@@ -371,6 +372,16 @@ class DeepseekV4Indexer(nn.Module):
             prefix=f"{prefix}.weights_proj",
         )
         self.weights_proj.quant_method = kernels.linear_method()
+        if kernels.uses_tilelang():
+            from vllm.models.deepseek_v4_1.tilelang.linear import (
+                TileLangScaledLinearMethod,
+            )
+
+            # DeepSeek scales the head weights by (heads * head_dim) ** -0.5, a
+            # power of two folded exactly into the projection.
+            self.weights_proj.quant_method = TileLangScaledLinearMethod(
+                (hf.index_n_heads * 128) ** -0.5
+            )
         if owns_k:
             self.wk = ReplicatedLinear(
                 512,
@@ -1415,6 +1426,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             if index_weights is not None
             else self.indexer.weights_proj(hidden_states)[first:last]
         )
+        if kernels.uses_tilelang():
+            return iq_data, iq_scale, weights  # the projection applied the scale
         iw = torch.empty_like(weights)
         weight_scale.scale_index_weights(
             weights,
