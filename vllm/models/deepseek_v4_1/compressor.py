@@ -10,6 +10,7 @@ from b12x.preparation import PreparedCall
 
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+from vllm.models.deepseek_v4_1 import kernels
 from vllm.models.deepseek_v4_1.b12x_layers import B12xLinearMethod, B12xRMSNorm
 from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xBackend
 from vllm.triton_utils import tl, triton
@@ -147,7 +148,17 @@ class DeepseekCompressor(nn.Module):
             prefix=f"{prefix}.fused_wkv_wgate",
             params_dtype=torch.bfloat16,
         )
-        self.fused_wkv_wgate.quant_method = B12xLinearMethod()
+        if kernels.uses_tilelang():
+            from vllm.models.deepseek_v4_1.tilelang.linear import (
+                TileLangSplitLinearMethod,
+            )
+
+            # wkv and wgate (ratio 2) each project into their own buffer.
+            self.fused_wkv_wgate.quant_method = TileLangSplitLinearMethod(
+                compress_ratio
+            )
+        else:
+            self.fused_wkv_wgate.quant_method = B12xLinearMethod()
         self.fused_wkv_wgate.out_dtype = (
             torch.float32 if compress_ratio == 2 else torch.bfloat16
         )
@@ -323,6 +334,16 @@ class DeepseekCompressor(nn.Module):
 
     def _project(self, hidden_states):
         rows = hidden_states.shape[0]
+        if kernels.uses_tilelang():
+            from vllm.models.deepseek_v4_1.tilelang.linear import project_parts
+
+            project_parts(
+                self.fused_wkv_wgate,
+                hidden_states,
+                (self._values, self._gates)[: self.compress_ratio],
+                rows,
+            )
+            return
         plan = self._projection_plans.get(rows)
         if plan is None:
             plan = self._projection_plans[self._projection_capacity]
@@ -389,8 +410,12 @@ class DeepseekCompressor(nn.Module):
             prepare_call=make_call,
             benchmark_call=make_call,
         )
+        # The TileLang projection needs no B12X plan.
+        projection = (
+            () if kernels.uses_tilelang() else (self._projection_unit(workload),)
+        )
         return (
-            self._projection_unit(workload),
+            *projection,
             B12xPreparationUnit(
                 name="DeepseekCompressor",
                 key=(self.prefix, self.compress_ratio, self.capacity, self.requests),
