@@ -246,6 +246,11 @@ _compiled = None
 _compile_failed = False
 
 
+# Kernel family: "cute" (CuTe DSL, the default) or "tilelang"
+# (l2_prefetch_tilelang.py: same work split and PTX).
+_KERNELS = os.environ.get("VLLM_L2_PREFETCH_KERNELS", "cute").strip().lower()
+
+
 def _get_launcher():
     """Compile once (shape-dynamic segment table); returns a callable
     (segs_tensor, cuda_stream_handle) -> None, or None if unavailable."""
@@ -254,6 +259,22 @@ def _get_launcher():
         return _compiled
     if _compile_failed:
         return None
+    if _KERNELS == "tilelang":
+        try:
+            from vllm.models.glm5next.nvidia.l2_prefetch_tilelang import compile_launcher
+
+            _compiled = compile_launcher(_GRID, _BLOCK, _CHUNK_BYTES)
+            logger.info(
+                "[l2_prefetch] TileLang kernel ready (grid=%d block=%d chunk=%d)",
+                _GRID,
+                _BLOCK,
+                _CHUNK_BYTES,
+            )
+            return _compiled
+        except Exception as exc:  # noqa: BLE001
+            _compile_failed = True
+            logger.warning("[l2_prefetch] disabled: TileLang kernel compile failed: %s", exc)
+            return None
     if not _CUTE_OK:
         _compile_failed = True
         logger.warning("[l2_prefetch] disabled: CuTe DSL not available")
