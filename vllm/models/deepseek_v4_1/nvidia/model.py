@@ -711,7 +711,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         engram_mask: torch.Tensor | None = None
         if self.disk_engram and input_ids is not None:
             engram_hashes = self.prepared_engram_hashes[: input_ids.shape[0]]
-            engram_mask = ~image_sentinel_mask(input_ids)
+            image_mask = image_sentinel_mask(input_ids)
+            # The TileLang gate takes DeepSeek's mask: True passes an image through.
+            engram_mask = image_mask if kernels.uses_tilelang() else ~image_mask
         elif self.engram_hash is not None and input_ids is not None:
             attn_metadata = (
                 get_forward_context().attn_metadata
@@ -736,7 +738,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 query_start_loc[1] = input_ids.shape[0]
                 lookback_token_ids = input_ids.new_full((1, 3), -1)
             image_mask = image_sentinel_mask(input_ids)
-            engram_mask = ~image_mask
+            engram_mask = image_mask if kernels.uses_tilelang() else ~image_mask
             engram_hashes = self.engram_hash(
                 input_ids,
                 positions,

@@ -937,17 +937,22 @@ class Engram(nn.Module):
             hidden_size=self.dim,
             streams=self.hc_mult,
         )
-        self.mix_plans = {
-            masked: hyperconnection.plan(
-                mix_caps,
-                invocation={
-                    "operation": "engram_mix",
-                    "eps": self.eps,
-                    "token_mask": masked,
-                },
-            )
-            for masked in (False, True)
-        }
+        # The TileLang kernels gate through tilelang/engram.py, with no B12X plan.
+        self.mix_plans = (
+            {}
+            if kernels.uses_tilelang()
+            else {
+                masked: hyperconnection.plan(
+                    mix_caps,
+                    invocation={
+                        "operation": "engram_mix",
+                        "eps": self.eps,
+                        "token_mask": masked,
+                    },
+                )
+                for masked in (False, True)
+            }
+        )
         set_b12x_preparation_provider(self, self)
 
     def get_b12x_preparation_units(
@@ -1066,13 +1071,16 @@ class Engram(nn.Module):
             )
             for masked, plan in self.mix_plans.items()
         )
+        lookup = B12xPreparationUnit(
+            name="EngramLookup",
+            key=(id(self), workload.max_tokens),
+            requests=(request,),
+            stage="weights",
+        )
+        if not mix_requests:
+            return (lookup,)
         return (
-            B12xPreparationUnit(
-                name="EngramLookup",
-                key=(id(self), workload.max_tokens),
-                requests=(request,),
-                stage="weights",
-            ),
+            lookup,
             B12xPreparationUnit(
                 name="EngramMix",
                 key=(id(self), workload.max_tokens),
@@ -1155,6 +1163,9 @@ class Engram(nn.Module):
     def forward(self, hidden_states, hash_ids, token_mask=None, sp_rows=None):
         """Gate ``hidden_states`` with this layer's Engram rows.
 
+        ``token_mask`` marks the tokens to gate under the B12X kernels, and the
+        image tokens to pass through (DeepSeek's mask) under the TileLang kernels.
+
         With ``sp_rows`` (prefill sequence parallelism) ``hidden_states`` holds
         this rank's rows while ``hash_ids`` and ``token_mask`` cover every
         token; the lookup and projection still run on every row.
@@ -1185,6 +1196,15 @@ class Engram(nn.Module):
             state, mix_out, kv = state[:real], out[:real], kv[start : start + real]
             if token_mask is not None:
                 token_mask = token_mask[start : start + real]
+        if kernels.uses_tilelang():
+            from vllm.models.deepseek_v4_1.tilelang.engram import engram_gate
+
+            # The TileLang model passes DeepSeek's image-token mask (True skips).
+            engram_gate(
+                state, kv, self.norm_weights, token_mask, mix_out, self.eps,
+                self.hc_mult,
+            )
+            return out.view_as(hidden_states)
         hyperconnection.run_engram_mix(
             state,
             kv,
