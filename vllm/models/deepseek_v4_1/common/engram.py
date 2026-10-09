@@ -24,6 +24,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.model_executor.weight_transfer import copy_weight, get_file_tensor_source
+from vllm.models.deepseek_v4_1 import kernels
 from vllm.triton_utils import tl, triton
 from vllm.utils.b12x import (
     B12xPreparationUnit,
