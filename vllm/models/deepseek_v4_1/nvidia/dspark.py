@@ -90,6 +90,15 @@ def _vocab_parallel_greedy() -> bool:
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
 
 
+def _context_kv_projection(attn: nn.Module, capacity: int):
+    """The KV rows of ``attn``'s fused Q-A/KV weight as one projection."""
+    if kernels.uses_tilelang():
+        from ..tilelang.linear import TileLangBlock32Rows
+
+        return TileLangBlock32Rows(attn.fused_wqa_wkv, attn.q_lora_rank)
+    return _ContextKVProjection(attn, capacity)
+
+
 class _ContextKVProjection:
     """KV-only view of checkpoint block32 weights, packed once after loading."""
 
@@ -338,7 +347,7 @@ class DSparkDeepseekV4Model(nn.Module):
         self.target_layer_ids = tuple(config.dspark_target_layer_ids)
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
         self.context_capacity = vllm_config.scheduler_config.max_num_batched_tokens
-        self._context_kv_projections: list[_ContextKVProjection] = []
+        self._context_kv_projections: list = []
 
         self.num_dspark_layers = (
             getattr(config, "n_mtp_layers", None)
@@ -823,7 +832,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         for layer in self.model.layers:
             layer.attn.setup_wo_projection()
         self.model._context_kv_projections = [
-            _ContextKVProjection(layer.attn, self.model.context_capacity)
+            _context_kv_projection(layer.attn, self.model.context_capacity)
             for layer in self.model.layers
         ]
         first_layer = self.model.layers[0]
