@@ -574,9 +574,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if self.engram_hash is None:
                 raise RuntimeError("Disk Engram requires initialized hash state")
             hashes = self.prepared_engram_hashes[: input_ids.shape[0]]
+            image_mask = image_sentinel_mask(input_ids)
             self.engram_hash.run_native(
                 input_ids,
-                ~image_sentinel_mask(input_ids),
+                image_mask if kernels.uses_tilelang() else ~image_mask,
                 query_start_loc,
                 lookback_token_ids,
                 hashes,
