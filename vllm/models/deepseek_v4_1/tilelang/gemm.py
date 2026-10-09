@@ -56,6 +56,7 @@ def _mxfp8_gemm(
     out_dtype: T.dtype = T.bfloat16,
     padded_rows: bool = False,
     swizzle_panel: int = 0,
+    groups: int = 1,
 ):
     """``C[M, N] = (A * SFA) @ (B * SFB)^T`` for MXFP8 ``A[M, K]``, ``B[N, K]``.
 
@@ -75,9 +76,17 @@ def _mxfp8_gemm(
     ``swizzle_panel`` rasterizes the CTAs in panels of that many N tiles, so a
     weight larger than L2 is read once per panel rather than once per row of
     tiles; it only changes the order tiles run in.
+
+    With ``groups`` > 1 the projection is grouped (the attention's WO-A): ``A`` is
+    ``[M, groups * K]``, ``B`` and ``SFB`` stack the groups' ``[N, K]`` weights,
+    and ``C`` is ``[M, groups * N]``; output columns of group ``g`` read only A's
+    columns ``g * K`` to ``(g + 1) * K``. One launch covers every group.
     """
     assert K % block_K == 0 and block_K % 64 == 0, (
         "block_K must divide K and be a multiple of 64"
+    )
+    assert groups == 1 or (N % block_N == 0 and K % SF_WORD_K == 0), (
+        "grouped tiles must not straddle a group"
     )
     k_blocks = K // block_K
     M = T.dynamic("M")
@@ -86,20 +95,25 @@ def _mxfp8_gemm(
     accum_dtype = T.float32
     sf_words = scale_words(K)
     block_words = block_scale_words(block_K)
+    total_N = groups * N
 
     @T.prim_func
     def main(
-        A: T.Tensor((Mp, K), in_dtype),
-        B: T.Tensor((N, K), in_dtype),
-        SFA: T.Tensor((Mp, sf_words), T.uint32),
-        SFB: T.Tensor((N, sf_words), T.uint32),
-        C: T.Tensor((M, N), out_dtype),
+        A: T.Tensor((Mp, groups * K), in_dtype),
+        B: T.Tensor((total_N, K), in_dtype),
+        SFA: T.Tensor((Mp, groups * sf_words), T.uint32),
+        SFB: T.Tensor((total_N, sf_words), T.uint32),
+        C: T.Tensor((M, total_N), out_dtype),
     ):
         with T.Kernel(
-            T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads
+            T.ceildiv(total_N, block_N), T.ceildiv(M, block_M), threads=threads
         ) as (bx, by):
             if swizzle_panel:
                 T.use_swizzle(panel_size=swizzle_panel)
+            # The group's activation columns and scale words.
+            group = bx * block_N // N
+            a_k = group * K if groups > 1 else 0
+            a_word = group * sf_words if groups > 1 else 0
             A_shared = T.alloc_shared((block_M, block_K), in_dtype)
             B_shared = T.alloc_shared((block_N, block_K), in_dtype)
             SFA_shared = T.alloc_shared((block_M, block_words), T.uint32)
@@ -107,18 +121,19 @@ def _mxfp8_gemm(
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
             T.clear(C_local)
             for ko in T.Pipelined(k_blocks, num_stages=num_stages):
-                T.copy(A[by * block_M, ko * block_K], A_shared)
+                T.copy(A[by * block_M, a_k + ko * block_K], A_shared)
                 T.copy(B[bx * block_N, ko * block_K], B_shared)
                 # Edge tiles clamp their scale rows; those rows are never stored.
                 word0 = ko * block_K // SF_WORD_K
                 for i, w in T.Parallel(block_M, block_words):
                     SFA_shared[i, w] = SFA[
                         T.min(by * block_M + i, Mp - 1),
-                        T.min(word0 + w, sf_words - 1),
+                        a_word + T.min(word0 + w, sf_words - 1),
                     ]
                 for j, w in T.Parallel(block_N, block_words):
                     SFB_shared[j, w] = SFB[
-                        T.min(bx * block_N + j, N - 1), T.min(word0 + w, sf_words - 1)
+                        T.min(bx * block_N + j, total_N - 1),
+                        T.min(word0 + w, sf_words - 1),
                     ]
                 # The staged words start at the block's first word; k_start
                 # places the block inside it.
@@ -392,16 +407,20 @@ def decode_tile_rows(rows: int) -> int:
     return next(height for height in DECODE_TILE_ROWS if rows <= height)
 
 
-def fp8_decode_config(N: int, K: int, block_M: int = DECODE_ROWS) -> dict:
-    """Decode tile of an (N, K) block-32 FP8 projection, ``block_M`` rows tall."""
+def fp8_decode_config(
+    N: int, K: int, block_M: int = DECODE_ROWS, groups: int = 1
+) -> dict:
+    """Decode tile of an (N, K) block-32 FP8 projection, ``block_M`` rows tall;
+    grouped projections (``groups`` blocks of N rows) are keyed (N, K, groups)."""
     config = dict(
         block_M=block_M, block_N=64, block_K=pick_block_K(K), num_stages=3, threads=128
     )
-    config.update(DECODE_FP8_CONFIGS.get((N, K), {}).get(block_M, {}))
+    key = (N, K) if groups == 1 else (N, K, groups)
+    config.update(DECODE_FP8_CONFIGS.get(key, {}).get(block_M, {}))
     return config
 
 
-def fp8_prefill_config(N: int, K: int) -> dict:
+def fp8_prefill_config(N: int, K: int, groups: int = 1) -> dict:
     """Prefill tile of an (N, K) block-32 FP8 projection.
 
     A weight larger than L2 (the DSpark main projection, 39 MB at TP4) is
@@ -411,7 +430,7 @@ def fp8_prefill_config(N: int, K: int) -> dict:
     """
     device = torch.cuda.current_device()
     l2_bytes = torch.cuda.get_device_properties(device).L2_cache_size
-    swizzle_panel = 8 if l2_bytes < N * K else 0
+    swizzle_panel = 8 if l2_bytes < groups * N * K else 0
     return dict(default_config(DECODE_ROWS + 1, K), swizzle_panel=swizzle_panel)
 
 
