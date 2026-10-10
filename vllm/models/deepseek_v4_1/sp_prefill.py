@@ -350,8 +350,9 @@ def wo_slices(num_tokens: int) -> int:
 
 
 # Results of sequence-parallel steps stay unreduced where the TP group's
-# reduce-scatter is the rank-order one (see "Unreduced results").
-UNREDUCED = False
+# reduce-scatter is the rank-order one (see "Unreduced results"): the TileLang
+# family on the RoCE policy.
+UNREDUCED = True
 
 
 def unreduced_enabled() -> bool:
