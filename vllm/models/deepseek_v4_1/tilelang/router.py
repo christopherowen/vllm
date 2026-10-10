@@ -345,11 +345,16 @@ class TileLangGateRouter(TileKernelsRouter):
                 input_ids, self.image_sentinel_lo, self.image_sentinel_count
             )
         else:
-            if self._no_image is None or self._no_image.device != x.device:
-                from .linear import DECODE_ROWS
-
+            if (
+                self._no_image is None
+                or self._no_image.device != x.device
+                or self._no_image.numel() < rows
+            ):
+                # Every row count this fused path takes: the gate's split rows.
                 self._no_image = torch.zeros(
-                    DECODE_ROWS, dtype=torch.bool, device=x.device
+                    max(rows, gate.tilelang_split_rows),
+                    dtype=torch.bool,
+                    device=x.device,
                 )
             image_bias, mask = bias, self._no_image[:rows]
         self._kernels[key](
