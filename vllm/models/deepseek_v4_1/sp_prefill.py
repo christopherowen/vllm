@@ -203,6 +203,82 @@ class SPRows:
         local[:real].copy_(rows)
         return local
 
+    def project_reduce_scatter(
+        self,
+        project,
+        row_shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+        slices: int = 1,
+        then=None,
+    ) -> torch.Tensor:
+        """This rank's L rows of the sum over ranks of a T-row projection.
+
+        ``project(start, stop, out)`` writes rows ``start:stop`` of the projection
+        into ``out``. With ``slices`` > 1 each rank's block is projected in that many
+        pieces, every piece of every block into one contiguous buffer, and each
+        piece is reduce-scattered on a side stream while the next is projected.
+        A projection whose rows do not depend on one another reduces to the same
+        bits as one projection and one reduce-scatter. ``then()`` runs on the
+        current stream after the last projection, before the last reduce-scatter
+        is awaited.
+        """
+        if slices <= 1:
+            padded = self.empty_padded(row_shape, dtype, device)
+            project(0, self.num_tokens, padded[: self.num_tokens])
+            if then is not None:
+                then()
+            return self.reduce_scatter(padded)
+        local, world, tokens = self.local_rows, self.world_size, self.num_tokens
+        out = torch.empty((local, *row_shape), dtype=dtype, device=device)
+        bounds = [local * i // slices for i in range(slices + 1)]
+        main = torch.cuda.current_stream(device)
+        side = _side_stream(device)
+        for lo, hi in zip(bounds, bounds[1:]):
+            if hi == lo:
+                continue
+            piece = torch.empty(
+                (world, hi - lo, *row_shape), dtype=dtype, device=device
+            )
+            for owner in range(world):
+                start, stop = owner * local + lo, owner * local + hi
+                real = max(0, min(stop, tokens) - start)
+                if real:
+                    project(start, start + real, piece[owner, :real])
+                if real < hi - lo:
+                    piece[owner, real:].zero_()
+            side.wait_stream(main)
+            with torch.cuda.stream(side):
+                reduced = tensor_model_parallel_reduce_scatter(
+                    piece.view(world * (hi - lo), *row_shape), dim=0
+                )
+                out[lo:hi].copy_(reduced)
+            piece.record_stream(side)
+        if then is not None:
+            then()
+        main.wait_stream(side)
+        return out
+
+
+# The attention's WO projection is reduce-scattered in two slices from this many
+# tokens, so half its reduce-scatter runs under the other half's projection.
+WO_SLICE_TOKENS = 2048
+
+
+def wo_slices(num_tokens: int) -> int:
+    """Slices of a sequence-parallel WO projection of ``num_tokens`` tokens."""
+    return 2 if num_tokens >= WO_SLICE_TOKENS else 1
+
+
+_SIDE_STREAMS: dict = {}
+
+
+def _side_stream(device: torch.device) -> torch.cuda.Stream:
+    """One stream per device for the reduce-scatters of sliced projections."""
+    if device not in _SIDE_STREAMS:
+        _SIDE_STREAMS[device] = torch.cuda.Stream(device)
+    return _SIDE_STREAMS[device]
+
 
 def plan_rows(
     num_tokens: int, min_rows: int, world_size: int, rank: int
