@@ -780,10 +780,10 @@ SPLIT_FP8: dict[tuple[int, int], dict] = {
         shards=5,
         rows=SPLIT_DECODE_ROWS,
         decode={
-            16: dict(block_N=32, block_K=256, num_stages=2, threads=128),
+            16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
             32: dict(block_N=32, block_K=256, num_stages=2, threads=128),
-            64: dict(block_N=64, block_K=128, num_stages=3, threads=128),
-            128: dict(block_N=128, block_K=128, num_stages=2, threads=128),
+            64: dict(block_N=32, block_K=128, num_stages=3, threads=128),
+            128: dict(block_N=64, block_K=128, num_stages=2, threads=128),
         },
         prefill=dict(block_M=128, block_N=64, block_K=128, num_stages=2),
     ),
