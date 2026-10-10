@@ -92,6 +92,12 @@ def _rotated(x, positions, cos_sin_cache, **kwargs):
 
 def _write_v41_cache(x, cache, slots, *, page_size, cache_kind, plan):
     """Write ``x``'s V4.1 records (``cache_kind`` swa or indexed) at ``slots``."""
+    if kernels.uses_tilelang():
+        # The same bytes as B12X's writer; its plans stay declared.
+        from .tilelang.cache_writer import write_cache
+
+        write_cache(x, cache, slots, page_size=page_size, cache_kind=cache_kind)
+        return
     mla.write_cache(
         x,
         cache,
