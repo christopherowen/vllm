@@ -137,11 +137,11 @@ def rank_order_sum(
     return out.copy_(total)
 
 
-def reduce_scatter_rank_order(
+def exchange_rank_order(
     comm, input_tensor: torch.Tensor, rank: int, world: int
-) -> torch.Tensor:
-    """Rows ``[rank * L, (rank + 1) * L)`` of the sum over ranks of ``input_tensor``
-    (contiguous, ``world * L`` rows), with the one-shot all-reduce's arithmetic.
+) -> list[torch.Tensor]:
+    """Every rank's chunk ``rank`` of ``input_tensor`` (contiguous, ``world * L``
+    rows), unreduced and in rank order; this rank's own is a view of the input.
 
     ``comm`` is the group's PyNCCL communicator (``send``, ``recv``,
     ``group_start``, ``group_end``)."""
@@ -177,8 +177,16 @@ def reduce_scatter_rank_order(
                 _send(comm, chunks[peer], peer)
                 _recv(comm, parts[peer], peer)
         comm.group_end()
-    # This rank's own chunk is read in place.
-    return rank_order_sum([chunks[r] if r == rank else parts[r] for r in range(world)])
+    return [chunks[r] if r == rank else parts[r] for r in range(world)]
+
+
+def reduce_scatter_rank_order(
+    comm, input_tensor: torch.Tensor, rank: int, world: int
+) -> torch.Tensor:
+    """Rows ``[rank * L, (rank + 1) * L)`` of the sum over ranks of ``input_tensor``
+    (contiguous, ``world * L`` rows), with the one-shot all-reduce's arithmetic: the
+    unreduced exchange, then the rank-order sum (this rank's chunk read in place)."""
+    return rank_order_sum(exchange_rank_order(comm, input_tensor, rank, world))
 
 
 def _send(comm, tensor: torch.Tensor, peer: int) -> None:
@@ -191,4 +199,9 @@ def _recv(comm, tensor: torch.Tensor, peer: int) -> None:
         comm.recv(tensor, peer)
 
 
-__all__ = ["rank_order_sum", "rank_order_sum_kernel", "reduce_scatter_rank_order"]
+__all__ = [
+    "exchange_rank_order",
+    "rank_order_sum",
+    "rank_order_sum_kernel",
+    "reduce_scatter_rank_order",
+]
