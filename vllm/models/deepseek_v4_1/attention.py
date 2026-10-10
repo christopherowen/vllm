@@ -1982,6 +1982,44 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             nope_dim=self.head_dim - self.rope_head_dim,
             rope_dim=self.rope_head_dim,
         )
+        if sp_rows is not None:
+            if rows != sp_rows.num_tokens:
+                raise ValueError(f"V4.1 SP WO expects {sp_rows.num_tokens} rows")
+            hidden = weights.hidden
+
+            def project(start, stop, out):
+                part = replace(
+                    wo_projection.bind_inv_rope(
+                        plan,
+                        scratch=scratch,
+                        o=o[start:stop],
+                        positions=positions[start:stop],
+                        cos_sin_cache=self.rotary_emb.cos_sin_cache,
+                        weights=weights,
+                        heads_per_group=self.n_local_heads // self.n_local_groups,
+                        nope_dim=self.head_dim - self.rope_head_dim,
+                        rope_dim=self.rope_head_dim,
+                    ),
+                    output=out.as_strided(
+                        (stop - start, hidden, 1), (hidden, 1, (stop - start) * hidden)
+                    ),
+                )
+                done = wo_projection.run_inv_rope(
+                    binding=part, plan=plan, stream=current_stream().cuda_stream
+                )
+                if done.data_ptr() != out.data_ptr():
+                    raise RuntimeError("V4.1 WO projection ignored its output")
+
+            retain_cuda_graph_capture_resource(scratch)
+            return sp_rows.project_reduce_scatter(
+                project,
+                (hidden,),
+                torch.bfloat16,
+                o.device,
+                # Slicing keeps the bits only with the rank-order reduce-scatter.
+                slices=sp_prefill.wo_slices(rows) if kernels.uses_tilelang() else 1,
+                then=lambda: l2_prefetch.issue(self._l2pf_ffn, rows),
+            )
         # The custom attention result must outlive reuse of the workspace arena.
         if sp_rows is None:
             output = torch.empty_strided(
