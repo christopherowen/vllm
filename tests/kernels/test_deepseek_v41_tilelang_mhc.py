@@ -19,6 +19,9 @@ if not (
 pytest.importorskip("tilelang")
 pytest.importorskip("tile_kernels")
 
+from vllm.models.deepseek_v4_1.tilelang.collectives import (  # noqa: E402
+    RankOrderParts,
+)
 from vllm.models.deepseek_v4_1.tilelang.mhc import (  # noqa: E402
     BLOCK_H,
     MIXES,
@@ -126,6 +129,32 @@ def test_post_pre_matches_reference(mhc, tokens):
     _check(actual, _reference(actual[0], fn, scale, base, incoming, weight), tokens)
 
 
+@pytest.mark.parametrize("world", [2, 3, 4])
+@pytest.mark.parametrize("tokens", [1, 9, 64, 300])
+def test_post_pre_adds_rank_order_parts(mhc, world, tokens):
+    """Unreduced partials give exactly the result of their rank-order sum."""
+    residual, fn, scale, base, weight, incoming = _inputs(tokens, seed=200 + tokens)
+    g = torch.Generator(device=DEVICE).manual_seed(world * 1000 + tokens)
+    parts = torch.randn(world, tokens, HIDDEN, generator=g, device=DEVICE)
+    parts = parts.bfloat16()
+    parts[0, 0, :8] = -0.0  # a signed zero, added to nothing, survives
+    post = torch.rand(tokens, 4, generator=g, device=DEVICE) * 2
+    comb = torch.softmax(torch.randn(tokens, 4, 4, generator=g, device=DEVICE), -1)
+    summed = RankOrderParts(parts).sum()
+    expected = mhc.post_pre(
+        summed, residual, post, comb, fn, scale, base, weight, incoming
+    )
+    actual = mhc.post_pre(
+        RankOrderParts(parts), residual, post, comb, fn, scale, base, weight, incoming
+    )
+    for a, b in zip(actual, expected):
+        assert torch.equal(a, b)
+    assert torch.equal(
+        mhc.post(RankOrderParts(parts), residual, post, comb),
+        mhc.post(summed, residual, post, comb),
+    )
+
+
 def test_first_layer_broadcast_matches_expanded(mhc):
     tokens = 13
     residual, fn, scale, base, weight, _ = _inputs(tokens, seed=5)
@@ -163,7 +192,7 @@ def test_project_streams_partials(block_M):
     y = torch.empty_like(C)
     comb = torch.empty(tokens, 4, 4, device=DEVICE)
     project_streams(HIDDEN, "pre", block_M=block_M)(
-        y, flat, incoming, comb, incoming, fn, flat, P, S, C, Q
+        y.unsqueeze(0), flat, incoming, comb, incoming, fn, flat, P, S, C, Q
     )
     # The projection runs on TF32 tensor cores, as in DeepGEMM.
     reference = flat.float() @ fn.T

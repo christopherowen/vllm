@@ -483,6 +483,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
             scope="global",
         )
 
+    @property
+    def rank_order_reduce_scatter(self) -> bool:
+        """Whether ``reduce_scatter`` is DS4.1's rank-order one (its TileLang
+        family on the RoCE policy), so an exchange of unreduced chunks plus the
+        rank-order sum may stand in for it."""
+        return self._roce_policy and envs.VLLM_DS41_KERNEL_BACKEND == "tilelang"
+
     def _require_roce_policy(self) -> None:
         """A selected policy cannot silently become a different backend."""
         if not self._roce_policy:

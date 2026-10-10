@@ -561,6 +561,35 @@ class MoERunner(MoERunnerInterface):
             if shared_output is None
             else torch.result_type(shared_output, fused_output)
         )
+        # The same model-installed callback the all-reduce path fires.
+        _hook = getattr(self, "_l2_prefetch_pre_reduce_hook", None)
+        # A model-installed replacement for the buffer and reduce-scatter below:
+        # hook(write, rows, padded_rows, row_shape, dtype, device, then), where
+        # write(start, stop, out) fills rows start:stop of the combined output.
+        _reduce = getattr(self, "_sp_project_reduce_scatter_hook", None)
+        if _reduce is not None:
+            if trunc_size is not None:
+                raise NotImplementedError(
+                    "MoE reduce-scatter hook with a trimmed output"
+                )
+
+            def write(start: int, stop: int, out: torch.Tensor) -> None:
+                if shared_output is None:
+                    out.copy_(fused_output[start:stop])
+                else:
+                    torch.add(
+                        shared_output[start:stop], fused_output[start:stop], out=out
+                    )
+
+            return _reduce(
+                write,
+                rows,
+                padded_rows,
+                fused_output.shape[1:],
+                dtype,
+                fused_output.device,
+                None if _hook is None else lambda: _hook(rows),
+            )
         states = fused_output.new_empty(
             (padded_rows, *fused_output.shape[1:]), dtype=dtype
         )
@@ -569,8 +598,6 @@ class MoERunner(MoERunnerInterface):
             states[:rows].copy_(fused_output)
         else:
             torch.add(shared_output, fused_output, out=states[:rows])
-        # The same model-installed callback the all-reduce path fires.
-        _hook = getattr(self, "_l2_prefetch_pre_reduce_hook", None)
         if _hook is not None:
             _hook(rows)
         states = tensor_model_parallel_reduce_scatter(states, dim=0)

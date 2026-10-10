@@ -37,6 +37,9 @@ import tilelang.language as T
 import torch
 from torch import nn
 
+from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.models.deepseek_v4_1 import sp_prefill
+from vllm.models.deepseek_v4_1.tilelang.collectives import RankOrderParts
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
     retain_cuda_graph_capture_resource,
@@ -60,6 +63,7 @@ def project_streams(
     mode: str,
     block_M: int = 16,
     block_H: int = BLOCK_H,
+    world: int = 1,
 ):
     """The streams' projection partials and their collapse, for one hidden block.
 
@@ -67,6 +71,10 @@ def project_streams(
     sublayer's output into the streams (``post``) and writes them, ``"pre"``
     reads streams already updated, and ``"broadcast"`` expands an embedding to
     four copies (the first layer, whose ``fn`` is the stream blocks summed).
+    ``X`` is ``(world, M, H)``: with ``world`` > 1 (``"post_pre"`` only) the
+    previous output arrives as the ranks' unreduced partials, which each thread
+    adds in FP32 in rank order and rounds once, as the rank-order reduce-scatter
+    does, so the output has the same bits as that sum read back.
 
     Each CTA owns ``block_H`` hidden columns of every stream, a K split of the
     projection, for ``block_M`` tokens. Each thread owns one token's
@@ -78,6 +86,7 @@ def project_streams(
     collapse is rounded to BF16, with its sum of squares ``Q``.
     """
     assert hidden_size % block_H == 0 and mode in ("pre", "post_pre", "broadcast")
+    assert 1 <= world <= 4 and (world == 1 or mode == "post_pre")
     splits = hidden_size // block_H
     streams = 1 if mode == "broadcast" else MULT
     K = streams * hidden_size
@@ -90,7 +99,7 @@ def project_streams(
 
     @T.prim_func
     def main(
-        X: T.Tensor((M, H), T.bfloat16),
+        X: T.Tensor((world, M, H), T.bfloat16),
         R: T.Tensor((M, MULT * H), T.bfloat16),
         post: T.Tensor((M, MULT), T.float32),
         comb: T.Tensor((M, MULT, MULT), T.float32),
@@ -132,9 +141,21 @@ def project_streams(
                     coef[MULT + k] = post[src, k]
                 for k in T.unroll(MULT * MULT):
                     coef[2 * MULT + k] = comb[src, k // MULT, k % MULT]
-            if mode != "pre":
+            if mode != "pre" and world == 1:
                 for v in T.vectorized(COLS):
-                    xv[v] = X[src, h0 + c0 + v]
+                    xv[v] = X[0, src, h0 + c0 + v]
+            if world > 1:
+                # The first part as is (signed zeros survive), then the others.
+                for r in T.unroll(world):
+                    for v in T.vectorized(COLS):
+                        xv[v] = X[r, src, h0 + c0 + v]
+                    for v in T.unroll(COLS):
+                        if r == 0:
+                            av[v] = T.Cast(T.float32, xv[v])
+                        else:
+                            av[v] = av[v] + T.Cast(T.float32, xv[v])
+                for v in T.unroll(COLS):
+                    xv[v] = T.Cast(T.bfloat16, av[v])
             if mode != "broadcast":
                 for m in T.unroll(MULT):
                     for v in T.vectorized(COLS):
@@ -340,8 +361,8 @@ def finalize(
 
 
 @cache
-def _project(hidden: int, mode: str):
-    return project_streams(hidden, mode, block_M=BLOCK_M)
+def _project(hidden: int, mode: str, world: int = 1):
+    return project_streams(hidden, mode, block_M=BLOCK_M, world=world)
 
 
 @cache
@@ -382,8 +403,12 @@ def _mhc_pre(
     if tokens == 0:
         return
     streams = MULT * hidden
+    world = 1
     # Unused operands of a mode take a buffer of the right shape; none is read.
     if previous_output is not None:
+        # (T, H), or the ranks' unreduced partials of it, (world, T, H).
+        if previous_output.ndim == 3:
+            world = int(previous_output.shape[0])
         mode, x, k = "post_pre", previous_output, streams
         source, updated = residual.view(tokens, streams), residual_out
         mix_post, mix_comb = previous_post, previous_comb
@@ -404,8 +429,8 @@ def _mhc_pre(
     )
     retain_cuda_graph_capture_resource(scratch)
     P, S, C, Q = scratch
-    _project(hidden, mode)(
-        x,
+    _project(hidden, mode, world)(
+        x if x.ndim == 3 else x.unsqueeze(0),
         source,
         mix_post,
         mix_comb,
@@ -496,6 +521,10 @@ class TileKernelsMHC(nn.Module):
         # Compile every kernel now, never during CUDA graph capture.
         for mode in ("pre", "post_pre", "broadcast"):
             _project(self.hidden_size, mode)
+        if sp_prefill.unreduced_enabled():
+            # Sequence-parallel steps hand post_pre the ranks' unreduced parts.
+            world = get_tensor_model_parallel_world_size()
+            _project(self.hidden_size, "post_pre", world)
         for k in (self.hidden_size, MULT * self.hidden_size):
             _finalize(self.hidden_size, k, self.rms_eps, self.hc_eps, self.iterations)
 
@@ -513,6 +542,9 @@ class TileKernelsMHC(nn.Module):
         previous_comb=None,
     ):
         tokens, device = int(residual.shape[0]), residual.device
+        if isinstance(previous_output, RankOrderParts):
+            # Added inside the projection kernel, in rank order.
+            previous_output = previous_output.packed
         if pre is None:
             pre = torch.zeros((tokens, MULT), dtype=torch.float32, device=device)
             pre[:, 0].fill_(1)
@@ -563,6 +595,8 @@ class TileKernelsMHC(nn.Module):
         )
 
     def post(self, x, residual, post, comb):
+        if isinstance(x, RankOrderParts):
+            x = x.sum()
         out = torch.empty_like(residual)
         _mhc_post(x, residual, post, comb, out)
         return out

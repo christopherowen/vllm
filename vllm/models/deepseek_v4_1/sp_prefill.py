@@ -63,6 +63,16 @@ the final collapse and norm, and for every aux hidden state a drafter
 consumes, the rows are gathered back to T. DSpark drafts from the aux hidden
 states only, so its pre-collapse MTP buffer is not filled under SP; other
 drafters gather it.
+
+## Unreduced results
+
+With ``UNREDUCED`` and the TP group's rank-order reduce-scatter (DS4.1's TileLang
+family on the RoCE fabric), the attention's WO output and the MoE output skip the
+sum: every rank's partial of this rank's rows is exchanged into one
+``(N, L, hidden)`` buffer, this rank's own written in place, and the decoder layer
+hands it on as ``RankOrderParts``. TileLang mHC's ``post_pre`` adds the parts in
+rank order as it loads them, the same arithmetic and the same bits as the
+rank-order reduce-scatter; any other consumer calls ``sum()``.
 """
 
 from collections.abc import Iterator
@@ -148,6 +158,8 @@ class SPRows:
     num_tokens: int
     world_size: int
     rank: int
+    # Results stay unreduced (see "Unreduced results").
+    unreduced: bool = False
 
     @property
     def padded_rows(self) -> int:
@@ -171,6 +183,7 @@ class SPRows:
 
     def gather(self, x: torch.Tensor) -> torch.Tensor:
         """All-gather this rank's L rows into the first T rows."""
+        x = materialize(x)
         if x.shape[0] != self.local_rows:
             raise ValueError(f"SP gather expects {self.local_rows} rows, got {x.shape}")
         return tensor_model_parallel_all_gather(x, dim=0)[: self.num_tokens]
@@ -222,7 +235,14 @@ class SPRows:
         bits as one projection and one reduce-scatter. ``then()`` runs on the
         current stream after the last projection, before the last reduce-scatter
         is awaited.
+
+        With ``unreduced`` rows the result is every rank's unreduced partial of
+        this rank's rows instead, ``(N, L, *row_shape)``; see "Unreduced results".
         """
+        if self.unreduced:
+            return self._project_exchange(
+                project, row_shape, dtype, device, slices, then
+            )
         if slices <= 1:
             padded = self.empty_padded(row_shape, dtype, device)
             project(0, self.num_tokens, padded[: self.num_tokens])
@@ -259,6 +279,48 @@ class SPRows:
         main.wait_stream(side)
         return out
 
+    def _project_exchange(self, project, row_shape, dtype, device, slices, then):
+        """``project_reduce_scatter`` without the sum: each rank's block goes into
+        its slot of one send buffer, this rank's own straight into its slot of
+        the parts, and the chunks are exchanged into the parts; with ``slices``
+        > 1 each slice is exchanged on the side stream while the next is
+        projected."""
+        from vllm.models.deepseek_v4_1.tilelang.collectives import exchange_into
+
+        local, world, tokens = self.local_rows, self.world_size, self.num_tokens
+        send = torch.empty((world, local, *row_shape), dtype=dtype, device=device)
+        parts = torch.empty_like(send)
+        comm = get_tp_group().device_communicator.pynccl_comm
+        slices = max(slices, 1)
+        bounds = [local * i // slices for i in range(slices + 1)]
+        main = torch.cuda.current_stream(device)
+        side = _side_stream(device) if slices > 1 else None
+        for lo, hi in zip(bounds, bounds[1:]):
+            if hi == lo:
+                continue
+            for owner in range(world):
+                dest = parts if owner == self.rank else send
+                start, stop = owner * local + lo, owner * local + hi
+                real = max(0, min(stop, tokens) - start)
+                if real:
+                    project(start, start + real, dest[owner, lo : lo + real])
+                if real < hi - lo:
+                    dest[owner, lo + real : hi].zero_()
+            if side is not None:
+                side.wait_stream(main)
+                with torch.cuda.stream(side):
+                    exchange_into(
+                        comm, send[:, lo:hi], parts[:, lo:hi], self.rank, world
+                    )
+        if then is not None:
+            then()
+        if side is None:
+            exchange_into(comm, send, parts, self.rank, world)
+        else:
+            # send and parts are freed only after this wait, on this stream.
+            main.wait_stream(side)
+        return parts
+
 
 # The attention's WO projection is reduce-scattered in two slices from this many
 # tokens, so half its reduce-scatter runs under the other half's projection.
@@ -268,6 +330,47 @@ WO_SLICE_TOKENS = 2048
 def wo_slices(num_tokens: int) -> int:
     """Slices of a sequence-parallel WO projection of ``num_tokens`` tokens."""
     return 2 if num_tokens >= WO_SLICE_TOKENS else 1
+
+
+# Results of sequence-parallel steps stay unreduced where the TP group's
+# reduce-scatter is the rank-order one (see "Unreduced results").
+UNREDUCED = False
+
+
+def unreduced_enabled() -> bool:
+    """Whether this process's SP steps keep their results unreduced."""
+    if not UNREDUCED or not model_parallel_is_initialized():
+        return False
+    comm = get_tp_group().device_communicator
+    return bool(getattr(comm, "rank_order_reduce_scatter", False))
+
+
+def materialize(x):
+    """``x``, or the rank-order sum of its parts."""
+    from vllm.models.deepseek_v4_1.tilelang.collectives import RankOrderParts
+
+    return x.sum() if isinstance(x, RankOrderParts) else x
+
+
+def unreduced_parts(x: torch.Tensor):
+    """A packed ``(N, L, ...)`` result of an unreduced step as ``RankOrderParts``."""
+    from vllm.models.deepseek_v4_1.tilelang.collectives import RankOrderParts
+
+    return RankOrderParts(x)
+
+
+def project_reduce_scatter_current(
+    project, rows, padded_rows, row_shape, dtype, device, then=None
+) -> torch.Tensor:
+    """The MoE runner's reduce-scatter hook: ``project_reduce_scatter`` over the
+    rows of the active SP forward (``activate``)."""
+    sp = current()
+    if sp is None or sp.num_tokens != rows or sp.padded_rows != padded_rows:
+        raise RuntimeError(
+            f"SP reduce-scatter of {rows} rows ({padded_rows} padded) outside its "
+            f"forward ({sp})"
+        )
+    return sp.project_reduce_scatter(project, row_shape, dtype, device, then=then)
 
 
 _SIDE_STREAMS: dict = {}
@@ -281,14 +384,18 @@ def _side_stream(device: torch.device) -> torch.cuda.Stream:
 
 
 def plan_rows(
-    num_tokens: int, min_rows: int, world_size: int, rank: int
+    num_tokens: int,
+    min_rows: int,
+    world_size: int,
+    rank: int,
+    unreduced: bool = False,
 ) -> SPRows | None:
     """The SP row layout for a forward of ``num_tokens`` tokens, or None."""
     if min_rows <= 0 or world_size <= 1 or num_tokens < min_rows:
         return None
     if not 0 <= rank < world_size:
         raise ValueError(f"TP rank {rank} is outside world size {world_size}")
-    return SPRows(num_tokens, world_size, rank)
+    return SPRows(num_tokens, world_size, rank, unreduced)
 
 
 _ROWS: ContextVar[SPRows | None] = ContextVar("ds41_prefill_sp_rows", default=None)
@@ -301,7 +408,7 @@ def current() -> SPRows | None:
 
 @contextmanager
 def activate(rows: SPRows) -> Iterator[None]:
-    """Expose ``rows`` across the opaque attention op boundary."""
+    """Expose ``rows`` across the opaque attention op and MoE runner boundaries."""
     token = _ROWS.set(rows)
     try:
         yield
