@@ -92,6 +92,11 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
+# Prefill chunks that end at absolute multiples of long_prefill_token_threshold,
+# whatever else the step holds (DeepSeek V4.1 temperature-0 determinism). Off: a
+# chunk takes whatever budget the step's other requests leave.
+ALIGN_PREFILL_CHUNKS = False
+
 
 def _build_kv_connector_block_state(
     kv_cache_config: KVCacheConfig,
@@ -833,6 +838,22 @@ class Scheduler(SchedulerInterface):
                 return queue
         return None
 
+    def _aligned_prefill_chunk(
+        self, num_computed_tokens: int, num_new_tokens: int
+    ) -> int:
+        """The prefill chunk that ends at the next multiple of the long-prefill
+        threshold, or at the prompt end.
+
+        Where a prompt splits decides which rows each step computes and, for
+        DeepSeek V4.1, where its CED decoder windows start; counting from the
+        computed tokens (prefix-cache hits included) keeps the boundaries
+        absolute, so they do not depend on the step's other requests.
+        """
+        threshold = self.scheduler_config.long_prefill_token_threshold
+        if threshold <= 0:
+            return num_new_tokens
+        return min(num_new_tokens, threshold - num_computed_tokens % threshold)
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -1101,6 +1122,11 @@ class Scheduler(SchedulerInterface):
                     < num_new_tokens
                 ):
                     num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+                aligned_chunk = None
+                if ALIGN_PREFILL_CHUNKS and request.is_prefill_chunk:
+                    aligned_chunk = num_new_tokens = self._aligned_prefill_chunk(
+                        request.num_computed_tokens, num_new_tokens
+                    )
                 if request.is_prefill_chunk and prefill_interleave_step is not None:
                     num_new_tokens = min(
                         num_new_tokens,
@@ -1111,6 +1137,10 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = min(
                     num_new_tokens, token_budget, input_budget - draft_slots
                 )
+                if aligned_chunk is not None and num_new_tokens < aligned_chunk:
+                    # No partial chunk: wait for a step with room for all of it.
+                    req_index += 1
+                    continue
                 # Make sure the input position does not exceed the max model len.
                 # This is necessary when using spec decoding.
                 num_new_tokens = min(
@@ -1705,6 +1735,11 @@ class Scheduler(SchedulerInterface):
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
+                    aligned_chunk = None
+                    if ALIGN_PREFILL_CHUNKS and num_new_tokens > 1:
+                        aligned_chunk = num_new_tokens = self._aligned_prefill_chunk(
+                            num_computed_tokens, num_new_tokens
+                        )
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -1718,6 +1753,9 @@ class Scheduler(SchedulerInterface):
 
                     num_new_tokens = min(num_new_tokens, request_token_budget)
                     assert num_new_tokens > 0
+                    if aligned_chunk is not None and num_new_tokens < aligned_chunk:
+                        # No partial chunk this step.
+                        break
 
                     # Apply Mamba alignment before encoder caps.
                     if self.need_mamba_block_aligned_split:
