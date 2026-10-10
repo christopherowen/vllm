@@ -93,9 +93,10 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 # Prefill chunks that end at absolute multiples of long_prefill_token_threshold,
-# whatever else the step holds (DeepSeek V4.1 temperature-0 determinism). Off: a
-# chunk takes whatever budget the step's other requests leave.
-ALIGN_PREFILL_CHUNKS = False
+# whatever else the step holds (DeepSeek V4.1 temperature-0 determinism, under
+# its TileLang kernel family). Otherwise a chunk takes whatever budget the step's
+# other requests leave.
+ALIGN_PREFILL_CHUNKS = envs.VLLM_DS41_KERNEL_BACKEND == "tilelang"
 
 
 def _build_kv_connector_block_state(
