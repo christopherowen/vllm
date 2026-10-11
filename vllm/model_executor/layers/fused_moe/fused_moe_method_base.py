@@ -61,6 +61,14 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         )
 
     @property
+    def modular_experts(self) -> "mk.FusedMoEExperts | None":
+        """A modular kernel's experts, else None."""
+        impl = getattr(self.moe_kernel, "impl", None)
+        if isinstance(impl, mk.FusedMoEKernelModularImpl):
+            return impl.fused_experts
+        return None
+
+    @property
     def output_dtype(self) -> torch.dtype:
         """Dtype produced by the routed experts: a modular kernel's experts say."""
         impl = getattr(self.moe_kernel, "impl", None)

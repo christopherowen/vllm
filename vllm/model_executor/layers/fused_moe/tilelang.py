@@ -145,11 +145,24 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
 
+    # Set by the MoE runner around one call whose shared expert runs before the
+    # routed experts: the combine adds ``combine_addend`` (the shared expert's
+    # output) to the FP32 sum and rounds the rank's partial once, in BF16 out.
+    fold_shared: bool = False
+    combine_addend: torch.Tensor | None = None
+
+    @property
+    def folds_shared_output(self) -> bool:
+        """Whether the combine can add the shared expert's output itself: when it
+        would otherwise write an FP32 partial for the runner to add and round."""
+        return _output_dtype() == torch.float32
+
     @property
     def output_dtype(self) -> torch.dtype:
         """FP32 under the MoE FP32 combine switch: the runner adds the shared
-        expert in FP32 and rounds the rank's partial once before the reduction."""
-        return _output_dtype()
+        expert in FP32 and rounds the rank's partial once before the reduction.
+        With the shared output folded into the combine, the layer's dtype."""
+        return self.moe_config.in_dtype if self.fold_shared else _output_dtype()
 
     # -- weights ----------------------------------------------------------
 
@@ -250,8 +263,12 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
         tail13, tail2 = self._tails
         weights = ((w1, tail13, self.w1_scale), (w2, tail2, self.w2_scale))
         workspace = workspace2.view(-1).view(torch.uint8)
+        shared = None
+        if self.fold_shared:
+            assert self.combine_addend is not None, "the shared output must be ready"
+            shared = self.combine_addend
         self._plan.run(
-            hidden_states, topk_ids, topk_weights, weights, output, workspace
+            hidden_states, topk_ids, topk_weights, weights, output, workspace, shared
         )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:

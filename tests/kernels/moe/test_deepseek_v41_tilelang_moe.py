@@ -153,3 +153,33 @@ def test_moe_experts_fp32_output(
             x[r : r + 1], ids[r : r + 1], route_weights[r : r + 1], weights, solo
         )
         assert torch.equal(solo[0], outs[torch.float32][r])
+
+
+@pytest.mark.parametrize("rows", [1, 12, 300])
+def test_moe_experts_fold_shared(
+    rows, hidden=384, intermediate=576, num_experts=32, topk=6
+):
+    """The FP32 plan's combine with the shared expert's output folded in (BF16 out)
+    gives the runner's bits: the FP32 partial plus the shared output in FP32, rounded
+    once, as the all-reduce path and the reduce-scatter buffer compute it. A row's
+    result does not depend on which of them a step takes."""
+    w13_packed, w13_sf, _ = _experts(num_experts, 2 * intermediate, hidden, 1)
+    w2_packed, w2_sf, _ = _experts(num_experts, hidden, intermediate, 2)
+    plan = MoeExpertsV41Plan(
+        num_experts, topk, hidden, intermediate, swiglu_limit=LIMIT,
+        out_dtype=torch.float32,
+    )  # fmt: skip
+    weights = plan.prepare_weights(w13_packed, w13_sf, w2_packed, w2_sf)
+    x = (torch.randn((rows, hidden), generator=_gen(3), device=DEVICE) * 0.5).bfloat16()
+    shared = (torch.randn((rows, hidden), generator=_gen(5), device=DEVICE)).bfloat16()
+    ids, route_weights = _routes(rows, num_experts, topk, 4, torch.int32)
+    wide = torch.empty((rows, hidden), dtype=torch.float32, device=DEVICE)
+    plan.run(x, ids, route_weights, weights, wide)
+    folded = torch.empty((rows, hidden), dtype=torch.bfloat16, device=DEVICE)
+    plan.run(x, ids, route_weights, weights, folded, shared=shared)
+    assert torch.equal(folded, (shared + wide).to(torch.bfloat16))  # all-reduce path
+    buffer = torch.empty_like(folded)
+    torch.add(shared, wide, out=buffer)  # reduce-scatter buffer
+    assert torch.equal(folded, buffer)
+    with pytest.raises(AssertionError):
+        plan.run(x, ids, route_weights, weights, folded)  # BF16 out needs the shared

@@ -442,6 +442,16 @@ class MoeDispatchV41Plan:
             for s in (False, True)
             for w in (False, True)
         }
+        # A wider output (the FP32 partial) can instead take the shared expert's
+        # output, add it in FP32 and round once to BF16 (``combine(shared=...)``).
+        self.fold_kernels = (
+            {}
+            if out_dtype == torch.bfloat16
+            else {
+                w: moe_combine_v41(hidden, topk, True, w, out_dtype=T.bfloat16)
+                for w in (False, True)
+            }
+        )
 
     def tiles(self, rows):
         return layout_tiles(rows, self.topk, self.block_M, self.num_experts)
@@ -502,7 +512,9 @@ class MoeDispatchV41Plan:
     def combine(self, y, layout, out, topk_weights=None, shared=None):
         """Sum each token's expert outputs into ``out``.
 
-        Pass ``topk_weights`` only if the experts did not apply them.
+        Pass ``topk_weights`` only if the experts did not apply them. A BF16 ``out``
+        of a plan with a wider output dtype takes ``shared``: the routes' FP32 sum
+        plus the shared output, rounded once.
         """
         rows = layout["route_pos"].shape[0]
         weights = (
@@ -510,7 +522,15 @@ class MoeDispatchV41Plan:
             if topk_weights is None
             else topk_weights
         )
-        kernel = self.combine_kernels[(shared is not None, topk_weights is not None)]
+        if out.dtype != self.out_dtype:
+            assert out.dtype == torch.bfloat16 and shared is not None, (
+                "only a shared input folds a wider combine into BF16"
+            )
+            kernel = self.fold_kernels[topk_weights is not None]
+        else:
+            kernel = self.combine_kernels[
+                (shared is not None, topk_weights is not None)
+            ]
         # Without a shared input the kernel never reads it: any BF16 rows do.
         kernel(y, layout["route_pos"], weights, y if shared is None else shared, out)
         return out
@@ -880,12 +900,13 @@ class MoeExpertsV41Plan:
             ((layout_rows, hidden), torch.bfloat16),  # down output
         )
 
-    def run(self, x, topk_ids, topk_weights, weights, out, workspace=None):
-        """``out[t] = sum_k w[t, k] * down_e(swiglu(gate_up_e(x[t])))``.
+    def run(self, x, topk_ids, topk_weights, weights, out, workspace=None, shared=None):
+        """``out[t] = sum_k w[t, k] * down_e(swiglu(gate_up_e(x[t]))) (+ shared[t])``.
 
         ``e`` is the token's k-th expert. ``weights`` comes from
         ``prepare_weights``; ``workspace`` is a byte buffer of at least
-        ``workspace_bytes(workspace_specs(rows))``.
+        ``workspace_bytes(workspace_specs(rows))``. ``shared`` (BF16 rows) is added
+        to the FP32 sum before the one rounding to ``out``'s dtype.
         """
         rows = x.shape[0]
         dispatch = self.dispatch[topk_ids.dtype]
@@ -907,7 +928,7 @@ class MoeExpertsV41Plan:
         self.gate_up(xq, x_words, *_present(gate_up), order, tile_expert, h)
         self.swiglu(h, hq, h_sf, layout["psum"], layout["layout_weights"], 1.0, None)
         self.down(hq, h_words, *_present(down), order, tile_expert, y)
-        return dispatch.combine(y, layout, out)
+        return dispatch.combine(y, layout, out, shared=shared)
 
 
 def _present(weights):

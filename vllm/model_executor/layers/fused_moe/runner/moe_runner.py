@@ -94,6 +94,8 @@ def get_layer_from_name(layer_name: str) -> MoERunnerInterface:
 if TYPE_CHECKING:
     from typing import TypeAlias
 
+    import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+
     _layer_name_type: TypeAlias = str | LayerName
 else:
     _layer_name_type = LayerName if _USE_LAYERNAME else str
@@ -426,6 +428,31 @@ class MoERunner(MoERunnerInterface):
                 shared_output *= 1.0 / self.routed_scaling_factor
         return shared_output, fused_output
 
+    def _shared_output_fold(
+        self, shared_experts_input: torch.Tensor | None
+    ) -> "mk.FusedMoEExperts | None":
+        """The routed experts whose combine adds the shared expert's output, or None.
+
+        Only when the shared expert runs before the routed experts on this stream
+        (no overlap), nothing scales, trims or transforms the routed output before
+        the add, and the experts would otherwise write a wider partial for the add
+        and one rounding here: they do both in the combine, with the same bits.
+        """
+        if (
+            self._shared_experts is None
+            or shared_experts_input is None
+            or self.routed_scaling_factor != 1.0
+            or self.routed_output_transform is not None
+            or self._fused_output_is_reduced
+            or self._shared_experts._determine_shared_experts_order(
+                shared_experts_input
+            )
+            != SharedExpertsOrder.NO_OVERLAP
+        ):
+            return None
+        experts = self._quant_method.modular_experts
+        return experts if getattr(experts, "folds_shared_output", False) else None
+
     @property
     def _fused_output_is_reduced(self) -> bool:
         return (
@@ -720,6 +747,11 @@ class MoERunner(MoERunnerInterface):
         self._maybe_apply_shared_experts(
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP, shared_workspace
         )
+        experts = self._quant_method.modular_experts
+        if getattr(experts, "fold_shared", False):
+            # The shared expert ran first: the combine adds its output (forward).
+            assert self._shared_experts is not None
+            experts.combine_addend = self._shared_experts.peek_output()
 
         if self.routed_experts.quant_method.is_monolithic:
             # Monolithic kernels: pass router_logits to routed_experts
@@ -855,17 +887,29 @@ class MoERunner(MoERunnerInterface):
             )
         )
 
-        result = self._forward_entry(
-            hidden_states,
-            router_logits,
-            shared_experts_input,
-            input_ids,
-            self._encode_layer_name(),
-            self.moe_config.hidden_dim_unpadded
-            if self._quant_method.has_unpadded_output
-            else 0,
-            self._quant_method.output_dtype,
+        fold = (
+            self._shared_output_fold(shared_experts_input)
+            if og_hidden_dim_pre_xform is None and og_hidden_dim_post_xform is None
+            else None
         )
+        if fold is not None:
+            fold.fold_shared = True
+        try:
+            result = self._forward_entry(
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+                self._encode_layer_name(),
+                self.moe_config.hidden_dim_unpadded
+                if self._quant_method.has_unpadded_output
+                else 0,
+                self._quant_method.output_dtype,
+            )
+        finally:
+            if fold is not None:
+                fold.fold_shared = False
+                fold.combine_addend = None
 
         #
         # Note: there are two all-reduce points below. They are mutually
@@ -879,6 +923,8 @@ class MoERunner(MoERunnerInterface):
         # Extract outputs from result
         shared_output, fused_output = _unpack(result)
         fused_output = cast(torch.Tensor, fused_output)
+        if fold is not None:
+            shared_output = None  # the combine added it
 
         if og_hidden_dim_pre_xform is not None:
             fused_output = fused_output[..., :og_hidden_dim_pre_xform]

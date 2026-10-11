@@ -208,6 +208,10 @@ class SharedExperts(torch.nn.Module):
     def _output_idx(self) -> int:
         return dbo_current_ubatch_id() if self.enable_dbo else 0
 
+    def peek_output(self) -> torch.Tensor | None:
+        """The finished output, left in place for ``output`` to take."""
+        return self._output[self._output_idx]
+
     @property
     def output(self) -> torch.Tensor:
         assert self._output[self._output_idx] is not None
