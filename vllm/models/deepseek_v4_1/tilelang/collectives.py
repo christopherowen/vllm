@@ -221,6 +221,27 @@ def reduce_scatter_rank_order(
     return rank_order_sum(exchange_rank_order(comm, input_tensor, rank, world))
 
 
+def all_reduce_rank_order(
+    comm, input_tensor: torch.Tensor, rank: int, world: int
+) -> torch.Tensor:
+    """The sum over ranks of ``input_tensor`` at any size, with the one-shot
+    all-reduce's arithmetic: its rows (zero-padded to a multiple of ``world``) are
+    reduce-scattered in rank order, then all-gathered, which moves bits without
+    arithmetic. A row has the same bits as the one-shot path would give it."""
+    rows = input_tensor.shape[0]
+    flat = input_tensor.reshape(rows, -1)
+    padded = -(-rows // world) * world
+    if padded != rows or not flat.is_contiguous():
+        buffer = flat.new_zeros((padded, flat.shape[1]))
+        buffer[:rows].copy_(flat)
+    else:
+        buffer = flat
+    own = reduce_scatter_rank_order(comm, buffer, rank, world)
+    gathered = torch.empty_like(buffer)
+    comm.all_gather(gathered, own)
+    return gathered[:rows].view(input_tensor.shape)
+
+
 def _send(comm, tensor: torch.Tensor, peer: int) -> None:
     if tensor.numel():
         comm.send(tensor, peer)
@@ -233,6 +254,7 @@ def _recv(comm, tensor: torch.Tensor, peer: int) -> None:
 
 __all__ = [
     "RankOrderParts",
+    "all_reduce_rank_order",
     "exchange_into",
     "exchange_rank_order",
     "rank_order_sum",

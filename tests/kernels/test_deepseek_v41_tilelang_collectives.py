@@ -11,6 +11,7 @@ import torch
 
 from vllm.models.deepseek_v4_1.tilelang.collectives import (
     RankOrderParts,
+    all_reduce_rank_order,
     exchange_into,
     rank_order_sum,
     reduce_scatter_rank_order,
@@ -25,6 +26,7 @@ class _Fabric:
         self.world = world
         self.barrier = threading.Barrier(world)
         self.queues = defaultdict(deque)
+        self.gathered = {}
         self.lock = threading.Lock()
 
 
@@ -46,6 +48,15 @@ class _Comm:
 
     def recv(self, tensor, peer):
         self.recvs.append((peer, tensor))
+
+    def all_gather(self, output, tensor):
+        """Every rank's ``tensor`` into ``output`` in rank order (data movement only)."""
+        fabric = self.fabric
+        with fabric.lock:
+            fabric.gathered[self.rank] = tensor.clone()
+        fabric.barrier.wait()
+        output.copy_(torch.cat([fabric.gathered[r] for r in range(fabric.world)]))
+        fabric.barrier.wait()
 
     def group_end(self):
         fabric = self.fabric
@@ -137,6 +148,21 @@ def test_sliced_exchange_into_parts_sums_alike(world, bounds):
         for r in range(world):
             assert torch.equal(sliced[rank].packed[r], inputs[r][rows])
         assert torch.equal(sliced[rank].sum(), whole[rank])
+
+
+@pytest.mark.parametrize("world", [2, 3, 4])
+@pytest.mark.parametrize("rows", [1, 5, 8, 13])
+def test_all_reduce_adds_as_the_one_shot_all_reduce(world, rows):
+    # Every rank gets every row, each summed in rank order with one rounding,
+    # whatever the row count (padding rows are dropped).
+    torch.manual_seed(world * 100 + rows)
+    width = 24
+    inputs = [torch.randn(rows, width).to(torch.bfloat16) for _ in range(world)]
+    out = _run(inputs, all_reduce_rank_order)
+    want = _reference(inputs)
+    for rank in range(world):
+        assert out[rank].shape == (rows, width)
+        assert torch.equal(out[rank], want)
 
 
 def test_row_bits_do_not_depend_on_owner_or_batch():
