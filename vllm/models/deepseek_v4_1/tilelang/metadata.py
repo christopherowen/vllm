@@ -239,8 +239,9 @@ def chunk_kernel(page: int, window: int, width: int, draft: bool, replay: bool):
 def decode_metadata_kernel(
     page: int, window: int, width: int, draft: bool, replay: bool, main_width: int
 ):
-    """``chunk`` and ``pages`` of the main cache in one launch: each row's window
-    metadata, then its main page table (block 0 and holes as -1)."""
+    """``chunk`` and ``pages`` of the main cache in one launch, a block for each part
+    of each row: the window metadata and the main page table (block 0 and holes as
+    -1)."""
     rows = T.dynamic("rows")
     src_rows = T.dynamic("src_rows")
     table_rows = T.dynamic("table_rows")
@@ -275,21 +276,26 @@ def decode_metadata_kernel(
         offset: T.int32,
         main_read_width: T.int32,
     ):
-        with T.Kernel(rows, threads=threads) as row:
+        # Two blocks a row, one launch: the window metadata, then the page table.
+        with T.Kernel(rows, 2, threads=threads) as (row, part):
             tx = T.get_thread_binding()
             info = T.alloc_local((2,), T.int64)  # window start, clamped length
-            window_row(
-                row, tx, info, positions, reqs, table, swa, lengths, top_lengths,
-                visible, starts, request_positions, replay_start, offset,
-            )  # fmt: skip
-            req = main_reqs[offset + row]
-            for k in T.serial(main_per_thread):
-                col = k * threads + tx
-                if col < main_width:
-                    page_id = T.if_then_else(
-                        (req >= 0) & (col < main_read_width), main_table[req, col], -1
-                    )
-                    main_pages[row, col] = T.if_then_else(page_id > 0, page_id, -1)
+            if part == 0:
+                window_row(
+                    row, tx, info, positions, reqs, table, swa, lengths, top_lengths,
+                    visible, starts, request_positions, replay_start, offset,
+                )  # fmt: skip
+            else:
+                req = main_reqs[offset + row]
+                for k in T.serial(main_per_thread):
+                    col = k * threads + tx
+                    if col < main_width:
+                        page_id = T.if_then_else(
+                            (req >= 0) & (col < main_read_width),
+                            main_table[req, col],
+                            -1,
+                        )
+                        main_pages[row, col] = T.if_then_else(page_id > 0, page_id, -1)
 
     return decode_metadata
 
