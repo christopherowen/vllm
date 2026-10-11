@@ -49,6 +49,12 @@ def _kernels():
     return moe
 
 
+def _output_dtype() -> torch.dtype:
+    from vllm.models.deepseek_v4_1.kernels import moe_output_dtype
+
+    return moe_output_dtype()
+
+
 class TileLangExperts(mk.FusedMoEExpertsModular):
     """MXFP4 experts with MXFP8 activations, in TileLang and TileKernels."""
 
@@ -139,6 +145,12 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
 
+    @property
+    def output_dtype(self) -> torch.dtype:
+        """FP32 under the MoE FP32 combine switch: the runner adds the shared
+        expert in FP32 and rounds the rank's partial once before the reduction."""
+        return _output_dtype()
+
     # -- weights ----------------------------------------------------------
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -153,6 +165,7 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
             w2.shape[1],
             w2.shape[2] * 2,
             swiglu_limit=self.moe_config.swiglu_limit if limit is None else limit,
+            out_dtype=self.output_dtype,
         )
         # Tile-major copies replace the checkpoint layout, so each GEMM tile's
         # weights and scales are contiguous. A K that ends 64 past a multiple

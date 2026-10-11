@@ -336,12 +336,15 @@ def moe_combine_v41(
     weighted: bool = False,
     block_D: int = 1024,
     threads: int = 128,
+    out_dtype: T.dtype = T.bfloat16,
 ):
     """``Out[t] = sum_k [Weights[t, k] *] Y[RoutePos[t, k]] (+ Shared[t])``.
 
-    FP32 in slot order, BF16 out.
+    FP32 in slot order; ``out_dtype`` out (FP32 keeps the routes' sum unrounded
+    until the rank's partial, shared expert included, rounds once).
     """
     rows, layout_rows = T.dynamic("rows, layout_rows")
+    shared_rows = T.dynamic("shared_rows")  # rows with a shared input; any otherwise
     while hidden % block_D:
         block_D //= 2
     assert block_D >= 8, f"hidden={hidden} must be a multiple of 8"
@@ -351,8 +354,8 @@ def moe_combine_v41(
         Y: T.Tensor([layout_rows, hidden], T.bfloat16),
         RoutePos: T.Tensor([rows, topk], T.int32),
         Weights: T.Tensor([rows, topk], T.float32),
-        Shared: T.Tensor([rows, hidden], T.bfloat16),
-        Out: T.Tensor([rows, hidden], T.bfloat16),
+        Shared: T.Tensor([shared_rows, hidden], T.bfloat16),
+        Out: T.Tensor([rows, hidden], out_dtype),
     ):
         with T.Kernel(hidden // block_D, rows, threads=threads) as (bd, row):
             acc = T.alloc_fragment([block_D], T.float32)
@@ -375,10 +378,10 @@ def moe_combine_v41(
                 if shared:
                     Out[row, bd * block_D + d] = T.cast(
                         acc[d] + T.cast(Shared[row, bd * block_D + d], T.float32),
-                        T.bfloat16,
+                        out_dtype,
                     )
                 else:
-                    Out[row, bd * block_D + d] = T.cast(acc[d], T.bfloat16)
+                    Out[row, bd * block_D + d] = T.cast(acc[d], out_dtype)
 
     return main
 
@@ -412,7 +415,15 @@ class MoeDispatchV41Plan:
         "num_tiles",
     )
 
-    def __init__(self, num_experts, topk, block_M, hidden, idx_dtype=torch.int64):
+    def __init__(
+        self,
+        num_experts,
+        topk,
+        block_M,
+        hidden,
+        idx_dtype=torch.int64,
+        out_dtype=torch.bfloat16,
+    ):
         self.num_experts, self.topk, self.block_M, self.hidden = (
             num_experts,
             topk,
@@ -424,8 +435,10 @@ class MoeDispatchV41Plan:
         self.count = moe_dispatch_v41(num_experts, topk, block_M, "count", tl_idx)
         self.layout = moe_dispatch_v41(num_experts, topk, block_M, "layout", tl_idx)
         self.scatter = moe_dispatch_v41(num_experts, topk, block_M, "scatter", tl_idx)
+        tl_out = {torch.bfloat16: T.bfloat16, torch.float32: T.float32}[out_dtype]
+        self.out_dtype = out_dtype
         self.combine_kernels = {
-            (s, w): moe_combine_v41(hidden, topk, s, w)
+            (s, w): moe_combine_v41(hidden, topk, s, w, out_dtype=tl_out)
             for s in (False, True)
             for w in (False, True)
         }
@@ -498,7 +511,8 @@ class MoeDispatchV41Plan:
             else topk_weights
         )
         kernel = self.combine_kernels[(shared is not None, topk_weights is not None)]
-        kernel(y, layout["route_pos"], weights, out if shared is None else shared, out)
+        # Without a shared input the kernel never reads it: any BF16 rows do.
+        kernel(y, layout["route_pos"], weights, y if shared is None else shared, out)
         return out
 
 
@@ -813,6 +827,7 @@ class MoeExpertsV41Plan:
         block_M=32,
         block_N=128,
         num_stages=3,
+        out_dtype=torch.bfloat16,
     ):
         self.num_experts, self.topk, self.hidden, self.intermediate = (
             num_experts,
@@ -828,9 +843,12 @@ class MoeExpertsV41Plan:
         self.down = grouped_fp8_fp4_gemm(
             num_experts, hidden, intermediate, topk, False, block_M, **config
         )
-        # Routers emit int32 or int64 expert ids.
+        # Routers emit int32 or int64 expert ids. The combine writes ``out_dtype``.
+        self.out_dtype = out_dtype
         self.dispatch = {
-            dtype: MoeDispatchV41Plan(num_experts, topk, block_M, hidden, dtype)
+            dtype: MoeDispatchV41Plan(
+                num_experts, topk, block_M, hidden, dtype, out_dtype
+            )
             for dtype in (torch.int32, torch.int64)
         }
         self.tk = _tile_kernels(block_M)

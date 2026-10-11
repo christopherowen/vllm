@@ -8,6 +8,7 @@ linear and MoE backends agree with it. Model code asks this module for the
 implementation of each component instead of naming a family.
 """
 
+import torch
 from torch import nn
 
 from vllm import envs
@@ -49,6 +50,18 @@ def embedding_method():
     from .b12x_layers import B12xEmbeddingMethod
 
     return B12xEmbeddingMethod()
+
+
+def moe_output_dtype() -> torch.dtype:
+    """The routed experts' output. FP32 keeps the routes' combined sum unrounded,
+    so the rank's partial (shared expert added in FP32) rounds once before the
+    cross-rank sum, as DeepSeek's row-parallel linears round theirs; BF16 rounds
+    at the combine and again at the shared add."""
+    return torch.float32 if MOE_FP32_COMBINE and uses_tilelang() else torch.bfloat16
+
+
+# The MoE combine stays FP32 until the rank's partial rounds, under the TileLang family.
+MOE_FP32_COMBINE = False
 
 
 def moe_router_class():

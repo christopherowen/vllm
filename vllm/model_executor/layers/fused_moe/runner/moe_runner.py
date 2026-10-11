@@ -556,11 +556,15 @@ class MoERunner(MoERunnerInterface):
         ):
             raise NotImplementedError("MoE reduce-scatter needs an unreduced output")
         rows = fused_output.shape[0]
+        # A routed output wider than the layer's dtype (TileLang's FP32 combine)
+        # is added to the shared expert in FP32 and rounds once into the buffer.
         dtype = (
             fused_output.dtype
             if shared_output is None
             else torch.result_type(shared_output, fused_output)
         )
+        if dtype != self.moe_config.in_dtype:
+            dtype = self.moe_config.in_dtype
         # The same model-installed callback the all-reduce path fires.
         _hook = getattr(self, "_l2_prefetch_pre_reduce_hook", None)
         # A model-installed replacement for the buffer and reduce-scatter below:
@@ -951,6 +955,11 @@ class MoERunner(MoERunnerInterface):
             )
         else:
             result = fused_output
+        if result.dtype != self.moe_config.in_dtype and not fused_output_is_reduced:
+            # A TP partial kept unrounded through its combine (TileLang MoE): the
+            # rank's partial, shared expert included, rounds once before the
+            # reduction, as a row-parallel linear rounds its partial.
+            result = result.to(self.moe_config.in_dtype)
 
         if reuse_output:
             result = self._maybe_reduce_final_output(

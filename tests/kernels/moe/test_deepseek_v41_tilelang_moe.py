@@ -119,3 +119,37 @@ def test_moe_experts(rows, idx_dtype, hidden, intermediate, num_experts=32, topk
         solo = torch.empty_like(x[r : r + 1])
         plan.run(x[r : r + 1], ids[r : r + 1], route_weights[r : r + 1], weights, solo)
         assert torch.equal(solo[0], out[r]), f"row {r} changed with batch composition"
+
+
+@pytest.mark.parametrize("rows", [1, 12, 300])
+def test_moe_experts_fp32_output(
+    rows, hidden=384, intermediate=576, num_experts=32, topk=6
+):
+    """An FP32 combine keeps the slot-order FP32 sum the BF16 combine rounds: the
+    same sum, unrounded, and as independent of the batch."""
+    w13_packed, w13_sf, _ = _experts(num_experts, 2 * intermediate, hidden, 1)
+    w2_packed, w2_sf, _ = _experts(num_experts, hidden, intermediate, 2)
+    plans = {
+        dtype: MoeExpertsV41Plan(
+            num_experts, topk, hidden, intermediate, swiglu_limit=LIMIT, out_dtype=dtype
+        )
+        for dtype in (torch.bfloat16, torch.float32)
+    }
+    weights = plans[torch.bfloat16].prepare_weights(
+        w13_packed, w13_sf, w2_packed, w2_sf
+    )
+    x = (torch.randn((rows, hidden), generator=_gen(3), device=DEVICE) * 0.5).bfloat16()
+    ids, route_weights = _routes(rows, num_experts, topk, 4, torch.int32)
+    outs = {}
+    for dtype, plan in plans.items():
+        assert plan.out_dtype == dtype
+        outs[dtype] = torch.empty((rows, hidden), dtype=dtype, device=DEVICE)
+        plan.run(x, ids, route_weights, weights, outs[dtype])
+    assert torch.equal(outs[torch.float32].bfloat16(), outs[torch.bfloat16])
+    assert not torch.equal(outs[torch.float32], outs[torch.bfloat16].float())
+    for r in {0, rows - 1}:
+        solo = torch.empty((1, hidden), dtype=torch.float32, device=DEVICE)
+        plans[torch.float32].run(
+            x[r : r + 1], ids[r : r + 1], route_weights[r : r + 1], weights, solo
+        )
+        assert torch.equal(solo[0], outs[torch.float32][r])
