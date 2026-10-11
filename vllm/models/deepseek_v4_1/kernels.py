@@ -81,7 +81,7 @@ def shared_expert_activation(act_fn: nn.Module) -> nn.Module:
 
 
 # The shared expert's SwiGLU at the reference's precision under the TileLang family.
-SHARED_SWIGLU_FP32 = False
+SHARED_SWIGLU_FP32 = True
 
 
 def moe_router_class():
