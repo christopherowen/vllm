@@ -512,6 +512,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 raise RuntimeError("Selected B12X all-reduce returned None")
             return out
 
+        if self._roce_policy and envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
+            # Past the one-shot dispatch limit (CED decoder steps of 205 rows or
+            # more), keep its arithmetic: NCCL's ring rounds every hop and adds
+            # in another order, so a row's bits would depend on its step's size.
+            from vllm.models.deepseek_v4_1.tilelang.collectives import (
+                all_reduce_rank_order,
+            )
+
+            return all_reduce_rank_order(
+                self.pynccl_comm, input_, self.rank_in_group, self.world_size
+            )
         if self._roce_policy:
             out = self.pynccl_comm.all_reduce(input_)
             if out is None:
