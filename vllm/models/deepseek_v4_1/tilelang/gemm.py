@@ -374,6 +374,66 @@ def bf16_gemm(
 
 
 @tilelang.jit
+def fp8w_bf16_gemm(
+    N: int,
+    K: int,
+    groups: int = 1,
+    block_M: int = 16,
+    block_N: int = 32,
+    block_K: int = 64,
+    num_stages: int = 2,
+    threads: int = 128,
+):
+    """``C[:, g*N:(g+1)*N] = A[:, g*K:(g+1)*K] @ W_g^T`` for every group ``g`` in one
+    launch: BF16 activations ``A[M, groups*K]`` against block-32 FP8 weights
+    ``W[groups*N, K]`` (E4M3, one UE8M0 exponent per 32x32 block in ``E``), each weight
+    tile expanded exactly to BF16 (an E4M3 value times a power of two fits BF16) and
+    multiplied on BF16 tensor cores with FP32 accumulation; BF16 out. This is DeepSeek's
+    reference WO-A: BF16 activations on the FP8 weights dequantized by ``convert.py``.
+
+    Every M tile runs the same K loop, so a row's bits do not depend on its batch.
+    """
+    assert K % block_K == 0 and block_K % 32 == 0 and N % block_N == 0
+    M = T.dynamic("M")
+    k_blocks = K // block_K
+    n_tiles = N // block_N
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, groups * K), T.bfloat16),
+        W: T.Tensor((groups * N, K), T.float8_e4m3fn),
+        E: T.Tensor((groups * N // 32, K // 32), T.uint8),
+        C: T.Tensor((M, groups * N), T.bfloat16),
+    ):
+        with T.Kernel(groups * n_tiles, T.ceildiv(M, block_M), threads=threads) as (
+            bx,
+            by,
+        ):
+            g = bx // n_tiles
+            n0 = g * N + (bx % n_tiles) * block_N
+            A_shared = T.alloc_shared((block_M, block_K), T.bfloat16)
+            W_shared = T.alloc_shared((block_N, block_K), T.float8_e4m3fn)
+            B_shared = T.alloc_shared((block_N, block_K), T.bfloat16)
+            C_local = T.alloc_fragment((block_M, block_N), T.float32)
+            T.clear(C_local)
+            for ko in T.Pipelined(k_blocks, num_stages=num_stages):
+                T.copy(A[by * block_M, g * K + ko * block_K], A_shared)
+                T.copy(W[n0, ko * block_K], W_shared)
+                for i, j in T.Parallel(block_N, block_K):
+                    exponent = T.Cast(
+                        T.uint32, E[(n0 + i) // 32, (ko * block_K + j) // 32]
+                    )
+                    scale = T.reinterpret(T.shift_left(exponent, 23), T.float32)
+                    B_shared[i, j] = T.Cast(
+                        T.bfloat16, T.Cast(T.float32, W_shared[i, j]) * scale
+                    )
+                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+            T.copy(C_local, C[by * block_M, n0])
+
+    return main
+
+
+@tilelang.jit
 def splitk_reduce_two(
     N: int,
     shards: int,

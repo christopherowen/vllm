@@ -82,8 +82,9 @@ def test_wo_projection():
         return out
 
     full = project(rows)
-    # Reference: TileKernels' inverse rotation in BF16, then FP64 GEMMs on the
-    # MXFP8 activations, the intermediate rounded to BF16 as the kernel stores it.
+    # Reference: TileKernels' inverse rotation in BF16, then FP64 GEMMs: WO-A on the
+    # BF16 activations (DeepSeek's dequantized BF16 einsum), WO-B on MXFP8 ones (its
+    # linear), the intermediate rounded to BF16 as the kernel stores it.
     rotated = o.clone()
     tile_kernels.transform.apply_rotary(
         rotated[..., -ROPE:],
@@ -92,7 +93,7 @@ def test_wo_projection():
         interleaved=True,
         conjugate=True,
     )
-    x = _mxfp8_values(rotated.view(rows, -1))
+    x = rotated.view(rows, -1).double()
     w_a, width = _dequant(wo_a), HEADS // GROUPS * HEAD_DIM
     a = torch.cat(
         [
@@ -137,3 +138,43 @@ def test_grouped_gemm_equals_groups(count):
                 scratch,
             )
             assert torch.equal(out[:, g * RANK : (g + 1) * RANK], single), f"group {g}"
+
+
+def test_wo_a_keeps_bf16_activations():
+    """WO-A within one BF16 rounding of the FP64 product of the BF16 activations and
+    the exactly dequantized weights, well inside what MXFP8 activations give, with the
+    same bits at every row count (every row tile runs one K loop)."""
+    from vllm.models.deepseek_v4_1.tilelang.wo import _GroupedBF16
+
+    width = HEADS // GROUPS * HEAD_DIM
+    layer = _block32(GROUPS * RANK, width, 7)
+    wo_a = _GroupedBF16(layer, GROUPS)
+    x = torch.randn((300, GROUPS * width), generator=_gen(8), device=DEVICE).bfloat16()
+    w = _dequant(layer)
+
+    def project(rows):
+        out = torch.empty((rows, GROUPS * RANK), dtype=torch.bfloat16, device=DEVICE)
+        wo_a(x[:rows], out)
+        return out
+
+    full = project(300)
+    ref = torch.cat(
+        [
+            x[:, g * width : (g + 1) * width].double() @ w[g * RANK : (g + 1) * RANK].T
+            for g in range(GROUPS)
+        ],
+        dim=1,
+    )
+    error = (full.double() - ref).abs()
+    assert (error <= ref.abs() * 2**-8 + 1e-3 * ref.abs().max()).all()
+    quantized = torch.cat(
+        [
+            _mxfp8_values(x[:, g * width : (g + 1) * width])
+            @ w[g * RANK : (g + 1) * RANK].T
+            for g in range(GROUPS)
+        ],
+        dim=1,
+    )
+    assert error.mean() < 0.25 * (quantized - ref).abs().mean()
+    for rows in (1, 7, 16, 17, 33, 64, 65, 100, 128, 129, 200):
+        assert torch.equal(project(rows), full[:rows]), rows
