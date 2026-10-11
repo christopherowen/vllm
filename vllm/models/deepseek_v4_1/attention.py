@@ -2114,20 +2114,33 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         return self._wo_plans[key]
 
     def _o_proj_tilelang(self, o, positions, sp_rows):
-        """The TileLang WO projection; ``o``'s RoPE columns are rotated in place."""
+        """The TileLang WO projection; ``o``'s RoPE columns are rotated in place.
+
+        A sequence-parallel step projects through ``project_reduce_scatter`` as the
+        B12X path does: in slices, and as unreduced rank-order parts when the step
+        keeps them, so a row's sum over ranks is the non-SP step's all-reduce."""
         rows, hidden = o.shape[0], self.hidden_size
-        if sp_rows is None:
-            local = torch.empty((rows, hidden), dtype=torch.bfloat16, device=o.device)
-        else:
+        cache = self.rotary_emb.cos_sin_cache
+        if sp_rows is not None:
             if rows != sp_rows.num_tokens:
                 raise ValueError(f"V4.1 SP WO expects {sp_rows.num_tokens} rows")
-            # Leading rows of the zero-padded buffer the reduce-scatter reads.
-            padded = sp_rows.empty_padded((hidden,), torch.bfloat16, o.device)
-            local = padded[:rows]
-        self._wo_projection_weights(o, positions, self.rotary_emb.cos_sin_cache, local)
+
+            def project(start, stop, out):
+                self._wo_projection_weights(
+                    o[start:stop], positions[start:stop], cache, out
+                )
+
+            return sp_rows.project_reduce_scatter(
+                project,
+                (hidden,),
+                torch.bfloat16,
+                o.device,
+                slices=sp_prefill.wo_slices(rows),
+                then=lambda: l2_prefetch.issue(self._l2pf_ffn, rows),
+            )
+        local = torch.empty((rows, hidden), dtype=torch.bfloat16, device=o.device)
+        self._wo_projection_weights(o, positions, cache, local)
         l2_prefetch.issue(self._l2pf_ffn, rows)
-        if sp_rows is not None:
-            return sp_rows.reduce_scatter(padded)
         if get_tensor_model_parallel_world_size() > 1:
             local = get_tp_group().all_reduce(local)
         return local
