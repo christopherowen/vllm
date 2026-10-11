@@ -45,13 +45,14 @@ def gather_partial_state_kernel(max_requests: int, page: int):
     """Each live request's ring carry: the even predecessor of an odd first position."""
     blocks = T.dynamic("blocks")
     width = T.dynamic("width")
+    pool_stride = T.dynamic("pool_stride")  # the allocator pads its pages
     table_rows = T.dynamic("table_rows")
     table_cols = T.dynamic("table_cols")
     table_stride = T.dynamic("table_stride")
 
     @T.prim_func
     def gather_partial_state(
-        pool: T.Tensor((blocks, width), T.float32),
+        pool: T.StridedTensor((blocks, width), (pool_stride, 1), T.float32),
         table: T.StridedTensor((table_rows, table_cols), (table_stride, 1), T.int32),
         starts: T.Tensor((max_requests + 1,), T.int32),
         positions: T.Tensor((max_requests,), T.int64),
@@ -105,6 +106,7 @@ def compress_kernel(ratio: int, max_requests: int, page: int, warps: int = 4):
     gate_rows = T.dynamic("gate_rows")  # rows at ratio 2; any buffer at ratio 1
     blocks = T.dynamic("blocks")
     width = T.dynamic("width")
+    pool_stride = T.dynamic("pool_stride")  # the allocator pads its pages
     value_dtype = T.float32 if ratio == 2 else T.bfloat16
 
     @T.prim_func
@@ -121,7 +123,7 @@ def compress_kernel(ratio: int, max_requests: int, page: int, warps: int = 4):
         pending_values: T.Tensor((max_requests, DIM), T.float32),
         pending_gates: T.Tensor((max_requests, DIM), T.float32),
         tags: T.Tensor((max_requests,), T.int64),
-        pool: T.Tensor((blocks, width), T.float32),
+        pool: T.StridedTensor((blocks, width), (pool_stride, 1), T.float32),
         out: T.Tensor((rows, DIM), T.bfloat16),
         emitted: T.Tensor((rows,), T.bool),
         emitted_slots: T.Tensor((rows,), T.int64),

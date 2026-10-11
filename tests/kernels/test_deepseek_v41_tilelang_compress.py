@@ -62,12 +62,19 @@ def _step(lengths, ratio, seed, padding=3):
             state_slots[starts[r] + k] = int(table[r, 0]) * PAGE + pos % PAGE
     weight = torch.rand(DIM, generator=g) + 0.5
     counts = torch.tensor([nt, nr], dtype=torch.int32)
-    pool = torch.randn(BLOCKS, PAGE * STATE, generator=g)
+    # Padded rows, as the KV allocator lays out its pages.
+    pool = torch.randn(BLOCKS, PAGE * STATE + 64, generator=g)[:, : PAGE * STATE]
     tensors = dict(
         starts=starts_t, positions=positions, values=values, gates=gates, slots=slots,
         table=table, state_slots=state_slots, weight=weight, counts=counts, pool=pool,
     )  # fmt: skip
-    return {k: v.to(DEVICE) for k, v in tensors.items()}, rows, starts
+    moved = {k: v.to(DEVICE) for k, v in tensors.items()}
+    moved["pool"] = torch.randn(BLOCKS, PAGE * STATE + 64, device=DEVICE)[
+        :, : PAGE * STATE
+    ]
+    moved["pool"].copy_(tensors["pool"])
+    assert not moved["pool"].is_contiguous()
+    return moved, rows, starts
 
 
 def _ring(step):
