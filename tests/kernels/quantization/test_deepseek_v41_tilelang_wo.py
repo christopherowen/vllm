@@ -143,7 +143,8 @@ def test_grouped_gemm_equals_groups(count):
 def test_wo_a_keeps_bf16_activations():
     """WO-A within one BF16 rounding of the FP64 product of the BF16 activations and
     the exactly dequantized weights, well inside what MXFP8 activations give, with the
-    same bits at every row count (every row tile runs one K loop)."""
+    same bits at every row count: decode rows split the K shards over CTAs and longer
+    steps add them inside the kernel, in the same order."""
     from vllm.models.deepseek_v4_1.tilelang.wo import _GroupedBF16
 
     width = HEADS // GROUPS * HEAD_DIM
@@ -152,9 +153,12 @@ def test_wo_a_keeps_bf16_activations():
     x = torch.randn((300, GROUPS * width), generator=_gen(8), device=DEVICE).bfloat16()
     w = _dequant(layer)
 
+    scratch = torch.empty(1 << 26, dtype=torch.uint8, device=DEVICE)  # split partials
+
     def project(rows):
         out = torch.empty((rows, GROUPS * RANK), dtype=torch.bfloat16, device=DEVICE)
-        wo_a(x[:rows], out)
+        with use_preallocated_workspace(scratch):
+            wo_a(x[:rows], out)
         return out
 
     full = project(300)

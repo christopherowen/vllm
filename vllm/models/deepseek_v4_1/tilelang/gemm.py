@@ -386,6 +386,7 @@ def fp8w_bf16_gemm(
     block_K: int = 64,
     num_stages: int = 2,
     threads: int = 128,
+    shards: int = 1,
 ):
     """``C[:, g*N:(g+1)*N] = A[:, g*K:(g+1)*K] @ W_g^T`` for every group ``g`` in one
     launch: BF16 activations ``A[M, groups*K]`` against block-32 FP8 weights
@@ -394,13 +395,17 @@ def fp8w_bf16_gemm(
     multiplied on BF16 tensor cores with FP32 accumulation; BF16 out. This is DeepSeek's
     reference WO-A: BF16 activations on the FP8 weights dequantized by ``convert.py``.
 
-    Every M tile runs the same K loop, so a row's bits do not depend on its batch.
+    Every M tile runs the same K loop, so a row's bits do not depend on its batch. With
+    ``shards`` > 1 each K shard is summed from zero and the shards added in order, the
+    arithmetic of ``fp8w_bf16_gemm_partials`` plus ``splitk_reduce``.
     """
     # Whole 32x32 scale blocks per tile (a 16-wide tile had no scale rows).
     assert K % block_K == 0 and block_K % 32 == 0 and N % block_N == 0
     assert block_N % 32 == 0
-    M = T.dynamic("M")
     k_blocks = K // block_K
+    assert k_blocks % shards == 0
+    shard_blocks = k_blocks // shards
+    M = T.dynamic("M")
     n_tiles = N // block_N
 
     @T.prim_func
@@ -421,26 +426,101 @@ def fp8w_bf16_gemm(
             S_shared = T.alloc_shared((block_N // 32, block_K // 32), T.float32)
             B_shared = T.alloc_shared((block_N, block_K), T.bfloat16)
             C_local = T.alloc_fragment((block_M, block_N), T.float32)
+            C_total = T.alloc_fragment(
+                (block_M, block_N) if shards > 1 else (1, 1), T.float32
+            )
             T.clear(C_local)
+            if shards > 1:
+                T.clear(C_total)
             for ko in T.Pipelined(k_blocks, num_stages=num_stages):
-                T.copy(A[by * block_M, g * K + ko * block_K], A_shared)
-                T.copy(W[n0, ko * block_K], W_shared)
-                # The tile's few UE8M0 exponents as FP32 powers of two, decoded once: a
-                # per-element uint8 gather vectorizes to a byte pack nvcc rejects.
-                for r, c in T.Parallel(block_N // 32, block_K // 32):
-                    exponent = T.Cast(
-                        T.uint32, E[n0 // 32 + r, ko * (block_K // 32) + c]
-                    )
-                    S_shared[r, c] = T.reinterpret(
-                        T.shift_left(exponent, 23), T.float32
-                    )
-                for i, j in T.Parallel(block_N, block_K):
-                    B_shared[i, j] = T.Cast(
-                        T.bfloat16,
-                        T.Cast(T.float32, W_shared[i, j]) * S_shared[i // 32, j // 32],
-                    )
-                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
-            T.copy(C_local, C[by * block_M, n0])
+                _w8a16_step(A, W, E, A_shared, W_shared, S_shared, B_shared, C_local,
+                            by, g, n0, ko, K, block_M, block_N, block_K)  # fmt: skip
+                if shards > 1:  # noqa: SIM102
+                    if (ko + 1) % shard_blocks == 0:
+                        for i, j in T.Parallel(block_M, block_N):
+                            C_total[i, j] = T.if_then_else(
+                                ko + 1 == shard_blocks,
+                                C_local[i, j],
+                                C_total[i, j] + C_local[i, j],
+                            )
+                        T.clear(C_local)
+            if shards > 1:
+                T.copy(C_total, C[by * block_M, n0])
+            else:
+                T.copy(C_local, C[by * block_M, n0])
+
+    return main
+
+
+@T.macro
+def _w8a16_step(
+    A, W, E, A_shared, W_shared, S_shared, B_shared, C_local, by, g, n0, ko, K,
+    block_M, block_N, block_K,
+):  # fmt: skip
+    """One K block of the W8A16 GEMM: copy the activation and weight tiles, decode the
+    tile's UE8M0 exponents to FP32 powers of two once (a per-element uint8 gather
+    vectorizes to a byte pack nvcc rejects), expand the weights exactly to BF16, MMA."""
+    T.copy(A[by * block_M, g * K + ko * block_K], A_shared)
+    T.copy(W[n0, ko * block_K], W_shared)
+    for r, c in T.Parallel(block_N // 32, block_K // 32):
+        exponent = T.Cast(T.uint32, E[n0 // 32 + r, ko * (block_K // 32) + c])
+        S_shared[r, c] = T.reinterpret(T.shift_left(exponent, 23), T.float32)
+    for i, j in T.Parallel(block_N, block_K):
+        B_shared[i, j] = T.Cast(
+            T.bfloat16,
+            T.Cast(T.float32, W_shared[i, j]) * S_shared[i // 32, j // 32],
+        )
+    T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+
+
+@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+def fp8w_bf16_gemm_partials(
+    N: int,
+    K: int,
+    groups: int,
+    shards: int,
+    block_M: int = 16,
+    block_N: int = 32,
+    block_K: int = 64,
+    num_stages: int = 2,
+    threads: int = 128,
+):
+    """Split-K W8A16 for decode rows: FP32 ``P[s]`` over K shard ``s`` of every group,
+    a CTA per (column tile, shard, row tile); ``splitk_reduce`` adds them in order."""
+    assert K % block_K == 0 and block_K % 32 == 0 and N % block_N == 0
+    assert block_N % 32 == 0
+    k_blocks = K // block_K
+    assert k_blocks % shards == 0
+    shard_blocks = k_blocks // shards
+    M = T.dynamic("M")
+    n_tiles = N // block_N
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, groups * K), T.bfloat16),
+        W: T.Tensor((groups * N, K), T.float8_e4m3fn),
+        E: T.Tensor((groups * N // 32, K // 32), T.uint8),
+        P: T.Tensor((shards, M, groups * N), T.float32),
+    ):
+        with T.Kernel(
+            groups * n_tiles, shards, T.ceildiv(M, block_M), threads=threads
+        ) as (bx, s, by):
+            g = bx // n_tiles
+            n0 = g * N + (bx % n_tiles) * block_N
+            A_shared = T.alloc_shared((block_M, block_K), T.bfloat16)
+            W_shared = T.alloc_shared((block_N, block_K), T.float8_e4m3fn)
+            S_shared = T.alloc_shared((block_N // 32, block_K // 32), T.float32)
+            B_shared = T.alloc_shared((block_N, block_K), T.bfloat16)
+            C_local = T.alloc_fragment((block_M, block_N), T.float32)
+            T.clear(C_local)
+            for kb in T.Pipelined(shard_blocks, num_stages=num_stages):
+                _w8a16_step(A, W, E, A_shared, W_shared, S_shared, B_shared, C_local,
+                            by, g, n0, s * shard_blocks + kb, K, block_M, block_N,
+                            block_K)  # fmt: skip
+            T.copy(
+                C_local,
+                P[s, by * block_M : (by + 1) * block_M, n0 : n0 + block_N],
+            )
 
     return main
 

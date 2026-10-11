@@ -21,13 +21,18 @@ from torch import nn
 from vllm.v1.worker.workspace import current_preallocated_workspace
 
 from .. import l2_prefetch
-from .gemm import fp8w_bf16_gemm
-from .linear import _block32_linear, _prepare_block32
+from .gemm import fp8w_bf16_gemm, fp8w_bf16_gemm_partials, splitk_reduce
+from .linear import _block32_linear, _prepare_block32, _scratch
 from .rope import rope_
 
-# WO-A row tiles: every tile runs the same K loop, so the bits do not depend on it.
-# WO-A's W8A16 tiles by row bucket, from the WO window-2 sweep (bits do not depend on
-# the tile): 32 columns up to 128 rows, 64 past them; two stages throughout.
+# WO-A's W8A16 GEMM sums K in _WO_A_SHARDS shards at every row count, each from zero,
+# added in shard order, so a row's bits do not depend on the path. Decode rows (up to
+# _WO_A_SPLIT_ROWS) split the shards over CTAs, FP32 partials then splitk_reduce, for
+# the SMs a 64-tile grid leaves idle; longer steps add the shards inside the kernel.
+# Tiles from the WO sweep (bits do not depend on the tile): 32 columns up to 128 rows,
+# 64 past them; two stages throughout.
+_WO_A_SHARDS = 4
+_WO_A_SPLIT_ROWS = 128
 _WO_A_TILES = {
     16: dict(block_M=16, block_N=32, num_stages=2),
     32: dict(block_M=32, block_N=32, num_stages=2),
@@ -56,15 +61,28 @@ class _GroupedBF16:
         self.weight = layer.weight.detach()
         self.tilelang_weight_sf = layer.weight_scale_inv.detach().view(torch.uint8)
         n, k = self.weight.shape
+        self.columns = n
         self.kernels = {
-            bucket: fp8w_bf16_gemm(n // groups, k, groups, **config)
+            bucket: fp8w_bf16_gemm_partials(
+                n // groups, k, groups, _WO_A_SHARDS, **config
+            )
+            if bucket is not None and bucket <= _WO_A_SPLIT_ROWS
+            else fp8w_bf16_gemm(n // groups, k, groups, shards=_WO_A_SHARDS, **config)
             for bucket, config in _WO_A_TILES.items()
         }
+        self.reduce = splitk_reduce(n, _WO_A_SHARDS)
 
     def __call__(self, x: torch.Tensor, out: torch.Tensor) -> None:
         rows = x.shape[0]
         bucket = next((b for b in _WO_A_TILES if b is not None and rows <= b), None)
-        self.kernels[bucket](x, self.weight, self.tilelang_weight_sf, out)
+        if bucket is None or bucket > _WO_A_SPLIT_ROWS:
+            self.kernels[bucket](x, self.weight, self.tilelang_weight_sf, out)
+            return
+        (partials,) = _scratch(
+            (((_WO_A_SHARDS, rows, self.columns), torch.float32),), None
+        )
+        self.kernels[bucket](x, self.weight, self.tilelang_weight_sf, partials)
+        self.reduce(partials, out)
 
 
 class TileLangWOProjection:
