@@ -1550,6 +1550,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         mode = "decode" if swa.is_decode else "extend"
         rows = q.shape[0]
         self._check_attention_rows(mode, rows)
+        # A mixed step's decode requests, its leading rows (the batch is reordered
+        # decode-first), keep the decode plan and the decode index mode: a row's
+        # arithmetic must not depend on whether a prefill shares its step.
+        decode_rows = 0
+        if mode == "extend":
+            decode_rows = min(getattr(swa, "num_decode_tokens", 0), rows)
+            if decode_rows:
+                self._check_attention_rows("decode", decode_rows)
         owner = (
             self._context[_source(self.prefix, self.index_source_layer_id)]
             if self.compress_ratio
@@ -1583,11 +1591,26 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 index_mode = "prefill_short"
                 chunk_rows = self._short_index_shape[0]
                 index_pages = self._short_index_pages
-            index_width = index_pages.shape[1]
+            rest = (index_mode, chunk_rows, index_pages, score_width)
+            decode = ("decode", self.DECODE_CHUNK, self._index_pages, None)
 
-            def select_rows(query, first, selected):
+            def select(query, first, selected):
+                # Decode requests' rows (global rows below decode_rows) take the
+                # decode index mode, as in a step of decode requests alone.
+                count = query[0].shape[0]
+                cut = min(max(decode_rows - first, 0), count)
+                if cut:
+                    select_rows([t[:cut] for t in query], first, selected[:cut], decode)
+                if cut < count:
+                    select_rows(
+                        [t[cut:] for t in query], first + cut, selected[cut:], rest
+                    )
+
+            def select_rows(query, first, selected, params):
                 # Query rows start at global row `first`; metadata and
                 # candidates are indexed by global row, `selected` by query row.
+                index_mode, chunk_rows, index_pages, score_width = params
+                index_width = index_pages.shape[1]
                 iq_data, iq_scale, iw = query
                 index_rows = iq_data.shape[0]
                 for offset in range(0, index_rows, chunk_rows):
@@ -1646,7 +1669,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     )
 
             if split is None:
-                select_rows(query, 0, self.topk_indices_buffer)
+                select(query, 0, self.topk_indices_buffer)
             else:
                 real = split.real_rows
                 local = slice(split.start, split.start + real)
@@ -1661,7 +1684,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     if owns_candidates:
                         self._candidates[:rows].fill_(-2)
                         self._candidate_lens[:rows].fill_(-2)
-                    select_rows(reference, 0, self.topk_indices_buffer)
+                    select(reference, 0, self.topk_indices_buffer)
                     expected = self.topk_indices_buffer[local].clone()
                     if owns_candidates:
                         expected_candidates = (
@@ -1672,19 +1695,22 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     repeat = torch.full(
                         (rows, 512), -2, dtype=torch.int32, device=q.device
                     )
-                    select_rows(reference, 0, repeat)
+                    select(reference, 0, repeat)
                     repeat = repeat[local]
                     selected.fill_(-2)
                     if owns_candidates:
                         self._candidates[local].fill_(-2)
                         self._candidate_lens[local].fill_(-2)
-                select_rows(query, split.start, selected)
+                select(query, split.start, selected)
                 if reference is not None:
                     self._check_index_split(
                         split, selected, expected, repeat, expected_candidates
                     )
                 self.topk_indices_buffer[:rows].copy_(split.gather(selected))
 
+        if decode_rows:
+            self._attend_split(q, output, swa, main, owner, rows, decode_rows)
+            return
         # Reuse the shared arena only after indexing completes. Keep full-batch
         # metadata beside, not overlapping, the native attention scratch.
         metadata_specs = self._attention_workspace_specs[mode]
@@ -1738,6 +1764,43 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             swa_lengths=swa_lengths[:rows],
             **kwargs,
         )
+
+    def _attend_split(self, q, output, swa, main, owner, rows, decode_rows):
+        """A mixed step's attention: its decode requests' rows on the decode plan,
+        the rest on the extend plan. Mixed steps run eagerly, so the per-row
+        metadata is an ordinary allocation and each plan borrows the workspace in
+        turn (stream order keeps the second from overwriting the first's scratch
+        while it runs)."""
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("V4.1 mixed-step attention is never captured")
+        metadata = tuple(
+            torch.empty((rows, *shape[1:]), dtype=dtype, device=q.device)
+            for shape, dtype in self._attention_workspace_specs["extend"]
+        )
+        self._write_decode_metadata(metadata, swa, main, rows)
+        swa_indices, swa_lengths, top_lengths = metadata[:3]
+        for mode, lo, hi in (("decode", 0, decode_rows), ("extend", decode_rows, rows)):
+            if hi == lo:
+                continue
+            scratch = current_workspace_manager().get_simultaneous(
+                *self._attention_scratch_specs(mode, hi - lo)
+            )
+            kwargs = {}
+            if main is not None:
+                kwargs = dict(
+                    indexed_indices=owner.topk_indices_buffer[lo:hi],
+                    indexed_lengths=top_lengths[lo:hi],
+                    indexed_page_table=metadata[3][lo:hi],
+                )
+            self._attend(
+                mode,
+                q[lo:hi],
+                output[lo:hi],
+                scratch=list(scratch),
+                swa_indices=swa_indices[lo:hi],
+                swa_lengths=swa_lengths[lo:hi],
+                **kwargs,
+            )
 
     def _quantize_index_query(self, mode: str, iq, iq_data, iq_scale) -> None:
         """MXFP4-quantize ``[rows, heads, 128]`` index queries into the outputs."""

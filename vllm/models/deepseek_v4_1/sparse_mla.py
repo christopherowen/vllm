@@ -17,6 +17,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
+from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheLayout
 
 
@@ -171,6 +172,10 @@ class DeepseekV41B12xMetadata:
     swa_replay_start: torch.Tensor | None = None
     # Rows the CED decoder's MoE routes (False for padding), in its compact layout.
     routing_mask: torch.Tensor | None = None
+    # The leading rows of decode requests (the batch is reordered decode-first):
+    # every row of a decode step; in a mixed step, the rows attention keeps on the
+    # decode plan so their arithmetic does not depend on the step.
+    num_decode_tokens: int = 0
 
 
 class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
@@ -280,6 +285,18 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
         )
 
     def _metadata(self, cm, table):
+        is_decode = (
+            self.reorder_batch_threshold is not None
+            and cm.max_query_len <= self.reorder_batch_threshold
+        )
+        if is_decode:
+            decode_tokens = cm.num_actual_tokens
+        elif self.reorder_batch_threshold is not None:
+            decode_tokens = split_decodes_and_prefills(
+                cm, decode_threshold=self.reorder_batch_threshold
+            )[2]
+        else:
+            decode_tokens = 0
         return DeepseekV41B12xMetadata(
             cm.num_actual_tokens,
             cm.num_reqs,
@@ -293,9 +310,9 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
             self.reqs,
             self.slots,
             self.lengths,
-            self.reorder_batch_threshold is not None
-            and cm.max_query_len <= self.reorder_batch_threshold,
+            is_decode,
             cm.max_seq_len,
+            num_decode_tokens=decode_tokens,
         )
 
 
