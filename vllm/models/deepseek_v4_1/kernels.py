@@ -61,7 +61,7 @@ def moe_output_dtype() -> torch.dtype:
 
 
 # The MoE combine stays FP32 until the rank's partial rounds, under the TileLang family.
-MOE_FP32_COMBINE = False
+MOE_FP32_COMBINE = True
 
 
 def moe_router_class():
