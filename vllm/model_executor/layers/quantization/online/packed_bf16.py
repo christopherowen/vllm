@@ -94,7 +94,12 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
         if self.tilelang:
             from vllm.models.deepseek_v4_1.tilelang.vocab import prepare_packed_head
 
-            prepare_packed_head(layer)
+            # The model's head dtype: FP32 logits as DeepSeek's reference head, or
+            # the model dtype.
+            model_config = get_current_vllm_config().model_config
+            prepare_packed_head(
+                layer, model_config.head_dtype if model_config else torch.bfloat16
+            )
         logger.info_once(
             "Packed the BF16 LM head exactly into 12 bits per weight: "
             "exponents %d..%d, %d out-of-window values kept exactly per shard.",

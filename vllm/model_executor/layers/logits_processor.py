@@ -162,7 +162,7 @@ class LogitsProcessor(PluggableLayer):
             ):
                 from vllm.models.deepseek_v4_1.tilelang.vocab import prepare_bf16_head
 
-                prepare_bf16_head(lm_head)
+                prepare_bf16_head(lm_head, self.head_dtype or lm_head.weight.dtype)
             return
         if _is_packed_head(lm_head):
             if (
@@ -365,6 +365,20 @@ class LogitsProcessor(PluggableLayer):
         embedding_bias: torch.Tensor | None,
     ) -> torch.Tensor:
         """Project hidden states through the lm_head, honoring head_dtype."""
+        if (
+            self.use_tilelang_vocab_projection
+            and embedding_bias is None
+            and hasattr(lm_head, "tilelang_vocab")
+            and getattr(lm_head, "tilelang_vocab_dtype", hidden_states.dtype)
+            == (self.head_dtype or hidden_states.dtype)
+        ):
+            # TileLang heads accumulate in FP32 and write the head dtype directly:
+            # FP32 logits from the exact packed or BF16 weights, not widened BF16.
+            from vllm.models.deepseek_v4_1.tilelang.vocab import project_head
+
+            flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+            logits = project_head(lm_head, flat)
+            return logits.reshape(*hidden_states.shape[:-1], -1)
         if self.head_dtype is None or self.head_dtype == hidden_states.dtype:
             if (
                 self.use_tilelang_vocab_projection

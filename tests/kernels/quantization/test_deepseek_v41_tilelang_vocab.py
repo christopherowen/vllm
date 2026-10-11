@@ -180,3 +180,54 @@ def test_logits_processor_projects_prepared_heads():
     logits = processor._apply_head(layer, hidden, None)
     expected = project_head(layer, hidden.reshape(-1, k)).reshape(2, 3, n)
     assert torch.equal(logits, expected)
+
+
+@pytest.mark.parametrize("rows", [1, 6, 48, 130])
+def test_packed_head_writes_fp32_logits(rows):
+    """FP32 logits are the BF16 head's accumulator unrounded: rounding them gives the
+    BF16 head's bits, and they sit closer to an FP64 reference."""
+    n, k = 1000, 512
+    weight = _head(n, k, seed=5)
+    bf16, fp32 = _packed_layer(weight), _packed_layer(weight)
+    prepare_packed_head(bf16)
+    prepare_packed_head(fp32, torch.float32)
+    x = (torch.randn(rows, k, device=DEVICE) * 0.5).bfloat16()
+    low, full = project_head(bf16, x), project_head(fp32, x)
+    assert full.dtype == torch.float32 and full.shape == (rows, n)
+    assert torch.equal(full.bfloat16(), low)
+    reference = x.double() @ weight.double().T
+    assert (full.double() - reference).abs().max() <= (
+        low.double() - reference
+    ).abs().max()
+
+
+def test_bf16_head_writes_fp32_logits_batch_invariant():
+    n, k = 32320, 256
+    generator = torch.Generator(device=DEVICE).manual_seed(9)
+    weight = (torch.randn(n, k, generator=generator, device=DEVICE) * 0.05).bfloat16()
+    bf16, fp32 = SimpleNamespace(weight=weight), SimpleNamespace(weight=weight)
+    prepare_bf16_head(bf16)
+    prepare_bf16_head(fp32, torch.float32)
+    x = torch.randn(130, k, device=DEVICE).bfloat16()
+    full = project_head(fp32, x)
+    assert full.dtype == torch.float32
+    assert torch.equal(full.bfloat16(), project_head(bf16, x))
+    for rows in (1, 5, 16, 17, 33, 64):
+        assert torch.equal(project_head(fp32, x[:rows]), full[:rows]), rows
+
+
+def test_logits_processor_projects_fp32_heads():
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+
+    processor = LogitsProcessor.__new__(LogitsProcessor)
+    torch.nn.Module.__init__(processor)
+    processor.head_dtype = torch.float32
+    processor.use_tilelang_vocab_projection = True
+    n, k = 1000, 512
+    layer = _packed_layer(_head(n, k, seed=13))
+    prepare_packed_head(layer, torch.float32)
+    hidden = (torch.randn(2, 3, k, device=DEVICE) * 0.5).bfloat16()
+    logits = processor._apply_head(layer, hidden, None)
+    assert logits.dtype == torch.float32
+    expected = project_head(layer, hidden.reshape(-1, k)).reshape(2, 3, n)
+    assert torch.equal(logits, expected)

@@ -97,8 +97,10 @@ def packed_vocab_projection(
     num_stages: int = 3,
     threads: int = 128,
     step_groups: int = 1,
+    out_dtype: T.dtype = T.bfloat16,
 ):
-    """``C[M, N] = A @ W^T`` for BF16 ``A[M, K]`` and the packed ``W``.
+    """``C[M, N] = A @ W^T`` for BF16 ``A[M, K]`` and the packed ``W``, accumulated
+    in FP32 and written as ``out_dtype`` (FP32 keeps the reference head's logits).
 
     Each pipeline step loads ``step_groups`` consecutive groups: longer
     contiguous runs of each row's bytes and codes.
@@ -123,7 +125,7 @@ def packed_vocab_projection(
         exception_rows: T.Tensor((E,), T.int32),
         exception_entries: T.Tensor((E,), T.int32),
         row_offsets: T.Tensor((N + 1,), T.int32),
-        C: T.Tensor((M, N), T.bfloat16),
+        C: T.Tensor((M, N), out_dtype),
     ):
         with T.Kernel(
             T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads
@@ -198,39 +200,54 @@ def packed_vocab_projection(
     return main
 
 
-def prepare_packed_head(layer: nn.Module) -> None:
-    """Compile a packed head's projection for every token tile."""
+_OUT = {torch.bfloat16: T.bfloat16, torch.float32: T.float32}
+
+
+def prepare_packed_head(
+    layer: nn.Module, out_dtype: torch.dtype = torch.bfloat16
+) -> None:
+    """Compile a packed head's projection for every token tile, writing ``out_dtype``
+    logits (BF16, or FP32 as DeepSeek's reference head computes them)."""
     n, k = int(layer.weight.shape[0]), layer.packed_bf16_in_features
+    layer.tilelang_vocab_dtype = out_dtype
     layer.tilelang_vocab = {
         block_M: packed_vocab_projection(
             n,
             k,
             layer.packed_bf16_exponent_base,
             block_M=block_M,
+            out_dtype=_OUT[out_dtype],
             **tile_config(block_M, k),
         )
         for block_M in ROW_TILES
     }
 
 
-def prepare_bf16_head(layer: nn.Module) -> None:
-    """Compile a BF16 head's projection for every token tile."""
+def prepare_bf16_head(
+    layer: nn.Module, out_dtype: torch.dtype = torch.bfloat16
+) -> None:
+    """Compile a BF16 head's projection for every token tile, writing ``out_dtype``."""
     n, k = map(int, layer.weight.shape)
     kernels = {}
     for block_M in ROW_TILES:
         config = dict(BF16_HEAD_CONFIGS[block_M])
         if k % config["block_K"]:
             config["block_K"] = 64
-        kernels[block_M] = bf16_gemm(n, k, block_M=block_M, num_stages=2, **config)
+        kernels[block_M] = bf16_gemm(
+            n, k, block_M=block_M, num_stages=2, out_dtype=_OUT[out_dtype], **config
+        )
+    layer.tilelang_vocab_dtype = out_dtype
     layer.tilelang_vocab = kernels
 
 
 def project_head(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    """BF16 logits of ``x[rows, K]`` through a prepared head."""
+    """Logits of ``x[rows, K]`` through a prepared head, in its prepared dtype."""
     x = x.contiguous()
     rows = x.shape[0]
     out = torch.empty(
-        (rows, layer.weight.shape[0]), dtype=torch.bfloat16, device=x.device
+        (rows, layer.weight.shape[0]),
+        dtype=getattr(layer, "tilelang_vocab_dtype", torch.bfloat16),
+        device=x.device,
     )
     kernel = layer.tilelang_vocab[row_tile(rows)]
     if hasattr(layer, "packed_bf16_exponent_base"):
