@@ -396,7 +396,9 @@ def fp8w_bf16_gemm(
 
     Every M tile runs the same K loop, so a row's bits do not depend on its batch.
     """
+    # Whole 32x32 scale blocks per tile (a 16-wide tile had no scale rows).
     assert K % block_K == 0 and block_K % 32 == 0 and N % block_N == 0
+    assert block_N % 32 == 0
     M = T.dynamic("M")
     k_blocks = K // block_K
     n_tiles = N // block_N

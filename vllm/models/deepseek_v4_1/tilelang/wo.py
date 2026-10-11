@@ -26,11 +26,14 @@ from .linear import _block32_linear, _prepare_block32
 from .rope import rope_
 
 # WO-A row tiles: every tile runs the same K loop, so the bits do not depend on it.
+# WO-A's W8A16 tiles by row bucket, from the WO window-2 sweep (bits do not depend on
+# the tile): 32 columns up to 128 rows, 64 past them; two stages throughout.
 _WO_A_TILES = {
-    16: dict(block_N=32, num_stages=2),
-    32: dict(block_N=32, num_stages=2),
-    64: dict(block_N=64, num_stages=2),
-    128: dict(block_N=64, num_stages=3),
+    16: dict(block_M=16, block_N=32, num_stages=2),
+    32: dict(block_M=32, block_N=32, num_stages=2),
+    64: dict(block_M=64, block_N=32, num_stages=2),
+    128: dict(block_M=128, block_N=32, num_stages=2),
+    None: dict(block_M=128, block_N=64, num_stages=2),
 }
 
 
@@ -54,14 +57,14 @@ class _GroupedBF16:
         self.tilelang_weight_sf = layer.weight_scale_inv.detach().view(torch.uint8)
         n, k = self.weight.shape
         self.kernels = {
-            rows: fp8w_bf16_gemm(n // groups, k, groups, block_M=rows, **config)
-            for rows, config in _WO_A_TILES.items()
+            bucket: fp8w_bf16_gemm(n // groups, k, groups, **config)
+            for bucket, config in _WO_A_TILES.items()
         }
 
     def __call__(self, x: torch.Tensor, out: torch.Tensor) -> None:
         rows = x.shape[0]
-        tile = next((t for t in _WO_A_TILES if rows <= t), max(_WO_A_TILES))
-        self.kernels[tile](x, self.weight, self.tilelang_weight_sf, out)
+        bucket = next((b for b in _WO_A_TILES if b is not None and rows <= b), None)
+        self.kernels[bucket](x, self.weight, self.tilelang_weight_sf, out)
 
 
 class TileLangWOProjection:
