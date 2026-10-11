@@ -373,7 +373,10 @@ def bf16_gemm(
     return gemm_bf16
 
 
-@tilelang.jit
+# Not warp-specialized: a producer warp's scale stores would reach the consumers only
+# through the copy barriers, which order the asynchronous copies alone (graph replays
+# gave other bits).
+@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
 def fp8w_bf16_gemm(
     N: int,
     K: int,
