@@ -413,19 +413,26 @@ def fp8w_bf16_gemm(
             n0 = g * N + (bx % n_tiles) * block_N
             A_shared = T.alloc_shared((block_M, block_K), T.bfloat16)
             W_shared = T.alloc_shared((block_N, block_K), T.float8_e4m3fn)
+            S_shared = T.alloc_shared((block_N // 32, block_K // 32), T.float32)
             B_shared = T.alloc_shared((block_N, block_K), T.bfloat16)
             C_local = T.alloc_fragment((block_M, block_N), T.float32)
             T.clear(C_local)
             for ko in T.Pipelined(k_blocks, num_stages=num_stages):
                 T.copy(A[by * block_M, g * K + ko * block_K], A_shared)
                 T.copy(W[n0, ko * block_K], W_shared)
-                for i, j in T.Parallel(block_N, block_K):
+                # The tile's few UE8M0 exponents as FP32 powers of two, decoded once: a
+                # per-element uint8 gather vectorizes to a byte pack nvcc rejects.
+                for r, c in T.Parallel(block_N // 32, block_K // 32):
                     exponent = T.Cast(
-                        T.uint32, E[(n0 + i) // 32, (ko * block_K + j) // 32]
+                        T.uint32, E[n0 // 32 + r, ko * (block_K // 32) + c]
                     )
-                    scale = T.reinterpret(T.shift_left(exponent, 23), T.float32)
+                    S_shared[r, c] = T.reinterpret(
+                        T.shift_left(exponent, 23), T.float32
+                    )
+                for i, j in T.Parallel(block_N, block_K):
                     B_shared[i, j] = T.Cast(
-                        T.bfloat16, T.Cast(T.float32, W_shared[i, j]) * scale
+                        T.bfloat16,
+                        T.Cast(T.float32, W_shared[i, j]) * S_shared[i // 32, j // 32],
                     )
                 T.gemm(A_shared, B_shared, C_local, transpose_B=True)
             T.copy(C_local, C[by * block_M, n0])
