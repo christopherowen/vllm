@@ -140,11 +140,16 @@ class SharedExperts(torch.nn.Module):
         else:
             return SharedExpertsOrder.NO_OVERLAP
 
-    def maybe_forward_async(self, shared_experts_input: torch.Tensor) -> bool:
+    def maybe_forward_async(
+        self,
+        shared_experts_input: torch.Tensor,
+        workspace: torch.Tensor | None = None,
+    ) -> bool:
         """Enqueue shared experts on the aux stream without waiting for them.
 
         Returns true if the shared experts were enqueued, false otherwise. Call
         `wait` to wait for the shared experts to finish if this returns true.
+        ``workspace`` binds an arena-backed MLP's scratch, as ``forward`` does.
         """
         if (
             self._determine_shared_experts_order(shared_experts_input)
@@ -156,7 +161,7 @@ class SharedExperts(torch.nn.Module):
         assert self._output[idx] is None
         shared_experts_input.record_stream(self._stream)
         self._input_ready_event[idx].record(current_stream())
-        with torch.cuda.stream(self._stream):
+        with torch.cuda.stream(self._stream), use_preallocated_workspace(workspace):
             self._input_ready_event[idx].wait(self._stream)
             self._output[idx] = self._layer(shared_experts_input)
             self._output_ready_event[idx].record(self._stream)
@@ -203,6 +208,13 @@ class SharedExperts(torch.nn.Module):
         output = self._output[self._output_idx]
         assert output is not None
         output.record_stream(current_stream())
+
+    def wait_output(self) -> torch.Tensor:
+        """``wait``, then the finished output, left in place for ``output``."""
+        self.wait()
+        output = self.peek_output()
+        assert output is not None
+        return output
 
     @property
     def _output_idx(self) -> int:

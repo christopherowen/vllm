@@ -433,10 +433,12 @@ class MoERunner(MoERunnerInterface):
     ) -> "mk.FusedMoEExperts | None":
         """The routed experts whose combine adds the shared expert's output, or None.
 
-        Only when the shared expert runs before the routed experts on this stream
-        (no overlap), nothing scales, trims or transforms the routed output before
-        the add, and the experts would otherwise write a wider partial for the add
-        and one rounding here: they do both in the combine, with the same bits.
+        When the shared expert runs before the routed experts on this stream (no
+        overlap), or on the aux stream (multi-stream overlap) and the experts can
+        wait for it just before their combine, nothing scales, trims or transforms
+        the routed output before the add, and the experts would otherwise write a
+        wider partial for the add and one rounding here: they do both in the
+        combine, with the same bits.
         """
         if (
             self._shared_experts is None
@@ -444,13 +446,18 @@ class MoERunner(MoERunnerInterface):
             or self.routed_scaling_factor != 1.0
             or self.routed_output_transform is not None
             or self._fused_output_is_reduced
-            or self._shared_experts._determine_shared_experts_order(
-                shared_experts_input
-            )
-            != SharedExpertsOrder.NO_OVERLAP
         ):
             return None
         experts = self._quant_method.modular_experts
+        order = self._shared_experts._determine_shared_experts_order(
+            shared_experts_input
+        )
+        if order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
+            supported = getattr(experts, "folds_deferred_shared_output", False)
+        else:
+            supported = order == SharedExpertsOrder.NO_OVERLAP
+        if not supported:
+            return None
         return experts if getattr(experts, "folds_shared_output", False) else None
 
     @property
@@ -748,10 +755,28 @@ class MoERunner(MoERunnerInterface):
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP, shared_workspace
         )
         experts = self._quant_method.modular_experts
+        overlap_fold = False
         if getattr(experts, "fold_shared", False):
-            # The shared expert ran first: the combine adds its output (forward).
             assert self._shared_experts is not None
-            experts.combine_addend = self._shared_experts.peek_output()
+            assert shared_experts_input is not None
+            overlap_fold = (
+                self._shared_experts._determine_shared_experts_order(
+                    shared_experts_input
+                )
+                == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
+            )
+            if not overlap_fold:
+                # The shared expert ran first: the combine adds its output (forward).
+                experts.combine_addend = self._shared_experts.peek_output()
+            else:
+                # The shared expert runs on the aux stream beside the routed
+                # experts; their combine waits for it, then adds its output.
+                if not shared_experts_overlapping:
+                    launched = self._shared_experts.maybe_forward_async(
+                        shared_experts_input, shared_workspace
+                    )
+                    assert launched
+                experts.combine_addend = self._shared_experts.wait_output
 
         if self.routed_experts.quant_method.is_monolithic:
             # Monolithic kernels: pass router_logits to routed_experts
@@ -787,7 +812,12 @@ class MoERunner(MoERunnerInterface):
                     workspace=workspace,
                 )
 
-        if shared_experts_overlapping:
+        if overlap_fold:
+            # The combine already waited; waiting again on the same event keeps
+            # the aux stream joined (CUDA graph capture needs it) at no cost.
+            assert self._shared_experts is not None
+            self._shared_experts.wait()
+        elif shared_experts_overlapping:
             assert self._shared_experts is not None
             self._shared_experts.wait()
         else:

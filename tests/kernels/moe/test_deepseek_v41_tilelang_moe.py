@@ -183,3 +183,41 @@ def test_moe_experts_fold_shared(
     assert torch.equal(folded, buffer)
     with pytest.raises(AssertionError):
         plan.run(x, ids, route_weights, weights, folded)  # BF16 out needs the shared
+
+
+@pytest.mark.parametrize("rows", [1, 12, 96])
+def test_moe_experts_fold_deferred_shared(
+    rows, hidden=384, intermediate=576, num_experts=32, topk=6
+):
+    """A callable shared addend, as the runner passes for a shared expert on the aux
+    stream: the plan calls it once, just before its combine, and the folded output
+    has the bits of the shared rows passed directly."""
+    w13_packed, w13_sf, _ = _experts(num_experts, 2 * intermediate, hidden, 1)
+    w2_packed, w2_sf, _ = _experts(num_experts, hidden, intermediate, 2)
+    plan = MoeExpertsV41Plan(
+        num_experts, topk, hidden, intermediate, swiglu_limit=LIMIT,
+        out_dtype=torch.float32,
+    )  # fmt: skip
+    weights = plan.prepare_weights(w13_packed, w13_sf, w2_packed, w2_sf)
+    x = (torch.randn((rows, hidden), generator=_gen(3), device=DEVICE) * 0.5).bfloat16()
+    source = torch.randn((rows, hidden), generator=_gen(5), device=DEVICE)
+    ids, route_weights = _routes(rows, num_experts, topk, 4, torch.int32)
+    direct = torch.empty((rows, hidden), dtype=torch.bfloat16, device=DEVICE)
+    plan.run(x, ids, route_weights, weights, direct, shared=source.bfloat16())
+
+    side, ready = torch.cuda.Stream(), torch.cuda.Event()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        shared = source.bfloat16()
+        ready.record(side)
+    calls = []
+
+    def resolve():
+        calls.append(1)
+        ready.wait(torch.cuda.current_stream())
+        return shared
+
+    deferred = torch.empty_like(direct)
+    plan.run(x, ids, route_weights, weights, deferred, shared=resolve)
+    assert calls == [1]
+    assert torch.equal(deferred, direct)

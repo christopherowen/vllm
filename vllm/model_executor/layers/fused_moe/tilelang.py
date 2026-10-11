@@ -18,6 +18,8 @@ step uses atomics on results, so a token's output does not depend on the
 rest of the batch.
 """
 
+from collections.abc import Callable
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -146,10 +148,15 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
         return TopKWeightAndReduceNoOP()
 
     # Set by the MoE runner around one call whose shared expert runs before the
-    # routed experts: the combine adds ``combine_addend`` (the shared expert's
-    # output) to the FP32 sum and rounds the rank's partial once, in BF16 out.
+    # routed experts, or beside them on the aux stream: the combine adds
+    # ``combine_addend`` (the shared expert's output, or a callable that waits for
+    # it and returns it) to the FP32 sum and rounds the rank's partial once, in
+    # BF16 out.
     fold_shared: bool = False
-    combine_addend: torch.Tensor | None = None
+    combine_addend: torch.Tensor | Callable[[], torch.Tensor] | None = None
+    # The plan resolves a callable addend just before its combine launch, so an
+    # aux-stream shared expert overlaps the routed experts' GEMMs.
+    folds_deferred_shared_output: bool = True
 
     @property
     def folds_shared_output(self) -> bool:
@@ -265,7 +272,7 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
         workspace = workspace2.view(-1).view(torch.uint8)
         shared = None
         if self.fold_shared:
-            assert self.combine_addend is not None, "the shared output must be ready"
+            assert self.combine_addend is not None, "the shared output must be given"
             shared = self.combine_addend
         self._plan.run(
             hidden_states, topk_ids, topk_weights, weights, output, workspace, shared

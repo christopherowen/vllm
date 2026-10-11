@@ -906,7 +906,9 @@ class MoeExpertsV41Plan:
         ``e`` is the token's k-th expert. ``weights`` comes from
         ``prepare_weights``; ``workspace`` is a byte buffer of at least
         ``workspace_bytes(workspace_specs(rows))``. ``shared`` (BF16 rows) is added
-        to the FP32 sum before the one rounding to ``out``'s dtype.
+        to the FP32 sum before the one rounding to ``out``'s dtype; a callable
+        ``shared`` is called just before the combine launch (it may wait for
+        another stream) and returns those rows.
         """
         rows = x.shape[0]
         dispatch = self.dispatch[topk_ids.dtype]
@@ -928,6 +930,8 @@ class MoeExpertsV41Plan:
         self.gate_up(xq, x_words, *_present(gate_up), order, tile_expert, h)
         self.swiglu(h, hq, h_sf, layout["psum"], layout["layout_weights"], 1.0, None)
         self.down(hq, h_words, *_present(down), order, tile_expert, y)
+        if callable(shared):
+            shared = shared()
         return dispatch.combine(y, layout, out, shared=shared)
 
 
