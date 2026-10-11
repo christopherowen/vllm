@@ -139,6 +139,64 @@ def tokens_kernel(max_requests: int, page: int, ratio: int, circular: bool):
     return tokens
 
 
+def _window_macro(page, window, width, draft, replay, threads, per_thread):
+    """One row's sliding-window metadata (``attention._chunk``), for a block of
+    ``threads`` threads."""
+
+    @T.macro
+    def window_row(
+        row, tx, info, positions, reqs, table, swa, lengths, top_lengths, visible,
+        starts, request_positions, replay_start, offset,
+    ):  # fmt: skip
+        req = reqs[offset + row]
+        pos = positions[offset + row]
+        valid = (req >= 0) & (pos >= 0)
+        if draft:
+            first = T.if_then_else(valid, T.Cast(T.int64, starts[req]), T.int64(0))
+            end = T.if_then_else(valid, T.Cast(T.int64, starts[req + 1]), T.int64(0))
+            prefix = T.if_then_else(valid, request_positions[req], T.int64(0))
+            info[0] = T.max(prefix - window, T.int64(0))
+            length = prefix + end - first - info[0]
+        else:
+            info[0] = T.max(pos + 1 - window, T.int64(0))
+            if replay:
+                info[0] = T.max(
+                    info[0], T.if_then_else(valid, replay_start[req], T.int64(0))
+                )
+            length = pos + 1 - info[0]
+        info[1] = T.if_then_else(
+            valid, T.min(T.max(length, T.int64(0)), T.int64(width)), T.int64(0)
+        )
+        for k in T.serial(per_thread):
+            col = k * threads + tx
+            if col < width:
+                logical = info[0] + col
+                inside = valid & (logical >= 0) & (col < info[1])
+                page_id = T.if_then_else(
+                    inside,
+                    T.Cast(T.int64, table[req, T.truncdiv(logical, page)]),
+                    T.int64(-1),
+                )
+                physical = page_id * page + T.truncmod(logical, page)
+                swa[row, col] = T.if_then_else(
+                    (page_id > 0) & (logical >= 0) & (col < info[1]),
+                    T.Cast(T.int32, physical),
+                    -1,
+                )
+        if tx == 0:
+            lengths[row] = T.Cast(T.int32, T.max(info[1], T.int64(0)))
+            top_lengths[row] = T.if_then_else(
+                valid, T.min(T.max(visible[offset + row], 0), _TOP), 0
+            )
+
+    return window_row
+
+
+def _threads(width: int) -> tuple[int, int]:
+    threads = min(256, max(32, (width + 31) // 32 * 32))
+    return threads, (width + threads - 1) // threads
+
+
 @tilelang.jit(pass_configs=_PASS)
 def chunk_kernel(page: int, window: int, width: int, draft: bool, replay: bool):
     rows = T.dynamic("rows")
@@ -149,8 +207,8 @@ def chunk_kernel(page: int, window: int, width: int, draft: bool, replay: bool):
     req_count = T.dynamic("req_count")
     starts_len = T.dynamic("starts_len")
     replay_len = T.dynamic("replay_len")
-    threads = min(256, max(32, (width + 31) // 32 * 32))
-    per_thread = (width + threads - 1) // threads
+    threads, per_thread = _threads(width)
+    window_row = _window_macro(page, window, width, draft, replay, threads, per_thread)
 
     @T.prim_func
     def chunk(
@@ -169,51 +227,71 @@ def chunk_kernel(page: int, window: int, width: int, draft: bool, replay: bool):
         with T.Kernel(rows, threads=threads) as row:
             tx = T.get_thread_binding()
             info = T.alloc_local((2,), T.int64)  # window start, clamped length
-            req = reqs[offset + row]
-            pos = positions[offset + row]
-            valid = (req >= 0) & (pos >= 0)
-            if draft:
-                first = T.if_then_else(valid, T.Cast(T.int64, starts[req]), T.int64(0))
-                end = T.if_then_else(
-                    valid, T.Cast(T.int64, starts[req + 1]), T.int64(0)
-                )
-                prefix = T.if_then_else(valid, request_positions[req], T.int64(0))
-                info[0] = T.max(prefix - window, T.int64(0))
-                length = prefix + end - first - info[0]
-            else:
-                info[0] = T.max(pos + 1 - window, T.int64(0))
-                if replay:
-                    info[0] = T.max(
-                        info[0],
-                        T.if_then_else(valid, replay_start[req], T.int64(0)),
-                    )
-                length = pos + 1 - info[0]
-            info[1] = T.if_then_else(
-                valid, T.min(T.max(length, T.int64(0)), T.int64(width)), T.int64(0)
-            )
-            for k in T.serial(per_thread):
-                col = k * threads + tx
-                if col < width:
-                    logical = info[0] + col
-                    inside = valid & (logical >= 0) & (col < info[1])
-                    page_id = T.if_then_else(
-                        inside,
-                        T.Cast(T.int64, table[req, T.truncdiv(logical, page)]),
-                        T.int64(-1),
-                    )
-                    physical = page_id * page + T.truncmod(logical, page)
-                    swa[row, col] = T.if_then_else(
-                        (page_id > 0) & (logical >= 0) & (col < info[1]),
-                        T.Cast(T.int32, physical),
-                        -1,
-                    )
-            if tx == 0:
-                lengths[row] = T.Cast(T.int32, T.max(info[1], T.int64(0)))
-                top_lengths[row] = T.if_then_else(
-                    valid, T.min(T.max(visible[offset + row], 0), _TOP), 0
-                )
+            window_row(
+                row, tx, info, positions, reqs, table, swa, lengths, top_lengths,
+                visible, starts, request_positions, replay_start, offset,
+            )  # fmt: skip
 
     return chunk
+
+
+@tilelang.jit(pass_configs=_PASS)
+def decode_metadata_kernel(
+    page: int, window: int, width: int, draft: bool, replay: bool, main_width: int
+):
+    """``chunk`` and ``pages`` of the main cache in one launch: each row's window
+    metadata, then its main page table (block 0 and holes as -1)."""
+    rows = T.dynamic("rows")
+    src_rows = T.dynamic("src_rows")
+    table_rows = T.dynamic("table_rows")
+    table_cols = T.dynamic("table_cols")
+    table_stride = T.dynamic("table_stride")
+    main_src_rows = T.dynamic("main_src_rows")
+    main_rows = T.dynamic("main_rows")
+    main_cols = T.dynamic("main_cols")
+    main_stride = T.dynamic("main_stride")
+    req_count = T.dynamic("req_count")
+    starts_len = T.dynamic("starts_len")
+    replay_len = T.dynamic("replay_len")
+    threads, per_thread = _threads(max(width, main_width))
+    window_row = _window_macro(page, window, width, draft, replay, threads, per_thread)
+    main_per_thread = (main_width + threads - 1) // threads
+
+    @T.prim_func
+    def decode_metadata(
+        positions: T.Tensor((src_rows,), T.int64),
+        reqs: T.Tensor((src_rows,), T.int32),
+        table: T.StridedTensor((table_rows, table_cols), (table_stride, 1), T.int32),
+        swa: T.Tensor((rows, width), T.int32),
+        lengths: T.Tensor((rows,), T.int32),
+        top_lengths: T.Tensor((rows,), T.int32),
+        visible: T.Tensor((src_rows,), T.int32),
+        starts: T.Tensor((starts_len,), T.int32),
+        request_positions: T.Tensor((req_count,), T.int64),
+        replay_start: T.Tensor((replay_len,), T.int64),
+        main_reqs: T.Tensor((main_src_rows,), T.int32),
+        main_table: T.StridedTensor((main_rows, main_cols), (main_stride, 1), T.int32),
+        main_pages: T.Tensor((rows, main_width), T.int32),
+        offset: T.int32,
+        main_read_width: T.int32,
+    ):
+        with T.Kernel(rows, threads=threads) as row:
+            tx = T.get_thread_binding()
+            info = T.alloc_local((2,), T.int64)  # window start, clamped length
+            window_row(
+                row, tx, info, positions, reqs, table, swa, lengths, top_lengths,
+                visible, starts, request_positions, replay_start, offset,
+            )  # fmt: skip
+            req = main_reqs[offset + row]
+            for k in T.serial(main_per_thread):
+                col = k * threads + tx
+                if col < main_width:
+                    page_id = T.if_then_else(
+                        (req >= 0) & (col < main_read_width), main_table[req, col], -1
+                    )
+                    main_pages[row, col] = T.if_then_else(page_id > 0, page_id, -1)
+
+    return decode_metadata
 
 
 @tilelang.jit(pass_configs=_PASS)
@@ -279,6 +357,22 @@ def chunk(
     )  # fmt: skip
 
 
+def decode_metadata(
+    positions, reqs, table, swa, lengths, top_lengths, visible, starts,
+    request_positions, main_reqs, main_table, main_pages, offset: int, rows: int,
+    main_read_width: int, *, page: int, window: int, draft: bool, replay_start=None,
+) -> None:  # fmt: skip
+    """``chunk`` then ``pages`` of the main cache for ``rows`` rows, one launch."""
+    width, main_width = swa.shape[1], main_pages.shape[1]
+    replay = replay_start is not None and not draft
+    decode_metadata_kernel(page, window, width, draft, replay, main_width)(
+        positions, reqs, table, swa[:rows], lengths[:rows], top_lengths[:rows],
+        visible, starts, request_positions,
+        replay_start if replay_start is not None else request_positions, main_reqs,
+        main_table, main_pages[:rows], offset, main_read_width,
+    )  # fmt: skip
+
+
 def pages(reqs, table, out, offset: int, rows: int, read_width: int) -> None:
     """``attention._pages`` for ``rows`` rows from source row ``offset``; ``out`` is
     ``[*, width]`` and columns at or past ``read_width`` are -1."""
@@ -288,6 +382,8 @@ def pages(reqs, table, out, offset: int, rows: int, read_width: int) -> None:
 __all__ = [
     "chunk",
     "chunk_kernel",
+    "decode_metadata",
+    "decode_metadata_kernel",
     "pages",
     "pages_kernel",
     "requests",

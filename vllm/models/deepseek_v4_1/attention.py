@@ -754,13 +754,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             (False, True) if self.is_ced_decoder and not self.is_draft else (False,)
         )
         for replay in replays:
-            tl_metadata.chunk_kernel(
+            args = (
                 self.swa_cache_layer.block_size,
                 self.window_size,
                 self.swa_width,
                 self.is_draft,
                 replay,
             )
+            if self.compress_ratio:
+                tl_metadata.decode_metadata_kernel(*args, self._main_width)
+            else:
+                tl_metadata.chunk_kernel(*args)
         widths = {self._main_width} if self.compress_ratio else set()
         if self.indexer is not None:
             widths.add(self._index_width)
@@ -1828,7 +1832,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         if kernels.uses_tilelang():
             from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
 
-            tl_metadata.chunk(
+            window = dict(
+                page=self.swa_cache_layer.block_size,
+                window=self.window_size,
+                draft=self.is_draft,
+                replay_start=swa.swa_replay_start if self.is_ced_decoder else None,
+            )
+            common = (
                 swa.positions,
                 swa.req_id_per_token,
                 swa.block_table,
@@ -1838,21 +1848,20 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 visible,
                 swa.query_start_loc,
                 swa.request_positions,
-                0,
-                rows,
-                page=self.swa_cache_layer.block_size,
-                window=self.window_size,
-                draft=self.is_draft,
-                replay_start=swa.swa_replay_start if self.is_ced_decoder else None,
             )
-            if main is not None:
-                tl_metadata.pages(
+            if main is None:
+                tl_metadata.chunk(*common, 0, rows, **window)
+            else:
+                # The window metadata and the main page table in one launch.
+                tl_metadata.decode_metadata(
+                    *common,
                     main.req_id_per_token,
                     main.block_table,
                     buffers[3],
                     0,
                     rows,
                     main.block_table.shape[1],
+                    **window,
                 )
             return
         _chunk[(rows,)](
