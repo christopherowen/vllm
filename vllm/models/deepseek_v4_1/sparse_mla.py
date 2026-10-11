@@ -8,6 +8,7 @@ from typing import ClassVar
 import torch
 
 from vllm.config import CacheConfig
+from vllm.models.deepseek_v4_1 import kernels
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -194,6 +195,14 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
         self.reqs = alloc((self.tokens,), torch.int32)
         self.slots = alloc((self.tokens,), torch.int64)
         self.lengths = alloc((self.tokens,), torch.int32)
+        if kernels.uses_tilelang():
+            from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
+
+            # Compiled with the builder, never during graph capture.
+            tl_metadata.requests_kernel(self.requests)
+            tl_metadata.tokens_kernel(
+                self.requests, self.page, self.ratio, self.circular
+            )
 
     def build(
         self,
@@ -203,6 +212,9 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
     ):
         cm = common_attn_metadata
         table = cm.block_table_tensor
+        if kernels.uses_tilelang():
+            self._build_tilelang(cm, table)
+            return self._metadata(cm, table)
         _requests[(triton.cdiv(self.requests + 1, 128),)](
             cm.query_start_loc,
             cm.seq_lens,
@@ -235,6 +247,39 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
             128,
             self.circular,
         )
+        return self._metadata(cm, table)
+
+    def _build_tilelang(self, cm, table) -> None:
+        """``_requests`` and ``_tokens`` as the TileLang metadata kernels."""
+        from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
+
+        tl_metadata.requests(
+            cm.query_start_loc,
+            cm.seq_lens,
+            self.starts,
+            self.request_positions,
+            self.counts,
+            cm.num_reqs,
+            cm.num_actual_tokens,
+        )
+        tl_metadata.tokens(
+            cm.query_start_loc,
+            cm.seq_lens,
+            table,
+            cm.slot_mapping,
+            self.positions,
+            self.reqs,
+            self.slots,
+            self.lengths,
+            cm.num_reqs,
+            cm.num_actual_tokens,
+            max_requests=self.requests,
+            page=self.page,
+            ratio=self.ratio,
+            circular=self.circular,
+        )
+
+    def _metadata(self, cm, table):
         return DeepseekV41B12xMetadata(
             cm.num_actual_tokens,
             cm.num_reqs,
