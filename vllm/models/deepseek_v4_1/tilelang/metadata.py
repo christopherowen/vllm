@@ -254,7 +254,9 @@ def decode_metadata_kernel(
     req_count = T.dynamic("req_count")
     starts_len = T.dynamic("starts_len")
     replay_len = T.dynamic("replay_len")
-    threads, per_thread = _threads(max(width, main_width))
+    # Blocks as wide as the window part; the page part loops (idle threads cost the
+    # prefill rows' blocks).
+    threads, per_thread = _threads(width)
     window_row = _window_macro(page, window, width, draft, replay, threads, per_thread)
     main_per_thread = (main_width + threads - 1) // threads
 
