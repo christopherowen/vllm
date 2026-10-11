@@ -19,7 +19,8 @@ that reading them once matters. Two TileLang kernels make each entry:
 
 - ``project_streams``: per hidden block, the previous sublayer's ``post``
   (writing the updated streams), the projection's split partials on TF32
-  tensor cores (DeepGEMM's precision) with the streams' sum of squares, and
+  tensor cores at FP32 precision (fn split into exact TF32 parts) with the
+  streams' sum of squares, and
   the streams collapsed with the incoming pre-mix in BF16, with its sum of
   squares. Each thread folds and accumulates one token's columns in
   registers; the GEMM reads the folded streams from shared memory. The split
@@ -82,7 +83,10 @@ def project_streams(
     registers, folds the previous output in, writes the updated streams, and
     keeps its share of the streams' sum of squares ``S`` and of the collapse
     with the incoming pre-mix. The projection ``P = streams @ fn^T`` runs on
-    TF32 tensor cores (DeepGEMM's precision), one stream at a time. The
+    TF32 tensor cores at FP32 precision, one stream at a time: the streams are
+    BF16 (exact in TF32) and each FP32 ``fn`` value is split exactly into three
+    TF32-representable parts, so every product is exact and the three GEMMs
+    accumulate in FP32, as DeepSeek's reference computes the mixes. The
     collapse is rounded to BF16, with its sum of squares ``Q``.
     """
     assert hidden_size % block_H == 0 and mode in ("pre", "post_pre", "broadcast")
@@ -96,6 +100,21 @@ def project_streams(
     threads = block_M * LANES
     H = hidden_size
     M = T.dynamic("M")
+
+    @T.macro
+    def split_tf32(F_shared, F_mid, F_low):
+        # fn = high + middle + low, each exact in TF32 (11 significant bits): the
+        # high part keeps fn's top 11 bits, the middle the next 11, the low the rest.
+        for i, j in T.Parallel(MIXES, block_H):
+            f = F_shared[i, j]
+            high = T.reinterpret(T.reinterpret(f, T.uint32) & 0xFFFFE000, T.float32)
+            rest = f - high
+            middle = T.reinterpret(
+                T.reinterpret(rest, T.uint32) & 0xFFFFE000, T.float32
+            )
+            F_shared[i, j] = high
+            F_mid[i, j] = middle
+            F_low[i, j] = rest - middle
 
     @T.prim_func
     def main(
@@ -115,6 +134,8 @@ def project_streams(
             h0 = sp * block_H
             A_shared = T.alloc_shared((block_M, block_H), T.float32)
             F_shared = T.alloc_shared((N, block_H), T.float32)
+            F_mid = T.alloc_shared((N, block_H), T.float32)
+            F_low = T.alloc_shared((N, block_H), T.float32)
             C_local = T.alloc_fragment((block_M, N), T.float32)
             xv = T.alloc_local((COLS,), T.bfloat16)
             rv = T.alloc_local((MULT * COLS,), T.bfloat16)
@@ -133,6 +154,8 @@ def project_streams(
             # The padding mixes stay zero; each stream's copy fills the rest.
             for i, j in T.Parallel(N - MIXES, block_H):
                 F_shared[MIXES + i, j] = 0.0
+                F_mid[MIXES + i, j] = 0.0
+                F_low[MIXES + i, j] = 0.0
             # This thread's token: its mixes, then its columns of x and the streams.
             for k in T.unroll(MULT):
                 coef[k] = pre_in[src, k]
@@ -178,7 +201,11 @@ def project_streams(
                         col[v] += coef[n] * av[v]
                 T.copy(Fn[0:MIXES, h0 : h0 + block_H], F_shared[0:MIXES, :])
                 T.sync_threads()
+                split_tf32(F_shared, F_mid, F_low)
+                T.sync_threads()
                 T.gemm(A_shared, F_shared, C_local, transpose_B=True)
+                T.gemm(A_shared, F_mid, C_local, transpose_B=True)
+                T.gemm(A_shared, F_low, C_local, transpose_B=True)
             else:
                 for n in T.unroll(MULT):
                     if mode == "post_pre":
@@ -206,7 +233,11 @@ def project_streams(
                         F_shared[0:MIXES, :],
                     )
                     T.sync_threads()
+                    split_tf32(F_shared, F_mid, F_low)
+                    T.sync_threads()
                     T.gemm(A_shared, F_shared, C_local, transpose_B=True)
+                    T.gemm(A_shared, F_mid, C_local, transpose_B=True)
+                    T.gemm(A_shared, F_low, C_local, transpose_B=True)
                     T.sync_threads()
 
             # The collapse in BF16 and its sum of squares, then the streams'.

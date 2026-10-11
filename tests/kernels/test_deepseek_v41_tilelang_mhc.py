@@ -194,9 +194,12 @@ def test_project_streams_partials(block_M):
     project_streams(HIDDEN, "pre", block_M=block_M)(
         y.unsqueeze(0), flat, incoming, comb, incoming, fn, flat, P, S, C, Q
     )
-    # The projection runs on TF32 tensor cores, as in DeepGEMM.
-    reference = flat.float() @ fn.T
-    torch.testing.assert_close(P.sum(0)[:, 0], reference, atol=2e-2, rtol=2e-3)
+    # FP32 precision on TF32 tensor cores: fn split into three exact TF32 parts.
+    # FP32 accumulation over 20480 products stays near 3e-5; fn cut to TF32's 11
+    # bits errs by about 5e-3 here, some twenty times this bound.
+    reference = flat.double() @ fn.double().T
+    error = (P.sum(0)[:, 0].double() - reference).abs().max().item()
+    assert error <= 3e-5 * reference.abs().max().item(), error
     squares = flat.float().square().sum(-1)
     torch.testing.assert_close(S.sum(0)[:, 0], squares, atol=0, rtol=1e-5)
     collapsed = (incoming.unsqueeze(-1) * residual.float()).sum(1).bfloat16()
