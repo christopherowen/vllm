@@ -64,6 +64,26 @@ def moe_output_dtype() -> torch.dtype:
 MOE_FP32_COMBINE = True
 
 
+def shared_expert_activation(act_fn: nn.Module) -> nn.Module:
+    """The shared expert's clamped SwiGLU; TileLang's keeps the reference's FP32
+    product (one BF16 rounding) where vLLM's rounds ``silu(gate)`` first."""
+    from vllm.model_executor.layers.activation import SiluAndMulWithClamp
+
+    if (
+        SHARED_SWIGLU_FP32
+        and uses_tilelang()
+        and isinstance(act_fn, SiluAndMulWithClamp)
+    ):
+        from .tilelang.activation import SiluAndMulClampFP32
+
+        return SiluAndMulClampFP32(act_fn.swiglu_limit)
+    return act_fn
+
+
+# The shared expert's SwiGLU at the reference's precision under the TileLang family.
+SHARED_SWIGLU_FP32 = False
+
+
 def moe_router_class():
     """Router class for the MoE layers; None keeps vLLM's for the config."""
     if uses_tilelang():

@@ -166,6 +166,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             router_cls=kernels.moe_router_class(),
         )
 
+        shared = getattr(self.ffn, "shared_experts", None)
+        if shared is not None:
+            shared.act_fn = kernels.shared_expert_activation(shared.act_fn)
+
         # A CED decoder layer routes the compact decoder rows, whose padding
         # mask differs from the step's. Tag its router by layer, never by the
         # row count, which an encoder forward can share.
