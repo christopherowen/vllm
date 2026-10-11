@@ -48,6 +48,27 @@ def _partial_argmax(
 
 
 @triton.jit
+def _partial_argmax_logits(
+    logits,
+    values,
+    indices,
+    logits_stride,
+    VOCAB: tl.constexpr,
+    PARTS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    part = tl.program_id(1)
+    col = part * BLOCK + tl.arange(0, BLOCK)
+    value = tl.load(logits + row * logits_stride + col, col < VOCAB, other=0)
+    value = tl.where(col < VOCAB, value.to(tl.float32), -float("inf"))
+    idx = tl.where(col < VOCAB, col, 2147483647)
+    best, index = tl.reduce((value, idx), 0, _first_argmax)
+    tl.store(values + row * PARTS + part, best)
+    tl.store(indices + row * PARTS + part, index)
+
+
+@triton.jit
 def _finish_argmax(
     values,
     indices,
@@ -133,6 +154,44 @@ def greedy_markov_shard_pair(
         partial_indices,
         base_logits.stride(0),
         markov_bias.stride(0),
+        vocab,
+        parts,
+        _BLOCK,
+    )
+    _finish_argmax_pair[(rows,)](
+        partial_values,
+        partial_indices,
+        pairs,
+        vocab_start,
+        parts,
+        triton.next_power_of_2(parts),
+    )
+
+
+def greedy_shard_pair(
+    logits: torch.Tensor,
+    vocab: int,
+    vocab_start: int,
+    pairs: torch.Tensor,
+    partial_values: torch.Tensor,
+    partial_indices: torch.Tensor,
+) -> None:
+    """``greedy_markov_shard_pair`` without a bias: each row's ``(max, global
+    index)`` over the first ``vocab`` columns of one vocabulary shard of
+    ``logits`` (its padding columns excluded), into FP32 ``pairs`` ([rows, 2])."""
+    rows = logits.shape[0]
+    if vocab > logits.shape[1]:
+        raise ValueError("the shard's real vocabulary exceeds its logits")
+    if vocab_start + vocab > 1 << 24:
+        raise ValueError("vocabulary indices must stay exact in FP32")
+    parts = triton.cdiv(vocab, _BLOCK)
+    if min(partial_values.numel(), partial_indices.numel()) < rows * parts:
+        raise ValueError("greedy scratch is smaller than the logits require")
+    _partial_argmax_logits[(rows, parts)](
+        logits,
+        partial_values,
+        partial_indices,
+        logits.stride(0),
         vocab,
         parts,
         _BLOCK,

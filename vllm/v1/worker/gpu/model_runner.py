@@ -22,6 +22,7 @@ import gc
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager
+import os
 from copy import deepcopy
 from typing import Any, NamedTuple
 
@@ -37,6 +38,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
+    get_tensor_model_parallel_world_size,
 )
 from vllm.forward_context import (
     BatchDescriptor,
@@ -131,6 +133,7 @@ from vllm.v1.worker.gpu.input_batch import (
     InputBuffers,
     combine_sampled_and_draft_tokens,
     expand_idx_mapping,
+    get_num_sampled_and_rejected,
     post_update,
     post_update_num_computed_tokens,
     prepare_pos_seq_lens,
@@ -173,6 +176,11 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
     verify_supports_aux_hidden_states_over_pp,
+)
+from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
+from vllm.v1.worker.gpu.spec_decode.greedy_verification import (
+    greedy_rejection_sample,
+    vocab_parallel_argmax,
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     RejectionSampler,
@@ -1779,6 +1787,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logits = logits[:, : self.vocab_size]
         else:
             sample_hidden_states = hidden_states[input_batch.logits_indices]
+            if self._verifies_greedily(input_batch, grammar_output):
+                return self._verify_greedily(sample_hidden_states, input_batch)
             logits = self.model.compute_logits(sample_hidden_states)
 
         if grammar_output is not None:
@@ -1839,6 +1849,89 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         assert sampler_output is not None
         return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
+
+    # Greedy verification from each rank's vocabulary shard (VLLM_GREEDY_VERIFICATION,
+    # on by default): see spec_decode/greedy_verification.py.
+    _greedy_verification: bool | None = None
+
+    def _greedy_verification_available(self) -> bool:
+        if self._greedy_verification is None:
+            processor = getattr(self.model, "logits_processor", None)
+            head = getattr(self.model, "lm_head", None)
+            self._greedy_verification = bool(
+                os.environ.get("VLLM_GREEDY_VERIFICATION", "1") == "1"
+                and type(self.rejection_sampler) is RejectionSampler
+                and self.rejection_sampler.watermark_key is None
+                and self.rejection_sampler.synthetic_conditional_rates is None
+                and self.sampler is not None
+                and not isinstance(self.sampler, GPUWatermarkSampler)
+                and not self.sampler.compute_nans
+                and not self.sampler.return_sampling_mask
+                and self.sampler.trace_replay_state is None
+                and self.batch_sharder is None
+                and hasattr(self.model, "compute_logits_local")
+                and hasattr(getattr(head, "shard_indices", None), "num_org_elements")
+                and processor is not None
+                and processor.scale == 1.0
+                and processor.soft_cap is None
+            )
+        return self._greedy_verification
+
+    def _verifies_greedily(
+        self, input_batch: InputBatch, grammar_output: GrammarOutput | None
+    ) -> bool:
+        """An all-greedy verification step that nothing else reads the logits of."""
+        if (
+            grammar_output is not None
+            or input_batch.num_reqs == 0
+            or input_batch.num_draft_tokens == 0
+            or not self._greedy_verification_available()
+        ):
+            return False
+        assert self.sampler is not None
+        idx = input_batch.idx_mapping_np
+        states = self.sampler.sampling_states
+        return bool(
+            np.all(states.temperature.np[idx] == 0.0)
+            and not np.any(self.sampler.needs_logits_processing[idx])
+            and states.max_num_logprobs(idx) == NO_LOGPROBS
+        )
+
+    def _verify_greedily(
+        self, sample_hidden_states: torch.Tensor, input_batch: InputBatch
+    ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
+        """The rejection sampler's output for an all-greedy step, without the
+        logits all-gather: the same committed tokens, bit for bit."""
+        assert self.rejection_sampler is not None and self.sampler is not None
+        shard = self.model.lm_head.shard_indices
+        target_ids = vocab_parallel_argmax(
+            self.model.compute_logits_local(sample_hidden_states),
+            shard.num_org_elements,
+            shard.org_vocab_start_index,
+            get_tensor_model_parallel_world_size(),
+        )
+        sampled, num_sampled = greedy_rejection_sample(
+            target_ids,
+            input_batch.input_ids[input_batch.logits_indices],
+            input_batch.cu_num_logits,
+            self.rejection_sampler.num_speculative_steps,
+        )
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            num_sampled,
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.sampler.req_states.prefill_len.gpu,
+            dead_row_cut=getattr(self, "_dead_row_cut", None),
+        )
+        output = SamplerOutput(
+            sampled_token_ids=sampled,
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+        )
+        return output, num_sampled, num_rejected
 
     def postprocess_sampled(
         self,
