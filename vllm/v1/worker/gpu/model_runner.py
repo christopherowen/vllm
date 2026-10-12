@@ -1037,7 +1037,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Compile the greedy verification kernels before readiness, with the
             # live path's dtypes and strides.
             assert self.rejection_sampler is not None
-            shard = self.model.lm_head.shard_indices
+            shard = self._language_model().lm_head.shard_indices
             target_ids = vocab_parallel_argmax(
                 self.model.compute_logits_local(hidden_states),
                 shard.num_org_elements,
@@ -1871,10 +1871,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     # on by default): see spec_decode/greedy_verification.py.
     _greedy_verification: bool | None = None
 
+    def _language_model(self) -> nn.Module:
+        """The model that owns the LM head (a multimodal wrapper delegates to it)."""
+        model = self.model
+        while getattr(model, "lm_head", None) is None and hasattr(model, "language_model"):
+            model = model.language_model
+        return model
+
     def _greedy_verification_available(self) -> bool:
         if self._greedy_verification is None:
-            processor = getattr(self.model, "logits_processor", None)
-            head = getattr(self.model, "lm_head", None)
+            language_model = self._language_model()
+            processor = getattr(language_model, "logits_processor", None)
+            head = getattr(language_model, "lm_head", None)
             self._greedy_verification = bool(
                 os.environ.get("VLLM_GREEDY_VERIFICATION", "1") == "1"
                 and type(self.rejection_sampler) is RejectionSampler
@@ -1891,6 +1899,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 and processor is not None
                 and processor.scale == 1.0
                 and processor.soft_cap is None
+            )
+            logger.info(
+                "Greedy verification from vocabulary shards: %s",
+                "on" if self._greedy_verification else "off",
             )
         return self._greedy_verification
 
@@ -1920,7 +1932,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """The rejection sampler's output for an all-greedy step, without the
         logits all-gather: the same committed tokens, bit for bit."""
         assert self.rejection_sampler is not None and self.sampler is not None
-        shard = self.model.lm_head.shard_indices
+        shard = self._language_model().lm_head.shard_indices
         target_ids = vocab_parallel_argmax(
             self.model.compute_logits_local(sample_hidden_states),
             shard.num_org_elements,
