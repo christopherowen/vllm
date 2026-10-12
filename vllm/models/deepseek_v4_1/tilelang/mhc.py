@@ -102,11 +102,13 @@ def project_streams(
     M = T.dynamic("M")
 
     @T.macro
-    def split_tf32(F_shared, F_mid, F_low):
+    def load_split_tf32(Fn, k0, F_shared, F_mid, F_low):
         # fn = high + middle + low, each exact in TF32 (11 significant bits): the
         # high part keeps fn's top 11 bits, the middle the next 11, the low the rest.
+        # Each value goes from global memory through registers into the three tiles
+        # in one pass.
         for i, j in T.Parallel(MIXES, block_H):
-            f = F_shared[i, j]
+            f = Fn[i, k0 + j]
             high = T.reinterpret(T.reinterpret(f, T.uint32) & 0xFFFFE000, T.float32)
             rest = f - high
             middle = T.reinterpret(
@@ -199,9 +201,7 @@ def project_streams(
                             R_out[token, n * H + h0 + c0 + v] = xv[v]
                     for v in T.unroll(COLS):
                         col[v] += coef[n] * av[v]
-                T.copy(Fn[0:MIXES, h0 : h0 + block_H], F_shared[0:MIXES, :])
-                T.sync_threads()
-                split_tf32(F_shared, F_mid, F_low)
+                load_split_tf32(Fn, h0, F_shared, F_mid, F_low)
                 T.sync_threads()
                 T.gemm(A_shared, F_shared, C_local, transpose_B=True)
                 T.gemm(A_shared, F_mid, C_local, transpose_B=True)
@@ -228,12 +228,7 @@ def project_streams(
                         A_shared[row, c0 + v] = av[v]
                         sq[v] += av[v] * av[v]
                         col[v] += coef[n] * av[v]
-                    T.copy(
-                        Fn[0:MIXES, n * H + h0 : n * H + h0 + block_H],
-                        F_shared[0:MIXES, :],
-                    )
-                    T.sync_threads()
-                    split_tf32(F_shared, F_mid, F_low)
+                    load_split_tf32(Fn, n * H + h0, F_shared, F_mid, F_low)
                     T.sync_threads()
                     T.gemm(A_shared, F_shared, C_local, transpose_B=True)
                     T.gemm(A_shared, F_mid, C_local, transpose_B=True)
