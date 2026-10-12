@@ -360,6 +360,12 @@ def moe_combine_v41(
         with T.Kernel(hidden // block_D, rows, threads=threads) as (bd, row):
             acc = T.alloc_fragment([block_D], T.float32)
             T.clear(acc)
+            if shared:
+                # Requested before the routes' loads, added after their sum: the
+                # same arithmetic, with the shared row's latency hidden.
+                sv = T.alloc_fragment([block_D], T.bfloat16)
+                for d in T.Parallel(block_D):
+                    sv[d] = Shared[row, bd * block_D + d]
             for k in T.serial(topk):
                 pos = RoutePos[row, k]
                 if pos >= 0:
@@ -377,8 +383,7 @@ def moe_combine_v41(
             for d in T.Parallel(block_D):
                 if shared:
                     Out[row, bd * block_D + d] = T.cast(
-                        acc[d] + T.cast(Shared[row, bd * block_D + d], T.float32),
-                        out_dtype,
+                        acc[d] + T.cast(sv[d], T.float32), out_dtype
                     )
                 else:
                     Out[row, bd * block_D + d] = T.cast(acc[d], out_dtype)
