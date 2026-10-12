@@ -127,9 +127,12 @@ def packed_vocab_projection(
         row_offsets: T.Tensor((N + 1,), T.int32),
         C: T.Tensor((M, N), out_dtype),
     ):
+        # Token tiles vary fastest: both tiles of a 96-row step read a vocabulary
+        # block's packed weights back to back, the second from L2, instead of the
+        # whole shard twice from DRAM. Each block computes the same as before.
         with T.Kernel(
-            T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads
-        ) as (bx, by):
+            T.ceildiv(M, block_M), T.ceildiv(N, block_N), threads=threads
+        ) as (by, bx):
             A_shared = T.alloc_shared((block_M, STEP), T.bfloat16)
             low_shared = T.alloc_shared((block_N, STEP), T.uint8)
             code_shared = T.alloc_shared((block_N, STEP // 2), T.uint8)
