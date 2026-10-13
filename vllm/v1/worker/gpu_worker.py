@@ -1552,6 +1552,18 @@ class Worker(WorkerBase):
                     # Recreate it so the next profile_prefix is honored.
                     self.profiler = None
 
+    def engine_grid(self, spec: str) -> dict:
+        """The engine cost grid (``GPUModelRunner.engine_grid``) for the dev-mode
+        collective RPC, whose arguments arrive as strings: ``spec`` is JSON."""
+        import json
+
+        grid = getattr(self.model_runner, "engine_grid", None)
+        if grid is None:
+            raise NotImplementedError("engine_grid needs the V2 GPU model runner")
+        result = grid(json.loads(spec))
+        result["rank"] = self.rank
+        return result
+
     def execute_dummy_batch(self) -> None:
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
         self.model_runner._dummy_run(num_tokens, uniform_decode=True)

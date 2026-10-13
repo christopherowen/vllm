@@ -859,6 +859,72 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
     @torch.inference_mode()
+    def engine_grid(self, spec: dict) -> dict:
+        """Time dummy steps at fixed shapes: the engine cost grid servebench reads.
+
+        ``spec`` holds ``shapes`` (each ``num_tokens``, optional ``num_reqs``,
+        ``context_len`` and ``prefill`` for a single request's chunk), ``replays``
+        and ``warmup``. Every shape runs ``warmup`` times untimed, then ``replays``
+        timed rounds alternate the shape order, as the cost profile does, so drift
+        and order effects spread over every shape. Returns each shape's whole-step
+        milliseconds (events around the dummy run) and, when every run reached the
+        drafter, the target forward and drafter split, step by step.
+
+        The steps are the cost profile's dummy runs: identical work on every build,
+        with no text, acceptance or scheduling in them. Run only on an idle server,
+        and reset the prefix cache afterwards, since dummy steps write KV slots.
+        """
+        shapes = spec["shapes"]
+        replays = int(spec.get("replays", 30))
+        warmup = int(spec.get("warmup", 2))
+
+        def run(shape: dict) -> None:
+            kwargs: dict[str, Any] = {
+                "num_tokens": int(shape["num_tokens"]),
+                "context_len": int(shape.get("context_len", 0)),
+            }
+            if shape.get("prefill"):
+                kwargs["single_request_prefill"] = True
+            elif shape.get("num_reqs") is not None:
+                kwargs["profile_num_reqs"] = int(shape["num_reqs"])
+            self._dummy_run(**kwargs)
+
+        for shape in shapes:
+            for _ in range(warmup):
+                run(shape)
+        order: list[int] = []
+        events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        with self.step_timing.collect() as timings:
+            for replay in range(replays):
+                indices = range(len(shapes))
+                for index in indices if replay % 2 == 0 else reversed(indices):
+                    start = torch.cuda.Event(enable_timing=True)
+                    end = torch.cuda.Event(enable_timing=True)
+                    start.record()
+                    run(shapes[index])
+                    end.record()
+                    events.append((start, end))
+                    order.append(index)
+        torch.cuda.synchronize()
+        results = [
+            {"shape": shape, "step_ms": [], "forward_ms": [], "drafter_ms": [], "modes": []}
+            for shape in shapes
+        ]
+        for index, (start, end) in zip(order, events):
+            # The whole dummy run on the stream: target, drafter and every gap
+            # between their kernels.
+            results[index]["step_ms"].append(start.elapsed_time(end))
+        # The target/drafter split exists only when every run reached the drafter.
+        if len(timings) == len(order):
+            for index, sample in zip(order, timings):
+                results[index]["forward_ms"].append(sample.forward_ms)
+                results[index]["drafter_ms"].append(sample.drafter_ms)
+                results[index]["modes"].append(
+                    [sample.full_cudagraph, sample.num_target_tokens, sample.num_reqs]
+                )
+        return {"replays": replays, "warmup": warmup, "shapes": results}
+
+    @torch.inference_mode()
     @step_eplb_after(is_dummy=True)
     def _dummy_run(
         self,
