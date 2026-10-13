@@ -919,6 +919,10 @@ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
     },
     (5120, 2048): {
         16: dict(block_N=128, block_K=128, num_stages=3),
+        # 2026-10-13 sweep (experiments/2026-10-13-tilelang-fp8-cast): 0.87 of the
+        # default tile at 48-64 rows; a 96-row tile 0.91 of the prefill tile at 72-96.
+        64: dict(block_N=128, block_K=128, num_stages=2),
+        96: dict(block_N=64, block_K=128, num_stages=2),
     },
     # TP4 DSpark main projection.
     (6400, 6144): {
@@ -1001,6 +1005,7 @@ WIDE_DECODE: dict[tuple[int, int], dict[int, int]] = {
     (1792, 5120): {96: 32, 128: 64},
     (1152, 5120): {128: 64},
     (5120, 576): {96: 32},
+    (5120, 2048): {96: 96},
 }
 
 # BF16 projections whose split-K decode path serves rows past DECODE_ROWS, by

@@ -269,6 +269,8 @@ def _prepare_block32(layer, groups: int = 1) -> None:
         layer.tilelang_key = id(layer)
         _LAYERS[layer.tilelang_key] = layer
         return
+    # The wide decode table can name a tile taller than DECODE_ROWS (WO-B's 96).
+    heights = sorted({*DECODE_TILE_ROWS, *layer.tilelang_wide.values()})
     layer.tilelang_decode = {
         block_M: mxfp8_gemm_decode(
             part,
@@ -277,7 +279,7 @@ def _prepare_block32(layer, groups: int = 1) -> None:
             padded_rows=True,
             groups=groups,
         )
-        for block_M in DECODE_TILE_ROWS
+        for block_M in heights
     }
     layer.tilelang_prefill = mxfp8_gemm(
         part, k, **fp8_prefill_config(part, k, groups), groups=groups
