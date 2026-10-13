@@ -162,17 +162,17 @@ def _block32_linear(
         use_packed_ue8m0=True,
         out=(xq[:rows], sf[:rows]),
     )
+    _block32_gemm(layer, xq, sf, out.view(rows, n), rows)
+
+
+def _block32_gemm(layer, xq, sf, out, rows: int) -> None:
+    """The GEMM of a block-32 projection without split-K on its MXFP8 activations
+    (``_activation_specs`` buffers, the first ``rows`` rows live)."""
     if rows > layer.tilelang_decode_rows:
         gemm = layer.tilelang_prefill
     else:
         gemm = layer.tilelang_decode[decode_tile_rows(rows, layer.tilelang_wide)]
-    gemm(
-        xq,
-        layer.weight,
-        sf.view(torch.uint32),
-        layer.tilelang_weight_sf,
-        out.view(rows, n),
-    )
+    gemm(xq, layer.weight, sf.view(torch.uint32), layer.tilelang_weight_sf, out)
 
 
 @_block32_linear.register_fake

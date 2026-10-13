@@ -11,8 +11,10 @@ WO-A keeps the BF16 activations, as the reference does (``convert.py`` dequantiz
 ``wo_a`` to BF16 and the projection is a BF16 einsum): one launch of the grouped
 W8A16 GEMM expands each FP8 weight tile exactly to BF16 and accumulates in FP32.
 WO-B is the ordinary block-32 projection with MXFP8 activations (DeepSeek's E4M3 and
-one UE8M0 scale per 32), as the reference's ``linear`` quantizes them. The
-checkpoint tensors are read in place.
+one UE8M0 scale per 32), as the reference's ``linear`` quantizes them. WO-A's last
+kernel (the GEMM's epilogue, or the split-K reduce at decode) rounds ``a`` to BF16 and
+applies that cast itself, so ``a`` never reaches memory in BF16: the bytes are those
+of ``per_token_cast`` on the BF16 ``a``. The checkpoint tensors are read in place.
 """
 
 import torch
@@ -21,8 +23,8 @@ from torch import nn
 from vllm.v1.worker.workspace import current_preallocated_workspace
 
 from .. import l2_prefetch
-from .gemm import fp8w_bf16_gemm, fp8w_bf16_gemm_partials, splitk_reduce
-from .linear import _block32_linear, _prepare_block32, _scratch
+from .gemm import fp8w_bf16_gemm_cast, fp8w_bf16_gemm_partials, splitk_reduce_cast
+from .linear import _activation_specs, _block32_gemm, _prepare_block32, _scratch
 from .rope import rope_
 
 # WO-A's W8A16 GEMM sums K in _WO_A_SHARDS shards at every row count, each from zero,
@@ -76,7 +78,7 @@ class _GroupedBF16:
                 **_WO_A_COMMON,
             )
             if tile["split"]
-            else fp8w_bf16_gemm(
+            else fp8w_bf16_gemm_cast(
                 n // groups,
                 k,
                 groups,
@@ -86,25 +88,35 @@ class _GroupedBF16:
             )
             for bucket, tile in _WO_A_TILES.items()
         }
-        self.reduce = splitk_reduce(n, _WO_A_SHARDS)
+        self.reduce = splitk_reduce_cast(n, _WO_A_SHARDS)
 
-    def __call__(self, x: torch.Tensor, out: torch.Tensor) -> None:
-        rows = x.shape[0]
-        bucket = next((b for b in _WO_A_TILES if b is not None and rows <= b), None)
+    @staticmethod
+    def bucket(rows: int):
+        return next((b for b in _WO_A_TILES if b is not None and rows <= b), None)
+
+    def partial_specs(self, rows: int):
+        """The split path's FP32 partials (nothing for the in-kernel path)."""
+        if not _WO_A_TILES[self.bucket(rows)]["split"]:
+            return ()
+        return (((_WO_A_SHARDS, rows, self.columns), torch.float32),)
+
+    def __call__(self, x, xq, sf, partials=None) -> None:
+        """WO-A of ``x``, cast as the reference's ``act_quant`` into ``xq`` (E4M3) and
+        ``sf`` (UE8M0 bytes); ``partials`` from ``partial_specs`` on the split path."""
+        bucket = self.bucket(x.shape[0])
         if not _WO_A_TILES[bucket]["split"]:
-            self.kernels[bucket](x, self.weight, self.tilelang_weight_sf, out)
+            self.kernels[bucket](x, self.weight, self.tilelang_weight_sf, xq, sf)
             return
-        (partials,) = _scratch(
-            (((_WO_A_SHARDS, rows, self.columns), torch.float32),), None
-        )
         self.kernels[bucket](x, self.weight, self.tilelang_weight_sf, partials)
-        self.reduce(partials, out)
+        self.reduce(partials, xq, sf)
 
 
 class TileLangWOProjection:
     def __init__(self, wo_a: nn.Module, wo_b: nn.Module, *, groups: int):
         self.a = _GroupedBF16(wo_a, groups)
         self.b = _Weight(wo_b, 1)
+        if self.b.tilelang_shards > 1:
+            raise ValueError("WO-B takes WO-A's MXFP8 output: no split-K path")
         self.hidden = wo_b.weight.shape[0]
 
     def l2_segments(self) -> list:
@@ -123,16 +135,23 @@ class TileLangWOProjection:
         """Project ``o`` ([T, heads, head_dim], contiguous BF16; its RoPE columns
         are overwritten) into ``out`` ([T, hidden] BF16)."""
         rows = o.shape[0]
+        if not rows:
+            return out
         rope_(o, positions, cos_sin_cache, 1, True)
         scratch = (
             None if torch.compiler.is_compiling() else current_preallocated_workspace()
         )
-        a = torch.empty(
-            (rows, self.a.weight.shape[0]), dtype=torch.bfloat16, device=o.device
+        # One borrow for everything live at once: WO-A's partials, then WO-B's MXFP8
+        # input in whole decode tiles.
+        partial_specs = self.a.partial_specs(rows)
+        views = _scratch(
+            (*partial_specs, *_activation_specs(rows, self.a.columns, self.b.tilelang_decode_rows)),
+            scratch,
         )
-        if rows:
-            self.a(o.view(rows, -1), a)
-        _block32_linear(a, out, self.b.tilelang_key, scratch)
+        partials = views[0] if partial_specs else None
+        xq, sf = views[-2], views[-1]
+        self.a(o.view(rows, -1), xq[:rows], sf[:rows], partials)
+        _block32_gemm(self.b, xq, sf, out, rows)
         return out
 
 

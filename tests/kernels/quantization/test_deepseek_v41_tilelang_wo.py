@@ -140,28 +140,45 @@ def test_grouped_gemm_equals_groups(count):
             assert torch.equal(out[:, g * RANK : (g + 1) * RANK], single), f"group {g}"
 
 
+def _wo_a_bf16(layer, x):
+    """WO-A's BF16 output through the unfused kernels with the WO's tile per bucket:
+    the value the fused path rounds to BF16 before its cast."""
+    from vllm.models.deepseek_v4_1.tilelang import gemm
+    from vllm.models.deepseek_v4_1.tilelang.wo import (
+        _WO_A_COMMON,
+        _WO_A_SHARDS,
+        _WO_A_TILES,
+        _GroupedBF16,
+    )
+
+    rows, (n, k) = x.shape[0], layer.weight.shape
+    tile = _WO_A_TILES[_GroupedBF16.bucket(rows)]
+    e = layer.weight_scale_inv.view(torch.uint8)
+    out = torch.empty((rows, n), dtype=torch.bfloat16, device=DEVICE)
+    if tile["split"]:
+        partials = torch.empty((_WO_A_SHARDS, rows, n), dtype=torch.float32, device=DEVICE)
+        gemm.fp8w_bf16_gemm_partials(
+            n // GROUPS, k, GROUPS, _WO_A_SHARDS, block_M=tile["block_M"], **_WO_A_COMMON
+        )(x, layer.weight, e, partials)
+        gemm.splitk_reduce(n, _WO_A_SHARDS)(partials, out)
+    else:
+        gemm.fp8w_bf16_gemm(
+            n // GROUPS, k, GROUPS, shards=_WO_A_SHARDS, block_M=tile["block_M"], **_WO_A_COMMON
+        )(x, layer.weight, e, out)
+    return out
+
+
 def test_wo_a_keeps_bf16_activations():
     """WO-A within one BF16 rounding of the FP64 product of the BF16 activations and
     the exactly dequantized weights, well inside what MXFP8 activations give, with the
     same bits at every row count: decode rows split the K shards over CTAs and longer
     steps add them inside the kernel, in the same order."""
-    from vllm.models.deepseek_v4_1.tilelang.wo import _GroupedBF16
-
     width = HEADS // GROUPS * HEAD_DIM
     layer = _block32(GROUPS * RANK, width, 7)
-    wo_a = _GroupedBF16(layer, GROUPS)
     x = torch.randn((300, GROUPS * width), generator=_gen(8), device=DEVICE).bfloat16()
     w = _dequant(layer)
 
-    scratch = torch.empty(1 << 26, dtype=torch.uint8, device=DEVICE)  # split partials
-
-    def project(rows):
-        out = torch.empty((rows, GROUPS * RANK), dtype=torch.bfloat16, device=DEVICE)
-        with use_preallocated_workspace(scratch):
-            wo_a(x[:rows], out)
-        return out
-
-    full = project(300)
+    full = _wo_a_bf16(layer, x)
     ref = torch.cat(
         [
             x[:, g * width : (g + 1) * width].double() @ w[g * RANK : (g + 1) * RANK].T
@@ -181,4 +198,29 @@ def test_wo_a_keeps_bf16_activations():
     )
     assert error.mean() < 0.25 * (quantized - ref).abs().mean()
     for rows in (1, 7, 16, 17, 33, 64, 65, 96, 97, 100, 128, 129, 200):
-        assert torch.equal(project(rows), full[:rows]), rows
+        assert torch.equal(_wo_a_bf16(layer, x[:rows]), full[:rows]), rows
+
+
+def test_wo_a_casts_as_per_token_cast():
+    """WO-A's fused output is the reference's activation cast of its BF16 output, byte
+    for byte (E4M3 values and UE8M0 bytes), on the split decode path and the in-kernel
+    path, including blocks below the amax floor."""
+    from vllm.models.deepseek_v4_1.tilelang.wo import _GroupedBF16
+
+    width = HEADS // GROUPS * HEAD_DIM
+    layer = _block32(GROUPS * RANK, width, 9)
+    wo_a = _GroupedBF16(layer, GROUPS)
+    x = torch.randn((300, GROUPS * width), generator=_gen(10), device=DEVICE).bfloat16()
+    x[::5] *= 1e-7  # some rows' outputs fall below the amax floor
+    for rows in (1, 7, 16, 17, 33, 64, 65, 96, 97, 100, 128, 129, 200, 300):
+        a = _wo_a_bf16(layer, x[:rows])
+        ref_q, ref_sf = tile_kernels.quant.per_token_cast(
+            a, "e4m3", 32, round_sf=True, use_packed_ue8m0=True
+        )
+        xq = torch.empty((rows, GROUPS * RANK), dtype=torch.float8_e4m3fn, device=DEVICE)
+        sf = torch.empty((rows, GROUPS * RANK // 32), dtype=torch.uint8, device=DEVICE)
+        specs = wo_a.partial_specs(rows)
+        partials = torch.empty(specs[0][0], dtype=specs[0][1], device=DEVICE) if specs else None
+        wo_a(x[:rows], xq, sf, partials)
+        assert torch.equal(xq.view(torch.uint8), ref_q.view(torch.uint8)), rows
+        assert torch.equal(sf, ref_sf.contiguous().view(torch.uint8)[:, : sf.shape[1]]), rows

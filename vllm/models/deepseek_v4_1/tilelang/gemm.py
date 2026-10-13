@@ -299,6 +299,67 @@ def splitk_reduce(
     return gemm_splitk_reduce
 
 
+# DeepSeek's act_quant(x, 32, "ue8m0") as TileKernels' per_token_cast computes it
+# (byte-identical: experiments/2026-10-13-tilelang-wo/check_cast_reference.py).
+_FP8_MAX = 448.0
+_FP8_MAX_INV = 1 / _FP8_MAX
+_AMAX_FLOOR = 1e-4
+
+
+@T.macro
+def _reference_cast(X, amax, inv, Q, S, row0, col0, rows, blocks, M):
+    """Quantize ``X[r, e]`` (FP32 copies of BF16 values; row ``r`` is 32-element block
+    ``r % blocks`` of output row ``row0 + r // blocks``) as act_quant: amax over the
+    block floored at 1e-4, the exponent ceil(log2(amax / 448)) from ``amax * (1/448)``'s
+    bits, E4M3 of ``x * 2^-e``, and the UE8M0 byte ``e + 127`` into ``S``."""
+    T.reduce_absmax(X, amax, dim=1)
+    for r in T.Parallel(rows * blocks):
+        bits = T.reinterpret(T.max(amax[r], T.float32(_AMAX_FLOOR)) * T.float32(_FP8_MAX_INV), T.uint32)
+        exponent = T.Cast(T.int32, ((bits - T.uint32(1)) >> 23) + T.uint32(1)) - 127
+        inv[r] = T.reinterpret(T.Cast(T.uint32, 127 - exponent) << 23, T.float32)
+        if row0 + r // blocks < M:
+            S[row0 + r // blocks, col0 // 32 + r % blocks] = T.Cast(T.uint8, exponent + 127)
+    for r, e in T.Parallel(rows * blocks, 32):
+        if row0 + r // blocks < M:
+            Q[row0 + r // blocks, col0 + (r % blocks) * 32 + e] = T.Cast(
+                T.float8_e4m3fn, X[r, e] * inv[r]
+            )
+
+
+@tilelang.jit
+def splitk_reduce_cast(N: int, shards: int, block_M: int = 4, threads: int = 128):
+    """``splitk_reduce`` to BF16, then the reference's activation cast: E4M3 ``Q`` and
+    one UE8M0 byte per 32 columns in ``S``, the bytes of BF16 ``C`` through
+    ``per_token_cast``. WO-A's split decode path hands WO-B its MXFP8 input directly."""
+    assert N % 128 == 0
+    M = T.dynamic("M")
+    blocks = 4  # 128 columns per CTA
+
+    @T.prim_func
+    def gemm_splitk_reduce_cast(
+        P: T.Tensor((shards, M, N), T.float32),
+        Q: T.Tensor((M, N), T.float8_e4m3fn),
+        S: T.Tensor((M, N // 32), T.uint8),
+    ):
+        with T.Kernel(N // 128, T.ceildiv(M, block_M), threads=threads) as (bx, by):
+            X = T.alloc_fragment((block_M * blocks, 32), T.float32)
+            amax = T.alloc_fragment((block_M * blocks,), T.float32)
+            inv = T.alloc_fragment((block_M * blocks,), T.float32)
+            for r, e in T.Parallel(block_M * blocks, 32):
+                m = T.min(by * block_M + r // blocks, M - 1)
+                n = bx * 128 + (r % blocks) * 32 + e
+                X[r, e] = P[0, m, n]
+            for s in T.serial(1, shards):
+                for r, e in T.Parallel(block_M * blocks, 32):
+                    m = T.min(by * block_M + r // blocks, M - 1)
+                    X[r, e] += P[s, m, bx * 128 + (r % blocks) * 32 + e]
+            for r, e in T.Parallel(block_M * blocks, 32):
+                X[r, e] = T.Cast(T.float32, T.Cast(T.bfloat16, X[r, e]))
+            _reference_cast(X, amax, inv, Q, S, by * block_M, bx * 128, block_M, blocks, M)
+
+    return gemm_splitk_reduce_cast
+
+
 @tilelang.jit
 def bf16_gemm(
     N: int,
@@ -450,6 +511,83 @@ def fp8w_bf16_gemm(
                 T.copy(C_local, C[by * block_M, n0])
 
     return gemm_fp8w_bf16
+
+
+@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+def fp8w_bf16_gemm_cast(
+    N: int,
+    K: int,
+    groups: int = 1,
+    block_M: int = 16,
+    block_N: int = 32,
+    block_K: int = 64,
+    num_stages: int = 2,
+    threads: int = 128,
+    shards: int = 1,
+):
+    """``fp8w_bf16_gemm`` whose epilogue rounds each output tile to BF16 and applies
+    the reference's activation cast (``_reference_cast``): E4M3 ``Q`` and UE8M0 bytes
+    ``S``, the bytes ``per_token_cast`` gives the BF16 output, without writing it."""
+    assert K % block_K == 0 and block_K % 32 == 0 and N % block_N == 0
+    assert block_N % 32 == 0
+    k_blocks = K // block_K
+    assert k_blocks % shards == 0
+    shard_blocks = k_blocks // shards
+    M = T.dynamic("M")
+    n_tiles = N // block_N
+    blocks = block_N // 32
+
+    @T.prim_func
+    def gemm_fp8w_bf16_cast(
+        A: T.Tensor((M, groups * K), T.bfloat16),
+        W: T.Tensor((groups * N, K), T.float8_e4m3fn),
+        E: T.Tensor((groups * N // 32, K // 32), T.uint8),
+        Q: T.Tensor((M, groups * N), T.float8_e4m3fn),
+        S: T.Tensor((M, groups * N // 32), T.uint8),
+    ):
+        with T.Kernel(groups * n_tiles, T.ceildiv(M, block_M), threads=threads) as (
+            bx,
+            by,
+        ):
+            g = bx // n_tiles
+            n0 = g * N + (bx % n_tiles) * block_N
+            A_shared = T.alloc_shared((block_M, block_K), T.bfloat16)
+            W_shared = T.alloc_shared((block_N, block_K), T.float8_e4m3fn)
+            S_shared = T.alloc_shared((block_N // 32, block_K // 32), T.float32)
+            B_shared = T.alloc_shared((block_N, block_K), T.bfloat16)
+            C_shared = T.alloc_shared((block_M, block_N), T.bfloat16)
+            C_local = T.alloc_fragment((block_M, block_N), T.float32)
+            C_total = T.alloc_fragment(
+                (block_M, block_N) if shards > 1 else (1, 1), T.float32
+            )
+            X = T.alloc_fragment((block_M * blocks, 32), T.float32)
+            amax = T.alloc_fragment((block_M * blocks,), T.float32)
+            inv = T.alloc_fragment((block_M * blocks,), T.float32)
+            T.clear(C_local)
+            if shards > 1:
+                T.clear(C_total)
+            for ko in T.Pipelined(k_blocks, num_stages=num_stages):
+                _w8a16_step(A, W, E, A_shared, W_shared, S_shared, B_shared, C_local,
+                            by, g, n0, ko, K, block_M, block_N, block_K)  # fmt: skip
+                if shards > 1:  # noqa: SIM102
+                    if (ko + 1) % shard_blocks == 0:
+                        for i, j in T.Parallel(block_M, block_N):
+                            C_total[i, j] = T.if_then_else(
+                                ko + 1 == shard_blocks,
+                                C_local[i, j],
+                                C_total[i, j] + C_local[i, j],
+                            )
+                        T.clear(C_local)
+            # The BF16 output tile, as fp8w_bf16_gemm would store it.
+            if shards > 1:
+                T.copy(C_total, C_shared)
+            else:
+                T.copy(C_local, C_shared)
+            for r, e in T.Parallel(block_M * blocks, 32):
+                X[r, e] = T.Cast(T.float32, C_shared[r // blocks, (r % blocks) * 32 + e])
+            _reference_cast(X, amax, inv, Q, S, by * block_M, n0, block_M, blocks, M)
+
+    return gemm_fp8w_bf16_cast
 
 
 @T.macro
