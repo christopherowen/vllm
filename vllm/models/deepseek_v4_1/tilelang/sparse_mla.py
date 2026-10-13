@@ -73,6 +73,15 @@ LOG2E = 1.44269504
 SEGMENT_CHUNKS = 4
 # The plan runs decode while it needs at most this many waves of CTAs.
 DECODE_MAX_WAVES = 3
+# FOLD: every route adds a segment to the running softmax state as
+# ``L = fma(l, b, L * a)`` and ``o = fma(acc, b, o * a)``. The other order,
+# ``fma(L, a, l * b)``, is not fixed by its source: where the state is still the
+# constant start (L = 1, o = 0), as in extend's unrolled one-segment fold on SWA-only
+# layers, the compiler may rewrite ``fma(1, a, l * b)`` as ``fma(l, b, a)``, one
+# rounding fewer than decode's separate merge kernel, and the routes then differ in a
+# few elements of rows with two or more keys. Here the product the constant meets
+# (``L * a``, ``o * a``) is exact when L = 1 or o = 0, and the fused product is
+# explicit, so every route rounds the same way.
 
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
@@ -423,15 +432,16 @@ def sparse_mla_fwd_v41(
                             alpha,
                             row_sum,
                         )
-                # Fold the segment into the running state, as the decode merge does.
+                # Fold the segment into the running state, as the decode merge does,
+                # in the form no constant can change (see FOLD below).
                 for h in T.Parallel(block_H):
                     m_new = T.max(M[h], m_g[h])
                     a[h] = T.exp2(M[h] - m_new)
                     b[h] = T.exp2(m_g[h] - m_new)
-                    L[h] = T.fma(L[h], a[h], T.fmul(l_g[h], b[h]))
+                    L[h] = T.fma(l_g[h], b[h], T.fmul(L[h], a[h]))
                     M[h] = m_new
                 for h, d in T.Parallel(block_H, D):
-                    acc_o[h, d] = T.fma(acc_o[h, d], a[h], T.fmul(acc_g[h, d], b[h]))
+                    acc_o[h, d] = T.fma(acc_g[h, d], b[h], T.fmul(acc_o[h, d], a[h]))
 
             for h in T.Parallel(block_H):
                 L[h] = 1.0 / L[h]
@@ -553,10 +563,10 @@ def sparse_mla_fwd_v41(
                 m_new = T.max(M, PartialStats[rc, c, hc, 0])
                 a = T.exp2(M - m_new)
                 b = T.exp2(PartialStats[rc, c, hc, 0] - m_new)
-                L = T.fma(L, a, T.fmul(PartialStats[rc, c, hc, 1], b))
+                L = T.fma(PartialStats[rc, c, hc, 1], b, T.fmul(L, a))
                 M = m_new
                 for d in T.Parallel(D):
-                    o[d] = T.fma(o[d], a, T.fmul(Partial[rc, c, hc, d], b))
+                    o[d] = T.fma(Partial[rc, c, hc, d], b, T.fmul(o[d], a))
             L = 1.0 / L
             for d in T.Parallel(D):
                 Output[rc, hc, d] = T.fmul(o[d], L)

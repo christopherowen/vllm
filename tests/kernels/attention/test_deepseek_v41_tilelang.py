@@ -561,3 +561,36 @@ def test_sparse_mla(
     )
     for kernel, out in outs.items():
         assert torch.equal(out, outs["extend"]), f"{kernel} differs from extend"
+
+
+# Heads per rank: TP4 (16), TP3 (24 of 72 padded).
+@pytest.mark.parametrize("heads", [16, 24])
+@pytest.mark.parametrize("keys", [1, 2, 3, 8])
+def test_sparse_mla_routes_short_rows(heads, keys, rows=1024, swa_width=128, page=128):
+    """A prompt's first rows attend to a few keys. On the SWA-only layer (one segment)
+    extend's fold starts from the constant state; every route must round alike (FOLD)."""
+    gen = _gen(keys)
+    swa_pages = 24
+    q = torch.randn((rows, heads, HEAD_DIM), generator=gen, device=DEVICE).bfloat16()
+    sinks = torch.randn((heads,), generator=gen, device=DEVICE)
+    swa = _pack_swa(
+        torch.randn((swa_pages * page, HEAD_DIM), generator=gen, device=DEVICE)
+    )
+    swa_idx = torch.full((rows, swa_width), -1, dtype=torch.int32, device=DEVICE)
+    swa_idx[:, :keys] = torch.randint(
+        0, swa_pages * page, (rows, keys), generator=gen, device=DEVICE, dtype=torch.int32
+    )
+    swa_len = torch.full((rows,), keys, dtype=torch.int32, device=DEVICE)
+    plan = SparseMlaV41Plan(
+        heads, swa_width, 0, page, swa_page_size=page,
+        max_rows=rows, decode_max_rows=rows, split_max_rows=rows,
+    )  # fmt: skip
+    pool = _paged(swa, page)
+    outs = {}
+    for kernel in plan.kernels:
+        out = torch.empty((rows, heads, HEAD_DIM), dtype=torch.bfloat16, device=DEVICE)
+        plan.run(q, pool, swa_idx, swa_len, sinks, out, kernel=kernel)
+        outs[kernel] = out
+    for kernel, out in outs.items():
+        differ = int((out.view(torch.int16) != outs["extend"].view(torch.int16)).sum())
+        assert differ == 0, f"{kernel} differs from extend in {differ} elements"
