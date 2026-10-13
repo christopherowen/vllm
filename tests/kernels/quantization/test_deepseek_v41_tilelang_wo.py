@@ -26,7 +26,7 @@ from vllm.v1.worker.workspace import use_preallocated_workspace  # noqa: E402
 DEVICE = "cuda"
 # TP4: 16 heads of 512 in 2 groups, rank 1024, hidden 5120.
 HEADS, HEAD_DIM, GROUPS, RANK, HIDDEN, ROPE = 16, 512, 2, 1024, 5120, 64
-ROWS = (1, 7, 16, 33, 64, 65, 200)
+ROWS = (1, 7, 16, 33, 64, 65, 96, 97, 128, 129, 200)
 
 
 def _gen(seed):
@@ -180,5 +180,5 @@ def test_wo_a_keeps_bf16_activations():
         dim=1,
     )
     assert error.mean() < 0.25 * (quantized - ref).abs().mean()
-    for rows in (1, 7, 16, 17, 33, 64, 65, 100, 128, 129, 200):
+    for rows in (1, 7, 16, 17, 33, 64, 65, 96, 97, 100, 128, 129, 200):
         assert torch.equal(project(rows), full[:rows]), rows

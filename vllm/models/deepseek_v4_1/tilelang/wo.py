@@ -29,16 +29,18 @@ from .rope import rope_
 # added in shard order, so a row's bits do not depend on the path. A bucket either
 # splits the shards over CTAs (FP32 partials, then splitk_reduce: the SMs a narrow grid
 # leaves idle at decode) or adds them inside the kernel (no partials to write and read
-# back). Path and tile per bucket from the split sweep (bits depend on neither): 64
-# columns and two stages throughout; four shards beat two at decode.
+# back). Path and tile per bucket from the split sweeps (bits depend on neither): 64
+# columns and two stages throughout; four shards beat two at decode, and tiles as tall
+# as the bucket from 65 rows (2026-10-13 sweep 2: 72-96 rows 27.9-29.5 against 34.5 us,
+# 512 rows 119.1 against 131.8 us, 8192 rows 1675 against 1758 us).
 _WO_A_SHARDS = 4
 _WO_A_TILES = {
     16: dict(split=True, block_M=16),
     32: dict(split=True, block_M=32),
     64: dict(split=True, block_M=64),
-    96: dict(split=False, block_M=32),
-    128: dict(split=True, block_M=64),
-    None: dict(split=False, block_M=64),
+    96: dict(split=True, block_M=96),
+    128: dict(split=True, block_M=128),
+    None: dict(split=False, block_M=96),
 }
 _WO_A_COMMON = dict(block_N=64, num_stages=2)
 
@@ -50,7 +52,8 @@ class _Weight:
         self.weight = layer.weight.detach()
         self.weight_scale_inv = layer.weight_scale_inv.detach()
         _prepare_block32(self, groups)
-        # 16-stream steps (up to 96 rows) stay on decode tiles, two of 64 rows.
+        # Verification steps stay on decode tiles to 128 rows: one 96-row tile to 96
+        # (WIDE_DECODE), two of 64 rows past it.
         self.tilelang_decode_rows = 128
 
 
