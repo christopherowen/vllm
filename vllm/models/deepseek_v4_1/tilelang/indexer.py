@@ -190,7 +190,7 @@ def indexer_score_v41(
     if not candidates:
 
         @T.prim_func
-        def main(
+        def indexer_score(
             Q: T.Tensor([rows, heads, D], fp4),
             QScale: T.Tensor([rows, heads], T.uint32),
             Weights: T.Tensor([rows, heads], T.bfloat16),
@@ -220,10 +220,10 @@ def indexer_score_v41(
                     Scores,
                 )
 
-        return main
+        return indexer_score
 
     @T.prim_func
-    def main(
+    def indexer_score(
         Q: T.Tensor([rows, heads, D], fp4),
         QScale: T.Tensor([rows, heads], T.uint32),
         Weights: T.Tensor([rows, heads], T.bfloat16),
@@ -253,7 +253,7 @@ def indexer_score_v41(
                 Scores,
             )
 
-    return main
+    return indexer_score
 
 
 def _e2m1_code(x):
@@ -337,7 +337,7 @@ def mxfp4_quantize_v41(paged: bool = False, page_size: int = 64, threads: int = 
     if paged:
 
         @T.prim_func
-        def main(
+        def indexer_mxfp4_quantize(
             X: T.Tensor([rows, INDEX_DIM], T.bfloat16),
             Slots: T.Tensor([rows], T.int64),
             Pool: T.StridedTensor(
@@ -346,17 +346,17 @@ def mxfp4_quantize_v41(paged: bool = False, page_size: int = 64, threads: int = 
         ):
             body(X, None, None, Slots, Pool)
 
-        return main
+        return indexer_mxfp4_quantize
 
     @T.prim_func
-    def main(
+    def indexer_mxfp4_quantize(
         X: T.Tensor([rows, INDEX_DIM], T.bfloat16),
         Q: T.Tensor([rows, INDEX_DIM // 2], T.uint8),
         S: T.Tensor([rows, groups], T.uint8),
     ):
         body(X, Q, S, None, None)
 
-    return main
+    return indexer_mxfp4_quantize
 
 
 def quantize_mxfp4(x, q, scales):
@@ -698,7 +698,7 @@ def indexer_topk_segment_v41(
         if candidates:
 
             @T.prim_func
-            def main(
+            def indexer_topk_segment(
                 Scores: T.Tensor([rows, width], T.bfloat16),
                 Lengths: T.Tensor([rows], T.int32),
                 WorkValues: T.Tensor([rows, segments * topk], T.bfloat16),
@@ -716,10 +716,10 @@ def indexer_topk_segment_v41(
                     WorkEntries,
                 )
 
-            return main
+            return indexer_topk_segment
 
         @T.prim_func
-        def main(
+        def indexer_topk_segment(
             Scores: T.Tensor([rows, width], T.bfloat16),
             Lengths: T.Tensor([rows], T.int32),
             Active: T.Tensor([1], T.int32),
@@ -730,12 +730,12 @@ def indexer_topk_segment_v41(
                 Scores, Lengths, Active, None, None, None, None, WorkValues, WorkEntries
             )
 
-        return main
+        return indexer_topk_segment
 
     if candidates:
 
         @T.prim_func
-        def main(
+        def indexer_topk_segment(
             Scores: T.Tensor([rows, width], T.bfloat16),
             Lengths: T.Tensor([rows], T.int32),
             Gather: T.Tensor([rows, width], T.int32),
@@ -744,12 +744,12 @@ def indexer_topk_segment_v41(
         ):
             body(Scores, Lengths, None, Gather, Indices, Values, None, None, None)
 
-        return main
+        return indexer_topk_segment
 
     if group > 1:
 
         @T.prim_func
-        def main(
+        def indexer_topk_segment(
             Scores: T.Tensor([rows, width], T.bfloat16),
             Lengths: T.Tensor([rows], T.int32),
             Active: T.Tensor([1], T.int32),
@@ -759,10 +759,10 @@ def indexer_topk_segment_v41(
         ):
             body(Scores, Lengths, Active, None, Indices, Values, Counts, None, None)
 
-        return main
+        return indexer_topk_segment
 
     @T.prim_func
-    def main(
+    def indexer_topk_segment(
         Scores: T.Tensor([rows, width], T.bfloat16),
         Lengths: T.Tensor([rows], T.int32),
         Active: T.Tensor([1], T.int32),
@@ -771,7 +771,7 @@ def indexer_topk_segment_v41(
     ):
         body(Scores, Lengths, Active, None, Indices, Values, None, None, None)
 
-    return main
+    return indexer_topk_segment
 
 
 @tilelang.jit(
@@ -872,7 +872,7 @@ def indexer_topk_merge_v41(
         if candidates:
 
             @T.prim_func
-            def main(
+            def indexer_topk_merge(
                 WorkValues: T.Tensor([rows, lists * topk], T.bfloat16),
                 WorkEntries: T.Tensor([rows, lists * topk], T.int32),
                 Lengths: T.Tensor([rows], T.int32),
@@ -890,10 +890,10 @@ def indexer_topk_merge_v41(
                     None,
                 )
 
-            return main
+            return indexer_topk_merge
 
         @T.prim_func
-        def main(
+        def indexer_topk_merge(
             WorkValues: T.Tensor([rows, lists * topk], T.bfloat16),
             WorkEntries: T.Tensor([rows, lists * topk], T.int32),
             Lengths: T.Tensor([rows], T.int32),
@@ -912,12 +912,12 @@ def indexer_topk_merge_v41(
                 None,
             )
 
-        return main
+        return indexer_topk_merge
 
     if candidates:
 
         @T.prim_func
-        def main(
+        def indexer_topk_merge(
             WorkValues: T.Tensor([rows, lists * topk], T.bfloat16),
             WorkEntries: T.Tensor([rows, lists * topk], T.int32),
             Lengths: T.Tensor([rows], T.int32),
@@ -927,12 +927,12 @@ def indexer_topk_merge_v41(
         ):
             body(WorkValues, WorkEntries, Lengths, None, Gather, Indices, Values, None)
 
-        return main
+        return indexer_topk_merge
 
     if group > 1:
 
         @T.prim_func
-        def main(
+        def indexer_topk_merge(
             WorkValues: T.Tensor([rows, lists * topk], T.bfloat16),
             WorkEntries: T.Tensor([rows, lists * topk], T.int32),
             Lengths: T.Tensor([rows], T.int32),
@@ -945,10 +945,10 @@ def indexer_topk_merge_v41(
                 WorkValues, WorkEntries, Lengths, Active, None, Indices, Values, Counts
             )
 
-        return main
+        return indexer_topk_merge
 
     @T.prim_func
-    def main(
+    def indexer_topk_merge(
         WorkValues: T.Tensor([rows, lists * topk], T.bfloat16),
         WorkEntries: T.Tensor([rows, lists * topk], T.int32),
         Lengths: T.Tensor([rows], T.int32),
@@ -958,7 +958,7 @@ def indexer_topk_merge_v41(
     ):
         body(WorkValues, WorkEntries, Lengths, Active, None, Indices, Values, None)
 
-    return main
+    return indexer_topk_merge
 
 
 _MERGE_KEYS = 8192  # keys one merge CTA holds in shared memory (32 KiB)

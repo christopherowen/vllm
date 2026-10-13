@@ -173,7 +173,7 @@ def route_partials(
     rows = T.dynamic("rows")
 
     @T.prim_func
-    def main(
+    def router_partials(
         P: T.Tensor((shards, rows, num_experts), T.float32),
         bias: T.Tensor((num_experts,), T.float32),
         image_bias: T.Tensor((num_experts,), T.float32),
@@ -278,7 +278,7 @@ def route_partials(
                 topk_idx[row, lane] = chosen_idx
                 topk_weights[row, lane] = chosen_score / total * routed_scaling_factor
 
-    return main
+    return router_partials
 
 
 class TileLangGateRouter(TileKernelsRouter):

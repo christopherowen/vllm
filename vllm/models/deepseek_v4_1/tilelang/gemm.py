@@ -107,7 +107,7 @@ def _mxfp8_gemm(
     total_N = groups * N
 
     @T.prim_func
-    def main(
+    def gemm_mxfp8(
         A: T.Tensor((Mp, groups * K), in_dtype),
         B: T.Tensor((total_N, K), in_dtype),
         SFA: T.Tensor((Mp, groups * sf_words), T.uint32),
@@ -176,7 +176,7 @@ def _mxfp8_gemm(
             else:
                 T.copy(C_local, C[by * block_M, bx * block_N])
 
-    return main
+    return gemm_mxfp8
 
 
 # Prefill tiles use TileLang's warp-specialized pipeline (TMA producer warps,
@@ -208,7 +208,7 @@ def _mxfp8_gemm_partials(
     block_words = block_scale_words(block_K)
 
     @T.prim_func
-    def main(
+    def gemm_mxfp8_partials(
         A: T.Tensor((Mp, K), in_dtype),
         B: T.Tensor((N, K), in_dtype),
         SFA: T.Tensor((Mp, sf_words), T.uint32),
@@ -252,7 +252,7 @@ def _mxfp8_gemm_partials(
                 )
             T.copy(C_local, P[s, by * block_M, bx * block_N])
 
-    return main
+    return gemm_mxfp8_partials
 
 
 mxfp8_gemm = tilelang.jit(_mxfp8_gemm)
@@ -281,7 +281,7 @@ def splitk_reduce(
     M = T.dynamic("M")
 
     @T.prim_func
-    def main(P: T.Tensor((shards, M, N), T.float32), C: T.Tensor((M, N), out_dtype)):
+    def gemm_splitk_reduce(P: T.Tensor((shards, M, N), T.float32), C: T.Tensor((M, N), out_dtype)):
         with T.Kernel(T.ceildiv(N, block_N), M, threads=threads) as (bx, m):
             acc = T.alloc_fragment((block_N,), T.float32)
             # Columns past N (a narrow projection's last block) are skipped.
@@ -296,7 +296,7 @@ def splitk_reduce(
                 if bx * block_N + j < N:
                     C[m, bx * block_N + j] = acc[j]
 
-    return main
+    return gemm_splitk_reduce
 
 
 @tilelang.jit
@@ -325,7 +325,7 @@ def bf16_gemm(
     shard_blocks = k_blocks // shards
 
     @T.prim_func
-    def main(
+    def gemm_bf16(
         A: T.Tensor((M, K), dtype),
         B: T.Tensor((N, K), dtype),
         C: T.Tensor((M, N), out_dtype),
@@ -370,7 +370,7 @@ def bf16_gemm(
             else:
                 T.copy(C_local, C[by * block_M, bx * block_N])
 
-    return main
+    return gemm_bf16
 
 
 @tilelang.jit
@@ -388,7 +388,7 @@ def splitk_reduce_two(
     tiles = N // block_N
 
     @T.prim_func
-    def main(
+    def gemm_splitk_reduce_two(
         P: T.Tensor((shards, M, 2 * N), T.float32),
         C0: T.Tensor((M, N), out_dtype),
         C1: T.Tensor((M, N), out_dtype),
@@ -407,7 +407,7 @@ def splitk_reduce_two(
                 for j in T.Parallel(block_N):
                     C1[m, (bx - tiles) * block_N + j] = acc[j]
 
-    return main
+    return gemm_splitk_reduce_two
 
 
 @tilelang.jit
@@ -436,7 +436,7 @@ def bf16_gemm_two(
     tiles = N // block_N
 
     @T.prim_func
-    def main(
+    def gemm_bf16_two(
         A: T.Tensor((M, K), dtype),
         B: T.Tensor((2 * N, K), dtype),
         C0: T.Tensor((M, N), out_dtype),
@@ -486,7 +486,7 @@ def bf16_gemm_two(
                 else:
                     T.copy(C_local, C1[by * block_M, (bx - tiles) * block_N])
 
-    return main
+    return gemm_bf16_two
 
 
 @tilelang.jit
@@ -508,7 +508,7 @@ def bf16_gemm_partials(
     shard_blocks = K // block_K // shards
 
     @T.prim_func
-    def main(
+    def gemm_bf16_partials(
         A: T.Tensor((M, K), dtype),
         B: T.Tensor((N, K), dtype),
         P: T.Tensor((shards, M, N), T.float32),
@@ -544,7 +544,7 @@ def bf16_gemm_partials(
                 ],
             )
 
-    return main
+    return gemm_bf16_partials
 
 
 # The last CTA to finish a split-K tile adds the shards. Every CTA publishes its
@@ -650,7 +650,7 @@ def bf16_gemm_splitk(
     if parts == 2:
 
         @T.prim_func
-        def main(
+        def gemm_bf16_splitk(
             A: T.Tensor((M, K), dtype),
             B: T.Tensor((N, K), dtype),
             P: T.Tensor((shards, M, N), T.float32),
@@ -663,7 +663,7 @@ def bf16_gemm_splitk(
     else:
 
         @T.prim_func
-        def main(
+        def gemm_bf16_splitk(
             A: T.Tensor((M, K), dtype),
             B: T.Tensor((N, K), dtype),
             P: T.Tensor((shards, M, N), T.float32),
@@ -672,7 +672,7 @@ def bf16_gemm_splitk(
         ):
             body(A, B, P, counters, C0, None)
 
-    return main
+    return gemm_bf16_splitk
 
 
 # ---------------------------------------------------------------------------

@@ -119,7 +119,7 @@ def project_streams(
             F_low[i, j] = rest - middle
 
     @T.prim_func
-    def main(
+    def mhc_project_streams(
         X: T.Tensor((world, M, H), T.bfloat16),
         R: T.Tensor((M, MULT * H), T.bfloat16),
         post: T.Tensor((M, MULT), T.float32),
@@ -261,7 +261,7 @@ def project_streams(
                 if by * block_M + i < M:
                     P[sp, by * block_M + i, 0, j] = C_local[i, j]
 
-    return main
+    return mhc_project_streams
 
 
 @tilelang.jit(pass_configs=_PASS_CONFIGS)
@@ -286,7 +286,7 @@ def finalize(
     M = T.dynamic("M")
 
     @T.prim_func
-    def main(
+    def mhc_finalize(
         P: T.Tensor((splits, M, 1, MIXES), T.float32),
         S: T.Tensor((splits, M, 1), T.float32),
         C: T.Tensor((M, hidden_size), T.bfloat16),
@@ -383,7 +383,7 @@ def finalize(
                         for v in T.vectorized(VEC):
                             y[pid, chunk * VEC + v] = xv[v]
 
-    return main
+    return mhc_finalize
 
 
 @cache

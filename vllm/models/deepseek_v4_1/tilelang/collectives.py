@@ -54,7 +54,7 @@ def rank_order_sum_kernel(world: int, threads: int = 256):
     if world == 2:
 
         @T.prim_func
-        def rank_order_sum(
+        def collectives_rank_order_sum(
             s0: T.Tensor((m, _VEC), T.bfloat16),
             s1: T.Tensor((m, _VEC), T.bfloat16),
             out: T.Tensor((m, _VEC), T.bfloat16),
@@ -71,7 +71,7 @@ def rank_order_sum_kernel(world: int, threads: int = 256):
     elif world == 3:
 
         @T.prim_func
-        def rank_order_sum(
+        def collectives_rank_order_sum(
             s0: T.Tensor((m, _VEC), T.bfloat16),
             s1: T.Tensor((m, _VEC), T.bfloat16),
             s2: T.Tensor((m, _VEC), T.bfloat16),
@@ -90,7 +90,7 @@ def rank_order_sum_kernel(world: int, threads: int = 256):
     else:
 
         @T.prim_func
-        def rank_order_sum(
+        def collectives_rank_order_sum(
             s0: T.Tensor((m, _VEC), T.bfloat16),
             s1: T.Tensor((m, _VEC), T.bfloat16),
             s2: T.Tensor((m, _VEC), T.bfloat16),
@@ -108,7 +108,7 @@ def rank_order_sum_kernel(world: int, threads: int = 256):
                     load(s3, xs, total, row, False)
                     store(out, xs, total, row)
 
-    return rank_order_sum
+    return collectives_rank_order_sum
 
 
 def rank_order_sum(

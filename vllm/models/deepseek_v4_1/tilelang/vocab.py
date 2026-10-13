@@ -119,7 +119,7 @@ def packed_vocab_projection(
     E = T.dynamic("E")
 
     @T.prim_func
-    def main(
+    def vocab_packed_projection(
         A: T.Tensor((M, K), T.bfloat16),
         W: T.Tensor((N, row_bytes), T.uint8),
         exception_rows: T.Tensor((E,), T.int32),
@@ -200,7 +200,7 @@ def packed_vocab_projection(
                     )
             T.copy(C_local, C[by * block_M, bx * block_N])
 
-    return main
+    return vocab_packed_projection
 
 
 _OUT = {torch.bfloat16: T.bfloat16, torch.float32: T.float32}

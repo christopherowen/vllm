@@ -91,7 +91,7 @@ def cache_writer_kernel(cache_kind: str, page_size: int, slot_dtype: str = "int6
     page_words, word_stride = T.dynamic("page_words, word_stride")
 
     @T.prim_func
-    def write(
+    def cache_writer(
         kv: T.StridedTensor((tokens, DIM), (kv_stride, 1), T.bfloat16),
         cache: T.StridedTensor((pages, page_bytes), (page_stride, 1), T.uint8),
         words: T.StridedTensor((pages, page_words), (word_stride, 1), word_dtype),
@@ -167,7 +167,7 @@ def cache_writer_kernel(cache_kind: str, page_size: int, slot_dtype: str = "int6
                                 scale_code, T.uint8
                             )
 
-    return write
+    return cache_writer
 
 
 def write_cache(

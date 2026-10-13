@@ -17,7 +17,7 @@ def _plan(*tensors):
 
 
 def test_tilelang_prefetch_leaves_data_unchanged():
-    from vllm.models.glm5next.nvidia.l2_prefetch_tilelang import compile_launcher
+    from vllm.models.glm5next.nvidia.tilelang.l2_prefetch import compile_launcher
 
     launch = compile_launcher(grid=2, block=128, chunk=4096)
     # Sizes that end mid-chunk and below the 16-byte granule.
@@ -36,7 +36,7 @@ def test_tilelang_prefetch_leaves_data_unchanged():
 
 
 def test_tilelang_prefetch_captures_in_a_graph():
-    from vllm.models.glm5next.nvidia.l2_prefetch_tilelang import compile_launcher
+    from vllm.models.glm5next.nvidia.tilelang.l2_prefetch import compile_launcher
 
     launch = compile_launcher(grid=2, block=128, chunk=4096)
     w = torch.randn(8 * 1024 * 1024, device="cuda")

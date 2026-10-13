@@ -183,7 +183,7 @@ def moe_dispatch_v41(
     if part == "fused":
 
         @T.prim_func
-        def main(
+        def moe_dispatch(
             TopkIdx: T.Tensor([rows, topk], idx_dtype),
             TopkWeights: T.Tensor([rows, topk], T.float32),
             Order: T.Tensor([tiles * block_M], T.int32),
@@ -233,12 +233,12 @@ def moe_dispatch_v41(
                     else:
                         RoutePos[tx // topk, tx % topk] = -1
 
-        return main
+        return moe_dispatch
 
     if part == "count":
 
         @T.prim_func
-        def main(
+        def moe_dispatch(
             TopkIdx: T.Tensor([rows, topk], idx_dtype),
             ChunkCount: T.Tensor([chunks, num_experts], T.int32),
             Rank: T.Tensor([rows * topk], T.int32),
@@ -254,12 +254,12 @@ def moe_dispatch_v41(
                 if c * threads + tx < rows * topk:
                     Rank[c * threads + tx] = rank
 
-        return main
+        return moe_dispatch
 
     if part == "layout":
 
         @T.prim_func
-        def main(
+        def moe_dispatch(
             ChunkCount: T.Tensor([chunks, num_experts], T.int32),
             Order: T.Tensor([tiles * block_M], T.int32),
             LayoutWeights: T.Tensor([tiles * block_M], T.float32),
@@ -296,12 +296,12 @@ def moe_dispatch_v41(
                     tiles,
                 )
 
-        return main
+        return moe_dispatch
 
     assert part == "scatter", part
 
     @T.prim_func
-    def main(
+    def moe_dispatch(
         TopkIdx: T.Tensor([rows, topk], idx_dtype),
         TopkWeights: T.Tensor([rows, topk], T.float32),
         ChunkCount: T.Tensor([chunks, num_experts], T.int32),
@@ -325,7 +325,7 @@ def moe_dispatch_v41(
                 else:
                     RoutePos[r // topk, r % topk] = -1
 
-    return main
+    return moe_dispatch
 
 
 @tilelang.jit
@@ -350,7 +350,7 @@ def moe_combine_v41(
     assert block_D >= 8, f"hidden={hidden} must be a multiple of 8"
 
     @T.prim_func
-    def main(
+    def moe_combine(
         Y: T.Tensor([layout_rows, hidden], T.bfloat16),
         RoutePos: T.Tensor([rows, topk], T.int32),
         Weights: T.Tensor([rows, topk], T.float32),
@@ -388,7 +388,7 @@ def moe_combine_v41(
                 else:
                     Out[row, bd * block_D + d] = T.cast(acc[d], out_dtype)
 
-    return main
+    return moe_combine
 
 
 def layout_tiles(rows: int, topk: int, block_M: int, num_experts: int) -> int:
@@ -751,7 +751,7 @@ def grouped_fp8_fp4_gemm(
     if tail:
 
         @T.prim_func
-        def main(
+        def moe_grouped_fp8_fp4_gemm(
             A: T.Tensor((a_rows, K), T.float8_e4m3fn),
             SFA: T.Tensor((a_rows, sf_words), T.uint32),
             B: T.Tensor(b_shape, T.float4_e2m1fn),
@@ -766,7 +766,7 @@ def grouped_fp8_fp4_gemm(
     else:
 
         @T.prim_func
-        def main(
+        def moe_grouped_fp8_fp4_gemm(
             A: T.Tensor((a_rows, K), T.float8_e4m3fn),
             SFA: T.Tensor((a_rows, sf_words), T.uint32),
             B: T.Tensor(b_shape, T.float4_e2m1fn),
@@ -777,7 +777,7 @@ def grouped_fp8_fp4_gemm(
         ):
             body(A, SFA, B, None, SFB, Order, TileExpert, C)
 
-    return main
+    return moe_grouped_fp8_fp4_gemm
 
 
 def tile_expert_weights(b_packed, block_N):

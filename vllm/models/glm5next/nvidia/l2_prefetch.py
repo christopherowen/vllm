@@ -247,7 +247,7 @@ _compile_failed = False
 
 
 # Kernel family: "cute" (CuTe DSL, the default) or "tilelang"
-# (l2_prefetch_tilelang.py: same work split and PTX).
+# (tilelang/l2_prefetch.py: same work split and PTX).
 _KERNELS = os.environ.get("VLLM_L2_PREFETCH_KERNELS", "cute").strip().lower()
 
 
@@ -261,7 +261,7 @@ def _get_launcher():
         return None
     if _KERNELS == "tilelang":
         try:
-            from vllm.models.glm5next.nvidia.l2_prefetch_tilelang import compile_launcher
+            from vllm.models.glm5next.nvidia.tilelang.l2_prefetch import compile_launcher
 
             _compiled = compile_launcher(_GRID, _BLOCK, _CHUNK_BYTES)
             logger.info(

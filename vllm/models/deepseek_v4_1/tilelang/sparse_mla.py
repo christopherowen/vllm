@@ -566,7 +566,7 @@ def sparse_mla_fwd_v41(
         if idx_blocks:
 
             @T.prim_func
-            def main(
+            def sparse_mla(
                 Q: T.Tensor([rows, heads, D], dtype),
                 SwaRecords: T.StridedTensor(
                     [swa_pool, swa_bytes], [swa_stride, 1], T.uint8
@@ -595,10 +595,10 @@ def sparse_mla_fwd_v41(
                     Output,
                 )
 
-            return main
+            return sparse_mla
 
         @T.prim_func
-        def main(
+        def sparse_mla(
             Q: T.Tensor([rows, heads, D], dtype),
             SwaRecords: T.StridedTensor(
                 [swa_pool, swa_bytes], [swa_stride, 1], T.uint8
@@ -621,12 +621,12 @@ def sparse_mla_fwd_v41(
                 Output,
             )
 
-        return main
+        return sparse_mla
 
     if idx_blocks:
 
         @T.prim_func
-        def main(
+        def sparse_mla(
             Q: T.Tensor([rows, heads, D], dtype),
             SwaRecords: T.StridedTensor(
                 [swa_pool, swa_bytes], [swa_stride, 1], T.uint8
@@ -659,10 +659,10 @@ def sparse_mla_fwd_v41(
                 Output,
             )
 
-        return main
+        return sparse_mla
 
     @T.prim_func
-    def main(
+    def sparse_mla(
         Q: T.Tensor([rows, heads, D], dtype),
         SwaRecords: T.StridedTensor([swa_pool, swa_bytes], [swa_stride, 1], T.uint8),
         SwaIndices: T.Tensor([rows, swa_width], T.int32),
@@ -687,7 +687,7 @@ def sparse_mla_fwd_v41(
             Output,
         )
 
-    return main
+    return sparse_mla
 
 
 class SparseMlaV41Plan:

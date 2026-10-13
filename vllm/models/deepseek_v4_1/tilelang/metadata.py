@@ -38,7 +38,7 @@ def requests_kernel(max_requests: int):
     seq_len = T.dynamic("seq_len")
 
     @T.prim_func
-    def requests(
+    def metadata_requests(
         starts: T.Tensor((starts_len,), T.int32),
         seq: T.Tensor((seq_len,), T.int32),
         out_starts: T.Tensor((max_requests + 1,), T.int32),
@@ -63,7 +63,7 @@ def requests_kernel(max_requests: int):
                 counts[0] = nt
                 counts[1] = nr
 
-    return requests
+    return metadata_requests
 
 
 @tilelang.jit(pass_configs=_PASS)
@@ -78,7 +78,7 @@ def tokens_kernel(max_requests: int, page: int, ratio: int, circular: bool):
     steps = _search_steps(max_requests)
 
     @T.prim_func
-    def tokens(
+    def metadata_tokens(
         starts: T.Tensor((starts_len,), T.int32),
         seq: T.Tensor((seq_len,), T.int32),
         table: T.StridedTensor((table_rows, table_cols), (table_stride, 1), T.int32),
@@ -136,7 +136,7 @@ def tokens_kernel(max_requests: int, page: int, ratio: int, circular: bool):
                     valid, T.Cast(T.int32, T.truncdiv(pos + 1, ratio)), 0
                 )
 
-    return tokens
+    return metadata_tokens
 
 
 def _window_macro(page, window, width, draft, replay, threads, per_thread):
@@ -211,7 +211,7 @@ def chunk_kernel(page: int, window: int, width: int, draft: bool, replay: bool):
     window_row = _window_macro(page, window, width, draft, replay, threads, per_thread)
 
     @T.prim_func
-    def chunk(
+    def metadata_chunk(
         positions: T.Tensor((src_rows,), T.int64),
         reqs: T.Tensor((src_rows,), T.int32),
         table: T.StridedTensor((table_rows, table_cols), (table_stride, 1), T.int32),
@@ -232,7 +232,7 @@ def chunk_kernel(page: int, window: int, width: int, draft: bool, replay: bool):
                 visible, starts, request_positions, replay_start, offset,
             )  # fmt: skip
 
-    return chunk
+    return metadata_chunk
 
 
 @tilelang.jit(pass_configs=_PASS)
@@ -261,7 +261,7 @@ def decode_metadata_kernel(
     main_per_thread = (main_width + threads - 1) // threads
 
     @T.prim_func
-    def decode_metadata(
+    def metadata_decode(
         positions: T.Tensor((src_rows,), T.int64),
         reqs: T.Tensor((src_rows,), T.int32),
         table: T.StridedTensor((table_rows, table_cols), (table_stride, 1), T.int32),
@@ -299,7 +299,7 @@ def decode_metadata_kernel(
                         )
                         main_pages[row, col] = T.if_then_else(page_id > 0, page_id, -1)
 
-    return decode_metadata
+    return metadata_decode
 
 
 @tilelang.jit(pass_configs=_PASS)
@@ -311,7 +311,7 @@ def pages_kernel(width: int):
     table_stride = T.dynamic("table_stride")
 
     @T.prim_func
-    def pages(
+    def metadata_pages(
         reqs: T.Tensor((src_rows,), T.int32),
         table: T.StridedTensor((table_rows, table_cols), (table_stride, 1), T.int32),
         out: T.Tensor((rows, width), T.int32),
@@ -328,7 +328,7 @@ def pages_kernel(width: int):
                 # vLLM reserves physical block zero; page tables use -1 for holes.
                 out[row, col] = T.if_then_else(page_id > 0, page_id, -1)
 
-    return pages
+    return metadata_pages
 
 
 def requests(starts, seq, out_starts, positions, counts, nr: int, nt: int) -> None:

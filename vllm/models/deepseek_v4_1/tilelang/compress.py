@@ -51,7 +51,7 @@ def gather_partial_state_kernel(max_requests: int, page: int):
     table_stride = T.dynamic("table_stride")
 
     @T.prim_func
-    def gather_partial_state(
+    def compress_gather_partial_state(
         pool: T.StridedTensor((blocks, width), (pool_stride, 1), T.float32),
         table: T.StridedTensor((table_rows, table_cols), (table_stride, 1), T.int32),
         starts: T.Tensor((max_requests + 1,), T.int32),
@@ -94,7 +94,7 @@ def gather_partial_state_kernel(max_requests: int, page: int):
                 tags[r] = T.if_then_else(valid, pos - 1, T.int64(-1))
                 local_ids[r] = T.if_then_else(live, T.Cast(T.int64, r), T.int64(-1))
 
-    return gather_partial_state
+    return compress_gather_partial_state
 
 
 @tilelang.jit(pass_configs=_PASS)

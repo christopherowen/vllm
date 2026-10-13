@@ -30,7 +30,7 @@ def swiglu_clamp_kernel(n: int, limit: float, threads: int = 128):
     per_block = threads * _VEC
 
     @T.prim_func
-    def main(
+    def activation_swiglu_clamp(
         X: T.Tensor((M, 2 * n), T.bfloat16),
         Y: T.Tensor((M, n), T.bfloat16),
     ):
@@ -54,7 +54,7 @@ def swiglu_clamp_kernel(n: int, limit: float, threads: int = 128):
                 for v in T.vectorized(_VEC):
                     Y[by, col + v] = out[v]
 
-    return main
+    return activation_swiglu_clamp
 
 
 @cache
