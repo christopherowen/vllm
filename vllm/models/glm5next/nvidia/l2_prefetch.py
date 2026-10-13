@@ -272,9 +272,13 @@ def _get_launcher():
             )
             return _compiled
         except Exception as exc:  # noqa: BLE001
-            _compile_failed = True
-            logger.warning("[l2_prefetch] disabled: TileLang kernel compile failed: %s", exc)
-            return None
+            # The TileLang family is only ever selected explicitly; serving on
+            # without the prefetch would cost several percent of decode with
+            # nothing but a log line to show for it.
+            raise RuntimeError(
+                "VLLM_L2_PREFETCH_KERNELS=tilelang was requested but the TileLang "
+                f"L2 prefetch kernel could not be compiled: {exc}"
+            ) from exc
     if not _CUTE_OK:
         _compile_failed = True
         logger.warning("[l2_prefetch] disabled: CuTe DSL not available")
