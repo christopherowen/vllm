@@ -409,7 +409,7 @@ def fp8w_bf16_gemm(
     n_tiles = N // block_N
 
     @T.prim_func
-    def main(
+    def gemm_fp8w_bf16(
         A: T.Tensor((M, groups * K), T.bfloat16),
         W: T.Tensor((groups * N, K), T.float8_e4m3fn),
         E: T.Tensor((groups * N // 32, K // 32), T.uint8),
@@ -449,7 +449,7 @@ def fp8w_bf16_gemm(
             else:
                 T.copy(C_local, C[by * block_M, n0])
 
-    return main
+    return gemm_fp8w_bf16
 
 
 @T.macro
@@ -496,7 +496,7 @@ def fp8w_bf16_gemm_partials(
     n_tiles = N // block_N
 
     @T.prim_func
-    def main(
+    def gemm_fp8w_bf16_partials(
         A: T.Tensor((M, groups * K), T.bfloat16),
         W: T.Tensor((groups * N, K), T.float8_e4m3fn),
         E: T.Tensor((groups * N // 32, K // 32), T.uint8),
@@ -522,7 +522,7 @@ def fp8w_bf16_gemm_partials(
                 P[s, by * block_M : (by + 1) * block_M, n0 : n0 + block_N],
             )
 
-    return main
+    return gemm_fp8w_bf16_partials
 
 
 @tilelang.jit
