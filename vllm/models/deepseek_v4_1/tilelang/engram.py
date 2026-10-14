@@ -11,7 +11,9 @@ the multi-stream residual. For each token and stream, with the stream's residual
     gate = sigmoid(copysign(sqrt(max(|dot|, 1e-6)), dot))
     out  = x + gate * v
 
-in FP32, rounded to BF16. Image tokens keep ``x``. One block per (token, stream)
+in FP32, rounded to BF16. Image tokens keep ``x``. The magnitude's floor compares
+and selects, as the reference's ``clamp_min``, so a NaN dot makes the stream NaN
+rather than gating it with the floor. One block per (token, stream)
 spreads a row's loads over the whole block, and every load (the value too) is
 issued before the reduction, so a decode row costs one DRAM round trip.
 """
@@ -100,9 +102,11 @@ def engram_gate_kernel(
                         * T.rsqrt(acc[1] / hidden + eps)
                         * scalar
                     )
-                    gate[0] = T.sigmoid(
-                        T.copysign(T.sqrt(T.max(T.abs(dot), T.float32(CLAMP))), dot)
+                    magnitude = T.abs(dot)
+                    floored = T.if_then_else(
+                        magnitude < CLAMP, T.float32(CLAMP), magnitude
                     )
+                    gate[0] = T.sigmoid(T.copysign(T.sqrt(floored), dot))
                 T.sync_threads()
                 for c in T.serial(chunks):
                     for i in T.vectorized(vec):
