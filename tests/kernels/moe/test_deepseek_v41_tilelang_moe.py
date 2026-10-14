@@ -261,13 +261,6 @@ def test_moe_experts_nan_token_stays_in_its_row(rows):
     assert_other_rows_equal(run(x), clean, [5])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="TileKernels' fused SwiGLU (66258df, quant/swiglu_forward_cuda.py "
-    "210-211 and 264-265) clamps with T.min/T.max, which return the limit for a "
-    "NaN; DeepSeek's Expert.forward uses torch.clamp, which keeps it",
-)
 def test_moe_experts_nan_token_is_nan(rows=12):
     """A NaN in a token's input reaches every output of that token, as in DeepSeek's
     ``Expert.forward``."""

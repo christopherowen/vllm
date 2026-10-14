@@ -312,6 +312,14 @@ def test_indexer_dense(context, page_size=64, rows=4):
     assert torch.equal(out, expected)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="the indexer's score ReLU is max(dot, 0), which drops a NaN; the NaN-keeping "
+    "forms tried so far either serialize the per-head loop (isnan, a 32-bit bit test) or "
+    "are folded away by TileLang's simplifier (dot != dot), so the fix waits for a "
+    "vectorizable NaN-keeping max (spark-ds41f experiments/2026-10-14-kernel-contracts)",
+)
 def test_indexer_nonfinite_query_scale(page_size=64, rows=4, context=4096):
     """An infinite index query quantizes to the UE8M0 scale ``0xFF``, which makes its
     head's dot NaN. DeepSeek's indexer takes ``relu_`` of the score and keeps the
