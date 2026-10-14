@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DeepSeek-V4.1 TileLang CSA compression against DeepSeek's arithmetic (B12X's
-reference oracle) and vLLM's Triton state-ring kernels."""
+"""DeepSeek-V4.1 TileLang CSA compression against DeepSeek's arithmetic and vLLM's
+Triton state-ring kernels."""
 
 import pytest
 import torch
@@ -14,9 +14,6 @@ if not (
     pytest.skip("TileLang V4.1 kernels target SM120/SM121", allow_module_level=True)
 
 pytest.importorskip("tilelang")
-pytest.importorskip("b12x")
-
-from b12x.attention.mla_compress.reference import normalized_latent  # noqa: E402
 
 from vllm.models.deepseek_v4_1.compressor import (  # noqa: E402
     _load_partial_state,
@@ -108,8 +105,22 @@ def test_gather_equals_triton(seed):
         assert torch.equal(a, b)
 
 
+def normalized_latent(values, weight, gates=None):
+    """One latent of DeepSeek's ``Compressor``: the softmax-gated pool in FP32,
+    rounded to BF16 (``kv.to(dtype)``), then its ``RMSNorm`` in FP32 with the
+    checkpoint's ``norm_eps`` of 1e-20."""
+    pooled = (
+        values
+        if gates is None
+        else (values.float() * gates.float().softmax(dim=0)).sum(dim=0)
+    )
+    rounded = pooled.to(torch.bfloat16).float()
+    rstd = torch.rsqrt(rounded.square().mean(dim=-1, keepdim=True) + 1e-20)
+    return (rounded * rstd * weight.float()).to(torch.bfloat16)
+
+
 def _reference(step, rows, starts, ratio, carry):
-    """DeepSeek's arithmetic, token by token (B12X's oracle for one latent)."""
+    """DeepSeek's arithmetic, token by token."""
     out = torch.zeros(rows, DIM, dtype=torch.bfloat16, device=DEVICE)
     emitted = torch.zeros(rows, dtype=torch.bool, device=DEVICE)
     slots = torch.full((rows,), -1, dtype=torch.int64, device=DEVICE)
