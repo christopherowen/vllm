@@ -605,6 +605,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
     def all_reduce_in_place(self, input_: torch.Tensor) -> torch.Tensor:
         """Use NCCL's aliasing contract for a caller-donated intermediate."""
+        if self._roce_policy:
+            # The policy reduces with the one-shot runtime or the rank-order
+            # exchange. NCCL's in-place ring adds in another order, and no model
+            # served on this policy reduces in place.
+            raise RuntimeError("RoCEnante policy has no in-place all-reduce")
         pynccl_comm = self.pynccl_comm
         if (
             pynccl_comm is None
@@ -884,8 +889,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
             torch.distributed.recv(tensor, self.ranks[src], self.device_group)
         return tensor
 
+    def gather(
+        self, input_: torch.Tensor, dst: int = 0, dim: int = -1
+    ) -> torch.Tensor | None:
+        if self._roce_policy:
+            # The base class gathers through the PyTorch NCCL process group,
+            # which the policy never creates; logits all-gather on CUDA.
+            raise RuntimeError("RoCEnante policy has no gather; all-gather instead")
+        return super().gather(input_, dst, dim)
+
     def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
         """Broadcast a tensor from source rank to all ranks."""
+        self._require_roce_policy()
         if self.world_size == 1:
             return tensor
 
@@ -1155,6 +1170,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def batch_isend_irecv(self, p2p_ops: list):
+        self._require_roce_policy()
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.batch_isend_irecv(p2p_ops)
