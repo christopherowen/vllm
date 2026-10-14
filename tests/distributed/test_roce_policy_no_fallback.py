@@ -12,6 +12,7 @@ import pytest
 import torch
 import torch.distributed
 
+import vllm.envs as envs
 from vllm.distributed.device_communicators import cuda_communicator
 from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
@@ -117,3 +118,20 @@ def test_no_inherited_collective_uses_the_process_group():
         if getattr(cuda_communicator.CudaCommunicator, name) is method:
             inherited.append(name)
     assert inherited == []
+
+
+class _SparknetAdapter(_OneShot):
+    def __init__(self, report: str | None = None):
+        self.report = report
+
+    def failure(self) -> str | None:
+        return self.report
+
+
+def test_failure_report_comes_from_the_one_shot_runtime(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_DS41_KERNEL_BACKEND", "tilelang", raising=False)
+    comm = _policy_communicator()
+    comm.b12x_ar_comm = _SparknetAdapter(report="saw nothing from rank 2")
+    assert comm.roce_failure() == "saw nothing from rank 2"
+    comm.b12x_ar_comm.report = None
+    assert comm.roce_failure() is None

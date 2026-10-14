@@ -93,3 +93,49 @@ def test_no_roce_communicator_means_no_wrapping(monkeypatch):
         assert worker._b12x_roce_guarded(output) is output
         async_output = _AsyncOutput(output, [])
         assert worker._b12x_roce_guarded(async_output) is async_output
+
+
+REPORT = (
+    "RoCE collective on rank 0 saw nothing from rank 2, HCA 1, for 10.001 s "
+    "(timeout 10 s) at sequence 4855; the GPU was stopped there"
+)
+
+
+class _StoppedAsyncOutput(AsyncModelRunnerOutput):
+    def get_output(self) -> ModelRunnerOutput:
+        raise RuntimeError("CUDA error: unspecified launch failure")
+
+
+def _worker_with_failure(monkeypatch, report) -> Worker:
+    worker = Worker.__new__(Worker)
+    communicator = SimpleNamespace(b12x_ar_comm=Mock(), roce_failure=lambda: report)
+    group = SimpleNamespace(device_communicator=communicator)
+    monkeypatch.setattr(gpu_worker_module, "get_tp_group", lambda: group)
+    return worker
+
+
+def test_a_stopped_collective_is_named_as_the_cause(monkeypatch):
+    """A one-shot collective that timed out stopped the GPU; CUDA's launch
+    failure is re-raised as the collective's report, in a step and when an
+    asynchronous output completes."""
+    worker = _worker_with_failure(monkeypatch, REPORT)
+    with (
+        pytest.raises(RuntimeError, match="saw nothing from rank 2") as raised,
+        gpu_worker_module._collective_cause(worker._roce_failure),
+    ):
+        raise RuntimeError("CUDA error: unspecified launch failure")
+    assert "unspecified launch failure" in str(raised.value.__cause__)
+    wrapped = worker._b12x_roce_guarded(_StoppedAsyncOutput())
+    with pytest.raises(RuntimeError, match="saw nothing from rank 2"):
+        wrapped.get_output()
+
+
+def test_errors_without_a_stopped_collective_pass_unchanged(monkeypatch):
+    worker = _worker_with_failure(monkeypatch, None)
+    error = ValueError("unrelated")
+    with (
+        pytest.raises(ValueError) as raised,
+        gpu_worker_module._collective_cause(worker._roce_failure),
+    ):
+        raise error
+    assert raised.value is error

@@ -490,6 +490,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
         rank-order sum may stand in for it."""
         return self._roce_policy and envs.VLLM_DS41_KERNEL_BACKEND == "tilelang"
 
+    def roce_failure(self) -> str | None:
+        """The one-shot collectives' failure report, or None.
+
+        A collective that waited past its timeout stopped the GPU, so CUDA
+        raises a launch failure at the next sync; this names the peer it
+        waited for. Readable after the stop (the record is in pinned host
+        memory).
+        """
+        if self._roce_policy and envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
+            return self.b12x_ar_comm.failure()
+        return None
+
     def _require_roce_policy(self) -> None:
         """A selected policy cannot silently become a different backend."""
         if not self._roce_policy:

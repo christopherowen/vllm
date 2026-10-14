@@ -224,6 +224,7 @@ if TYPE_CHECKING:
     VLLM_DS41_ATTENTION_COMPUTE: Literal["bf16", "reference", "auto"] = "bf16"
     VLLM_DS41_HEAD_DTYPE: Literal["float32", "model"] = "float32"
     VLLM_DS41_KERNEL_BACKEND: Literal["b12x", "tilelang"] = "b12x"
+    VLLM_STARTUP_RENDEZVOUS_TIMEOUT_MS: int = 1_800_000
     VLLM_DS41_ENGRAM_OVERLAP: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_HC_TP: bool = True
@@ -1911,6 +1912,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_DS41_KERNEL_BACKEND",
         "b12x",
         ["b12x", "tilelang"],
+    ),
+    # How long a rank waits on the host for the others at a startup rendezvous
+    # (before memory profiling, after the local JIT warm-up). Ranks finish
+    # loading and compiling minutes apart on cold disks and caches; waiting on
+    # the CPU spins no GPU, and the monitored barrier names a missing rank.
+    "VLLM_STARTUP_RENDEZVOUS_TIMEOUT_MS": lambda: int(
+        os.getenv("VLLM_STARTUP_RENDEZVOUS_TIMEOUT_MS", "1800000")
     ),
     # Read DeepSeek V4.1 disk Engram rows while the target graph starts.
     "VLLM_DS41_ENGRAM_OVERLAP": lambda: bool(

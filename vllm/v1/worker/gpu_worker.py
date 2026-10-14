@@ -50,6 +50,7 @@ from vllm.distributed.parallel_state import (
     get_pcp_group,
     get_pp_group,
     get_tp_group,
+    get_world_group,
     resume_device_comms,
     suspend_device_comms,
 )
@@ -182,14 +183,34 @@ class AsyncIntermediateTensors(IntermediateTensors):
         return object.__getattribute__(self, name)
 
 
+@contextmanager
+def _collective_cause(failure: Callable[[], str | None]):
+    """Re-raise an error as the one-shot collectives' failure report, if any.
+
+    A collective that waited past its timeout stopped the GPU, so CUDA raises
+    a launch failure at the next sync, which does not say which peer stalled.
+    """
+    try:
+        yield
+    except Exception as error:
+        report = failure()
+        if report is not None:
+            raise RuntimeError(report) from error
+        raise
+
+
 class _B12xRoceCheckedAsyncOutput(AsyncModelRunnerOutput):
     """An asynchronous output whose completion is followed by the RoCEnante check."""
 
     def __init__(
-        self, inner: AsyncModelRunnerOutput, check: Callable[[], None]
+        self,
+        inner: AsyncModelRunnerOutput,
+        check: Callable[[], None],
+        failure: Callable[[], str | None],
     ) -> None:
         self._inner = inner
         self._check = check
+        self._failure = failure
 
     def get_output(self) -> ModelRunnerOutput:
         """Wait for the wrapped output, then run the fail-stop check.
@@ -200,7 +221,8 @@ class _B12xRoceCheckedAsyncOutput(AsyncModelRunnerOutput):
         Raises:
             RuntimeError: When a RoCEnante wait timed out or its proxy died.
         """
-        output = self._inner.get_output()
+        with _collective_cause(self._failure):
+            output = self._inner.get_output()
         self._check()
         return output
 
@@ -632,6 +654,8 @@ class Worker(WorkerBase):
     def determine_available_memory(self) -> int:
         """Profile model memory through the ordinary vLLM admission path."""
         maybe_apply_startup_plan(self)
+        # Loading compiled each rank's kernels for as long as its cache needed.
+        self._startup_rendezvous("memory profiling")
 
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             try:
@@ -979,6 +1003,8 @@ class Worker(WorkerBase):
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
         kernel_warmup(self)
+        # The JIT warm-up compiles locally, for as long as each rank's cache needs.
+        self._startup_rendezvous("warm-up")
 
         if self.use_v2_model_runner:
             # A workspace resize after capture frees what the graphs point at.
@@ -1340,7 +1366,36 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self._b12x_roce_guarded(self.model_runner.sample_tokens(grammar_output))
+        with _collective_cause(self._roce_failure):
+            output = self.model_runner.sample_tokens(grammar_output)
+        return self._b12x_roce_guarded(output)
+
+    def _roce_failure(self) -> str | None:
+        """The TP communicator's one-shot collective failure report, or None."""
+        communicator = get_tp_group().device_communicator
+        failure = getattr(communicator, "roce_failure", None)
+        return None if failure is None else failure()
+
+    def _startup_rendezvous(self, phase: str) -> None:
+        """Wait on the host until every rank reaches ``phase``.
+
+        On cold disks and JIT caches ranks finish loading and compiling minutes
+        apart. Without this, the first rank in waits for the others inside the
+        phase's first collective, spinning on the GPU, until its timeout stops
+        it. On the host the wait costs nothing and names a missing rank.
+        """
+        group = get_world_group()
+        if group.world_size == 1:
+            return
+        started = time.monotonic()
+        torch.distributed.monitored_barrier(
+            group=group.cpu_group,
+            timeout=timedelta(milliseconds=envs.VLLM_STARTUP_RENDEZVOUS_TIMEOUT_MS),
+            wait_all_ranks=True,
+        )
+        waited = time.monotonic() - started
+        if waited >= 1.0:
+            logger.info("Waited %.1f s for every rank before %s.", waited, phase)
 
     def _b12x_roce_health_check(self) -> Callable[[], None] | None:
         """The RoCEnante health check of the TP communicator, if one is active.
@@ -1378,7 +1433,7 @@ class Worker(WorkerBase):
         if check is None:
             return output
         if isinstance(output, AsyncModelRunnerOutput):
-            return _B12xRoceCheckedAsyncOutput(output, check)
+            return _B12xRoceCheckedAsyncOutput(output, check, self._roce_failure)
         check()
         return output
 
@@ -1444,7 +1499,10 @@ class Worker(WorkerBase):
                 comm_postprocess=comm_postprocess,
             )
 
-        with self.annotate_profile(scheduler_output):
+        with (
+            self.annotate_profile(scheduler_output),
+            _collective_cause(self._roce_failure),
+        ):
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )
