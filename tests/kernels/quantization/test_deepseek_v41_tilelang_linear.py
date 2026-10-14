@@ -15,6 +15,13 @@ if not (
 pytest.importorskip("tilelang")
 tile_kernels = pytest.importorskip("tile_kernels")
 
+from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
+    INF,
+    NAN,
+    assert_other_rows_equal,
+    assert_rows_nan,
+    assert_same_nonfinite,
+)
 from vllm.models.deepseek_v4_1.tilelang.gemm import (  # noqa: E402
     DECODE_ROWS,
     DECODE_TILE_ROWS,
@@ -281,6 +288,59 @@ def test_block32_rows(n=1792, k=5120, start=1280):
             assert torch.equal(rows(x[:count]), full[:count]), f"rows={count}"
     with pytest.raises(ValueError):
         TileLangBlock32Rows(layer, start + 16)
+
+
+# The router splits K eight ways; (100, 200) cannot split.
+@pytest.mark.parametrize("n, k", [(384, 5120), (100, 200)])
+@pytest.mark.parametrize("rows", [7, 65])
+def test_bf16_gemm_nonfinite(n, k, rows):
+    """NaNs and signed infinities land where the FP32 product puts them, through the
+    split-K partials of decode rows too, and the other rows keep their bits."""
+    gen = _gen(9)
+    weight = torch.randn((n, k), generator=gen, device=DEVICE).bfloat16()
+    x = torch.randn((rows, k), generator=gen, device=DEVICE).bfloat16()
+    shards = bf16_shards(n, k)
+
+    def project(a):
+        out = torch.empty((rows, n), dtype=torch.float32, device=DEVICE)
+        if shards > 1 and rows <= DECODE_ROWS:
+            p = torch.empty((shards, rows, n), dtype=torch.float32, device=DEVICE)
+            bf16_gemm_partials(n, k, shards, block_M=16)(a, weight, p)
+            splitk_reduce(n, shards, out_dtype="float32")(p, out)
+        else:
+            bf16_gemm(n, k, out_dtype="float32", shards=shards)(a, weight, out)
+        return out
+
+    clean = project(x)
+    poisoned = [1, 3, 4]
+    x[1, 5], x[3, 7], x[4, 9] = NAN, INF, -INF
+    out = project(x)
+    assert_same_nonfinite(out, x.float() @ weight.float().T)
+    assert_other_rows_equal(out, clean, poisoned)
+
+
+def test_block32_rows_nan_row(n=1792, k=5120, start=1280):
+    """A NaN in one row's activations survives the MXFP8 cast and reaches every output
+    of that row, at split-K decode sizes and in the prefill GEMM, and no other row
+    moves."""
+    from torch import nn
+
+    from vllm.models.deepseek_v4_1.tilelang.linear import TileLangBlock32Rows
+    from vllm.v1.worker.workspace import use_preallocated_workspace
+
+    weight, exps, _ = _block32_weight(n, k, 6)
+    layer = nn.Module()
+    layer.weight, layer.weight_scale_inv = weight, exps
+    rows = TileLangBlock32Rows(layer, start)
+    scratch = torch.empty(16 << 20, dtype=torch.uint8, device=DEVICE)
+    for count in (7, 300):
+        x = torch.randn((count, k), generator=_gen(count), device=DEVICE).bfloat16()
+        with use_preallocated_workspace(scratch):
+            clean = rows(x).clone()
+            x[2, 11] = NAN
+            out = rows(x)
+        assert_rows_nan(out, [2], f"rows={count}: ")
+        assert_other_rows_equal(out, clean, [2], f"rows={count}: ")
 
 
 @pytest.mark.parametrize("hidden", [128, 512, 4096])

@@ -15,6 +15,12 @@ if not (
 
 pytest.importorskip("tilelang")
 
+from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
+    INF,
+    NAN,
+    assert_finite_equal,
+    assert_same_nonfinite,
+)
 from vllm.models.deepseek_v4_1.tilelang.activation import (  # noqa: E402
     SiluAndMulClampFP32,
 )
@@ -49,3 +55,24 @@ def test_rows_independent_of_batch():
     full = act(gate_up)
     for rows in (1, 7, 64, 129):
         assert torch.equal(act(gate_up[:rows]), full[:rows]), rows
+
+
+def test_nonfinite_like_the_reference():
+    """``torch.clamp`` passes a NaN through and saturates the infinities; a clamp
+    built on ``fminf``/``fmaxf`` would return the limit for a NaN and hide it."""
+    limit, n = 10.0, 512
+    generator = torch.Generator(device="cuda").manual_seed(5)
+    gate_up = (torch.randn(8, 2 * n, generator=generator, device="cuda") * 6).bfloat16()
+    for row, col, value in (
+        (0, 3, NAN),  # gate
+        (1, n + 5, NAN),  # up
+        (2, 7, INF),  # gate: silu(limit)
+        (3, 9, -INF),  # gate: silu(-inf) is NaN
+        (4, n + 11, INF),  # up saturates at the limit
+        (5, n + 13, -INF),
+    ):
+        gate_up[row, col] = value
+    out = SiluAndMulClampFP32(limit)(gate_up)
+    ref = _reference(gate_up, limit)
+    assert_same_nonfinite(out, ref)
+    assert_finite_equal(out, ref)

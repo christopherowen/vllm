@@ -19,6 +19,11 @@ if not (
 pytest.importorskip("tilelang")
 pytest.importorskip("tile_kernels")
 
+from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
+    NAN,
+    assert_other_rows_equal,
+    assert_rows_nan,
+)
 from vllm.models.deepseek_v4_1.tilelang.collectives import (  # noqa: E402
     RankOrderParts,
 )
@@ -178,6 +183,21 @@ def test_rows_independent_of_batch(mhc):
     part = mhc.pre(residual[70:71], fn, scale, base, weight, incoming[70:71])
     for a, b in zip(part[1:], full[1:]):
         assert torch.equal(a, b[70:71])
+
+
+def test_pre_nan_token(mhc):
+    """A NaN in one token's residual makes all of that token's mixes and its y NaN,
+    as the FP32 reference's softmax, Sinkhorn and norm do, and moves no other
+    token."""
+    tokens, t = 33, 7
+    residual, fn, scale, base, weight, incoming = _inputs(tokens, seed=11)
+    clean = [a.clone() for a in mhc.pre(residual, fn, scale, base, weight, incoming)]
+    residual = residual.clone()
+    residual[t, 2, 100] = NAN
+    actual = mhc.pre(residual, fn, scale, base, weight, incoming)
+    for name, got, before in zip(("post", "comb", "y", "pre"), actual[1:], clean[1:]):
+        assert_rows_nan(got, [t], f"{name}: ")
+        assert_other_rows_equal(got, before, [t], f"{name}: ")
 
 
 @pytest.mark.parametrize("block_M", [16, 32])

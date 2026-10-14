@@ -15,6 +15,11 @@ if not (
 pytest.importorskip("tilelang")
 tile_kernels = pytest.importorskip("tile_kernels")
 
+from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
+    NAN,
+    assert_other_rows_equal,
+    assert_rows_nan,
+)
 from vllm.models.deepseek_v4_1.tilelang.moe import (  # noqa: E402
     MoeExpertsV41Plan,
     workspace_bytes,
@@ -71,14 +76,19 @@ def _routes(rows, num_experts, topk, seed, dtype):
     return ids.contiguous(), weights.float().contiguous()
 
 
-def _reference(x, ids, weights, w13, w2, intermediate):
-    """FP32 experts over the kernels' MXFP8 tokens; the down input stays unquantized."""
+def _mxfp8_values(x):
+    """TileKernels' MXFP8 cast (a UE8M0 scale per 32 values), dequantized."""
     xq, sf = tile_kernels.quant.per_token_cast(
         x, "e4m3", 32, round_sf=True, use_packed_ue8m0=True
     )
     # Rows of packed exponents are padded to whole words.
     exps = sf.contiguous().view(torch.uint8)[:, : x.shape[1] // 32]
-    xd = xq.float() * torch.exp2(exps.float() - 127).repeat_interleave(32, -1)
+    return xq.float() * torch.exp2(exps.float() - 127).repeat_interleave(32, -1)
+
+
+def _reference(x, ids, weights, w13, w2, intermediate):
+    """FP32 experts over the kernels' MXFP8 tokens; the down input stays unquantized."""
+    xd = _mxfp8_values(x)
     out = torch.zeros(x.shape, dtype=torch.float32, device=DEVICE)
     for slot in range(ids.shape[1]):
         e = ids[:, slot].long()
@@ -221,3 +231,47 @@ def test_moe_experts_fold_deferred_shared(
     plan.run(x, ids, route_weights, weights, deferred, shared=resolve)
     assert calls == [1]
     assert torch.equal(deferred, direct)
+
+
+def _case(rows, hidden=384, intermediate=576, num_experts=32, topk=6):
+    w13_packed, w13_sf, w13 = _experts(num_experts, 2 * intermediate, hidden, 1)
+    w2_packed, w2_sf, w2 = _experts(num_experts, hidden, intermediate, 2)
+    plan = MoeExpertsV41Plan(
+        num_experts, topk, hidden, intermediate, swiglu_limit=LIMIT
+    )
+    weights = plan.prepare_weights(w13_packed, w13_sf, w2_packed, w2_sf)
+    x = (torch.randn((rows, hidden), generator=_gen(3), device=DEVICE) * 0.5).bfloat16()
+    ids, route_weights = _routes(rows, num_experts, topk, 4, torch.int32)
+
+    def run(tokens):
+        out = torch.empty_like(tokens)
+        plan.run(tokens, ids, route_weights, weights, out)
+        return out
+
+    return run, x, ids, route_weights, w13, w2, intermediate
+
+
+@pytest.mark.parametrize("rows", [12, 300])
+def test_moe_experts_nan_token_stays_in_its_row(rows):
+    """A NaN in one token's input changes no other token's bits, though the expert
+    tiles mix tokens."""
+    run, x, *_ = _case(rows)
+    clean = run(x)
+    x[5, 17] = NAN
+    assert_other_rows_equal(run(x), clean, [5])
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="TileKernels' fused SwiGLU (66258df, quant/swiglu_forward_cuda.py "
+    "210-211 and 264-265) clamps with T.min/T.max, which return the limit for a "
+    "NaN; DeepSeek's Expert.forward uses torch.clamp, which keeps it",
+)
+def test_moe_experts_nan_token_is_nan(rows=12):
+    """A NaN in a token's input reaches every output of that token, as in DeepSeek's
+    ``Expert.forward``."""
+    run, x, *_ = _case(rows)
+    x[5, 17] = NAN
+    assert_rows_nan(run(x), [5])
+

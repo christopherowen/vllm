@@ -15,6 +15,11 @@ if not (
 pytest.importorskip("tilelang")
 tile_kernels = pytest.importorskip("tile_kernels")
 
+from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
+    NAN,
+    assert_other_rows_equal,
+    assert_same_nonfinite,
+)
 from vllm.models.deepseek_v4_1.tilelang.engram import CLAMP, engram_gate  # noqa: E402
 
 DEVICE = "cuda"
@@ -79,3 +84,25 @@ def test_engram_gate(masked):
         )
         assert torch.equal(out[:rows], full[:rows]), f"rows={rows}"
         assert out[rows:].isnan().all(), f"rows={rows} wrote past its rows"
+
+
+@pytest.mark.parametrize("where", ["residual", "key", "value"])
+def test_nonfinite_like_the_reference(where):
+    """A NaN in a stream's residual or key makes its gate NaN, so the reference's
+    whole stream is NaN (``clamp_min`` passes it, unlike ``max(|dot|, CLAMP)``);
+    a NaN in the shared value reaches every stream at that channel."""
+    rows, t, h, d = 17, 5, 2, 100
+    x, kv, weight, _ = _inputs(rows, seed=5)
+    clean = torch.empty_like(x)
+    engram_gate(x, kv, weight, None, clean, EPS, HC)
+    if where == "residual":
+        x[t, h * DIM + d] = NAN
+    elif where == "key":
+        kv[t, h * DIM + d] = NAN
+    else:
+        kv[t, HC * DIM + d] = NAN
+    out = torch.empty_like(x)
+    engram_gate(x, kv, weight, None, out, EPS, HC)
+    ref = _reference(x, kv, weight, torch.zeros(rows, dtype=torch.bool, device=DEVICE))
+    assert_same_nonfinite(out, ref)
+    assert_other_rows_equal(out, clean, [t])

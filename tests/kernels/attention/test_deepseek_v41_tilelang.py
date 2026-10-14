@@ -18,6 +18,11 @@ if not (
 
 tilelang = pytest.importorskip("tilelang")
 
+from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
+    assert_other_rows_equal,
+    assert_rows_nan,
+    assert_same_nonfinite,
+)
 from vllm.models.deepseek_v4_1.tilelang.indexer import (  # noqa: E402
     CANDIDATE_BLOCK,
     CANDIDATE_BLOCKS,
@@ -307,6 +312,41 @@ def test_indexer_dense(context, page_size=64, rows=4):
     assert torch.equal(out, expected)
 
 
+def test_indexer_nonfinite_query_scale(page_size=64, rows=4, context=4096):
+    """An infinite index query quantizes to the UE8M0 scale ``0xFF``, which makes its
+    head's dot NaN. DeepSeek's indexer takes ``relu_`` of the score and keeps the
+    NaN; ``max(dot, 0)`` would drop the head silently. The other rows keep their
+    bits."""
+    inp = _index_inputs(rows, context, page_size)
+    width = (context + page_size - 1) // page_size * page_size
+    plan = IndexerV41Plan(width, page_size)
+    names = (
+        "q_packed",
+        "q_scales",
+        "weights",
+        "pool",
+        "page_table",
+        "lengths",
+        "active",
+    )
+    _, scores = plan.run(*(inp[k] for k in names))
+    clean = scores.clone()
+    r, h = 1, 3
+    inp["q_scales"][r, h, 0] = 0xFF
+    inp["q_packed"][r, h, 0] = 0  # a zero code: 0 x inf is NaN in any order
+    inp["q_values"] = _decode_mxfp4(inp["q_packed"], inp["q_scales"])
+    _, scores = plan.run(*(inp[k] for k in names))
+    extent = _dense_extent(inp, width)
+    ref = _ref_scores(
+        inp, page_size, extent, lambda i: torch.arange(extent[i], device=DEVICE)
+    )
+    assert ref[r].isnan().all()
+    assert_same_nonfinite(scores[r, : extent[r]], ref[r], f"row {r}: ")
+    for i in range(rows):
+        if i != r:
+            assert torch.equal(scores[i, : extent[i]], clean[i, : extent[i]]), i
+
+
 def test_indexer_candidates(page_size=64, rows=3, context=8192):
     inp = _index_inputs(rows, context, page_size)
     width = CANDIDATE_BLOCKS * CANDIDATE_BLOCK
@@ -492,12 +532,8 @@ def _ref_mla(q, swa, swa_idx, swa_len, sinks, idx=None, idx_slots=None, idx_len=
     return out.bfloat16()
 
 
-@pytest.mark.parametrize("idx_width", [0, 512])
-# Heads per rank: TP4 (16), TP3 (24 of 72 padded), TP1 (64).
-@pytest.mark.parametrize("heads", [16, 24, 64])
-def test_sparse_mla(
-    idx_width, heads, rows=6, swa_width=128, swa_page=128, idx_page=128
-):
+def _mla_case(idx_width, heads, rows, swa_width=128, swa_page=128, idx_page=128):
+    """Random queries, sinks, packed caches and selection lists for ``rows`` rows."""
     gen = _gen(1)
     swa_pages, idx_pages, idx_context = 24, 40, 4096
     q = torch.randn((rows, heads, HEAD_DIM), generator=gen, device=DEVICE).bfloat16()
@@ -524,7 +560,10 @@ def test_sparse_mla(
         heads, swa_width, idx_width, idx_page, swa_page_size=swa_page,
         max_rows=rows, decode_max_rows=rows, split_max_rows=rows,
     )  # fmt: skip
-    indexed, ref_indexed = {}, {}
+    case = dict(
+        plan=plan, q=q, sinks=sinks, swa=swa, swa_idx=swa_idx, swa_len=swa_len,
+        swa_page=swa_page, idx_page=idx_page, idx=None,
+    )  # fmt: skip
     if idx_width:
         idx = _pack_idx(
             torch.randn((idx_pages * idx_page, HEAD_DIM), generator=gen, device=DEVICE)
@@ -538,29 +577,157 @@ def test_sparse_mla(
                 for _ in range(rows)
             ]
         ).to(torch.int32)
-        pages = table.long().gather(1, idx_logical.long().clamp_min(0) // idx_page)
-        idx_slots = torch.where(
-            idx_logical >= 0, pages * idx_page + idx_logical.long() % idx_page, -1
-        )
+        case.update(idx=idx, idx_logical=idx_logical, idx_len=idx_len, table=table)
+    return case
+
+
+def _idx_slots(case, logical):
+    page = case["idx_page"]
+    pages = case["table"].long().gather(1, logical.long().clamp_min(0) // page)
+    return torch.where(logical >= 0, pages * page + logical.long() % page, -1)
+
+
+def _mla_run(case, swa_pool=None, idx_pool=None, swa_idx=None, idx_logical=None):
+    """Every route's output, from the case's caches unless pools are given."""
+    plan, rows = case["plan"], case["q"].shape[0]
+    indexed = {}
+    if case["idx"] is not None:
         indexed = dict(
-            idx_cache=_paged(idx, idx_page),
-            idx_indices=idx_logical,
-            idx_lengths=idx_len,
-            idx_page_table=table,
+            idx_cache=_paged(case["idx"], case["idx_page"])
+            if idx_pool is None
+            else idx_pool,
+            idx_indices=case["idx_logical"] if idx_logical is None else idx_logical,
+            idx_lengths=case["idx_len"],
+            idx_page_table=case["table"],
         )
-        ref_indexed = dict(idx=idx, idx_slots=idx_slots, idx_len=idx_len)
-    swa_pool = _paged(swa, swa_page)
+    pool = _paged(case["swa"], case["swa_page"]) if swa_pool is None else swa_pool
     outs = {}
     for kernel in plan.kernels:
-        out = torch.empty((rows, heads, HEAD_DIM), dtype=torch.bfloat16, device=DEVICE)
-        plan.run(q, swa_pool, swa_idx, swa_len, sinks, out, kernel=kernel, **indexed)
+        out = torch.empty(
+            (rows, case["q"].shape[1], HEAD_DIM), dtype=torch.bfloat16, device=DEVICE
+        )
+        plan.run(
+            case["q"],
+            pool,
+            case["swa_idx"] if swa_idx is None else swa_idx,
+            case["swa_len"],
+            case["sinks"],
+            out,
+            kernel=kernel,
+            **indexed,
+        )
         outs[kernel] = out
-    ref = _ref_mla(q, swa, swa_idx, swa_len, sinks, **ref_indexed)
+    return outs
+
+
+def _mla_ref(case, swa=None):
+    ref_indexed = {}
+    if case["idx"] is not None:
+        ref_indexed = dict(
+            idx=case["idx"],
+            idx_slots=_idx_slots(case, case["idx_logical"]),
+            idx_len=case["idx_len"],
+        )
+    swa = case["swa"] if swa is None else swa
+    return _ref_mla(
+        case["q"], swa, case["swa_idx"], case["swa_len"], case["sinks"], **ref_indexed
+    )
+
+
+@pytest.mark.parametrize("idx_width", [0, 512])
+# Heads per rank: TP4 (16), TP3 (24 of 72 padded), TP1 (64).
+@pytest.mark.parametrize("heads", [16, 24, 64])
+def test_sparse_mla(idx_width, heads, rows=6):
+    case = _mla_case(idx_width, heads, rows)
+    outs = _mla_run(case)
+    ref = _mla_ref(case)
     torch.testing.assert_close(
         outs["extend"].float(), ref.float(), rtol=2e-2, atol=2e-2
     )
     for kernel, out in outs.items():
         assert torch.equal(out, outs["extend"]), f"{kernel} differs from extend"
+
+
+def _selected(slots, lengths):
+    """The slots any row selects within its length."""
+    keep = torch.arange(slots.shape[1], device=DEVICE) < lengths[:, None].long()
+    return torch.unique(slots[keep & (slots >= 0)].long())
+
+
+def _poisoned_pool(records, page_size):
+    """``_paged`` with the padding and the other layers' pages all ``0xFF``."""
+    slots, record_bytes = records.shape
+    pages = slots // page_size
+    pool = _page_buffer(pages, page_size * record_bytes, fill=0xFF)
+    pool[:, : page_size * record_bytes] = records.view(pages, -1)
+    return pool
+
+
+@pytest.mark.parametrize("idx_width", [0, 512])
+def test_sparse_mla_reads_only_selected_records(idx_width, heads=16, rows=6):
+    """DeepSeek's ``sparse_attn`` loads zeros for slots it does not select. Here every
+    record no row selects is poisoned (``0xFF`` bytes: NaN payloads and the largest
+    scale), page 0, the padding and the other layers' pages included, and each list
+    points past its length at poisoned records: every route keeps the clean bits.
+    A masked record that reached the arithmetic would turn its row NaN, since a zero
+    weight times NaN is NaN."""
+    case = _mla_case(idx_width, heads, rows)
+    # Masked slots clamp to record 0, so no row may select it.
+    case["swa_idx"][case["swa_idx"] == 0] = -1
+    if idx_width:
+        case["idx_logical"][_idx_slots(case, case["idx_logical"]) == 0] = -1
+    clean = _mla_run(case)
+
+    def poison(records, used):
+        records = records.clone()
+        unused = torch.ones(records.shape[0], dtype=torch.bool, device=DEVICE)
+        unused[used] = False
+        assert unused[0]
+        records[unused] = 0xFF
+        return records, unused.nonzero().flatten()
+
+    swa, swa_unused = poison(case["swa"], _selected(case["swa_idx"], case["swa_len"]))
+    swa_idx = case["swa_idx"].clone()
+    past = torch.arange(swa_idx.shape[1], device=DEVICE) >= case["swa_len"][:, None]
+    swa_idx[past] = int(swa_unused[-1])
+    kwargs = dict(swa_pool=_poisoned_pool(swa, case["swa_page"]), swa_idx=swa_idx)
+    if idx_width:
+        used = _selected(_idx_slots(case, case["idx_logical"]), case["idx_len"])
+        idx, idx_unused = poison(case["idx"], used)
+        logical = case["idx_logical"].clone()
+        everything = torch.arange(
+            case["table"].shape[1] * case["idx_page"], device=DEVICE
+        )
+        physical = _idx_slots(case, everything.expand(rows, -1))
+        for r in range(rows):
+            # A logical position of this row whose record is poisoned.
+            spare = everything[torch.isin(physical[r], idx_unused[1:])][-1]
+            logical[r, int(case["idx_len"][r]) :] = int(spare)
+        kwargs.update(
+            idx_pool=_poisoned_pool(idx, case["idx_page"]), idx_logical=logical
+        )
+    for kernel, out in _mla_run(case, **kwargs).items():
+        assert torch.equal(out, clean[kernel]), f"{kernel} read an unselected record"
+
+
+def test_sparse_mla_selected_nan_reaches_its_rows(heads=16, rows=6):
+    """A NaN in a selected key makes every head of each row that selects it NaN, as
+    in the reference's softmax, and leaves the other rows' bits alone."""
+    case = _mla_case(0, heads, rows)
+    clean = _mla_run(case)
+    slot = int(case["swa_idx"][0, 0])
+    swa = case["swa"].clone()
+    swa[slot, 0] = 0x7F  # E4M3 NaN
+    keep = (
+        torch.arange(case["swa_idx"].shape[1], device=DEVICE) < case["swa_len"][:, None]
+    )
+    hit = ((case["swa_idx"] == slot) & keep).any(1).nonzero().flatten().tolist()
+    assert 0 in hit
+    ref = _mla_ref(case, swa)
+    for kernel, out in _mla_run(case, swa_pool=_paged(swa, case["swa_page"])).items():
+        assert_same_nonfinite(out, ref, f"{kernel}: ")
+        assert_rows_nan(out, hit, f"{kernel}: ")
+        assert_other_rows_equal(out, clean[kernel], hit, f"{kernel}: ")
 
 
 # Heads per rank: TP4 (16), TP3 (24 of 72 padded).

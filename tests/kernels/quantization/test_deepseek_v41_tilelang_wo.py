@@ -16,6 +16,11 @@ if not (
 pytest.importorskip("tilelang")
 tile_kernels = pytest.importorskip("tile_kernels")
 
+from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
+    NAN,
+    assert_other_rows_equal,
+    assert_rows_nan,
+)
 from vllm.models.deepseek_v4_1.tilelang.linear import (  # noqa: E402
     _block32_linear,
     _prepare_block32,
@@ -108,6 +113,34 @@ def test_wo_projection():
     )
     for count in ROWS:
         assert torch.equal(project(count), full[:count]), f"rows={count}"
+
+
+@pytest.mark.parametrize("count", [7, 97])
+def test_wo_projection_nan_row(count):
+    """A NaN in one head of one row's attention output makes that row's whole
+    projection NaN (WO-B mixes both groups) and leaves the other rows' bits."""
+    wo = TileLangWOProjection(
+        _block32(GROUPS * RANK, HEADS // GROUPS * HEAD_DIM, 1),
+        _block32(HIDDEN, GROUPS * RANK, 2),
+        groups=GROUPS,
+    )
+    gen = _gen(13)
+    o = torch.randn((count, HEADS, HEAD_DIM), generator=gen, device=DEVICE).bfloat16()
+    positions = torch.randint(0, 4096, (count,), generator=gen, device=DEVICE)
+    table = _table()
+    scratch = torch.empty(32 << 20, dtype=torch.uint8, device=DEVICE)
+
+    def project(values):
+        out = torch.empty((count, HIDDEN), dtype=torch.bfloat16, device=DEVICE)
+        with use_preallocated_workspace(scratch):
+            wo(values.clone(), positions, table, out)
+        return out
+
+    clean = project(o)
+    o[3, 5, 17] = NAN
+    out = project(o)
+    assert_rows_nan(out, [3])
+    assert_other_rows_equal(out, clean, [3])
 
 
 @pytest.mark.parametrize("count", ROWS)
