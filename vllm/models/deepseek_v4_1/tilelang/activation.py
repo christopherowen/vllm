@@ -24,7 +24,9 @@ _VEC = 8
 @tilelang.jit
 def swiglu_clamp_kernel(n: int, limit: float, threads: int = 128):
     """``Y[m, j] = bf16(silu(min(G, limit)) * clamp(U, -limit, limit))`` in FP32, for
-    ``X = [G | U]`` of shape ``[M, 2n]`` (BF16)."""
+    ``X = [G | U]`` of shape ``[M, 2n]`` (BF16). The clamps compare and select, as
+    ``torch.clamp`` does, so a NaN passes through; ``min``/``max`` (``fminf``,
+    ``fmaxf``) would return the limit and hide it."""
     assert n % _VEC == 0
     M = T.dynamic("M")
     per_block = threads * _VEC
@@ -45,11 +47,11 @@ def swiglu_clamp_kernel(n: int, limit: float, threads: int = 128):
                 for v in T.vectorized(_VEC):
                     up[v] = X[by, n + col + v]
                 for v in T.unroll(_VEC):
-                    g = T.min(T.Cast(T.float32, gate[v]), T.float32(limit))
-                    u = T.max(
-                        T.min(T.Cast(T.float32, up[v]), T.float32(limit)),
-                        T.float32(-limit),
-                    )
+                    g = T.alloc_var(T.float32, init=T.Cast(T.float32, gate[v]))
+                    u = T.alloc_var(T.float32, init=T.Cast(T.float32, up[v]))
+                    g = T.if_then_else(g > limit, T.float32(limit), g)
+                    u = T.if_then_else(u > limit, T.float32(limit), u)
+                    u = T.if_then_else(u < -limit, T.float32(-limit), u)
                     out[v] = T.Cast(T.bfloat16, g / (1.0 + T.exp(-g)) * u)
                 for v in T.vectorized(_VEC):
                     Y[by, col + v] = out[v]
