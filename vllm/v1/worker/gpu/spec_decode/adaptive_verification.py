@@ -92,11 +92,6 @@ def _assign_draft_token_budget(
     torch.sum(admitted.view_as(survival), dim=1, dtype=capacities.dtype, out=capacities)
 
 
-_assign_draft_token_budget_compiled = torch.compile(
-    _assign_draft_token_budget, dynamic=True
-)
-
-
 def build_cost_tables_from_curves(
     draft_curve: list[tuple[int, float]],
     verify_curve: list[tuple[int, float]],
@@ -300,6 +295,24 @@ class AdaptiveVerificationManager:
             for batch in self.batches_to_profile(capture_sizes, full_batch_shapes):
                 run_dummy(**batch)
         self.set_initial_cost_curves(timings, pin_key=key)
+
+    def load_draft_budget_kernels(self) -> None:
+        """Run the draft-budget selection once at its smallest and largest shapes,
+        so its kernels are loaded at startup rather than on the first step that
+        trims a budget."""
+        device = self._confidence_probs.device
+        steps = self.num_speculative_steps
+        probs = torch.ones_like(self._confidence_probs)
+        max_reqs = probs.shape[0]
+        for num_reqs, draft_budget in ((1, 1), (max_reqs, max_reqs * steps - 1)):
+            if not 0 < draft_budget < num_reqs * steps:
+                continue
+            capacities = torch.full(
+                (num_reqs,), steps, dtype=self._batch_draft_capacity.dtype, device=device
+            )
+            idx_mapping = torch.arange(num_reqs, dtype=torch.int64, device=device)
+            _assign_draft_token_budget(probs, idx_mapping, capacities, draft_budget, steps)
+        torch.cuda.synchronize(device)
 
     def set_initial_cost_curves(
         self, samples: list[StepTimingSample], pin_key: dict | None = None
@@ -743,7 +756,7 @@ class AdaptiveVerificationManager:
         else:
             async_tensor_h2d(scheduled_drafts, out=capacities)
             if draft_budget < int(scheduled_drafts.sum()):
-                _assign_draft_token_budget_compiled(
+                _assign_draft_token_budget(
                     self._confidence_probs,
                     idx_mapping,
                     capacities,

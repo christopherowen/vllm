@@ -42,6 +42,7 @@ _verbose: bool = False
 _cutedsl_hook_installed: bool = False
 _tilelang_hook_installed: bool = False
 _tilelang_jitimpl_compile_depth: int = 0
+_dynamo_hook_installed: bool = False
 
 
 def is_active() -> bool:
@@ -75,6 +76,7 @@ def activate(*, mode: JitMonitorMode = "warn", verbose: bool = False) -> None:
     _setup_triton_autotuning_print()
     _setup_triton_jit_hook()
     _setup_cutedsl_jit_hook()
+    _setup_dynamo_compile_hook()
 
     # Refer to #51159. tilelang ships broken symbols
     # on rocm.
@@ -109,6 +111,44 @@ def _setup_triton_autotuning_print() -> None:
         return
 
     knobs.autotuning.print = True
+
+
+# ------------------------------------------------------------------
+# torch.compile (Dynamo) compilation hook
+# ------------------------------------------------------------------
+
+
+def _setup_dynamo_compile_hook() -> None:
+    """Report torch.compile compilations during inference.
+
+    A function compiled during serving also loads its kernels there, from the
+    compile cache too, where no Triton compilation is seen. Inductor's launcher
+    loads a module (cuModuleLoad) holding the GIL while it waits for the device:
+    a latency spike, and a deadlock if the device is waiting for a host thread
+    that needs the GIL. ``torch._dynamo.reset()`` drops the callback; vLLM does
+    not reset Dynamo after activation.
+    """
+    global _dynamo_hook_installed
+    if _dynamo_hook_installed:
+        return
+    try:
+        from torch._dynamo.callback import on_compile_start
+    except Exception:
+        logger.debug("torch._dynamo callbacks are unavailable; skipping the Dynamo monitor.")
+        return
+
+    def _on_compile_start(*args, **kwargs) -> None:
+        if _active:
+            detail = _safe_repr(args[0]) if args else None
+            _handle_jit_event(
+                backend="torch.compile",
+                event="compilation",
+                fn_name="Dynamo frame",
+                detail=detail,
+            )
+
+    on_compile_start(_on_compile_start)
+    _dynamo_hook_installed = True
 
 
 # ------------------------------------------------------------------

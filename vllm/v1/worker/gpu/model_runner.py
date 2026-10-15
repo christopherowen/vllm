@@ -1357,6 +1357,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             self.cudagraph_manager.captured_token_counts(),
                             self.cudagraph_manager.captured_full_batch_shapes(),
                         )
+                        self.adaptive_verification.load_draft_budget_kernels()
                     self.kv_connector.reset_capture_state()
 
             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
