@@ -407,6 +407,19 @@ def test_ram_engram_checkpoint_tp4_graph_reads_live_host_aliases(
             session.close()
 
 
+def _settled_reader_stats(model, timeout_s: float = 30.0) -> list[dict]:
+    """Each disk table's reader counters once it has served every queued step. The
+    worker updates them just after publishing a step, so a snapshot taken while the
+    GPU is still on its way (or the second table is still being read) would race."""
+    torch.cuda.synchronize()
+    deadline = time.monotonic() + timeout_s
+    while True:
+        stats = [engram.embed_tokens.disk_rows.stats() for engram in _engrams(model)]
+        if all(s["queued"] == 0 for s in stats) or time.monotonic() > deadline:
+            return stats
+        time.sleep(0.001)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
     tiny_engram_checkpoint,
@@ -507,13 +520,9 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
             )
             for index, engram in enumerate(_engrams(resident)):
                 engram.prepare_embeddings(hashes[:, index])
-            stats = [
-                engram.embed_tokens.disk_rows.stats() for engram in _engrams(target)
-            ]
+            stats = _settled_reader_stats(target)
             graph.replay()
-            assert stats == [
-                engram.embed_tokens.disk_rows.stats() for engram in _engrams(target)
-            ]
+            assert stats == _settled_reader_stats(target)
             for index, engram in enumerate(_engrams(resident)):
                 expected = engram(
                     hidden, hashes[:, index], ~image_sentinel_mask(batch.input_ids)
