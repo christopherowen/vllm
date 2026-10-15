@@ -77,13 +77,13 @@ class EngramConfig:
     """Native V4.1 table storage: resident CUDA rows, mapped pinned host RAM,
     or SSD io_uring staging. Independent of the legacy cpu_offload option."""
 
-    disk_resident_scales: bool = False
-    """Keep original E8M0 scale bytes in mapped host RAM for disk tables.
-    Weights still use io_uring. Requires about 5.72 GiB total host RAM on V4.1."""
-
     projection_tp: bool = False
     """Shard Engram WKV output columns over TP and gather the BF16 result.
     Opt-in pending matched whole-serving performance and precision checks."""
+
+    disk_resident_scales: bool = False
+    """Removed: the disk reader reads scales from disk. Accepted only as False, so a
+    deployment that still passes it starts; to be dropped once none does."""
 
     _ram_budget_checked_nbytes: int | None = field(default=None, init=False, repr=False)
     """Preflight state carried to workers; never re-charge allocated TP peers."""
@@ -92,6 +92,8 @@ class EngramConfig:
     def _validate_shared_memory(self) -> Self:
         if self.dp_shared_memory and not self.cpu_offload:
             raise ValueError("dp_shared_memory requires cpu_offload=True")
+        if self.disk_resident_scales:
+            raise ValueError("disk_resident_scales was removed: the disk reader reads scales from disk")
         return self
 
     def verify_model_config(
@@ -116,25 +118,15 @@ class EngramConfig:
                 "embeddings, non-empty n-gram layer ids, and CUDA."
             )
 
-        if self.table_memory != "disk" and self.disk_resident_scales:
-            raise ValueError("disk Engram controls require table_memory='disk'")
         if self.table_memory == "ram":
             self._verify_ram_budget(model_config.hf_text_config, tp_size)
-        elif self.disk_resident_scales:
-            self._verify_ram_budget(
-                model_config.hf_text_config, tp_size, scales_only=True
-            )
 
-    def _verify_ram_budget(
-        self, hf_config, tp_size: int, *, scales_only: bool = False
-    ) -> None:
+    def _verify_ram_budget(self, hf_config, tp_size: int) -> None:
         from vllm.model_executor.model_loader.weight_utils import (
             _get_available_ram_bytes,
         )
 
         planned = _ram_table_nbytes(hf_config, tp_size)
-        if scales_only:
-            planned = planned // 264 * 8
         if self._ram_budget_checked_nbytes == planned:
             return
         reserve = _RAM_RESERVE_BYTES
