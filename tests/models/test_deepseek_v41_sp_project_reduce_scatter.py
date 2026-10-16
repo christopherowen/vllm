@@ -119,3 +119,39 @@ def test_unreduced_parts_hold_every_block(monkeypatch, tokens, rank, slices, per
         sp_prefill.materialize(sp_prefill.unreduced_parts(parts)),
         collectives.rank_order_sum(list(parts)),
     )
+
+
+@pytest.mark.parametrize("tokens", [37, 40, 205])
+@pytest.mark.parametrize("world", [3, 4])
+def test_column_exchange_gives_each_rank_its_rows_of_the_product(
+    monkeypatch, tokens, world
+):
+    """Every rank's exchanged rows equal its rows of the gathered product cut to the
+    logical width (the other ranks' all-to-all blocks simulated)."""
+    width, block = 50, 17  # logical width over world * block padded columns
+    product = torch.randn(tokens, world * block, device="cuda")
+    ranks = [
+        sp_prefill.SPRows(num_tokens=tokens, world_size=world, rank=r)
+        for r in range(world)
+    ]
+    padded = []
+    for r, rows in enumerate(ranks):
+        local = torch.zeros(rows.padded_rows, block, device="cuda")
+        local[:tokens] = product[:, r * block : (r + 1) * block]
+        padded.append(local)
+    for r, rows in enumerate(ranks):
+        own = rows.local_rows
+
+        def all_to_all(x, r=r, own=own):  # block s of the result comes from rank s
+            assert torch.equal(x, padded[r])
+            return torch.cat([padded[s][r * own : (r + 1) * own] for s in range(world)])
+
+        monkeypatch.setattr(sp_prefill, "tensor_model_parallel_all_to_all", all_to_all)
+        local = product[:, r * block : (r + 1) * block]
+        result = rows.exchange_columns(local, width)
+        assert result.shape == (own, width) and result.is_contiguous()
+        real = rows.real_rows
+        assert torch.equal(
+            result[:real], product[rows.start : rows.start + real, :width]
+        )
+        assert torch.equal(result[real:], torch.zeros_like(result[real:]))

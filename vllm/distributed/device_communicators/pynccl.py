@@ -561,6 +561,28 @@ class PyNcclCommunicator:
             cudaStream_t(stream.cuda_stream),
         )
 
+    def all_to_all(self, output: torch.Tensor, input_: torch.Tensor, stream=None):
+        """Exchange equal dim-0 blocks: block i of ``input_`` goes to rank i, and
+        block i of ``output`` comes from rank i (one grouped send/recv per peer)."""
+        if self.disabled:
+            return
+        world = self.world_size
+        if input_.shape != output.shape or input_.shape[0] % world:
+            raise ValueError(
+                f"all_to_all needs equal shapes divisible by {world} rows: "
+                f"{tuple(input_.shape)} -> {tuple(output.shape)}"
+            )
+        if stream is None:
+            stream = current_stream()
+        sent, received = input_.chunk(world), output.chunk(world)
+        received[self.rank].copy_(sent[self.rank])
+        self.group_start()
+        for peer in range(world):
+            if peer != self.rank:
+                self.send(sent[peer], peer, stream)
+                self.recv(received[peer], peer, stream)
+        self.group_end()
+
     def group_start(self):
         self.nccl.ncclGroupStart()
 

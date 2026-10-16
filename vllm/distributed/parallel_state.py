@@ -305,6 +305,18 @@ def all_gather_fake(
     return torch.empty(new_shape, dtype=tensor.dtype, device=tensor.device)
 
 
+def all_to_all(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._all_to_all_out_place(tensor)
+
+
+def all_to_all_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+    return torch.empty_like(tensor)
+
+
 def patched_fused_scaled_matmul_reduce_scatter_fake(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -473,6 +485,12 @@ direct_register_custom_op(
     op_name="all_gather",
     op_func=all_gather,
     fake_impl=all_gather_fake,
+)
+
+direct_register_custom_op(
+    op_name="all_to_all",
+    op_func=all_to_all,
+    fake_impl=all_to_all_fake,
 )
 
 # TODO: Remove this once the pytorch fix
@@ -849,6 +867,20 @@ class GroupCoordinator:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_gather(input_, dim)
+
+    def all_to_all(self, input_: torch.Tensor) -> torch.Tensor:
+        """Exchange equal dim-0 blocks: block i of the input goes to rank i, and
+        block i of the output came from rank i."""
+        if self.world_size == 1:
+            return input_
+        if self.use_custom_op_call:
+            return torch.ops.vllm.all_to_all(input_, group_name=self.unique_name)
+        return self._all_to_all_out_place(input_)
+
+    def _all_to_all_out_place(self, input_: torch.Tensor) -> torch.Tensor:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.all_to_all(input_)
 
     def all_gatherv(
         self,

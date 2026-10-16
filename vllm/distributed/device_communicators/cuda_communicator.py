@@ -693,6 +693,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
             + input_size[dim + 1 :]
         )
 
+    def all_to_all(self, input_: torch.Tensor) -> torch.Tensor:
+        """Equal dim-0 blocks: block i goes to rank i; the output's block i came
+        from rank i. PyNCCL only (grouped send/recv)."""
+        self._require_roce_policy()
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is None or pynccl_comm.disabled:
+            raise RuntimeError("all_to_all needs the PyNCCL communicator")
+        input_ = input_.contiguous()
+        output = torch.empty_like(input_)
+        pynccl_comm.all_to_all(output, input_)
+        return output
+
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
         self._require_roce_policy()
         world_size = self.world_size

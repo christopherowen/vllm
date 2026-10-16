@@ -68,6 +68,10 @@ class _PaddedColumnParallelLinear(ColumnParallelLinear):
             return output
         return output[..., : self.logical_output_size].contiguous()
 
+    def local_product(self, input_):
+        """This rank's column block of the product, not gathered."""
+        return self.quant_method.apply(self, input_, None)
+
 logger = init_logger(__name__)
 DEAD_ID = -1
 
@@ -932,7 +936,9 @@ class Engram(nn.Module):
 
         With ``sp_rows`` (prefill sequence parallelism) ``hidden_states`` holds
         this rank's rows while ``hash_ids`` and ``token_mask`` cover every
-        token; the lookup and projection still run on every row.
+        token; the lookup and projection still run on every row, and with a
+        column-parallel projection each rank receives only its own rows of the
+        product (an all-to-all instead of an all-gather of every row).
         """
         if (
             self.embed_tokens.table_memory == "disk"
@@ -946,7 +952,14 @@ class Engram(nn.Module):
         if self.embed_tokens.table_memory == "disk":
             self.embed_tokens.gather_rows(self.staged_rows[: hash_ids.shape[0]])
         rows = tensor_model_parallel_all_reduce(self.staged_rows[: hash_ids.shape[0]])
-        kv = self.wkv(rows)
+        if sp_rows is not None and isinstance(self.wkv, _PaddedColumnParallelLinear):
+            kv = sp_rows.exchange_columns(
+                self.wkv.local_product(rows), self.wkv.logical_output_size
+            )
+            kv_start = 0
+        else:
+            kv = self.wkv(rows)
+            kv_start = 0 if sp_rows is None else sp_rows.start
         state = hidden_states.flatten(1)
         out = torch.empty_like(state)
         mix_out = out
@@ -957,7 +970,8 @@ class Engram(nn.Module):
                 out[real:].copy_(state[real:])
             if real == 0:
                 return out.view_as(hidden_states)
-            state, mix_out, kv = state[:real], out[:real], kv[start : start + real]
+            state, mix_out = state[:real], out[:real]
+            kv = kv[kv_start : kv_start + real]
             if token_mask is not None:
                 token_mask = token_mask[start : start + real]
         if kernels.uses_tilelang():

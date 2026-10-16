@@ -26,6 +26,12 @@ def tensor_model_parallel_all_gather(
     return get_tp_group().all_gather(input_, dim)
 
 
+def tensor_model_parallel_all_to_all(input_: torch.Tensor) -> torch.Tensor:
+    """Exchange equal dim-0 blocks across the model parallel group: block i goes
+    to rank i, and the output's block i came from rank i."""
+    return get_tp_group().all_to_all(input_)
+
+
 def tensor_model_parallel_all_gatherv(
     input_: torch.Tensor, sizes: list[int], dim: int = 0
 ) -> torch.Tensor:
