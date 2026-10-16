@@ -305,16 +305,20 @@ def all_gather_fake(
     return torch.empty(new_shape, dtype=tensor.dtype, device=tensor.device)
 
 
-def all_to_all(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+def all_to_all_rows(
+    tensor: torch.Tensor, rows: int, world_size: int, group_name: str
+) -> torch.Tensor:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
-    return group._all_to_all_out_place(tensor)
+    return group._all_to_all_rows_out_place(tensor, rows)
 
 
-def all_to_all_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
-    return torch.empty_like(tensor)
+def all_to_all_rows_fake(
+    tensor: torch.Tensor, rows: int, world_size: int, group_name: str
+) -> torch.Tensor:
+    return tensor.new_empty((world_size, rows, *tensor.shape[1:]))
 
 
 def patched_fused_scaled_matmul_reduce_scatter_fake(
@@ -488,9 +492,9 @@ direct_register_custom_op(
 )
 
 direct_register_custom_op(
-    op_name="all_to_all",
-    op_func=all_to_all,
-    fake_impl=all_to_all_fake,
+    op_name="all_to_all_rows",
+    op_func=all_to_all_rows,
+    fake_impl=all_to_all_rows_fake,
 )
 
 # TODO: Remove this once the pytorch fix
@@ -868,19 +872,24 @@ class GroupCoordinator:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_gather(input_, dim)
 
-    def all_to_all(self, input_: torch.Tensor) -> torch.Tensor:
-        """Exchange equal dim-0 blocks: block i of the input goes to rank i, and
-        block i of the output came from rank i."""
+    def all_to_all_rows(self, input_: torch.Tensor, rows: int) -> torch.Tensor:
+        """Row blocks of ``rows``: block r of the input goes to rank r (the last
+        ranks' blocks short or empty), and the output's [s] holds rank s's block
+        for this rank; rows past this rank's real rows are not written."""
         if self.world_size == 1:
-            return input_
+            return input_.unsqueeze(0)
         if self.use_custom_op_call:
-            return torch.ops.vllm.all_to_all(input_, group_name=self.unique_name)
-        return self._all_to_all_out_place(input_)
+            return torch.ops.vllm.all_to_all_rows(
+                input_, rows, self.world_size, group_name=self.unique_name
+            )
+        return self._all_to_all_rows_out_place(input_, rows)
 
-    def _all_to_all_out_place(self, input_: torch.Tensor) -> torch.Tensor:
+    def _all_to_all_rows_out_place(
+        self, input_: torch.Tensor, rows: int
+    ) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
-        return self.device_communicator.all_to_all(input_)
+        return self.device_communicator.all_to_all_rows(input_, rows)
 
     def all_gatherv(
         self,

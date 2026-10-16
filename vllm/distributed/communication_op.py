@@ -26,10 +26,12 @@ def tensor_model_parallel_all_gather(
     return get_tp_group().all_gather(input_, dim)
 
 
-def tensor_model_parallel_all_to_all(input_: torch.Tensor) -> torch.Tensor:
-    """Exchange equal dim-0 blocks across the model parallel group: block i goes
-    to rank i, and the output's block i came from rank i."""
-    return get_tp_group().all_to_all(input_)
+def tensor_model_parallel_all_to_all_rows(
+    input_: torch.Tensor, rows: int
+) -> torch.Tensor:
+    """Row blocks of ``rows`` across the model parallel group: block r goes to
+    rank r, and the output's [s] holds rank s's block for this rank."""
+    return get_tp_group().all_to_all_rows(input_, rows)
 
 
 def tensor_model_parallel_all_gatherv(

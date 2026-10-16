@@ -992,10 +992,17 @@ class Engram(nn.Module):
         if self.embed_tokens.table_memory == "disk":
             self.embed_tokens.gather_rows(self.staged_rows[: hash_ids.shape[0]])
         rows = tensor_model_parallel_all_reduce(self.staged_rows[: hash_ids.shape[0]])
-        if sp_rows is not None and isinstance(self.wkv, _PaddedColumnParallelLinear):
-            kv = sp_rows.exchange_columns(
-                self.wkv.local_product(rows), self.wkv.logical_output_size
-            )
+        # With SP and a column-parallel projection, kv is every rank's column block
+        # of this rank's rows, [N, L, C]: the TileLang gate reads the blocks in
+        # place, B12X's mix packed rows.
+        blocked = sp_rows is not None and isinstance(
+            self.wkv, _PaddedColumnParallelLinear
+        )
+        if blocked:
+            kv = sp_rows.exchange_rows(self.wkv.local_product(rows))
+            if not kernels.uses_tilelang():
+                kv = sp_rows.pack_columns(kv, self.wkv.logical_output_size)
+                blocked = False
             kv_start = 0
         else:
             kv = self.wkv(rows)
@@ -1011,14 +1018,19 @@ class Engram(nn.Module):
             if real == 0:
                 return out.view_as(hidden_states)
             state, mix_out = state[:real], out[:real]
-            kv = kv[kv_start : kv_start + real]
+            if not blocked:  # the blocked gate reads only the first `real` rows
+                kv = kv[kv_start : kv_start + real]
             if token_mask is not None:
                 token_mask = token_mask[start : start + real]
         if kernels.uses_tilelang():
-            from vllm.models.deepseek_v4_1.tilelang.engram import engram_gate
+            from vllm.models.deepseek_v4_1.tilelang.engram import (
+                engram_gate,
+                engram_gate_blocked,
+            )
 
             # The TileLang model passes DeepSeek's image-token mask (True skips).
-            engram_gate(
+            gate = engram_gate_blocked if blocked else engram_gate
+            gate(
                 state, kv, self.norm_weights, token_mask, mix_out, self.eps,
                 self.hc_mult,
             )

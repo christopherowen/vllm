@@ -693,16 +693,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
             + input_size[dim + 1 :]
         )
 
-    def all_to_all(self, input_: torch.Tensor) -> torch.Tensor:
-        """Equal dim-0 blocks: block i goes to rank i; the output's block i came
-        from rank i. PyNCCL only (grouped send/recv)."""
+    def all_to_all_rows(self, input_: torch.Tensor, rows: int) -> torch.Tensor:
+        """Row blocks of ``rows``: block r goes to rank r; the output's [s] holds
+        rank s's block (rows past this rank's real rows unwritten). PyNCCL only
+        (grouped send/recv)."""
         self._require_roce_policy()
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is None or pynccl_comm.disabled:
-            raise RuntimeError("all_to_all needs the PyNCCL communicator")
+            raise RuntimeError("all_to_all_rows needs the PyNCCL communicator")
         input_ = input_.contiguous()
-        output = torch.empty_like(input_)
-        pynccl_comm.all_to_all(output, input_)
+        output = input_.new_empty((self.world_size, rows, *input_.shape[1:]))
+        pynccl_comm.all_to_all_rows(output, input_, rows)
         return output
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):

@@ -20,7 +20,11 @@ from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
     assert_other_rows_equal,
     assert_same_nonfinite,
 )
-from vllm.models.deepseek_v4_1.tilelang.engram import CLAMP, engram_gate  # noqa: E402
+from vllm.models.deepseek_v4_1.tilelang.engram import (  # noqa: E402
+    CLAMP,
+    engram_gate,
+    engram_gate_blocked,
+)
 
 DEVICE = "cuda"
 HC, DIM, EPS = 4, 5120, 1e-6
@@ -106,3 +110,24 @@ def test_nonfinite_like_the_reference(where):
     ref = _reference(x, kv, weight, torch.zeros(rows, dtype=torch.bool, device=DEVICE))
     assert_same_nonfinite(out, ref)
     assert_other_rows_equal(out, clean, [t])
+
+
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize("blocks, block_cols", [(3, 8544), (4, 6400)])
+@pytest.mark.parametrize("rows", [6, 300])
+def test_blocked_kv_gives_the_packed_bits(masked, blocks, block_cols, rows):
+    """kv as prefill SP's exchanged column blocks [N, L, C] (TP3's and TP4's widths),
+    read in place, gives the packed gate's bits; rows past the tokens are not read."""
+    x, kv, weight, image = _inputs(rows, seed=7)
+    width = (HC + 1) * DIM
+    padded = torch.zeros((rows + 3, blocks * block_cols), device=DEVICE).bfloat16()
+    padded[:rows, :width] = kv
+    padded[rows:] = NAN  # rows a rank does not own: never read
+    blocked = padded.view(rows + 3, blocks, block_cols).transpose(0, 1).contiguous()
+    mask = image if masked else None
+    packed_out = torch.empty_like(x)
+    blocked_out = torch.empty_like(x)
+    engram_gate(x, kv, weight, mask, packed_out, EPS, HC)
+    engram_gate_blocked(x, blocked, weight, mask, blocked_out, EPS, HC)
+    torch.cuda.synchronize()
+    assert torch.equal(packed_out.view(torch.int16), blocked_out.view(torch.int16))

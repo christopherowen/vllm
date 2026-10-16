@@ -46,7 +46,8 @@ row and then compacts.
 - Local rows (L): the residual carry, mHC pre / post / post_pre / collapse,
   attn_norm, ffn_norm, the Engram gate (``run_engram_mix``) and the final norm.
 - Gathered rows (T): the Engram lookup reduction and ``wkv`` (each rank keeps
-  only its own rows of ``wkv``'s product, exchanged all-to-all), attention
+  only its own rows of ``wkv``'s product, exchanged all-to-all; the TileLang
+  gate reads the exchanged column blocks in place), attention
   (``wq_b``, indexer, compressor, KV cache writes, sparse MLA, WO), and the
   MoE gate, top-k, routed and shared experts.
 - In attention layers without a compressor, the row-wise front
@@ -87,7 +88,7 @@ from vllm.distributed import (
     get_tp_group,
     model_parallel_is_initialized,
     tensor_model_parallel_all_gather,
-    tensor_model_parallel_all_to_all,
+    tensor_model_parallel_all_to_all_rows,
     tensor_model_parallel_reduce_scatter,
 )
 from vllm.logger import init_logger
@@ -198,30 +199,31 @@ class SPRows:
             )
         return tensor_model_parallel_reduce_scatter(padded, dim=0)
 
-    def exchange_columns(self, local: torch.Tensor, width: int) -> torch.Tensor:
-        """This rank's L rows of a column-parallel product of all T rows, ``local``
-        being this rank's column block of every row: an all-to-all sends each rank
-        its rows' blocks, laid side by side in rank order (the column order an
-        all-gather of the blocks gives) and cut to ``width``. It moves 1/N of the
-        all-gather's bytes and the arithmetic is unchanged."""
+    def exchange_rows(self, local: torch.Tensor) -> torch.Tensor:
+        """Every rank's column block of this rank's rows of a column-parallel product
+        of all T rows, ``local`` being this rank's block of every row: ``[N, L, C]``,
+        [s] from rank s, so the blocks side by side in rank order are the columns an
+        all-gather gives. An all-to-all of each rank's real rows: 1/N of the
+        all-gather's bytes, no copy. Rows past this rank's real rows are not written."""
         if local.shape[0] != self.num_tokens:
             raise ValueError(
-                f"SP column exchange expects {self.num_tokens} rows, got {local.shape}"
+                f"SP row exchange expects {self.num_tokens} rows, got {local.shape}"
             )
-        padded = self.empty_padded(local.shape[1:], local.dtype, local.device)
-        padded[: self.num_tokens].copy_(local)
-        blocks = tensor_model_parallel_all_to_all(padded).view(
-            self.world_size, self.local_rows, -1
-        )
-        # One copy into packed rows (consumers such as the TileLang gate require them);
-        # a block wholly past ``width`` is padding and is dropped.
+        return tensor_model_parallel_all_to_all_rows(local, self.local_rows)
+
+    @staticmethod
+    def pack_columns(blocks: torch.Tensor, width: int) -> torch.Tensor:
+        """``exchange_rows``'s blocks side by side, cut to ``width``, as packed rows
+        (one copy; a block wholly past ``width`` is padding and is dropped)."""
         block = blocks.shape[-1]
-        parts = [
-            blocks[rank, :, : width - rank * block]
-            for rank in range(self.world_size)
-            if rank * block < width
-        ]
-        return torch.cat(parts, dim=1)
+        return torch.cat(
+            [
+                blocks[rank, :, : width - rank * block]
+                for rank in range(blocks.shape[0])
+                if rank * block < width
+            ],
+            dim=1,
+        )
 
     def empty_padded(
         self, row_shape: tuple[int, ...], dtype: torch.dtype, device: torch.device

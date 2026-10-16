@@ -561,26 +561,39 @@ class PyNcclCommunicator:
             cudaStream_t(stream.cuda_stream),
         )
 
-    def all_to_all(self, output: torch.Tensor, input_: torch.Tensor, stream=None):
-        """Exchange equal dim-0 blocks: block i of ``input_`` goes to rank i, and
-        block i of ``output`` comes from rank i (one grouped send/recv per peer)."""
+    def all_to_all_rows(
+        self, output: torch.Tensor, input_: torch.Tensor, rows: int, stream=None
+    ):
+        """Row blocks of ``rows``: rank r receives ``input_``'s rows
+        ``[r * rows, (r + 1) * rows)``, the last ranks' blocks short or empty when
+        ``input_`` has fewer rows; ``output[s, :n]`` receives rank s's block for this
+        rank (n its real rows, the same from every rank), and later rows are not
+        written. One grouped send/recv per peer."""
         if self.disabled:
             return
-        world = self.world_size
-        if input_.shape != output.shape or input_.shape[0] % world:
+        world, me, total = self.world_size, self.rank, input_.shape[0]
+        if output.shape[:2] != (world, rows) or output.shape[2:] != input_.shape[1:]:
             raise ValueError(
-                f"all_to_all needs equal shapes divisible by {world} rows: "
-                f"{tuple(input_.shape)} -> {tuple(output.shape)}"
+                f"all_to_all_rows: {tuple(input_.shape)} in blocks of {rows} rows "
+                f"cannot fill {tuple(output.shape)}"
             )
+
+        def real(rank: int) -> int:
+            return max(0, min(rows, total - rank * rows))
+
         if stream is None:
             stream = current_stream()
-        sent, received = input_.chunk(world), output.chunk(world)
-        received[self.rank].copy_(sent[self.rank])
+        mine = real(me)
+        if mine:
+            output[me, :mine].copy_(input_[me * rows : me * rows + mine])
         self.group_start()
         for peer in range(world):
-            if peer != self.rank:
-                self.send(sent[peer], peer, stream)
-                self.recv(received[peer], peer, stream)
+            if peer == me:
+                continue
+            if real(peer):
+                self.send(input_[peer * rows : peer * rows + real(peer)], peer, stream)
+            if mine:
+                self.recv(output[peer, :mine], peer, stream)
         self.group_end()
 
     def group_start(self):
