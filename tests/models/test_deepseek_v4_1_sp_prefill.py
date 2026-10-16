@@ -269,7 +269,9 @@ def test_moe_reduce_scatter_sums_shared_and_routed_before_the_scatter(monkeypatc
     )
     runner = SimpleNamespace(
         moe_config=SimpleNamespace(
-            is_sequence_parallel=False, skip_final_all_reduce=False
+            is_sequence_parallel=False,
+            skip_final_all_reduce=False,
+            in_dtype=torch.float32,
         ),
         router=object(),
         _l2_prefetch_pre_reduce_hook=lambda rows: events.append(("hook", rows)),
@@ -530,6 +532,7 @@ def test_model_forward_matches_full_rows(
             use_mega_moe=False,
             use_sequence_parallel=False,
             prefill_sp_min_rows=min_rows,
+            prefill_sp_unreduced=False,
             prefill_sp_skips_mtp_buffer=skip_mtp_buffer,
             disk_engram=False,
             engram_hash=None,
