@@ -110,12 +110,13 @@ class EngramDiskRows:
     def __init__(self, *, device, table_rows: int, shard_start: int, shard_end: int,
                  max_lookups: int, queue_depth: int = 128, ids_timeout_s: float = 20.0,
                  rows_timeout_s: float = 10.0, delay_s: float = 0.0,
-                 check_early: bool = False):
+                 check_early: bool = False, timeline: bool = False):
         self.native = load()
         self.device = _indexed(device)
         self.shard_start, self.shard_end = int(shard_start), int(shard_end)
         self.max_lookups = int(max_lookups)
         self.check_early = bool(check_early)
+        self.timeline_enabled = bool(timeline)
         self._allocations = []
         self.ids = torch.empty(self.max_lookups, dtype=torch.int64, pin_memory=True)
         self.weights = self._mapped((self.max_lookups, ROW_BYTES), torch.uint8, True)
@@ -129,6 +130,7 @@ class EngramDiskRows:
             table_rows, self.shard_start, self.shard_end, self.max_lookups, queue_depth,
             self.ids.data_ptr(), self.weights.pointer, self.scales.pointer, self.control.pointer,
             float(ids_timeout_s), float(delay_s), self.check_early,
+            self.timeline_enabled,
         )
         self._ids_seq_device = self.control.device_view.data_ptr() + 4 * self.native.CTRL_IDS_SEQ
         self._sequence = 0
@@ -207,6 +209,18 @@ class EngramDiskRows:
 
     def stats(self) -> dict:
         return self.native.status(self._reader)
+
+    TIMELINE_FIELDS = ("sequence", "count", "early", "gpu_sequence", "gpu_wait_ns",
+                       "submitted", "started", "consumed", "ids", "read", "published")
+
+    def timeline(self) -> list[dict]:
+        """Debug: the steps served since the last call, oldest first (``timeline`` on).
+        Times are CLOCK_MONOTONIC ns: the host queued the step (submitted), the worker
+        began it (started), saw the previous step gathered (consumed, early rows only),
+        saw the GPU's IDs (ids), read the rows (read) and published them (published).
+        gpu_wait_ns is the GPU's wait for gpu_sequence, the step before this one."""
+        rows = self.native.timeline(self._reader)
+        return [dict(zip(self.TIMELINE_FIELDS, row)) for row in rows]
 
     def close(self) -> None:
         """Stop the reader, then free the buffers; the GPU must be done with them."""

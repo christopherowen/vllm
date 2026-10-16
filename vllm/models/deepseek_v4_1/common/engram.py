@@ -84,6 +84,43 @@ ENGRAM_READ_DELAY_S = float(os.environ.get("SPARK3_ENGRAM_READ_DELAY_MS", "0")) 
 # Debug only (off and free in serving): every row ID the host hashed early must equal
 # the GPU's, or the step fails with both.
 ENGRAM_CHECK_EARLY_IDS = os.environ.get("SPARK3_ENGRAM_CHECK_EARLY_IDS", "0") == "1"
+# Debug only (off and free in serving: the wait kernel's timing is compiled in only
+# when set): every disk table's reader records each step's timeline, and the GPU each
+# wait's length; a thread appends them every few seconds to JSON lines in
+# SPARK3_ENGRAM_TIMELINE_DIR (<host>-tp<rank>-layer<id>.jsonl).
+ENGRAM_TIMELINE = os.environ.get("SPARK3_ENGRAM_TIMELINE", "0") == "1"
+ENGRAM_TIMELINE_DIR = os.environ.get(
+    "SPARK3_ENGRAM_TIMELINE_DIR", "/cache/kkref/engram-timeline"
+)
+_timeline_tables: list = []
+
+
+def _dump_timelines() -> None:
+    import json
+    import socket
+    import time
+
+    os.makedirs(ENGRAM_TIMELINE_DIR, exist_ok=True)
+    host = socket.gethostname()
+    while True:
+        time.sleep(5)
+        for rows, rank, layer in list(_timeline_tables):
+            records = rows.timeline()
+            if records:
+                name = f"{host}-tp{rank}-layer{layer}.jsonl"
+                path = os.path.join(ENGRAM_TIMELINE_DIR, name)
+                with open(path, "a") as out:
+                    out.writelines(json.dumps(record) + "\n" for record in records)
+
+
+def _record_timeline(rows, rank: int, layer: int) -> None:
+    if not _timeline_tables:
+        import threading
+
+        threading.Thread(
+            target=_dump_timelines, name="engram-timeline", daemon=True
+        ).start()
+    _timeline_tables.append((rows, rank, layer))
 
 
 @lru_cache(maxsize=2)
@@ -647,10 +684,13 @@ class ParallelEngramEmbedding(nn.Module):
             rows_timeout_s=ENGRAM_ROWS_TIMEOUT_S,
             delay_s=ENGRAM_READ_DELAY_S,
             check_early=ENGRAM_CHECK_EARLY_IDS,
+            timeline=ENGRAM_TIMELINE,
         )
         for path, offset, scale in self._disk_sources:
             rows.add_source(path, offset, scale=scale)
         self.disk_rows = rows
+        if ENGRAM_TIMELINE:
+            _record_timeline(rows, self.caps.tp_rank, self.caps.layer_id)
 
     def stage_rows(self, indices, num_tokens, stream, early=None):
         """Queue a step's rows: copy its row IDs (``indices`` [tokens, 24], the GPU's

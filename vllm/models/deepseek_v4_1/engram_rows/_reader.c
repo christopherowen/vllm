@@ -56,7 +56,7 @@ static void system_error(failure_t *failure, const char *operation) {
 #include "_row_plan.h"
 
 #define READER_CAPSULE "vllm.engram_rows.reader"
-#define ABI_VERSION 3
+#define ABI_VERSION 4
 
 /* Control block: 32-bit words in mapped host memory, one 64-byte line per writer. */
 #define CTRL_IDS_SEQ 0      /* the GPU stream: the step whose row IDs are on the host */
@@ -65,6 +65,8 @@ static void system_error(failure_t *failure, const char *operation) {
 #define CTRL_TIMEOUT_US 32  /* the host: how long the GPU waits for a step's rows */
 #define CTRL_WAITED_US 33   /* the GPU: how long a timed-out wait waited */
 #define CTRL_FAILED_SEQ 34  /* the GPU: the step a timed-out wait was for */
+#define CTRL_GPU_WAIT_SEQ 40 /* debug (timeline): the step the GPU last waited for */
+#define CTRL_GPU_WAIT_NS 41  /* debug (timeline): how long that wait took, ns */
 #define CTRL_PHASE 48       /* the worker: PHASE_* */
 #define CTRL_PHASE_SEQ 49   /* the worker: the step it is on */
 #define CTRL_WORDS 64
@@ -87,7 +89,16 @@ typedef struct {
     uint32_t count;
     int64_t *early;   /* the host's IDs (UNKNOWN_ID where only the GPU knows), or NULL */
     bool has_unknown; /* some lookup needs the GPU's ID */
+    uint64_t submitted; /* when the host queued the step (CLOCK_MONOTONIC ns) */
 } step_t;
+
+/* Debug (timeline): one record per served step, times in CLOCK_MONOTONIC ns. The GPU's
+ * wait is the last one it recorded when the step's service began: the previous step's. */
+typedef struct {
+    uint32_t sequence, count, early, gpu_sequence, gpu_wait_ns;
+    uint64_t submitted, started, consumed, ids, read, published;
+} record_t;
+#define TIMELINE 8192
 
 typedef struct {
     ple_plan_t plan;
@@ -107,6 +118,8 @@ typedef struct {
     uint32_t *control;
     int64_t *late; /* the GPU's IDs of a step's lookups the host did not know, -1 elsewhere */
     bool check_early; /* debug: an early ID must equal the GPU's */
+    record_t *timeline; /* debug: the last TIMELINE served steps (mutex), or NULL */
+    uint64_t timeline_next, timeline_read;
     /* Serving: started (sources fixed) and closing are set once; pending (steps
      * queued or being read) is guarded by the queue's mutex, the rest by mutex. */
     bool started, closing;
@@ -397,6 +410,12 @@ static bool late_ids(reader_t *reader, step_t step, failure_t *failure) {
 
 static void serve(reader_t *reader, step_t step) {
     failure_t failure = {{0}};
+    uint64_t started = now_ns();
+    uint32_t gpu_sequence = 0, gpu_wait_ns = 0;
+    if (reader->timeline) {
+        gpu_sequence = __atomic_load_n(&reader->control[CTRL_GPU_WAIT_SEQ], __ATOMIC_ACQUIRE);
+        gpu_wait_ns = __atomic_load_n(&reader->control[CTRL_GPU_WAIT_NS], __ATOMIC_RELAXED);
+    }
     control_store(reader, CTRL_PHASE_SEQ, step.sequence);
     uint64_t early_count = 0;
     double consumed_wait = 0.0, early_read = 0.0;
@@ -435,6 +454,14 @@ static void serve(reader_t *reader, step_t step) {
     /* The rows are in place before the GPU can see the step. */
     __atomic_store_n(&reader->control[CTRL_ROWS_SEQ], step.sequence, __ATOMIC_RELEASE);
     control_store(reader, CTRL_PHASE, PHASE_IDLE);
+    if (reader->timeline) {
+        record_t record = {step.sequence, step.count, (uint32_t)early_count, gpu_sequence, gpu_wait_ns,
+                           step.submitted, started, started + (uint64_t)(consumed_wait * 1e9),
+                           ids_at, read_at, now_ns()};
+        pthread_mutex_lock(&reader->mutex);
+        reader->timeline[reader->timeline_next++ % TIMELINE] = record;
+        pthread_mutex_unlock(&reader->mutex);
+    }
 }
 
 /* The process's one worker and its queue of (reader, step) jobs. */
@@ -496,6 +523,7 @@ static void release(reader_t *reader) {
     if (reader->ring_ready) io_uring_queue_exit(&reader->ring);
     free(reader->iovecs);
     free(reader->late);
+    free(reader->timeline);
     free(reader->free_slots);
     free(reader->registered_fds);
     ple_plan_release(&reader->plan);
@@ -521,18 +549,19 @@ static reader_t *get_reader(PyObject *capsule) {
 }
 
 /* reader(table_rows, shard_start, shard_end, max_lookups, queue_depth, ids, weights,
- *        scales, control, ids_timeout_s, delay_s, check_early): the four buffers are
- * addresses of host memory that outlives the reader; check_early (debug) fails a step
- * whose early ID differs from the GPU's. */
+ *        scales, control, ids_timeout_s, delay_s, check_early, timeline): the four buffers
+ * are addresses of host memory that outlives the reader; check_early (debug) fails a step
+ * whose early ID differs from the GPU's; timeline (debug) records each served step. */
 static PyObject *py_reader(PyObject *self, PyObject *args) {
     (void)self;
     long long table_rows, shard_start, shard_end, max_lookups;
     int depth;
     unsigned long long ids, weights, scales, control;
     double ids_timeout, delay;
-    int check_early;
-    if (!PyArg_ParseTuple(args, "LLLLiKKKKddp", &table_rows, &shard_start, &shard_end, &max_lookups,
-                          &depth, &ids, &weights, &scales, &control, &ids_timeout, &delay, &check_early))
+    int check_early, timeline;
+    if (!PyArg_ParseTuple(args, "LLLLiKKKKddpp", &table_rows, &shard_start, &shard_end, &max_lookups,
+                          &depth, &ids, &weights, &scales, &control, &ids_timeout, &delay, &check_early,
+                          &timeline))
         return NULL;
     if (table_rows <= 0 || shard_start < 0 || shard_end < shard_start || shard_end > table_rows ||
         max_lookups <= 0 || max_lookups > UINT32_MAX || depth <= 0 || depth > 32768 || !ids ||
@@ -556,6 +585,10 @@ static PyObject *py_reader(PyObject *self, PyObject *args) {
     reader->ids_timeout_ns = (uint64_t)(ids_timeout * 1e9);
     reader->delay_ns = (uint64_t)(delay * 1e9);
     reader->check_early = check_early != 0;
+    if (timeline && !(reader->timeline = calloc(TIMELINE, sizeof(*reader->timeline)))) {
+        release(reader);
+        return PyErr_NoMemory();
+    }
     reader->late = malloc((size_t)max_lookups * sizeof(*reader->late));
     if (!reader->late) {
         release(reader);
@@ -640,6 +673,7 @@ static PyObject *py_submit(PyObject *self, PyObject *args) {
     PyObject *capsule, *early_object = Py_None;
     unsigned int sequence, count;
     double wait;
+    uint64_t submitted = now_ns();
     if (!PyArg_ParseTuple(args, "OIId|O", &capsule, &sequence, &count, &wait, &early_object)) return NULL;
     reader_t *reader = get_reader(capsule);
     if (!reader) return NULL;
@@ -697,7 +731,7 @@ static PyObject *py_submit(PyObject *self, PyObject *args) {
         }
         if (!problem) {
             __atomic_store_n(&reader->started, true, __ATOMIC_RELAXED);
-            queue.jobs[queue.tail % QUEUE] = (job_t){reader, {sequence, count, early, has_unknown}};
+            queue.jobs[queue.tail % QUEUE] = (job_t){reader, {sequence, count, early, has_unknown, submitted}};
             early = NULL;
             queue.tail++;
             reader->pending++;
@@ -746,11 +780,51 @@ static PyObject *py_status(PyObject *self, PyObject *capsule) {
     return result;
 }
 
+/* timeline(reader) (debug): the records of the steps served since the last call (at most
+ * the last TIMELINE), oldest first, as tuples in record_t's field order; [] when off. */
+static PyObject *py_timeline(PyObject *self, PyObject *capsule) {
+    (void)self;
+    reader_t *reader = get_reader(capsule);
+    if (!reader) return NULL;
+    PyObject *result = PyList_New(0);
+    if (!result || !reader->timeline) return result;
+    record_t *copy = malloc(TIMELINE * sizeof(*copy));
+    if (!copy) {
+        Py_DECREF(result);
+        return PyErr_NoMemory();
+    }
+    uint64_t first, last;
+    pthread_mutex_lock(&reader->mutex);
+    last = reader->timeline_next;
+    first = reader->timeline_read + TIMELINE < last ? last - TIMELINE : reader->timeline_read;
+    for (uint64_t i = first; i < last; i++) copy[i - first] = reader->timeline[i % TIMELINE];
+    reader->timeline_read = last;
+    pthread_mutex_unlock(&reader->mutex);
+    for (uint64_t i = 0; i < last - first; i++) {
+        record_t *r = &copy[i];
+        PyObject *row = Py_BuildValue("(IIIIIKKKKKK)", r->sequence, r->count, r->early, r->gpu_sequence,
+                                      r->gpu_wait_ns, (unsigned long long)r->submitted,
+                                      (unsigned long long)r->started, (unsigned long long)r->consumed,
+                                      (unsigned long long)r->ids, (unsigned long long)r->read,
+                                      (unsigned long long)r->published);
+        if (!row || PyList_Append(result, row) < 0) {
+            Py_XDECREF(row);
+            Py_DECREF(result);
+            free(copy);
+            return NULL;
+        }
+        Py_DECREF(row);
+    }
+    free(copy);
+    return result;
+}
+
 static PyMethodDef methods[] = {
     {"reader", py_reader, METH_VARARGS, NULL},
     {"add", py_add, METH_VARARGS, NULL},
     {"submit", py_submit, METH_VARARGS, NULL},
     {"status", py_status, METH_O, NULL},
+    {"timeline", py_timeline, METH_O, NULL},
     {NULL, NULL, 0, NULL},
 };
 
@@ -769,6 +843,8 @@ PyMODINIT_FUNC PyInit__engram_rows_reader(void) {
         PyModule_AddIntConstant(result, "CTRL_TIMEOUT_US", CTRL_TIMEOUT_US) < 0 ||
         PyModule_AddIntConstant(result, "CTRL_WAITED_US", CTRL_WAITED_US) < 0 ||
         PyModule_AddIntConstant(result, "CTRL_FAILED_SEQ", CTRL_FAILED_SEQ) < 0 ||
+        PyModule_AddIntConstant(result, "CTRL_GPU_WAIT_SEQ", CTRL_GPU_WAIT_SEQ) < 0 ||
+        PyModule_AddIntConstant(result, "CTRL_GPU_WAIT_NS", CTRL_GPU_WAIT_NS) < 0 ||
         PyModule_AddIntConstant(result, "CTRL_PHASE", CTRL_PHASE) < 0 ||
         PyModule_AddIntConstant(result, "CTRL_PHASE_SEQ", CTRL_PHASE_SEQ) < 0 ||
         PyModule_AddIntConstant(result, "CTRL_WORDS", CTRL_WORDS) < 0) {

@@ -23,6 +23,8 @@ stream:
 
 # No `from __future__ import annotations`: TileLang reads the prim_func
 # annotations eagerly, and the symbolic shape must resolve.
+import os
+
 import tilelang
 import tilelang.language as T
 import torch
@@ -32,8 +34,16 @@ ROW = 256
 SCALES = ROW // 32
 CONTROL_WORDS = 64
 
+# Debug only: the wait records each wait's length for the reader's timeline
+# (SPARK3_ENGRAM_TIMELINE, common/engram.py); compiled in only when set.
+_TIMING = (
+    "#define ENGRAM_TIMING\n"
+    if os.environ.get("SPARK3_ENGRAM_TIMELINE", "0") == "1"
+    else ""
+)
+
 # Control-block word offsets, as in engram_rows/_reader.c.
-_HEADER = r"""
+_HEADER = _TIMING + r"""
 // Engram rows: the reader publishes a step by writing its sequence number into the
 // control block in mapped host memory; this stream wrote the step it staged there.
 #define ENGRAM_CTRL_IDS_SEQ 0
@@ -42,6 +52,8 @@ _HEADER = r"""
 #define ENGRAM_CTRL_TIMEOUT_US 32
 #define ENGRAM_CTRL_WAITED_US 33
 #define ENGRAM_CTRL_FAILED_SEQ 34
+#define ENGRAM_CTRL_GPU_WAIT_SEQ 40
+#define ENGRAM_CTRL_GPU_WAIT_NS 41
 #define ENGRAM_CTRL_PHASE 48
 #define ENGRAM_PHASE_FAILED 3
 
@@ -55,10 +67,26 @@ __device__ __forceinline__ void engram_wait_rows(void *control) {
     unsigned target;
     asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(target) : "l"(ctrl + ENGRAM_CTRL_IDS_SEQ) : "memory");
     unsigned long long start = 0ull, limit = 0ull;
+#ifdef ENGRAM_TIMING
+    unsigned long long entered;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(entered));
+#endif
     for (unsigned polls = 1u;; polls++) {
         unsigned seen;
         asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(seen) : "l"(ctrl + ENGRAM_CTRL_ROWS_SEQ) : "memory");
         if ((int)(seen - target) >= 0) {
+#ifdef ENGRAM_TIMING
+            unsigned long long left;
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(left));
+            unsigned long long ns = left - entered;
+            unsigned waited = ns > 0xffffffffull ? 0xffffffffu : (unsigned)ns;
+            asm volatile("st.relaxed.sys.global.u32 [%0], %1;"
+                         :: "l"(ctrl + ENGRAM_CTRL_GPU_WAIT_NS), "r"(waited)
+                         : "memory");
+            asm volatile("st.release.sys.global.u32 [%0], %1;"
+                         :: "l"(ctrl + ENGRAM_CTRL_GPU_WAIT_SEQ), "r"(target)
+                         : "memory");
+#endif
             return;
         }
         if ((polls & 63u) == 0u) {

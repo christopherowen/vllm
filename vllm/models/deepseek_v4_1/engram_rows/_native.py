@@ -25,7 +25,7 @@ from pathlib import Path
 _LOCK = threading.Lock()
 _SOURCE = Path(__file__).with_name("_reader.c")
 _NAME = "_engram_rows_reader"
-ABI_VERSION = 3
+ABI_VERSION = 4
 
 
 def _pkg_config(*args: str) -> str:

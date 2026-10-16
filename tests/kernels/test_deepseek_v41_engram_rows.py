@@ -446,3 +446,53 @@ def test_a_mismatched_early_id_is_named():
     while rows.failure() is None and time.monotonic() < deadline:
         time.sleep(0.01)
     assert "lookup 29: the host hashed row 11, the GPU row 10" in rows.failure()
+
+
+_TIMELINE_CHILD = """
+import os, sys, torch
+sys.path.insert(0, os.path.dirname(sys.argv[1]))
+import test_deepseek_v41_engram_rows as t
+_, _, paths = t._write_table(t._table_dir(), seed=27)
+rows = t._rows(paths, tokens=4, timeline=True, delay_s=0.05)
+first = torch.randint(0, t.TABLE_ROWS, (4, t.HEADS)).cuda()
+for _ in range(3):
+    t._step(rows, first, 4)
+torch.cuda.synchronize()
+records = rows.timeline()
+assert [r["sequence"] for r in records] == [1, 2, 3], records
+for r in records:
+    assert r["submitted"] <= r["started"] <= r["ids"] <= r["read"] <= r["published"], r
+    assert r["count"] == 4 * t.HEADS and r["early"] == 0
+# Step 1's kernels compile on the host while its rows are read, so its wait is short;
+# the GPU waited for step 2's delayed rows, and step 3's service saw that wait.
+assert records[1]["gpu_sequence"] == 1, records[1]
+third = records[2]
+assert third["gpu_sequence"] == 2 and third["gpu_wait_ns"] > 10_000_000, third
+assert rows.timeline() == []
+rows.close()
+"""
+
+
+def test_timeline_records_each_step_and_the_gpu_wait():
+    """Debug: with the timeline on, the reader records each served step in order and the
+    GPU each wait's length (the timing is compiled into the wait only with the flag set,
+    so this runs in a child process)."""
+    import subprocess
+    import sys
+
+    env = dict(os.environ, SPARK3_ENGRAM_TIMELINE="1")
+    result = subprocess.run(
+        [sys.executable, "-c", _TIMELINE_CHILD, __file__],
+        env=env, capture_output=True, text=True, timeout=600,
+    )
+    assert result.returncode == 0, result.stderr[-3000:]
+
+
+def test_timeline_is_off_by_default():
+    _, _, paths = _write_table(_table_dir(), seed=28)
+    rows = _rows(paths, tokens=4)
+    ids = torch.randint(0, TABLE_ROWS, (4, HEADS)).cuda()
+    _step(rows, ids, 4)
+    torch.cuda.synchronize()
+    assert not rows.timeline_enabled and rows.timeline() == []
+    rows.close()
