@@ -48,6 +48,20 @@ def weight_transfer(
 def copy_weight(destination: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
     writer = _writer.get()
     if destination.is_meta or writer is None or not writer(destination, source):
+        if (
+            destination.is_cuda
+            and source.device.type == "cpu"
+            and not source.is_pinned()
+        ):
+            # A checkpoint tensor is often a view of a memory-mapped file (safetensors).
+            # On GB10, a pageable copy above about 128 KiB reads the source through the
+            # host page tables, and with driver R580 on a 64 KiB-page kernel it never
+            # completes when the file pages are not yet mapped and the copy does not
+            # start on a page boundary (the host spins in the copy, the GPU is idle).
+            # A copy into anonymous memory reads the file on the CPU first. (Not
+            # pin_memory: Torch's host allocator keeps every pinned block, rounded up
+            # to a power of two, and on GB10 that memory is the GPU's.)
+            source = source.clone()
         destination.copy_(source)
     return destination
 
