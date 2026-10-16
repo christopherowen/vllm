@@ -1007,8 +1007,9 @@ def test_disk_engram_model_allocates_hash_buffer_from_declared_caps(monkeypatch)
 @pytest.mark.parametrize("tp_rank", [0, 3])
 @torch.inference_mode()
 def test_disk_rows_read_whole_table_sources(tmp_path, dist_init, tp_rank):
-    """Each rank reads its shard of the global tables from unaligned file offsets;
-    disk tables prepare no B12X lookup."""
+    """Each rank reads its shard (its hash columns) of the global tables from unaligned
+    file offsets, and other ranks' columns gather as zeros; disk tables prepare no B12X
+    lookup."""
     device = torch.device("cuda", torch.cuda.current_device())
     capacity = 7
     geometry = native.build_geometry(base_table_size=19, compressed_vocab_size=32)
@@ -1072,6 +1073,9 @@ def test_disk_rows_read_whole_table_sources(tmp_path, dist_init, tp_rank):
             module.stage_rows(ids + shift, count, torch.cuda.current_stream())
             embed.gather_rows(output)
             reference = weight.float()[ids.cpu() + shift].flatten(1).bfloat16()
+            owned = torch.tensor([bool(embed.column_mask >> h & 1) for h in range(24)])
+            reference[:, ~owned.repeat_interleave(256)] = 0
+            assert int(owned.sum()) == 24 // caps.tp_size
             torch.testing.assert_close(output.cpu(), reference, rtol=0, atol=0)
             assert output.data_ptr() == address
     finally:
