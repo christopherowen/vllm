@@ -15,6 +15,7 @@ from vllm.config import get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
@@ -530,6 +531,26 @@ def _load_table(param, loaded_weight):
             )
 
 
+def column_shard(geometry, layer_index: int, tp_size: int, tp_rank: int):
+    """A disk table's shard on whole hash columns, or None.
+
+    A layer's table is its 24 hash columns' prime-sized ranges back to back, each
+    just above the Engram vocabulary. When the TP size divides 24, rank r owns
+    columns [24r/N, 24(r+1)/N): rows ``offsets`` start to end (within a few
+    thousand rows of an equal split), and in the gathered rows the contiguous band
+    of those columns' 256 values. Returns (row start, row end, band start, band
+    end)."""
+    columns = len(geometry.offsets[layer_index])
+    if columns % tp_size:
+        return None
+    per_rank = columns // tp_size
+    offsets = [int(o) for o in geometry.offsets[layer_index]]
+    table_rows = int(geometry.num_embeddings[layer_index])
+    first, last = tp_rank * per_rank, (tp_rank + 1) * per_rank
+    end = offsets[last] if last < columns else table_rows
+    return offsets[first], end, first * 256, last * 256
+
+
 class ParallelEngramEmbedding(nn.Module):
     def __init__(self, plan, caps, geometry, table_memory="device"):
         super().__init__()
@@ -541,6 +562,23 @@ class ParallelEngramEmbedding(nn.Module):
         self.shard_rows = (self.table_rows + caps.tp_size - 1) // caps.tp_size
         self.shard_start = caps.tp_rank * self.shard_rows
         self.shard_end = (caps.tp_rank + 1) * self.shard_rows
+        # A disk table's rank reads whole hash columns when the TP size divides
+        # them, so its gathered rows are one band and the ranks' rows are joined by
+        # an all-gather of the bands, not summed (resident tables keep equal rows).
+        self.band = None
+        columns = (
+            column_shard(
+                geometry,
+                geometry.layer_ids.index(caps.layer_id),
+                caps.tp_size,
+                caps.tp_rank,
+            )
+            if table_memory == "disk"
+            else None
+        )
+        if columns is not None:
+            self.shard_start, self.shard_end, *band = columns
+            self.band = tuple(band)
         self.weight_shape = (self.shard_rows, 256)
         self.scale_shape = (self.shard_rows, 8)
         self.tp_size = caps.tp_size
@@ -991,7 +1029,17 @@ class Engram(nn.Module):
             raise RuntimeError("Disk Engram output is not prepared")
         if self.embed_tokens.table_memory == "disk":
             self.embed_tokens.gather_rows(self.staged_rows[: hash_ids.shape[0]])
-        rows = tensor_model_parallel_all_reduce(self.staged_rows[: hash_ids.shape[0]])
+        band = self.embed_tokens.band
+        if band is not None:
+            # This rank's gathered rows are one band of whole hash columns.
+            rows = tensor_model_parallel_all_gather(
+                self.staged_rows[: hash_ids.shape[0], band[0] : band[1]].contiguous(),
+                dim=-1,
+            )
+        else:
+            rows = tensor_model_parallel_all_reduce(
+                self.staged_rows[: hash_ids.shape[0]]
+            )
         # With SP and a column-parallel projection, kv is every rank's column block
         # of this rank's rows, [N, L, C]: the TileLang gate reads the blocks in
         # place, B12X's mix packed rows.

@@ -1076,3 +1076,23 @@ def test_disk_rows_read_whole_table_sources(tmp_path, dist_init, tp_rank):
             assert output.data_ptr() == address
     finally:
         embed.close()
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 3, 4, 6])
+def test_disk_shards_are_whole_hash_columns(tp_size):
+    """When the TP size divides the 24 hash columns, every rank's disk shard is whole
+    columns: the shards tile the table at column offsets and their bands tile the
+    gathered row's 24 * 256 values in rank order (an all-gather joins them)."""
+    from vllm.models.deepseek_v4_1.common.engram import column_shard
+
+    geometry = native.build_geometry(base_table_size=19, compressed_vocab_size=32)
+    for index in range(len(geometry.layer_ids)):
+        offsets = [int(o) for o in geometry.offsets[index]]
+        shards = [column_shard(geometry, index, tp_size, r) for r in range(tp_size)]
+        assert shards[0][0] == 0 and shards[-1][1] == geometry.num_embeddings[index]
+        assert shards[0][2] == 0 and shards[-1][3] == 24 * 256
+        for (start, end, low, high), following in zip(shards, shards[1:] + [None]):
+            assert start in offsets and low == offsets.index(start) * 256
+            if following is not None:
+                assert (end, high) == (following[0], following[2])
+    assert column_shard(geometry, 0, 5, 0) is None  # 24 columns do not split five ways
