@@ -77,6 +77,9 @@ DEAD_ID = -1
 ENGRAM_ROWS_TIMEOUT_S = float(os.environ.get("SPARK3_ENGRAM_ROWS_TIMEOUT_MS", "10000")) / 1000
 # Tests only: delay every disk read, to show the forward waits for its rows.
 ENGRAM_READ_DELAY_S = float(os.environ.get("SPARK3_ENGRAM_READ_DELAY_MS", "0")) / 1000
+# Debug only (off and free in serving): every row ID the host hashed early must equal
+# the GPU's, or the step fails with both.
+ENGRAM_CHECK_EARLY_IDS = os.environ.get("SPARK3_ENGRAM_CHECK_EARLY_IDS", "0") == "1"
 
 
 @lru_cache(maxsize=2)
@@ -639,21 +642,23 @@ class ParallelEngramEmbedding(nn.Module):
             max_lookups=self.caps.max_tokens * 24,
             rows_timeout_s=ENGRAM_ROWS_TIMEOUT_S,
             delay_s=ENGRAM_READ_DELAY_S,
+            check_early=ENGRAM_CHECK_EARLY_IDS,
         )
         for path, offset, scale in self._disk_sources:
             rows.add_source(path, offset, scale=scale)
         self.disk_rows = rows
 
-    def stage_rows(self, indices, num_tokens, stream):
-        """Queue a step's rows: copy its row IDs (``indices`` [tokens, 24]) and live
-        token count, then hand the step to the reader. Returns at once; the forward's
-        ``gather_rows`` waits for the rows."""
+    def stage_rows(self, indices, num_tokens, stream, early=None):
+        """Queue a step's rows: copy its row IDs (``indices`` [tokens, 24], the GPU's
+        hash) and live token count, then hand the step to the reader with the IDs the
+        host hashed (``early`` [tokens, 24] int64 on the host, or None). Returns at
+        once; the forward's ``gather_rows`` waits for the rows."""
         if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Disk Engram staging must run outside compile/capture")
         tokens = indices.shape[0]
         self.hashes[:tokens].copy_(indices)
         self.num_tokens.copy_(num_tokens)
-        self.disk_rows.stage(stream, self.hashes, tokens * 24)
+        self.disk_rows.stage(stream, self.hashes, tokens * 24, early)
 
     def stage_no_rows(self):
         """A dummy step: the gather writes zeros and waits for nothing."""
@@ -897,10 +902,11 @@ class Engram(nn.Module):
         )
         self.embed_tokens.open_disk_rows()
 
-    def stage_rows(self, hash_ids, num_tokens, stream):
-        """Queue this step's disk rows; the forward gathers them."""
+    def stage_rows(self, hash_ids, num_tokens, stream, early=None):
+        """Queue this step's disk rows (``early``: the IDs the host hashed); the
+        forward gathers them."""
         self.invalidate_disk_output()
-        self.embed_tokens.stage_rows(hash_ids, num_tokens, stream)
+        self.embed_tokens.stage_rows(hash_ids, num_tokens, stream, early)
         self._disk_prepared_tokens = hash_ids.shape[0]
         self._disk_prepared = True
 

@@ -16,6 +16,9 @@ stream:
   rounded to BF16) into the token's head slice. A token past the step or a row
   outside this rank's shard loads nothing and writes zeros (the reader leaves those
   slots untouched).
+- the release: one thread writes the step it gathered into the control block, so the
+  reader may now fill the buffers with the next step's early rows (those the host
+  hashed while this step ran).
 """
 
 # No `from __future__ import annotations`: TileLang reads the prim_func
@@ -34,6 +37,7 @@ _HEADER = r"""
 // Engram rows: the reader publishes a step by writing its sequence number into the
 // control block in mapped host memory; this stream wrote the step it staged there.
 #define ENGRAM_CTRL_IDS_SEQ 0
+#define ENGRAM_CTRL_CONSUMED_SEQ 1
 #define ENGRAM_CTRL_ROWS_SEQ 16
 #define ENGRAM_CTRL_TIMEOUT_US 32
 #define ENGRAM_CTRL_WAITED_US 33
@@ -79,6 +83,17 @@ __device__ __forceinline__ void engram_wait_rows(void *control) {
         }
     }
 }
+
+// The stream's gather of the step it staged is done (the kernels before this one have
+// retired their loads of the mapped rows): tell the reader, with release semantics.
+__device__ __forceinline__ void engram_release_rows(void *control) {
+    unsigned *ctrl = (unsigned *)control;
+    unsigned staged;
+    asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
+                 : "=r"(staged) : "l"(ctrl + ENGRAM_CTRL_IDS_SEQ) : "memory");
+    asm volatile("st.release.sys.global.u32 [%0], %1;"
+                 :: "l"(ctrl + ENGRAM_CTRL_CONSUMED_SEQ), "r"(staged) : "memory");
+}
 """
 
 
@@ -92,6 +107,20 @@ def engram_rows_wait_kernel():
                 T.call_extern("engram_wait_rows", T.address_of(control[0]), dtype="handle")
 
     return engram_rows_wait
+
+
+@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+def engram_rows_release_kernel():
+    @T.prim_func
+    def engram_rows_release(control: T.Tensor((CONTROL_WORDS,), T.int32)):
+        with T.Kernel(1, threads=32):
+            T.import_source(_HEADER)
+            if T.get_thread_binding() == 0:
+                T.call_extern(
+                    "engram_release_rows", T.address_of(control[0]), dtype="handle"
+                )
+
+    return engram_rows_release
 
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
@@ -144,16 +173,16 @@ def engram_rows_gather(
     shard_start: int,
     shard_end: int,
 ) -> None:
-    """Wait for the staged step's rows and dequantize the first ``num_tokens``
-    tokens' rows into ``out`` ([tokens, 24 * 256] BF16). ``ids`` ([>= tokens, 24]
-    int64) are the step's row IDs; ``rows``, ``scales`` and ``control`` are the
-    reader's mapped buffers."""
+    """Wait for the staged step's rows, dequantize the first ``num_tokens`` tokens'
+    rows into ``out`` ([tokens, 24 * 256] BF16), then release the buffers to the
+    reader. ``ids`` ([>= tokens, 24] int64) are the step's row IDs; ``rows``,
+    ``scales`` and ``control`` are the reader's mapped buffers."""
     engram_rows_wait_kernel()(control)
     tokens = out.shape[0]
-    if tokens == 0:
-        return
-    kernel = engram_rows_gather_kernel(rows.shape[0], shard_start, shard_end)
-    kernel(ids[:tokens], num_tokens, rows, scales, out)
+    if tokens:
+        kernel = engram_rows_gather_kernel(rows.shape[0], shard_start, shard_end)
+        kernel(ids[:tokens], num_tokens, rows, scales, out)
+    engram_rows_release_kernel()(control)
 
 
 @engram_rows_gather.register_fake

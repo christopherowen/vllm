@@ -6,11 +6,17 @@
  * One worker thread serves every reader's steps in the order the model submits
  * them: per step, the first Engram layer's table, then the second's, so the rows
  * the forward needs first are read first and the two tables never compete for the
- * disk. For each step the worker waits until the GPU has written the step's
- * sequence number into the reader's control block (the stream writes it after
- * copying the row IDs to the host), reads the rows into the mapped buffers the GPU
- * gathers from, and publishes the step by writing its sequence number into the
- * control block. The worker never takes the GIL and never calls CUDA, so nothing
+ * disk. A step's lookups split by when their row IDs exist. Those the host already
+ * hashed (prompt tokens: the runner prepares a step before the GPU runs it) come
+ * with the step as its early IDs, and the worker reads them as soon as the GPU has
+ * finished gathering the reader's previous step (the GPU writes that step's
+ * sequence number into the control block after its gather), so they are read while
+ * the previous step computes. The rest (tokens the GPU samples) are known when the
+ * GPU has written the step's sequence number into the control block (the stream
+ * writes it after copying the row IDs to the host); the worker then reads those,
+ * and publishes the step by writing its sequence number into the control block. A
+ * step with no early IDs is read entirely the second way; one whose IDs are all
+ * early does not wait for the GPU's. The worker never takes the GIL and never calls CUDA, so nothing
  * another thread does in Python or in the CUDA driver can hold back the rows. A
  * failed step is recorded and not published, and the control block says so: the
  * GPU's wait then stops it at once with a named record instead of letting it read
@@ -50,10 +56,11 @@ static void system_error(failure_t *failure, const char *operation) {
 #include "_row_plan.h"
 
 #define READER_CAPSULE "vllm.engram_rows.reader"
-#define ABI_VERSION 2
+#define ABI_VERSION 3
 
 /* Control block: 32-bit words in mapped host memory, one 64-byte line per writer. */
 #define CTRL_IDS_SEQ 0      /* the GPU stream: the step whose row IDs are on the host */
+#define CTRL_CONSUMED_SEQ 1 /* the GPU: the step whose rows it has gathered */
 #define CTRL_ROWS_SEQ 16    /* the worker: the step whose rows are in the buffers */
 #define CTRL_TIMEOUT_US 32  /* the host: how long the GPU waits for a step's rows */
 #define CTRL_WAITED_US 33   /* the GPU: how long a timed-out wait waited */
@@ -62,7 +69,10 @@ static void system_error(failure_t *failure, const char *operation) {
 #define CTRL_PHASE_SEQ 49   /* the worker: the step it is on */
 #define CTRL_WORDS 64
 
-enum { PHASE_IDLE = 0, PHASE_WAITING_IDS = 1, PHASE_READING = 2, PHASE_FAILED = 3 };
+enum { PHASE_IDLE = 0, PHASE_WAITING_IDS = 1, PHASE_READING = 2, PHASE_FAILED = 3, PHASE_WAITING_CONSUMED = 4 };
+
+/* An early ID the host does not know: the GPU's ID for that lookup is read later. */
+#define UNKNOWN_ID INT64_MIN
 
 #define QUEUE 64u /* steps queued across all readers */
 
@@ -75,6 +85,8 @@ typedef struct {
 typedef struct {
     uint32_t sequence;
     uint32_t count;
+    int64_t *early;   /* the host's IDs (UNKNOWN_ID where only the GPU knows), or NULL */
+    bool has_unknown; /* some lookup needs the GPU's ID */
 } step_t;
 
 typedef struct {
@@ -93,6 +105,8 @@ typedef struct {
     const char *ids;
     char *weights, *scales;
     uint32_t *control;
+    int64_t *late; /* the GPU's IDs of a step's lookups the host did not know, -1 elsewhere */
+    bool check_early; /* debug: an early ID must equal the GPU's */
     /* Serving: started (sources fixed) and closing are set once; pending (steps
      * queued or being read) is guarded by the queue's mutex, the rest by mutex. */
     bool started, closing;
@@ -100,8 +114,8 @@ typedef struct {
     pthread_mutex_t mutex;
     uint64_t ids_timeout_ns, delay_ns;
     failure_t failure; /* the first failure; no step is read after it */
-    uint64_t steps_done, lookups_done;
-    double ids_wait_seconds, read_seconds;
+    uint64_t steps_done, lookups_done, early_lookups;
+    double ids_wait_seconds, read_seconds, consumed_wait_seconds, early_read_seconds;
 } reader_t;
 
 static uint64_t now_ns(void) {
@@ -282,8 +296,9 @@ static int ple_register_files(ple_plan_t *plan, void *owner) {
     return error;
 }
 
-/* Read one step's rows: the IDs are in reader->ids, the rows go to their lookup slots. */
-static failure_t read_rows(reader_t *reader, uint32_t count) {
+/* Read the rows of ``count`` lookups whose IDs are ``ids`` into their lookup slots; an
+ * ID outside this rank's shard (or -1, or UNKNOWN_ID) leaves its slot untouched. */
+static failure_t read_rows(reader_t *reader, const char *ids, uint32_t count) {
     reader->plan.failure.message[0] = 0;
     reader->plan.lookups = count;
     reader->plan.requested_bytes = reader->plan.read_bytes = reader->plan.read_calls = 0;
@@ -291,7 +306,7 @@ static failure_t read_rows(reader_t *reader, uint32_t count) {
     if (reader->poisoned)
         snprintf(reader->plan.failure.message, sizeof(reader->plan.failure.message),
                  "Engram reader is unusable after an io_uring submission or completion failure");
-    else if (ple_plan(&reader->plan, reader->ids, count) &&
+    else if (ple_plan(&reader->plan, ids, count) &&
              reader->plan.job_count)
         ple_uring_run(reader);
     return reader->plan.failure;
@@ -299,23 +314,22 @@ static failure_t read_rows(reader_t *reader, uint32_t count) {
 
 /* --- worker ------------------------------------------------------------------ */
 
-/* Wait for the GPU to write the step's row IDs: spin for 200 us (the IDs of a step the
- * GPU is already on arrive within it), then poll every 10 us. */
-static bool wait_for_ids(reader_t *reader, uint32_t sequence, failure_t *failure) {
+/* Wait until the GPU has written ``target`` (or later) into control word ``word``: spin
+ * for 200 us (a step the GPU is already on answers within it), then poll every 10 us. */
+static bool wait_for_gpu(reader_t *reader, int word, uint32_t target, failure_t *failure,
+                         const char *what, const char *hint) {
     uint64_t start = now_ns();
     for (;;) {
-        if (reached(__atomic_load_n(&reader->control[CTRL_IDS_SEQ], __ATOMIC_ACQUIRE), sequence))
+        if (reached(__atomic_load_n(&reader->control[word], __ATOMIC_ACQUIRE), target))
             return true;
         if (__atomic_load_n(&reader->closing, __ATOMIC_RELAXED)) {
-            snprintf(failure->message, sizeof(failure->message),
-                     "Engram reader closed before the row IDs of step %u arrived", sequence);
+            snprintf(failure->message, sizeof(failure->message), "Engram reader closed before %s %u", what,
+                     target);
             return false;
         }
         if (now_ns() - start > reader->ids_timeout_ns) {
-            snprintf(failure->message, sizeof(failure->message),
-                     "the row IDs of Engram step %u did not arrive within %.1f s: the GPU is "
-                     "blocked before the step's Engram staging",
-                     sequence, (double)reader->ids_timeout_ns * 1e-9);
+            snprintf(failure->message, sizeof(failure->message), "%s %u did not come within %.1f s: %s", what,
+                     target, (double)reader->ids_timeout_ns * 1e-9, hint);
             return false;
         }
         if (now_ns() - start > 200000) {
@@ -329,20 +343,76 @@ static bool wait_for_ids(reader_t *reader, uint32_t sequence, failure_t *failure
     }
 }
 
+static void pause_for_delay(reader_t *reader) {
+    if (reader->delay_ns) {
+        struct timespec pause = {(time_t)(reader->delay_ns / 1000000000ull),
+                                 (long)(reader->delay_ns % 1000000000ull)};
+        nanosleep(&pause, NULL);
+    }
+}
+
+/* The step's early part: wait until the GPU has gathered the reader's previous step
+ * (its rows are in the same buffers), then read the lookups the host hashed. */
+static bool read_early(reader_t *reader, step_t step, failure_t *failure, double *consumed_wait,
+                       double *early_read, uint64_t *early_count) {
+    control_store(reader, CTRL_PHASE, PHASE_WAITING_CONSUMED);
+    uint64_t start = now_ns();
+    /* Sequences run 1, 2, ... 0xFFFFFFFF, 1: the step before 1 is 0xFFFFFFFF (or none,
+     * when the control block's 0 has reached it already). */
+    uint32_t previous = step.sequence == 1 ? 0xFFFFFFFFu : step.sequence - 1;
+    if (!wait_for_gpu(reader, CTRL_CONSUMED_SEQ, previous, failure,
+                      "the GPU's gather of the rows of Engram step",
+                      "the GPU never gathered the previous step's rows"))
+        return false;
+    uint64_t consumed_at = now_ns();
+    pause_for_delay(reader);
+    control_store(reader, CTRL_PHASE, PHASE_READING);
+    *failure = read_rows(reader, (const char *)step.early, step.count);
+    *consumed_wait = (double)(consumed_at - start) * 1e-9;
+    *early_read = (double)(now_ns() - consumed_at) * 1e-9;
+    for (uint32_t i = 0; i < step.count; i++) *early_count += step.early[i] != UNKNOWN_ID;
+    return !failure->message[0];
+}
+
+/* The GPU's IDs: check the early ones (debug) and keep only those the host did not know. */
+static bool late_ids(reader_t *reader, step_t step, failure_t *failure) {
+    const int64_t *gpu = (const int64_t *)reader->ids;
+    for (uint32_t i = 0; i < step.count; i++) {
+        int64_t id;
+        memcpy(&id, gpu + i, sizeof(id));
+        if (step.early && step.early[i] != UNKNOWN_ID) {
+            if (reader->check_early && step.early[i] != id) {
+                snprintf(failure->message, sizeof(failure->message),
+                         "Engram step %u lookup %u: the host hashed row %lld, the GPU row %lld", step.sequence,
+                         i, (long long)step.early[i], (long long)id);
+                return false;
+            }
+            reader->late[i] = -1;
+        } else {
+            reader->late[i] = id;
+        }
+    }
+    return true;
+}
+
 static void serve(reader_t *reader, step_t step) {
     failure_t failure = {{0}};
     control_store(reader, CTRL_PHASE_SEQ, step.sequence);
-    control_store(reader, CTRL_PHASE, PHASE_WAITING_IDS);
+    uint64_t early_count = 0;
+    double consumed_wait = 0.0, early_read = 0.0;
+    bool ok = !step.early || read_early(reader, step, &failure, &consumed_wait, &early_read, &early_count);
     uint64_t start = now_ns(), ids_at = start, read_at = start;
-    if (wait_for_ids(reader, step.sequence, &failure)) {
+    if (ok && (step.has_unknown || reader->check_early)) {
+        control_store(reader, CTRL_PHASE, PHASE_WAITING_IDS);
+        ok = wait_for_gpu(reader, CTRL_IDS_SEQ, step.sequence, &failure, "the row IDs of Engram step",
+                          "the GPU is blocked before the step's Engram staging");
         ids_at = now_ns();
-        if (reader->delay_ns) {
-            struct timespec pause = {(time_t)(reader->delay_ns / 1000000000ull),
-                                     (long)(reader->delay_ns % 1000000000ull)};
-            nanosleep(&pause, NULL);
+        if (ok && !step.early) pause_for_delay(reader);
+        if (ok) ok = late_ids(reader, step, &failure);
+        if (ok && step.has_unknown) {
+            control_store(reader, CTRL_PHASE, PHASE_READING);
+            failure = read_rows(reader, (const char *)reader->late, step.count);
         }
-        control_store(reader, CTRL_PHASE, PHASE_READING);
-        failure = read_rows(reader, step.count);
         read_at = now_ns();
     }
     pthread_mutex_lock(&reader->mutex);
@@ -351,6 +421,9 @@ static void serve(reader_t *reader, step_t step) {
     } else {
         reader->steps_done++;
         reader->lookups_done += step.count;
+        reader->early_lookups += early_count;
+        reader->consumed_wait_seconds += consumed_wait;
+        reader->early_read_seconds += early_read;
         reader->ids_wait_seconds += (double)(ids_at - start) * 1e-9;
         reader->read_seconds += (double)(read_at - ids_at) * 1e-9;
     }
@@ -405,6 +478,7 @@ static void *worker_main(void *arg) {
         bool failed = job.reader->failure.message[0] != 0;
         pthread_mutex_unlock(&job.reader->mutex);
         if (!failed) serve(job.reader, job.step);
+        free(job.step.early);
         pthread_mutex_lock(&queue.mutex);
         job.reader->pending--;
         pthread_cond_broadcast(&queue.idle);
@@ -421,6 +495,7 @@ static void release(reader_t *reader) {
     pthread_mutex_unlock(&queue.mutex);
     if (reader->ring_ready) io_uring_queue_exit(&reader->ring);
     free(reader->iovecs);
+    free(reader->late);
     free(reader->free_slots);
     free(reader->registered_fds);
     ple_plan_release(&reader->plan);
@@ -446,16 +521,18 @@ static reader_t *get_reader(PyObject *capsule) {
 }
 
 /* reader(table_rows, shard_start, shard_end, max_lookups, queue_depth, ids, weights,
- *        scales, control, ids_timeout_s, delay_s): the four buffers are addresses of
- * host memory that outlives the reader. */
+ *        scales, control, ids_timeout_s, delay_s, check_early): the four buffers are
+ * addresses of host memory that outlives the reader; check_early (debug) fails a step
+ * whose early ID differs from the GPU's. */
 static PyObject *py_reader(PyObject *self, PyObject *args) {
     (void)self;
     long long table_rows, shard_start, shard_end, max_lookups;
     int depth;
     unsigned long long ids, weights, scales, control;
     double ids_timeout, delay;
-    if (!PyArg_ParseTuple(args, "LLLLiKKKKdd", &table_rows, &shard_start, &shard_end, &max_lookups,
-                          &depth, &ids, &weights, &scales, &control, &ids_timeout, &delay))
+    int check_early;
+    if (!PyArg_ParseTuple(args, "LLLLiKKKKddp", &table_rows, &shard_start, &shard_end, &max_lookups,
+                          &depth, &ids, &weights, &scales, &control, &ids_timeout, &delay, &check_early))
         return NULL;
     if (table_rows <= 0 || shard_start < 0 || shard_end < shard_start || shard_end > table_rows ||
         max_lookups <= 0 || max_lookups > UINT32_MAX || depth <= 0 || depth > 32768 || !ids ||
@@ -478,6 +555,12 @@ static PyObject *py_reader(PyObject *self, PyObject *args) {
     reader->control = (uint32_t *)(uintptr_t)control;
     reader->ids_timeout_ns = (uint64_t)(ids_timeout * 1e9);
     reader->delay_ns = (uint64_t)(delay * 1e9);
+    reader->check_early = check_early != 0;
+    reader->late = malloc((size_t)max_lookups * sizeof(*reader->late));
+    if (!reader->late) {
+        release(reader);
+        return PyErr_NoMemory();
+    }
     reader->slots_count = (unsigned)depth;
     reader->slots = calloc(reader->slots_count, sizeof(*reader->slots));
     error = posix_memalign((void **)&reader->buffers, PLE_BLOCK, (size_t)reader->slots_count * PLE_READ_MAX);
@@ -548,19 +631,39 @@ static PyObject *py_add(PyObject *self, PyObject *args) {
     Py_RETURN_NONE;
 }
 
-/* submit(reader, sequence, count, wait_s): queue one step behind every step already
- * queued. Returns at once unless the queue is full; then it waits for space, without
- * the GIL. */
+/* submit(reader, sequence, count, wait_s, early): queue one step behind every step
+ * already queued. ``early`` is None or ``count`` int64 IDs the host hashed
+ * (UNKNOWN_ID where only the GPU knows the ID), copied here. Returns at once unless
+ * the queue is full; then it waits for space, without the GIL. */
 static PyObject *py_submit(PyObject *self, PyObject *args) {
     (void)self;
-    PyObject *capsule;
+    PyObject *capsule, *early_object = Py_None;
     unsigned int sequence, count;
     double wait;
-    if (!PyArg_ParseTuple(args, "OIId", &capsule, &sequence, &count, &wait)) return NULL;
+    if (!PyArg_ParseTuple(args, "OIId|O", &capsule, &sequence, &count, &wait, &early_object)) return NULL;
     reader_t *reader = get_reader(capsule);
     if (!reader) return NULL;
     if (count > reader->plan.max_lookups)
         return PyErr_Format(PyExc_ValueError, "Engram step of %u lookups exceeds the reader's capacity", count);
+    int64_t *early = NULL;
+    bool has_unknown = true;
+    if (early_object != Py_None) {
+        Py_buffer view;
+        if (PyObject_GetBuffer(early_object, &view, PyBUF_C_CONTIGUOUS) < 0) return NULL;
+        if (view.len != (Py_ssize_t)count * (Py_ssize_t)sizeof(int64_t)) {
+            PyBuffer_Release(&view);
+            return PyErr_Format(PyExc_ValueError, "Engram early IDs must be %u int64 values", count);
+        }
+        early = malloc((size_t)count * sizeof(*early) + 1);
+        if (!early) {
+            PyBuffer_Release(&view);
+            return PyErr_NoMemory();
+        }
+        memcpy(early, view.buf, (size_t)count * sizeof(*early));
+        PyBuffer_Release(&view);
+        has_unknown = false;
+        for (uint32_t i = 0; i < count && !has_unknown; i++) has_unknown = early[i] == UNKNOWN_ID;
+    }
     const char *problem = NULL;
     failure_t failure = {{0}};
     Py_BEGIN_ALLOW_THREADS
@@ -594,7 +697,8 @@ static PyObject *py_submit(PyObject *self, PyObject *args) {
         }
         if (!problem) {
             __atomic_store_n(&reader->started, true, __ATOMIC_RELAXED);
-            queue.jobs[queue.tail % QUEUE] = (job_t){reader, {sequence, count}};
+            queue.jobs[queue.tail % QUEUE] = (job_t){reader, {sequence, count, early, has_unknown}};
+            early = NULL;
             queue.tail++;
             reader->pending++;
             pthread_cond_signal(&queue.wake);
@@ -602,6 +706,7 @@ static PyObject *py_submit(PyObject *self, PyObject *args) {
     }
     pthread_mutex_unlock(&queue.mutex);
     Py_END_ALLOW_THREADS
+    free(early); /* not queued */
     if (failure.message[0]) return PyErr_Format(PyExc_RuntimeError, "%s", failure.message);
     if (problem) return PyErr_Format(PyExc_RuntimeError, "%s", problem);
     Py_RETURN_NONE;
@@ -613,8 +718,8 @@ static PyObject *py_status(PyObject *self, PyObject *capsule) {
     reader_t *reader = get_reader(capsule);
     if (!reader) return NULL;
     failure_t failure;
-    uint64_t steps, lookups, queued;
-    double ids_wait, read;
+    uint64_t steps, lookups, queued, early;
+    double ids_wait, read, consumed_wait, early_read;
     Py_BEGIN_ALLOW_THREADS
     pthread_mutex_lock(&queue.mutex);
     queued = reader->pending;
@@ -625,14 +730,19 @@ static PyObject *py_status(PyObject *self, PyObject *capsule) {
     lookups = reader->lookups_done;
     ids_wait = reader->ids_wait_seconds;
     read = reader->read_seconds;
+    early = reader->early_lookups;
+    consumed_wait = reader->consumed_wait_seconds;
+    early_read = reader->early_read_seconds;
     pthread_mutex_unlock(&reader->mutex);
     Py_END_ALLOW_THREADS
     PyObject *message = failure.message[0] ? PyUnicode_FromString(failure.message) : Py_NewRef(Py_None);
     if (!message) return NULL;
-    PyObject *result = Py_BuildValue("{s:N,s:K,s:K,s:K,s:d,s:d}", "failure", message, "steps",
+    PyObject *result = Py_BuildValue("{s:N,s:K,s:K,s:K,s:K,s:d,s:d,s:d,s:d}", "failure", message, "steps",
                                      (unsigned long long)steps, "lookups", (unsigned long long)lookups,
-                                     "queued", (unsigned long long)queued, "ids_wait_seconds", ids_wait,
-                                     "read_seconds", read);
+                                     "early_lookups", (unsigned long long)early, "queued",
+                                     (unsigned long long)queued, "ids_wait_seconds", ids_wait,
+                                     "read_seconds", read, "consumed_wait_seconds", consumed_wait,
+                                     "early_read_seconds", early_read);
     return result;
 }
 
@@ -654,6 +764,7 @@ PyMODINIT_FUNC PyInit__engram_rows_reader(void) {
     if (!result) return NULL;
     if (PyModule_AddIntConstant(result, "ABI_VERSION", ABI_VERSION) < 0 ||
         PyModule_AddIntConstant(result, "CTRL_IDS_SEQ", CTRL_IDS_SEQ) < 0 ||
+        PyModule_AddIntConstant(result, "CTRL_CONSUMED_SEQ", CTRL_CONSUMED_SEQ) < 0 ||
         PyModule_AddIntConstant(result, "CTRL_ROWS_SEQ", CTRL_ROWS_SEQ) < 0 ||
         PyModule_AddIntConstant(result, "CTRL_TIMEOUT_US", CTRL_TIMEOUT_US) < 0 ||
         PyModule_AddIntConstant(result, "CTRL_WAITED_US", CTRL_WAITED_US) < 0 ||

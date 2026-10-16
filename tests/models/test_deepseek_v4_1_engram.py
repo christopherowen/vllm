@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from b12x._lib.runtime_control import kernel_resolution_guard
@@ -21,6 +22,7 @@ from vllm.config.engram import EngramConfig
 from vllm.config.load import LoadConfig
 from vllm.model_executor.model_loader import default_loader, weight_utils
 from vllm.model_executor.models.utils import WeightsMapper
+from vllm.models.deepseek_v4_1.common import engram as engram_module
 from vllm.models.deepseek_v4_1.common.engram import (
     Engram,
     NgramHashState,
@@ -117,6 +119,7 @@ def tiny_engram_checkpoint(tmp_path, dist_init):
             ),
             layer_ids=geometry.layer_ids,
             geometry=geometry,
+            token_map=list(range(32)),
             table_memory=memory,
         )
         target = DeepseekV4Model.__new__(DeepseekV4Model)
@@ -442,12 +445,15 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
     state.ced_state = None
     state.lookback_token_ids = torch.empty(2, 3, dtype=torch.int32, device="cuda")
     state.disk_engram_models = (target,)
+    state._prefill_tokens = {}
+    state._host_engram_hash = None
     monkeypatch.setattr(DefaultModelState, "prepare_inputs", lambda *args: {})
     monkeypatch.setattr(DefaultModelState, "prepare_dummy_inputs", lambda *args: {})
     batch = SimpleNamespace(
         input_ids=torch.zeros(4, dtype=torch.int32, device="cuda"),
         query_start_loc=torch.tensor([0, 2, 2], dtype=torch.int32, device="cuda"),
         idx_mapping=torch.tensor([0], dtype=torch.int32, device="cuda"),
+        has_prefill=False,
     )
     req_states = SimpleNamespace(
         num_computed_tokens=SimpleNamespace(
@@ -573,6 +579,117 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
         with pytest.raises(RuntimeError, match="not prepared"):
             consume()
     torch.cuda.current_stream().wait_stream(stream)
+    session.close()
+    resident_session.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_disk_engram_rows_the_host_hashed_equal_the_gpu_rows(
+    tiny_engram_checkpoint, tmp_path, monkeypatch
+):
+    """The host hashes a step's prefill chunks and the reader reads their rows before
+    the GPU's hash; a decode row in the same step comes from the GPU's hash. With the
+    debug check on, every early ID equals the GPU's, and the rows equal the resident
+    table's: a first chunk, a later chunk with history, a mixed step (decode first,
+    an image token in its history) and a decode-only step."""
+    monkeypatch.setattr(engram_module, "ENGRAM_CHECK_EARLY_IDS", True)
+    make_model, weights, paths = tiny_engram_checkpoint
+    root, target, session = make_model("disk")
+    resident_root, resident, resident_session = make_model("device")
+    _load_checkpoint(root, tmp_path)
+    with torch.no_grad():
+        resident_root.load_weights(weights.items())
+        for engram in (*_engrams(target), *_engrams(resident)):
+            engram.process_weights_after_loading()
+    _prepare_engram(session, target)
+    _prepare_engram(resident_session, resident)
+    for engram in _engrams(target):
+        assert engram.embed_tokens.disk_rows.check_early
+
+    prompt = [5, 9, 13, 17, 19, 23]
+    state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
+    state.ced_state = None
+    state.lookback_token_ids = torch.empty(2, 3, dtype=torch.int32, device="cuda")
+    state.disk_engram_models = (target,)
+    state._prefill_tokens = {"a": np.array(prompt, dtype=np.int32)}
+    state._host_engram_hash = None
+    monkeypatch.setattr(DefaultModelState, "prepare_inputs", lambda *args: {})
+    all_token_ids = torch.tensor(
+        [prompt, [4, 129264, 6, 8, 10, 12]], dtype=torch.int32, device="cuda"
+    )
+    slots = {"a": 0, "b": 1}
+    hidden = torch.ones(4, 4, 64, dtype=torch.bfloat16, device="cuda")
+    # (input ids, [(request, computed tokens, rows, prefilling)], early lookups)
+    steps = (
+        ([13, 17, 19, 31], [("a", 2, 3, True)], 4 * 24),
+        ([23, 31, 31, 31], [("a", 5, 1, True)], 4 * 24),
+        ([10, 13, 17, 31], [("b", 4, 1, False), ("a", 2, 2, True)], 3 * 24),
+        ([10, 31, 31, 31], [("b", 4, 1, False)], 0),
+    )
+    with torch.inference_mode():
+        for ids, requests, early in steps:
+            names = [name for name, *_ in requests]
+            computed = torch.zeros(2, dtype=torch.int32, device="cuda")
+            for name, done, _, _ in requests:
+                computed[slots[name]] = done
+            rows = np.array([n for _, _, n, _ in requests], dtype=np.int32)
+            starts = np.zeros(len(requests) + 1, dtype=np.int32)
+            np.cumsum(rows, out=starts[1:])
+            loc = (
+                np.concatenate([starts, [starts[-1]]]) if len(requests) == 1 else starts
+            )
+            prefilling = np.array([p for *_, p in requests], dtype=np.bool_)
+            batch = SimpleNamespace(
+                input_ids=torch.tensor(ids, dtype=torch.int32, device="cuda"),
+                query_start_loc=torch.tensor(loc, dtype=torch.int32, device="cuda"),
+                idx_mapping=torch.tensor(
+                    [slots[n] for n in names], dtype=torch.int32, device="cuda"
+                ),
+                req_ids=names,
+                query_start_loc_np=loc,
+                num_scheduled_tokens=rows,
+                num_computed_prefill_tokens_np=np.array(
+                    [d for _, d, _, _ in requests], dtype=np.int32
+                ),
+                is_prefilling_np=prefilling,
+                has_prefill=bool(prefilling.any()),
+                num_draft_tokens_per_req=None,
+            )
+            req_states = SimpleNamespace(
+                num_computed_tokens=SimpleNamespace(gpu=computed),
+                all_token_ids=SimpleNamespace(gpu=all_token_ids),
+            )
+            before = [s["early_lookups"] for s in _settled_reader_stats(target)]
+            state.prepare_inputs(batch, req_states)
+            mask = ~image_sentinel_mask(batch.input_ids)
+            actual = tuple(
+                engram(hidden, target.prepared_engram_hashes[:4, index], mask)
+                for index, engram in enumerate(_engrams(target))
+            )
+            stats = _settled_reader_stats(target)
+            for engram in _engrams(target):
+                assert engram.embed_tokens.disk_rows.failure() is None
+            assert [s["early_lookups"] - b for s, b in zip(stats, before)] == [
+                early
+            ] * 2
+
+            history = torch.full((2, 3), -1, dtype=torch.int32, device="cuda")
+            for row, (name, done, _, _) in enumerate(requests):
+                width = min(done, 3)
+                history[row, 3 - width :] = all_token_ids[
+                    slots[name], done - width : done
+                ]
+            hashes = resident.engram_hash(
+                batch.input_ids,
+                None,
+                batch.query_start_loc,
+                image_sentinel_mask(batch.input_ids),
+                history,
+            )
+            for index, engram in enumerate(_engrams(resident)):
+                engram.prepare_embeddings(hashes[:, index])
+                expected = engram(hidden, hashes[:, index], mask)
+                torch.testing.assert_close(actual[index], expected, rtol=0, atol=0)
     session.close()
     resident_session.close()
 

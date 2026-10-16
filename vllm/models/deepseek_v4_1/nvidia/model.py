@@ -545,9 +545,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             spec_config is not None and spec_config.use_dspark()
         )
 
-    def prepare_disk_engram(self, input_ids, query_start_loc, lookback_token_ids):
+    def prepare_disk_engram(
+        self, input_ids, query_start_loc, lookback_token_ids, early=None
+    ):
         """Hash this step's tokens and queue each disk Engram table's rows; each
-        Engram layer's forward gathers them."""
+        Engram layer's forward gathers them. ``early`` ([tokens, layers, 24] int64 on
+        the host, or None) holds the row IDs the host hashed for the tokens it knows,
+        ``host_hash.UNKNOWN`` elsewhere: the reader reads those rows before the GPU
+        reaches the step."""
         if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "Disk Engram preparation must run outside compile/capture"
@@ -571,7 +576,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         stream = torch.cuda.current_stream()
         for engram in engrams:
             engram.stage_rows(
-                hashes[:, engram.layer_hash_index], self.engram_hash.num_tokens, stream
+                hashes[:, engram.layer_hash_index],
+                self.engram_hash.num_tokens,
+                stream,
+                None if early is None else early[:, engram.layer_hash_index],
             )
 
     def prepare_dummy_engram(self, num_tokens):

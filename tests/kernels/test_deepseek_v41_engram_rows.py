@@ -236,3 +236,213 @@ if __name__ == "__main__" and sys.argv[1:2] == ["--child-timeout"]:
     _child_times_out(sys.argv[2])
 if __name__ == "__main__" and sys.argv[1:2] == ["--child-reader-fails"]:
     _child_reader_fails(sys.argv[2])
+
+
+# --- Rows the host hashed: read while the previous step computes ------------------
+
+
+def _host_hash_inputs(seed=11):
+    """A random Engram geometry over the real vocabulary size (so the image sentinel
+    and out-of-vocabulary ids are in play)."""
+    from vllm.models.deepseek_v4_1.engram_rows.host_hash import HostEngramHash
+
+    gen = torch.Generator().manual_seed(seed)
+    vocab, layers = 129280, 2
+    token_map = torch.randint(0, 1 << 20, (vocab,), generator=gen, dtype=torch.int64)
+    multipliers = torch.randint(
+        -(1 << 62), 1 << 62, (layers, 4), generator=gen, dtype=torch.int64
+    )
+    primes = torch.randint(
+        1 << 20, 1 << 28, (layers, HEADS), generator=gen, dtype=torch.int64
+    )
+    offsets = torch.randint(
+        0, 1 << 30, (layers, HEADS), generator=gen, dtype=torch.int64
+    )
+    host = HostEngramHash(
+        token_map.numpy(), multipliers.numpy(), primes.numpy(), offsets.numpy()
+    )
+    return gen, host, token_map, multipliers, primes, offsets
+
+
+def test_host_hash_equals_the_gpu_hash():
+    """The host's hash of a step's known rows equals the GPU kernel's, bit for bit:
+    requests at their first chunk and later ones (with history), image tokens,
+    out-of-vocabulary ids, a missing history start, and padding."""
+    from vllm.models.deepseek_v4_1.engram_rows.host_hash import IMAGE_SENTINEL
+    from vllm.models.deepseek_v4_1.tilelang.engram_hash import engram_hash
+
+    gen, host, token_map, multipliers, primes, offsets = _host_hash_inputs()
+    specs = [(0, 57), (37, 81), (2, 19), (0, 3)]  # (chunk start, rows) per request
+    requests, ids, history, starts = [], [], [], [0]
+    for start, rows in specs:
+        tokens = torch.randint(
+            0, 129280, (start + rows,), generator=gen, dtype=torch.int64
+        )
+        tokens[torch.randint(0, start + rows, (5,), generator=gen)] = IMAGE_SENTINEL
+        tokens[torch.randint(0, start + rows, (3,), generator=gen)] = (
+            200_000  # out of vocabulary
+        )
+        chunk = tokens[start:]
+        ids.append(chunk)
+        lookback = [int(tokens[p]) if p >= 0 else -1 for p in range(start - 3, start)]
+        history.append(lookback)
+        requests.append(
+            (
+                starts[-1],
+                rows,
+                tokens.numpy().astype("int32"),
+                __import__("numpy").arange(start, start + rows),
+            )
+        )
+        starts.append(starts[-1] + rows)
+    live, padded = starts[-1], starts[-1] + 9
+    ids = torch.cat(ids + [torch.zeros(9, dtype=torch.int64)]).cuda()
+    out = torch.empty((padded, 2, HEADS), dtype=torch.int64, device="cuda")
+    engram_hash(
+        ids,
+        ids == IMAGE_SENTINEL,
+        torch.tensor(starts, dtype=torch.int32, device="cuda"),
+        torch.tensor(history, dtype=torch.int64, device="cuda"),
+        token_map.cuda(),
+        multipliers.cuda(),
+        primes.cuda(),
+        offsets.cuda(),
+        out,
+        torch.zeros(1, dtype=torch.int32, device="cuda"),
+        torch.zeros(1, dtype=torch.int32, device="cuda"),
+    )
+    expected = host.step_ids(padded, requests)
+    assert (expected[live:] == -1).all()
+    assert torch.equal(out.cpu(), torch.from_numpy(expected))
+
+
+def _early_step(rows, ids, live, early):
+    stream = torch.cuda.current_stream()
+    num_tokens = torch.tensor([live], dtype=torch.int32, device="cuda")
+    out = torch.full(
+        (ids.shape[0], HEADS * 256), 7, dtype=torch.bfloat16, device="cuda"
+    )
+    rows.stage(stream, ids, ids.numel(), early)
+    rows.gather(out, ids, num_tokens)
+    return out
+
+
+@pytest.mark.parametrize("known", ["all", "some"])
+def test_early_rows_give_the_gpu_ids_rows(known):
+    """A step whose rows the host hashed (all, or some with the rest UNKNOWN) gathers
+    the bits a step read from the GPU's IDs does."""
+    from vllm.models.deepseek_v4_1.engram_rows.host_hash import UNKNOWN
+
+    codes, scales, paths = _write_table(_table_dir(), seed=21)
+    rows = _rows(paths, 700, 3900, check_early=True)
+    gen = torch.Generator().manual_seed(22)
+    for step in range(12):
+        ids = torch.randint(0, TABLE_ROWS, (16, HEADS), generator=gen)
+        early = ids.clone().numpy()
+        if known == "some":
+            early[torch.rand(16, generator=gen).numpy() < 0.4] = UNKNOWN
+        out = _early_step(rows, ids.cuda(), 14, early)
+        torch.testing.assert_close(
+            out.cpu(),
+            _reference(codes, scales, ids, 14, 700, 3900),
+            rtol=0,
+            atol=0,
+            equal_nan=True,
+            msg=f"step {step}",
+        )
+    stats = rows.stats()
+    assert (
+        stats["failure"] is None and stats["steps"] == 12 and stats["early_lookups"] > 0
+    )
+    rows.close()
+
+
+def test_early_rows_wait_for_the_previous_gather():
+    """The reader writes a step's early rows only after the GPU has gathered the
+    previous step from the same buffers. As in serving, the next step is staged on the
+    stream after the previous step's gather, while the host runs ahead of the GPU."""
+    codes, scales, paths = _write_table(_table_dir(), seed=23)
+    rows = _rows(paths, tokens=4)
+    stream = torch.cuda.current_stream()
+    first = torch.randint(0, TABLE_ROWS, (4, HEADS)).cuda()
+    second = torch.randint(0, TABLE_ROWS, (4, HEADS))
+    # Device copies before the GPU is kept busy: a pageable copy waits for the stream.
+    second_gpu = second.cuda()
+    num_tokens = torch.tensor([4], dtype=torch.int32, device="cuda")
+    out1 = torch.empty((4, HEADS * 256), dtype=torch.bfloat16, device="cuda")
+    out2 = torch.empty_like(out1)
+    # A whole step first, so no kernel compiles while the GPU is kept busy below.
+    rows.stage(stream, first, first.numel())
+    rows.gather(out1, first, num_tokens)
+    torch.cuda.synchronize()
+    rows.stage(stream, first, first.numel())
+    deadline = time.monotonic() + 30
+    while (
+        int(rows._control[rows.native.CTRL_ROWS_SEQ]) != rows._sequence
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.001)
+    held = rows.weights.host.clone()
+    torch.cuda._sleep(int(1e9))  # the GPU is still busy before step 1's gather
+    rows.gather(out1, first, num_tokens)
+    rows.stage(stream, second_gpu, second.numel(), second.numpy())
+    time.sleep(0.2)
+    assert torch.equal(rows.weights.host, held), (
+        "early rows overwrote rows the GPU had not gathered"
+    )
+    rows.gather(out2, second_gpu, num_tokens)
+    torch.testing.assert_close(
+        out1.cpu(),
+        _reference(codes, scales, first, 4, 0, TABLE_ROWS),
+        rtol=0,
+        atol=0,
+        equal_nan=True,
+    )
+    torch.testing.assert_close(
+        out2.cpu(),
+        _reference(codes, scales, second, 4, 0, TABLE_ROWS),
+        rtol=0,
+        atol=0,
+        equal_nan=True,
+    )
+    rows.close()
+
+
+def test_a_step_the_host_hashed_is_published_before_the_gpu_reaches_it():
+    """All of a step's rows known early: the reader publishes it while the GPU is still
+    busy before the step's staging (its row IDs have not reached the host)."""
+    _, _, paths = _write_table(_table_dir(), seed=25)
+    rows = _rows(paths, tokens=8)
+    stream = torch.cuda.current_stream()
+    ids = torch.randint(0, TABLE_ROWS, (8, HEADS))
+    ids_gpu = ids.cuda()  # before the sleep: a pageable copy waits for the stream
+    torch.cuda._sleep(int(2e9))  # about a second of GPU work ahead of the staging
+    rows.stage(stream, ids_gpu, ids.numel(), ids.numpy())
+    deadline = time.monotonic() + 30
+    while (
+        int(rows._control[rows.native.CTRL_ROWS_SEQ]) != rows._sequence
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.001)
+    assert int(rows._control[rows.native.CTRL_ROWS_SEQ]) == rows._sequence
+    assert int(rows._control[rows.native.CTRL_IDS_SEQ]) != rows._sequence, (
+        "the GPU reached the staging first"
+    )
+    torch.cuda.synchronize()
+    rows.close()
+
+
+def test_a_mismatched_early_id_is_named():
+    """Debug check: an early ID that differs from the GPU's fails the step with both."""
+    _, _, paths = _write_table(_table_dir(), seed=27)
+    rows = _rows(paths, tokens=2, check_early=True)
+    ids = torch.full((2, HEADS), 10, dtype=torch.int64)
+    early = ids.clone().numpy()
+    early[1, 5] = 11
+    rows.stage(
+        torch.cuda.current_stream(), ids.cuda(), ids.numel(), early
+    )  # no gather: it would wait
+    deadline = time.monotonic() + 30
+    while rows.failure() is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert "lookup 29: the host hashed row 11, the GPU row 10" in rows.failure()

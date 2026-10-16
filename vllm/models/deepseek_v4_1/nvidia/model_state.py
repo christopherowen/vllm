@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -62,6 +63,12 @@ class DeepseekV41ModelState(DefaultModelState):
     the full token history on device, so the window is gathered there every
     step: exact for prompt and generated tokens alike, whatever instance
     produced their KV.
+
+    With disk Engram tables, the host also keeps each request's prefill tokens
+    and hashes the rows of a step's prefill chunks when it prepares the step,
+    a step before the GPU runs it, so the reader can read them while the
+    previous step computes (``engram_rows/host_hash.py``). Rows of tokens the
+    GPU samples are hashed on the GPU as before; one step can hold both.
     """
 
     _ced_streaming_prefix_start: tuple[str, int] | None = None
@@ -130,6 +137,10 @@ class DeepseekV41ModelState(DefaultModelState):
             for module in model.modules()
             if isinstance(module, DeepseekV4Model) and module.disk_engram
         )
+        # Disk Engram: each live request's prefill tokens (prompt, and on resumption
+        # the outputs it recomputes), for the host's hash of its prefill chunks.
+        self._prefill_tokens: dict[str, np.ndarray] = {}
+        self._host_engram_hash = None
 
     def prepare_streaming_update(self, req_id: str) -> None:
         """Keep decoder history when the runner refreshes a live request."""
@@ -140,6 +151,10 @@ class DeepseekV41ModelState(DefaultModelState):
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
+        if self.disk_engram_models and new_req_data.prefill_token_ids is not None:
+            self._prefill_tokens[new_req_data.req_id] = np.asarray(
+                new_req_data.prefill_token_ids, dtype=np.int32
+            )
         sampling = new_req_data.sampling_params
         if sampling is not None and sampling.prompt_logprobs is not None:
             self._ced_prompt_logprobs.add(new_req_data.req_id)
@@ -158,6 +173,7 @@ class DeepseekV41ModelState(DefaultModelState):
 
     def remove_request(self, req_id: str) -> None:
         super().remove_request(req_id)
+        self._prefill_tokens.pop(req_id, None)
         self._ced_prompt_logprobs.discard(req_id)
         self._ced_prefix_start.pop(req_id, None)
 
@@ -273,9 +289,55 @@ class DeepseekV41ModelState(DefaultModelState):
         model_inputs["lookback_token_ids"] = window
         for model in self.disk_engram_models:
             model.prepare_disk_engram(
-                input_batch.input_ids, input_batch.query_start_loc, window
+                input_batch.input_ids,
+                input_batch.query_start_loc,
+                window,
+                self._early_engram_ids(model, input_batch),
             )
         return model_inputs
+
+    def _early_engram_ids(self, model, input_batch: InputBatch) -> np.ndarray | None:
+        """The step's Engram row IDs the host can hash now, ``[tokens, layers, 24]``
+        (``host_hash.UNKNOWN`` for rows of tokens the GPU samples, -1 for padding),
+        or None when the step has no prefill chunk to hash."""
+        if not input_batch.has_prefill:
+            return None
+        from vllm.models.deepseek_v4_1.engram_rows.host_hash import HostEngramHash
+
+        if self._host_engram_hash is None:
+            layout = model.engram_hash.layout
+            geometry = layout.geometry
+            self._host_engram_hash = HostEngramHash(
+                layout.token_map,
+                geometry.multipliers,
+                geometry.primes,
+                geometry.offsets,
+            )
+        starts = input_batch.query_start_loc_np
+        requests = []
+        for i, req_id in enumerate(input_batch.req_ids):
+            first, rows = int(starts[i]), int(input_batch.num_scheduled_tokens[i])
+            tokens = self._prefill_tokens.get(req_id)
+            positions = np.empty(0, dtype=np.int64)
+            if tokens is not None and input_batch.is_prefilling_np[i]:
+                start = int(input_batch.num_computed_prefill_tokens_np[i])
+                positions = np.arange(
+                    start, min(start + rows, len(tokens)), dtype=np.int64
+                )
+            requests.append((first, rows, tokens, positions))
+        hashed = [i for i, (*_, positions) in enumerate(requests) if len(positions)]
+        if not hashed:
+            return None
+        # Adaptive verification gives verifying requests row counts the GPU chooses,
+        # but keeps them at the front of the batch with the host's total, so every
+        # later request starts at the same row on the host and the GPU.
+        drafts = input_batch.num_draft_tokens_per_req
+        if drafts is not None and drafts[hashed[0] :].any():
+            raise RuntimeError(
+                "Engram host hash: a verifying request follows a prefill chunk, so "
+                "the chunk's rows are placed by the GPU"
+            )
+        return self._host_engram_hash.step_ids(input_batch.input_ids.shape[0], requests)
 
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
         model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
