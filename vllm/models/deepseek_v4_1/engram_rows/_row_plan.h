@@ -2,7 +2,8 @@
  * Row planning for the Engram disk reader, from b12x's PLE reader
  * (local-inference-lab/b12x b12x/loader/_row_plan.h, Apache-2.0): immutable source
  * registration and allocation-free planning of 4 KiB-aligned direct reads. Unlike
- * b12x's, it leaves the slots of other ranks' rows untouched. */
+ * b12x's, it leaves the slots of other ranks' rows untouched: a rank owns the rows in
+ * [tp_start, tp_end) of the hash columns in its mask (lookup i is column i % 24). */
 
 #ifndef B12X_ROW_PLAN_H
 #define B12X_ROW_PLAN_H
@@ -10,6 +11,8 @@
 #include <time.h>
 #define PLE_BLOCK 4096u
 #define PLE_READ_MAX 65536u
+#define PLE_COLUMNS 24u
+#define PLE_ALL_COLUMNS ((1u << PLE_COLUMNS) - 1u)
 
 typedef struct {
     int fd;
@@ -41,6 +44,7 @@ typedef struct {
 
 typedef struct {
     int64_t shard_rows, padded_rows, tp_start, tp_end;
+    uint32_t columns;
     size_t weight_bytes, scale_bytes, max_lookups, capacity;
     ple_fragment_t *fragments;
     ple_job_t *jobs;
@@ -69,9 +73,10 @@ static inline void ple_plan_release(ple_plan_t *reader) {
 }
 
 static inline int ple_plan_init(ple_plan_t *reader, int64_t shard_rows,
-        int64_t padded_rows, int64_t tp_start, int64_t tp_end,
+        int64_t padded_rows, int64_t tp_start, int64_t tp_end, uint32_t columns,
         int64_t weight_bytes, int64_t scale_bytes, int64_t max_lookups) {
     if (shard_rows <= 0 || padded_rows <= 0 || tp_start < 0 || tp_end < tp_start ||
+        !columns || (columns & ~PLE_ALL_COLUMNS) ||
         tp_end > padded_rows || weight_bytes <= 0 || scale_bytes < 0 || max_lookups <= 0 ||
         weight_bytes > PY_SSIZE_T_MAX / max_lookups ||
         scale_bytes > PY_SSIZE_T_MAX / max_lookups || max_lookups > PY_SSIZE_T_MAX / 8)
@@ -85,6 +90,7 @@ static inline int ple_plan_init(ple_plan_t *reader, int64_t shard_rows,
     reader->padded_rows = padded_rows;
     reader->tp_start = tp_start;
     reader->tp_end = tp_end;
+    reader->columns = columns;
     reader->weight_bytes = weight_bytes;
     reader->scale_bytes = scale_bytes;
     reader->max_lookups = max_lookups;
@@ -235,7 +241,9 @@ static inline bool ple_plan(ple_plan_t *reader, const char *ids, size_t count) {
         memcpy(&id, ids + i * sizeof(id), sizeof(id));
         /* Another rank's row (or a dead lookup): its slot is not read; the gather writes
          * zeros for it without loading the slot. */
-        if (id < reader->tp_start || id >= reader->tp_end) continue;
+        if (id < reader->tp_start || id >= reader->tp_end ||
+            !((reader->columns >> (i % PLE_COLUMNS)) & 1u))
+            continue;
         for (int plane = 0; plane < (reader->scale_bytes ? 2 : 1); plane++) {
             ple_source_t key = {.shard = id / reader->shard_rows, .scale = plane != 0};
             ple_source_t *source = reader->source_count ? bsearch(&key, reader->sources,

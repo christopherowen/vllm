@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The Engram disk reader and its TileLang wait and gather: the old path's bits, fresh
-rows on every step, other ranks' slots never read, tables read in staging order, rows
+rows on every step, other ranks' slots (rows or hash columns) never read, tables read in staging order, rows
 that arrive while the main thread holds the GIL, and failures that name themselves (a
 short read, a reader failure that stops the GPU at once, and a GPU wait that times
 out)."""
@@ -21,6 +21,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 
 TABLE_ROWS = 4099
 HEADS = 24
+ALL_COLUMNS = (1 << HEADS) - 1
+TP3_RANK1 = sum(1 << column for column in range(1, HEADS, 3))  # heads 1, 4, ..., 22
 WEIGHT_OFFSET, SCALE_OFFSET = 4093, 123  # unaligned: the planner aligns the reads
 
 
@@ -47,10 +49,11 @@ def _write_table(directory: str, seed: int = 0):
     return codes, scales, paths
 
 
-def _reference(codes, scales, ids, live, start, end):
+def _reference(codes, scales, ids, live, start, end, columns=ALL_COLUMNS):
     """b12x's lookup in torch: value times its E8M0 scale, rounded to BF16."""
     rows = ids.cpu().long()
     local = (rows >= start) & (rows < end)
+    local &= torch.tensor([bool(columns >> h & 1) for h in range(HEADS)])[None, :]
     local[live:] = False
     safe = rows.clamp(0, TABLE_ROWS - 1)
     values = codes[safe].view(torch.float8_e4m3fn).float()
@@ -84,11 +87,12 @@ def _same(a, b):
     return torch.equal(a.view(torch.int16).cpu(), b.view(torch.int16).cpu())
 
 
+@pytest.mark.parametrize("columns", [ALL_COLUMNS, TP3_RANK1])
 @pytest.mark.parametrize("shard", [(0, TABLE_ROWS), (1000, 3000)])
-def test_gather_matches_b12x_lookup_bits(shard):
+def test_gather_matches_b12x_lookup_bits(shard, columns):
     codes, scales, paths = _write_table(_table_dir())
     start, end = shard
-    rows = _rows(paths, start, end)
+    rows = _rows(paths, start, end, columns=columns)
     # Slots of other ranks' rows are never written or read: fill them with E4M3 NaN.
     rows.weights.host.fill_(0x7F)
     rows.scales.host.fill_(0xFF)
@@ -98,8 +102,11 @@ def test_gather_matches_b12x_lookup_bits(shard):
     ids[5, 4] = -1  # a dead lookup
     ids = ids.cuda()
     out, num_tokens = _step(rows, ids, 13)
-    torch.testing.assert_close(out.cpu(), _reference(codes, scales, ids, 13, start, end),
+    torch.testing.assert_close(out.cpu(), _reference(codes, scales, ids, 13, start, end, columns),
                                rtol=0, atol=0, equal_nan=True)
+    if columns != ALL_COLUMNS:
+        rows.close()
+        return  # b12x's lookup shards by rows only
     # The old path: b12x's Triton lookup over the same mapped buffers, compact rows.
     from b12x.sequence.engram._kernels import _lookup
 
@@ -463,6 +470,7 @@ assert [r["sequence"] for r in records] == [1, 2, 3], records
 for r in records:
     assert r["submitted"] <= r["started"] <= r["ids"] <= r["read"] <= r["published"], r
     assert r["count"] == 4 * t.HEADS and r["early"] == 0
+    assert 0 < r["plan_ns"] <= r["read"] - r["ids"], r
 # Step 1's kernels compile on the host while its rows are read, so its wait is short;
 # the GPU waited for step 2's delayed rows, and step 3's service saw that wait.
 assert records[1]["gpu_sequence"] == 1, records[1]
@@ -486,6 +494,13 @@ def test_timeline_records_each_step_and_the_gpu_wait():
         env=env, capture_output=True, text=True, timeout=600,
     )
     assert result.returncode == 0, result.stderr[-3000:]
+
+
+@pytest.mark.parametrize("columns", [0, 1 << HEADS])
+def test_a_malformed_column_mask_is_refused(columns):
+    _, _, paths = _write_table(_table_dir(), seed=29)
+    with pytest.raises(ValueError, match="24-bit mask"):
+        _rows(paths, tokens=4, columns=columns)
 
 
 def test_timeline_is_off_by_default():

@@ -532,23 +532,34 @@ def _load_table(param, loaded_weight):
 
 
 def column_shard(geometry, layer_index: int, tp_size: int, tp_rank: int):
-    """A disk table's shard on whole hash columns, or None.
+    """A disk table's shard on whole hash columns, or None: the columns rank
+    ``tp_rank`` reads, every ``tp_size``-th from ``tp_rank``.
 
-    A layer's table is its 24 hash columns' prime-sized ranges back to back, each
-    just above the Engram vocabulary. When the TP size divides 24, rank r owns
-    columns [24r/N, 24(r+1)/N): rows ``offsets`` start to end (within a few
-    thousand rows of an equal split), and in the gathered rows the contiguous band
-    of those columns' 256 values. Returns (row start, row end, band start, band
-    end)."""
+    A layer's table is its 24 hash columns' prime-sized ranges back to back; heads
+    0-7 hash 2-grams, 8-15 3-grams and 16-23 4-grams, and a longer n-gram repeats
+    less, so a step reads more distinct rows of it (1 : 1.35 : 1.54 on source text).
+    Interleaving gives every rank columns of each order (TP3: 3/3/2, 3/2/3, 2/3/3;
+    TP4: 2/2/2), where contiguous columns gave one rank every 4-gram head and the
+    slowest reads. A rank's gathered columns are joined by an all-gather and put back
+    in column order (``interleaved_rows``). Requires a TP size that divides 24."""
     columns = len(geometry.offsets[layer_index])
     if columns % tp_size:
         return None
-    per_rank = columns // tp_size
-    offsets = [int(o) for o in geometry.offsets[layer_index]]
-    table_rows = int(geometry.num_embeddings[layer_index])
-    first, last = tp_rank * per_rank, (tp_rank + 1) * per_rank
-    end = offsets[last] if last < columns else table_rows
-    return offsets[first], end, first * 256, last * 256
+    return tuple(range(tp_rank, columns, tp_size))
+
+
+def interleaved_rows(local: torch.Tensor, tp_size: int) -> torch.Tensor:
+    """Rows ``[T, 24 * 256]`` in column order from every rank's columns: ``local`` is
+    this rank's ``[T, (24 / tp_size) * 256]``, columns ``rank, rank + tp, ...``. The
+    all-gather lays them out rank-major, so rank r's k-th block is column k * tp + r;
+    a transpose puts them back. Exact copies: the same values as one reader's rows."""
+    tokens = local.shape[0]
+    gathered = tensor_model_parallel_all_gather(local, dim=-1)
+    return (
+        gathered.view(tokens, tp_size, 24 // tp_size, 256)
+        .transpose(1, 2)
+        .reshape(tokens, 24 * 256)
+    )
 
 
 class ParallelEngramEmbedding(nn.Module):
@@ -562,10 +573,11 @@ class ParallelEngramEmbedding(nn.Module):
         self.shard_rows = (self.table_rows + caps.tp_size - 1) // caps.tp_size
         self.shard_start = caps.tp_rank * self.shard_rows
         self.shard_end = (caps.tp_rank + 1) * self.shard_rows
-        # A disk table's rank reads whole hash columns when the TP size divides
-        # them, so its gathered rows are one band and the ranks' rows are joined by
-        # an all-gather of the bands, not summed (resident tables keep equal rows).
-        self.band = None
+        # A disk table's rank reads whole hash columns (every tp-th) when the TP size
+        # divides them, so the ranks' rows are joined by an all-gather of their
+        # columns, not summed (resident tables keep equal row shards).
+        self.columns = None
+        self.column_mask = (1 << 24) - 1
         columns = (
             column_shard(
                 geometry,
@@ -577,8 +589,9 @@ class ParallelEngramEmbedding(nn.Module):
             else None
         )
         if columns is not None:
-            self.shard_start, self.shard_end, *band = columns
-            self.band = tuple(band)
+            self.shard_start, self.shard_end = 0, self.table_rows
+            self.columns = columns
+            self.column_mask = sum(1 << column for column in columns)
         self.weight_shape = (self.shard_rows, 256)
         self.scale_shape = (self.shard_rows, 8)
         self.tp_size = caps.tp_size
@@ -718,6 +731,7 @@ class ParallelEngramEmbedding(nn.Module):
             table_rows=self.table_rows,
             shard_start=min(self.shard_start, self.table_rows),
             shard_end=min(self.shard_end, self.table_rows),
+            columns=self.column_mask,
             max_lookups=self.caps.max_tokens * 24,
             rows_timeout_s=ENGRAM_ROWS_TIMEOUT_S,
             delay_s=ENGRAM_READ_DELAY_S,
@@ -1029,13 +1043,17 @@ class Engram(nn.Module):
             raise RuntimeError("Disk Engram output is not prepared")
         if self.embed_tokens.table_memory == "disk":
             self.embed_tokens.gather_rows(self.staged_rows[: hash_ids.shape[0]])
-        band = self.embed_tokens.band
-        if band is not None:
-            # This rank's gathered rows are one band of whole hash columns.
-            rows = tensor_model_parallel_all_gather(
-                self.staged_rows[: hash_ids.shape[0], band[0] : band[1]].contiguous(),
-                dim=-1,
+        columns = self.embed_tokens.columns
+        if columns is not None:
+            # This rank's gathered rows are its hash columns, every tp-th.
+            tp_size = 24 // len(columns)
+            tokens = hash_ids.shape[0]
+            local = (
+                self.staged_rows[:tokens]
+                .view(tokens, len(columns), tp_size, 256)[:, :, columns[0], :]
+                .reshape(tokens, len(columns) * 256)
             )
+            rows = interleaved_rows(local, tp_size)
         else:
             rows = tensor_model_parallel_all_reduce(
                 self.staged_rows[: hash_ids.shape[0]]

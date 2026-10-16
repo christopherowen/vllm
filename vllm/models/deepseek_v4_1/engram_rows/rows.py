@@ -98,8 +98,12 @@ class MappedHostAllocation:
                 self.close()
 
 
+ALL_COLUMNS = (1 << 24) - 1
+
+
 class EngramDiskRows:
-    """Rows ``[shard_start, shard_end)`` of one Engram table, ``max_lookups`` per step.
+    """Rows ``[shard_start, shard_end)`` of the hash columns in the 24-bit mask ``columns``
+    of one Engram table (lookup i of a step is column i % 24), ``max_lookups`` per step.
 
     ``ids_timeout_s`` bounds the reader's waits for the GPU (a step's row IDs, or its
     gather of the previous step) and ``rows_timeout_s`` the GPU's wait for its rows;
@@ -108,12 +112,16 @@ class EngramDiskRows:
     """
 
     def __init__(self, *, device, table_rows: int, shard_start: int, shard_end: int,
-                 max_lookups: int, queue_depth: int = 128, ids_timeout_s: float = 20.0,
+                 max_lookups: int, columns: int = ALL_COLUMNS, queue_depth: int = 128,
+                 ids_timeout_s: float = 20.0,
                  rows_timeout_s: float = 10.0, delay_s: float = 0.0,
                  check_early: bool = False, timeline: bool = False):
         self.native = load()
         self.device = _indexed(device)
         self.shard_start, self.shard_end = int(shard_start), int(shard_end)
+        self.columns = int(columns)
+        if not 0 < self.columns <= ALL_COLUMNS:
+            raise ValueError(f"Engram reader columns must be a nonzero 24-bit mask: {columns:#x}")
         self.max_lookups = int(max_lookups)
         self.check_early = bool(check_early)
         self.timeline_enabled = bool(timeline)
@@ -127,7 +135,7 @@ class EngramDiskRows:
         self._control[self.native.CTRL_TIMEOUT_US] = int(rows_timeout_s * 1e6)
         self.rows_e4m3 = self.weights.device_view.view(torch.float8_e4m3fn)
         self._reader = self.native.reader(
-            table_rows, self.shard_start, self.shard_end, self.max_lookups, queue_depth,
+            table_rows, self.shard_start, self.shard_end, self.columns, self.max_lookups, queue_depth,
             self.ids.data_ptr(), self.weights.pointer, self.scales.pointer, self.control.pointer,
             float(ids_timeout_s), float(delay_s), self.check_early,
             self.timeline_enabled,
@@ -175,11 +183,12 @@ class EngramDiskRows:
     def gather(self, out: torch.Tensor, ids: torch.Tensor, num_tokens: torch.Tensor) -> None:
         """Wait for the staged step's rows and dequantize the first ``num_tokens``
         tokens' rows into ``out`` (``[tokens, 24 * 256]`` BF16), zero elsewhere and for
-        rows outside this rank's shard. Capturable in a CUDA graph."""
+        rows outside this rank's shard or columns. Capturable in a CUDA graph."""
         from vllm.models.deepseek_v4_1.tilelang.engram_rows import engram_rows_gather
 
         engram_rows_gather(ids, num_tokens, self.rows_e4m3, self.scales.device_view,
-                           self.control.device_view, out, self.shard_start, self.shard_end)
+                           self.control.device_view, out, self.shard_start, self.shard_end,
+                           self.columns)
 
     def failure(self) -> str | None:
         """Why the rows stopped, or None: the reader's failure or the GPU's timeout."""
@@ -211,14 +220,15 @@ class EngramDiskRows:
         return self.native.status(self._reader)
 
     TIMELINE_FIELDS = ("sequence", "count", "early", "gpu_sequence", "gpu_wait_ns",
-                       "submitted", "started", "consumed", "ids", "read", "published")
+                       "submitted", "started", "consumed", "ids", "read", "published", "plan_ns")
 
     def timeline(self) -> list[dict]:
         """Debug: the steps served since the last call, oldest first (``timeline`` on).
         Times are CLOCK_MONOTONIC ns: the host queued the step (submitted), the worker
         began it (started), saw the previous step gathered (consumed, early rows only),
         saw the GPU's IDs (ids), read the rows (read) and published them (published).
-        gpu_wait_ns is the GPU's wait for gpu_sequence, the step before this one."""
+        gpu_wait_ns is the GPU's wait for gpu_sequence, the step before this one; plan_ns
+        the time the step's reads spent planning (sorting and merging its lookups)."""
         rows = self.native.timeline(self._reader)
         return [dict(zip(self.TIMELINE_FIELDS, row)) for row in rows]
 

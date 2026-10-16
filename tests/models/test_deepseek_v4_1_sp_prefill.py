@@ -311,7 +311,7 @@ def test_engram_gates_only_the_real_local_rows(monkeypatch):
     monkeypatch.setattr(engram_ops, "tensor_model_parallel_all_reduce", lambda x: x)
     staged = torch.randn(tokens, 6)
     engram = SimpleNamespace(
-        embed_tokens=SimpleNamespace(table_memory="device", band=None),
+        embed_tokens=SimpleNamespace(table_memory="device", columns=None),
         overlap_epochs=None,
         staged_rows=staged,
         wkv=lambda rows: rows.repeat(1, 2),

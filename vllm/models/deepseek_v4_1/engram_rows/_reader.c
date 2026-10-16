@@ -56,7 +56,7 @@ static void system_error(failure_t *failure, const char *operation) {
 #include "_row_plan.h"
 
 #define READER_CAPSULE "vllm.engram_rows.reader"
-#define ABI_VERSION 4
+#define ABI_VERSION 5
 
 /* Control block: 32-bit words in mapped host memory, one 64-byte line per writer. */
 #define CTRL_IDS_SEQ 0      /* the GPU stream: the step whose row IDs are on the host */
@@ -96,7 +96,7 @@ typedef struct {
  * wait is the last one it recorded when the step's service began: the previous step's. */
 typedef struct {
     uint32_t sequence, count, early, gpu_sequence, gpu_wait_ns;
-    uint64_t submitted, started, consumed, ids, read, published;
+    uint64_t submitted, started, consumed, ids, read, published, plan_ns;
 } record_t;
 #define TIMELINE 8192
 
@@ -120,6 +120,7 @@ typedef struct {
     bool check_early; /* debug: an early ID must equal the GPU's */
     record_t *timeline; /* debug: the last TIMELINE served steps (mutex), or NULL */
     uint64_t timeline_next, timeline_read;
+    uint64_t step_plan_ns; /* debug (timeline): the served step's planning time, worker only */
     /* Serving: started (sources fixed) and closing are set once; pending (steps
      * queued or being read) is guarded by the queue's mutex, the rest by mutex. */
     bool started, closing;
@@ -316,12 +317,15 @@ static failure_t read_rows(reader_t *reader, const char *ids, uint32_t count) {
     reader->plan.lookups = count;
     reader->plan.requested_bytes = reader->plan.read_bytes = reader->plan.read_calls = 0;
     reader->plan.unique_blocks = reader->plan.coalesced_reads = reader->plan.submit_calls = 0;
-    if (reader->poisoned)
+    if (reader->poisoned) {
         snprintf(reader->plan.failure.message, sizeof(reader->plan.failure.message),
                  "Engram reader is unusable after an io_uring submission or completion failure");
-    else if (ple_plan(&reader->plan, ids, count) &&
-             reader->plan.job_count)
-        ple_uring_run(reader);
+        return reader->plan.failure;
+    }
+    uint64_t planning = now_ns();
+    bool planned = ple_plan(&reader->plan, ids, count);
+    reader->step_plan_ns += now_ns() - planning;
+    if (planned && reader->plan.job_count) ple_uring_run(reader);
     return reader->plan.failure;
 }
 
@@ -412,6 +416,7 @@ static void serve(reader_t *reader, step_t step) {
     failure_t failure = {{0}};
     uint64_t started = now_ns();
     uint32_t gpu_sequence = 0, gpu_wait_ns = 0;
+    reader->step_plan_ns = 0;
     if (reader->timeline) {
         gpu_sequence = __atomic_load_n(&reader->control[CTRL_GPU_WAIT_SEQ], __ATOMIC_ACQUIRE);
         gpu_wait_ns = __atomic_load_n(&reader->control[CTRL_GPU_WAIT_NS], __ATOMIC_RELAXED);
@@ -457,7 +462,7 @@ static void serve(reader_t *reader, step_t step) {
     if (reader->timeline) {
         record_t record = {step.sequence, step.count, (uint32_t)early_count, gpu_sequence, gpu_wait_ns,
                            step.submitted, started, started + (uint64_t)(consumed_wait * 1e9),
-                           ids_at, read_at, now_ns()};
+                           ids_at, read_at, now_ns(), reader->step_plan_ns};
         pthread_mutex_lock(&reader->mutex);
         reader->timeline[reader->timeline_next++ % TIMELINE] = record;
         pthread_mutex_unlock(&reader->mutex);
@@ -548,22 +553,26 @@ static reader_t *get_reader(PyObject *capsule) {
     return PyCapsule_GetPointer(capsule, READER_CAPSULE);
 }
 
-/* reader(table_rows, shard_start, shard_end, max_lookups, queue_depth, ids, weights,
- *        scales, control, ids_timeout_s, delay_s, check_early, timeline): the four buffers
+/* reader(table_rows, shard_start, shard_end, columns, max_lookups, queue_depth, ids, weights,
+ *        scales, control, ids_timeout_s, delay_s, check_early, timeline): the rank reads the
+ * rows in [shard_start, shard_end) of the hash columns in the 24-bit mask ``columns``
+ * (lookup i is column i % 24); the four buffers
  * are addresses of host memory that outlives the reader; check_early (debug) fails a step
  * whose early ID differs from the GPU's; timeline (debug) records each served step. */
 static PyObject *py_reader(PyObject *self, PyObject *args) {
     (void)self;
     long long table_rows, shard_start, shard_end, max_lookups;
+    unsigned int columns;
     int depth;
     unsigned long long ids, weights, scales, control;
     double ids_timeout, delay;
     int check_early, timeline;
-    if (!PyArg_ParseTuple(args, "LLLLiKKKKddpp", &table_rows, &shard_start, &shard_end, &max_lookups,
+    if (!PyArg_ParseTuple(args, "LLLILiKKKKddpp", &table_rows, &shard_start, &shard_end, &columns, &max_lookups,
                           &depth, &ids, &weights, &scales, &control, &ids_timeout, &delay, &check_early,
                           &timeline))
         return NULL;
     if (table_rows <= 0 || shard_start < 0 || shard_end < shard_start || shard_end > table_rows ||
+        !columns || (columns & ~PLE_ALL_COLUMNS) ||
         max_lookups <= 0 || max_lookups > UINT32_MAX || depth <= 0 || depth > 32768 || !ids ||
         !weights || !scales || !control || !(ids_timeout > 0) || delay < 0)
         return PyErr_Format(PyExc_ValueError, "invalid Engram reader geometry, buffers or times");
@@ -571,7 +580,7 @@ static PyObject *py_reader(PyObject *self, PyObject *args) {
     if (!reader) return PyErr_NoMemory();
     pthread_mutex_init(&reader->mutex, NULL);
     /* One whole-table source per plane: shard 0 spans every row. */
-    int error = ple_plan_init(&reader->plan, table_rows, table_rows, shard_start, shard_end, 256, 8,
+    int error = ple_plan_init(&reader->plan, table_rows, table_rows, shard_start, shard_end, columns, 256, 8,
                               max_lookups);
     if (error) {
         release(reader);
@@ -802,11 +811,11 @@ static PyObject *py_timeline(PyObject *self, PyObject *capsule) {
     pthread_mutex_unlock(&reader->mutex);
     for (uint64_t i = 0; i < last - first; i++) {
         record_t *r = &copy[i];
-        PyObject *row = Py_BuildValue("(IIIIIKKKKKK)", r->sequence, r->count, r->early, r->gpu_sequence,
+        PyObject *row = Py_BuildValue("(IIIIIKKKKKKK)", r->sequence, r->count, r->early, r->gpu_sequence,
                                       r->gpu_wait_ns, (unsigned long long)r->submitted,
                                       (unsigned long long)r->started, (unsigned long long)r->consumed,
                                       (unsigned long long)r->ids, (unsigned long long)r->read,
-                                      (unsigned long long)r->published);
+                                      (unsigned long long)r->published, (unsigned long long)r->plan_ns);
         if (!row || PyList_Append(result, row) < 0) {
             Py_XDECREF(row);
             Py_DECREF(result);

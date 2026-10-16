@@ -13,9 +13,9 @@ stream:
   memory from every gather block cost about 0.5 us a block.
 - the gather: one block per (head, token) dequantizes the row as b12x's Engram
   lookup does (the value times its E8M0 scale, 2^-127 for byte 0 and NaN for 255,
-  rounded to BF16) into the token's head slice. A token past the step or a row
-  outside this rank's shard loads nothing and writes zeros (the reader leaves those
-  slots untouched).
+  rounded to BF16) into the token's head slice. A token past the step, or a row
+  outside this rank's shard or hash columns, loads nothing and writes zeros (the
+  reader leaves those slots untouched).
 - the release: one thread writes the step it gathered into the control block, so the
   reader may now fill the buffers with the next step's early rows (those the host
   hashed while this step ran).
@@ -156,6 +156,7 @@ def engram_rows_gather_kernel(
     max_lookups: int,
     shard_start: int,
     shard_end: int,
+    columns: int = (1 << HEADS) - 1,
     threads: int = 64,
     vec: int = 4,
 ):
@@ -174,7 +175,10 @@ def engram_rows_gather_kernel(
             tx = T.get_thread_binding()
             row = ids[t, head]
             lookup = t * HEADS + head
-            if (t < num_tokens[0]) & (row >= shard_start) & (row < shard_end):
+            owned = (t < num_tokens[0]) & (row >= shard_start) & (row < shard_end)
+            if columns != (1 << HEADS) - 1:
+                owned = owned & (T.bitwise_and(T.shift_right(T.int32(columns), head), 1) == 1)
+            if owned:
                 exponent = T.cast(scales[lookup, tx * vec // 32], T.uint32)
                 scale = T.reinterpret(T.shift_left(exponent, 23), T.float32)
                 scale = T.if_then_else(exponent == 0, T.float32(2.0**-127), scale)
@@ -200,19 +204,22 @@ def engram_rows_gather(
     out: torch.Tensor,
     shard_start: int,
     shard_end: int,
+    columns: int = (1 << HEADS) - 1,
 ) -> None:
     """Wait for the staged step's rows, dequantize the first ``num_tokens`` tokens'
     rows into ``out`` ([tokens, 24 * 256] BF16), then release the buffers to the
     reader. ``ids`` ([>= tokens, 24] int64) are the step's row IDs; ``rows``,
-    ``scales`` and ``control`` are the reader's mapped buffers."""
+    ``scales`` and ``control`` are the reader's mapped buffers; the rank owns the
+    rows in [shard_start, shard_end) of the hash columns in the mask ``columns``."""
     engram_rows_wait_kernel()(control)
     tokens = out.shape[0]
     if tokens:
-        kernel = engram_rows_gather_kernel(rows.shape[0], shard_start, shard_end)
+        kernel = engram_rows_gather_kernel(rows.shape[0], shard_start, shard_end, columns)
         kernel(ids[:tokens], num_tokens, rows, scales, out)
     engram_rows_release_kernel()(control)
 
 
 @engram_rows_gather.register_fake
-def _engram_rows_gather_fake(ids, num_tokens, rows, scales, control, out, shard_start, shard_end):
+def _engram_rows_gather_fake(ids, num_tokens, rows, scales, control, out, shard_start, shard_end,
+                             columns=(1 << HEADS) - 1):
     return None
