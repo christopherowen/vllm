@@ -1450,6 +1450,14 @@ class Worker(WorkerBase):
         if tilelang_calls:
             prepare.freeze("every declared kernel was prepared before memory profiling")
             prepare.bind_declared(registry)
+            # Nothing compiles from here on: the JIT monitor reports (or, in error
+            # mode, refuses) any other compile, Triton's included, from profiling on.
+            from vllm.utils.jit_monitor import activate as activate_jit_monitor
+
+            activate_jit_monitor(
+                mode=self.observability_config.jit_monitor_mode,
+                verbose=self.observability_config.jit_monitor_verbose,
+            )
         logger.info(
             "Prepared %d TileLang calls and the registry's other kernels in %.1f s.",
             tilelang_calls,
