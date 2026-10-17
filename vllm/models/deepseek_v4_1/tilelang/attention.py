@@ -159,11 +159,10 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
         are checked on first use)."""
         plans = self.__dict__.get("_tilelang_plans")
         if plans is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "V4.1 TileLang kernels must be built before CUDA graph capture"
-                )
-            plans = self._tilelang_plans = self._build_tilelang_plans()
+            raise RuntimeError(
+                "V4.1 TileLang attention plans are built when the layer's kernels "
+                "are bound: declare_kernels() was not run for this layer"
+            )
         if not self.__dict__.get("_cache_pages_checked"):
             self._check_cache_pages()
             self._cache_pages_checked = True
