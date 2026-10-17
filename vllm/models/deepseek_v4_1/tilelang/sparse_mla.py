@@ -53,6 +53,13 @@ the arithmetic; ``schedule`` and ``block_H`` are not. ``SparseMlaV41Plan``
 compiles the kernels for one layer shape, owns the split workspace, and
 picks a kernel from the row count.
 
+The output is WO-A's input, as DeepSeek's reference prepares it after the
+attention (``wo_input``): the trailing RoPE coordinates of each head rotated
+back at the row's position, then ``act_quant(o, 32, "ue8m0", inplace=True)``,
+each 32-value block to E4M3 with a UE8M0 scale and back to BF16. Both run in
+the kernels' output store, once per row, where the rounded ``O * (1 / L)`` is
+already in shared memory: WO-A's GEMM then reads values it uses as they are.
+
 SM120/SM121 have no WGMMA and allow at most 99 KiB of shared memory per
 block, so the tiles are ``mma.sync`` tiles of 16..64 heads by 16..32
 entries, instead of the 64x64 SM90 tiles in
@@ -66,8 +73,11 @@ import tilelang.language as T
 import torch
 
 from . import prepare
+from .gemm import _reference_roundtrip
 
 HEAD_DIM = 512
+ROPE_DIM = 64  # each head's trailing RoPE coordinates
+NOPE_DIM = HEAD_DIM - ROPE_DIM
 SWA_RECORD_BYTES = 528  # 512 x E4M3 + 16 x UE8M0
 SWA_GROUP = 32
 IDX_RECORD_BYTES = 288  # 256 x packed E2M1 + 32 x E4M3
@@ -86,6 +96,33 @@ DECODE_MAX_WAVES = 3
 # few elements of rows with two or more keys. Here the product the constant meets
 # (``L * a``, ``o * a``) is exact when L = 1 or o = 0, and the fused product is
 # explicit, so every route rounds the same way.
+
+
+@T.macro
+def wo_input(O_shared, heads, position, CosSin, X, amax, inv, scale):
+    """Turn ``heads`` rows of attention output in ``O_shared`` (``[heads, 512]``
+    BF16) into WO-A's input in place, as the reference does before WO-A::
+
+        o[..., -64:] = inverse_rope(o[..., -64:])  # BF16
+        o = act_quant(o, 32, "ue8m0", inplace=True)  # MXFP8 values, BF16
+
+    The rotation is ``rope_``'s inverse arithmetic at ``position`` (GPT-J pairs, FP32
+    with ``ieee_fmaf``, cos and sin halves of one ``CosSin`` row, BF16 out); the
+    quantization is ``_reference_roundtrip``. ``X``, ``amax``, ``inv`` and ``scale``
+    are its ``[heads * 16, 32]`` and ``[heads * 16]`` FP32 fragments."""
+    half = ROPE_DIM // 2
+    for h, i in T.Parallel(heads, half):
+        first = T.Cast(T.float32, O_shared[h, NOPE_DIM + 2 * i])
+        second = T.Cast(T.float32, O_shared[h, NOPE_DIM + 2 * i + 1])
+        cosine = CosSin[position, i]
+        sine = CosSin[position, half + i]
+        O_shared[h, NOPE_DIM + 2 * i] = T.Cast(
+            T.bfloat16, T.ieee_fmaf(first, cosine, second * sine)
+        )
+        O_shared[h, NOPE_DIM + 2 * i + 1] = T.Cast(
+            T.bfloat16, T.ieee_fmaf(first, -sine, second * cosine)
+        )
+    _reference_roundtrip(O_shared, O_shared, X, amax, inv, scale, heads, HEAD_DIM)
 
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
@@ -119,19 +156,22 @@ def sparse_mla_fwd_v41(
     - ``IdxLengths``: ``[rows]`` int32 count of leading indexed entries to use;
     - ``IdxPageTable``: ``[rows, pages]`` int32 physical page of each logical
       ``idx_page_size`` page, as in vLLM's indexed page table;
-    - ``Sinks``: ``[heads]`` FP32 attention-sink logits.
+    - ``Sinks``: ``[heads]`` FP32 attention-sink logits;
+    - ``Positions``: ``[rows]`` int64 row positions and ``CosSin``:
+      ``[positions_max, 64]`` FP32 RoPE table rows (cos | sin), for ``wo_input``.
 
     ``decode`` then takes the FP32 workspaces ``Partial``
     (``[rows, segments, heads, 512]``) and ``PartialStats``
     (``[rows, segments, heads, 2]``). Both write ``Output``
-    (``[rows, heads, 512]`` BF16). ``rows``, the cache page counts and
-    strides, and the page-table width are dynamic.
+    (``[rows, heads, 512]`` BF16): WO-A's input (``wo_input``). ``rows``, the cache
+    page counts and strides, and the page-table width are dynamic.
     """
     # Cache pages are rows of a vLLM page buffer, which may interleave other
     # layers' pages (BLHNC) or pad: the row stride is a runtime value.
     rows, swa_pool, swa_stride, idx_pool, idx_stride, idx_pages = T.dynamic(
         "rows, swa_pool, swa_stride, idx_pool, idx_stride, idx_pages"
     )
+    positions_max = T.dynamic("positions_max")
     swa_bytes = swa_page_size * SWA_RECORD_BYTES
     idx_bytes = idx_page_size * IDX_RECORD_BYTES
 
@@ -355,6 +395,8 @@ def sparse_mla_fwd_v41(
         IdxLengths,
         IdxPageTable,
         Sinks,
+        Positions,
+        CosSin,
         Output,
     ):
         with T.Kernel(head_blocks, rows, threads=threads) as (hb, row):
@@ -379,6 +421,10 @@ def sparse_mla_fwd_v41(
             L = T.alloc_fragment([block_H], accum_dtype)
             a = T.alloc_fragment([block_H], accum_dtype)
             b = T.alloc_fragment([block_H], accum_dtype)
+            X = T.alloc_fragment([block_H * D // 32, 32], accum_dtype)
+            amax = T.alloc_fragment([block_H * D // 32], accum_dtype)
+            inv = T.alloc_fragment([block_H * D // 32], accum_dtype)
+            scale = T.alloc_fragment([block_H * D // 32], accum_dtype)
 
             # Resolve the row's slots once, so record copies never wait on index loads.
             gather_swa(SwaIndices, SwaLengths, row, 0, swa_blocks * BI, slots, 0)
@@ -449,9 +495,14 @@ def sparse_mla_fwd_v41(
 
             for h in T.Parallel(block_H):
                 L[h] = 1.0 / L[h]
+            # WO-A's input, staged in Q_shared once every warp is done with Q.
+            T.sync_threads()
+            for h, d in T.Parallel(block_H, D):
+                Q_shared[h, d] = T.fmul(acc_o[h, d], L[h])
+            wo_input(Q_shared, block_H, Positions[row], CosSin, X, amax, inv, scale)
             for h, d in T.Parallel(block_H, D):
                 if h0 + h < heads:
-                    Output[row, h0 + h, d] = T.fmul(acc_o[h, d], L[h])
+                    Output[row, h0 + h, d] = Q_shared[h, d]
 
     @T.macro
     def decode_body(
@@ -464,6 +515,8 @@ def sparse_mla_fwd_v41(
         IdxLengths,
         IdxPageTable,
         Sinks,
+        Positions,
+        CosSin,
         Partial,
         PartialStats,
         Output,
@@ -551,9 +604,14 @@ def sparse_mla_fwd_v41(
                     PartialStats[row, seg, h0 + h, 0] = m_g[h]
                     PartialStats[row, seg, h0 + h, 1] = l_g[h]
 
-        # Fold the segment partials in order, starting from the sink.
+        # Fold the segment partials in order from the sink; store WO-A's input.
         with T.Kernel(heads, rows, threads=128) as (hc, rc):
             o = T.alloc_fragment([D], accum_dtype)
+            O_shared = T.alloc_shared([1, D], dtype)
+            X = T.alloc_fragment([D // 32, 32], accum_dtype)
+            amax = T.alloc_fragment([D // 32], accum_dtype)
+            inv = T.alloc_fragment([D // 32], accum_dtype)
+            scale = T.alloc_fragment([D // 32], accum_dtype)
             M = T.alloc_var(accum_dtype)
             L = T.alloc_var(accum_dtype)
             a = T.alloc_var(accum_dtype)
@@ -573,7 +631,10 @@ def sparse_mla_fwd_v41(
                     o[d] = T.fma(Partial[rc, c, hc, d], b, T.fmul(o[d], a))
             L = 1.0 / L
             for d in T.Parallel(D):
-                Output[rc, hc, d] = T.fmul(o[d], L)
+                O_shared[0, d] = T.fmul(o[d], L)
+            wo_input(O_shared, 1, Positions[rc], CosSin, X, amax, inv, scale)
+            for d in T.Parallel(D):
+                Output[rc, hc, d] = O_shared[0, d]
 
     # SWA-only layers (idx_width == 0) compile without the indexed tensors.
     if schedule == "extend":
@@ -594,6 +655,8 @@ def sparse_mla_fwd_v41(
                 IdxLengths: T.Tensor([rows], T.int32),
                 IdxPageTable: T.Tensor([rows, idx_pages], T.int32),
                 Sinks: T.Tensor([heads], accum_dtype),
+                Positions: T.Tensor([rows], T.int64),
+                CosSin: T.Tensor([positions_max, ROPE_DIM], accum_dtype),
                 Output: T.Tensor([rows, heads, D], dtype),
             ):
                 extend_body(
@@ -606,6 +669,8 @@ def sparse_mla_fwd_v41(
                     IdxLengths,
                     IdxPageTable,
                     Sinks,
+                    Positions,
+                    CosSin,
                     Output,
                 )
 
@@ -620,6 +685,8 @@ def sparse_mla_fwd_v41(
             SwaIndices: T.Tensor([rows, swa_width], T.int32),
             SwaLengths: T.Tensor([rows], T.int32),
             Sinks: T.Tensor([heads], accum_dtype),
+            Positions: T.Tensor([rows], T.int64),
+            CosSin: T.Tensor([positions_max, ROPE_DIM], accum_dtype),
             Output: T.Tensor([rows, heads, D], dtype),
         ):
             extend_body(
@@ -632,6 +699,8 @@ def sparse_mla_fwd_v41(
                 None,
                 None,
                 Sinks,
+                Positions,
+                CosSin,
                 Output,
             )
 
@@ -654,6 +723,8 @@ def sparse_mla_fwd_v41(
             IdxLengths: T.Tensor([rows], T.int32),
             IdxPageTable: T.Tensor([rows, idx_pages], T.int32),
             Sinks: T.Tensor([heads], accum_dtype),
+            Positions: T.Tensor([rows], T.int64),
+            CosSin: T.Tensor([positions_max, ROPE_DIM], accum_dtype),
             Partial: T.Tensor([rows, segments, heads, D], accum_dtype),
             PartialStats: T.Tensor([rows, segments, heads, 2], accum_dtype),
             Output: T.Tensor([rows, heads, D], dtype),
@@ -668,6 +739,8 @@ def sparse_mla_fwd_v41(
                 IdxLengths,
                 IdxPageTable,
                 Sinks,
+                Positions,
+                CosSin,
                 Partial,
                 PartialStats,
                 Output,
@@ -682,6 +755,8 @@ def sparse_mla_fwd_v41(
         SwaIndices: T.Tensor([rows, swa_width], T.int32),
         SwaLengths: T.Tensor([rows], T.int32),
         Sinks: T.Tensor([heads], accum_dtype),
+        Positions: T.Tensor([rows], T.int64),
+        CosSin: T.Tensor([positions_max, ROPE_DIM], accum_dtype),
         Partial: T.Tensor([rows, segments, heads, D], accum_dtype),
         PartialStats: T.Tensor([rows, segments, heads, 2], accum_dtype),
         Output: T.Tensor([rows, heads, D], dtype),
@@ -696,6 +771,8 @@ def sparse_mla_fwd_v41(
             None,
             None,
             Sinks,
+            Positions,
+            CosSin,
             Partial,
             PartialStats,
             Output,
@@ -850,6 +927,8 @@ class SparseMlaV41Plan:
         swa_indices,
         swa_lengths,
         sinks,
+        positions,
+        cos_sin,
         out,
         *,
         idx_cache=None,
@@ -861,7 +940,10 @@ class SparseMlaV41Plan:
     ):
         """Attend over uint8 ``[pages, page_size * record_bytes]`` cache pages.
 
-        Writes ``out``. The page buffers may have any row stride.
+        Writes WO-A's input into ``out``: the rows' attention output with its RoPE
+        columns rotated back at ``positions`` (int64) through ``cos_sin`` (the FP32
+        ``[positions, 64]`` RoPE table), through the reference's ``act_quant``. The
+        page buffers may have any row stride.
 
         The indexed tensors are required when ``idx_width > 0`` and absent
         otherwise. ``kernel`` forces ``"split"``, ``"decode"`` or ``"extend"``.
@@ -883,6 +965,8 @@ class SparseMlaV41Plan:
             swa_lengths,
             *(indexed if self.idx_width else ()),
             sinks,
+            positions,
+            cos_sin,
         )
         if kernel == "extend":
             self.kernels["extend"](*args, out)

@@ -783,8 +783,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
     def _tilelang_calls(self) -> list:
         """The TileLang kernels of the shared layer paths, as ``prepare.call``s:
         window metadata and index page tables, the metadata builders of the cache
-        groups this layer joins, the RoPE of every role (WO's inverse rotation
-        included) and the cache writers, each in its call site's call form."""
+        groups this layer joins, the RoPE of every role and the cache writers, each
+        in its call site's call form."""
         from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
         from vllm.models.deepseek_v4_1.tilelang.cache_writer import writer_call
         from vllm.models.deepseek_v4_1.tilelang.rope import rope_call
@@ -827,12 +827,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             calls.extend(
                 tilelang_builder_kernels(cache.get_kv_cache_spec(self.config), requests)
             )
-        # _rope (heads, columns, ratio) by role; WO rotates its input back.
+        # _rope (heads, columns, ratio) by role (WO's input is rotated back in the
+        # attention kernels' output store).
         table_width = self.rotary_emb.cos_sin_cache.shape[1]
         roles = [
             (self.n_local_heads, self.head_dim, 1, False),  # q
             (1, 512, 1, False),  # kv
-            (self.n_local_heads, self.head_dim, 1, True),  # WO's inverse
         ]
         if self.indexer is not None:
             roles.append((self.indexer.heads, 128, 1, False))  # index query
@@ -1786,7 +1786,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 self.topk_indices_buffer[:rows].copy_(split.gather(selected))
 
         if decode_rows:
-            self._attend_split(q, output, swa, main, owner, rows, decode_rows)
+            self._attend_split(
+                q, output, positions, swa, main, owner, rows, decode_rows
+            )
             return
         # Reuse the shared arena only after indexing completes. Keep full-batch
         # metadata beside, not overlapping, the native attention scratch.
@@ -1837,12 +1839,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             q,
             output,
             scratch=buffers[metadata_count:],
+            positions=positions,
             swa_indices=swa_indices[:rows],
             swa_lengths=swa_lengths[:rows],
             **kwargs,
         )
 
-    def _attend_split(self, q, output, swa, main, owner, rows, decode_rows):
+    def _attend_split(self, q, output, positions, swa, main, owner, rows, decode_rows):
         """A mixed step's attention: its decode requests' rows on the decode plan,
         the rest on the extend plan. Mixed steps run eagerly, so the per-row
         metadata is an ordinary allocation and each plan borrows the workspace in
@@ -1874,6 +1877,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 q[lo:hi],
                 output[lo:hi],
                 scratch=list(scratch),
+                positions=positions[lo:hi],
                 swa_indices=swa_indices[lo:hi],
                 swa_lengths=swa_lengths[lo:hi],
                 **kwargs,
@@ -1949,8 +1953,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         dsa_indexer.score(binding)
         dsa_indexer.select(binding)
 
-    def _attend(self, mode: str, q, output, *, scratch, **indices):
-        """Sparse MLA over the SWA and (compressed layers) indexed caches."""
+    def _attend(self, mode: str, q, output, *, scratch, positions, **indices):
+        """Sparse MLA over the SWA and (compressed layers) indexed caches. B12X's WO
+        projection rotates its input back itself, so ``positions`` is unused here; the
+        TileLang layer's kernels prepare WO-A's input in their output store."""
+        del positions
         binding = mla.bind(self._attention_plan(mode), scratch=scratch, q=q, **indices)
         mla.run(
             binding=binding,
@@ -2190,22 +2197,20 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             )
         return self._wo_plans[key]
 
-    def _o_proj_tilelang(self, o, positions, sp_rows):
-        """The TileLang WO projection; ``o``'s RoPE columns are rotated in place.
+    def _o_proj_tilelang(self, o, sp_rows):
+        """The TileLang WO projection of WO-A's input ``o``, which the attention
+        kernels store already rotated back and through ``act_quant``.
 
         A sequence-parallel step projects through ``project_reduce_scatter`` as the
         B12X path does: in slices, and as unreduced rank-order parts when the step
         keeps them, so a row's sum over ranks is the non-SP step's all-reduce."""
         rows, hidden = o.shape[0], self.hidden_size
-        cache = self.rotary_emb.cos_sin_cache
         if sp_rows is not None:
             if rows != sp_rows.num_tokens:
                 raise ValueError(f"V4.1 SP WO expects {sp_rows.num_tokens} rows")
 
             def project(start, stop, out):
-                self._wo_projection_weights(
-                    o[start:stop], positions[start:stop], cache, out
-                )
+                self._wo_projection_weights(o[start:stop], out)
 
             return sp_rows.project_reduce_scatter(
                 project,
@@ -2216,7 +2221,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 then=lambda: l2_prefetch.issue(self._l2pf_ffn, rows),
             )
         local = torch.empty((rows, hidden), dtype=torch.bfloat16, device=o.device)
-        self._wo_projection_weights(o, positions, cache, local)
+        self._wo_projection_weights(o, local)
         l2_prefetch.issue(self._l2pf_ffn, rows)
         if get_tensor_model_parallel_world_size() > 1:
             local = get_tp_group().all_reduce(local)
@@ -2224,7 +2229,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
 
     def _o_proj(self, o, positions, *, is_prefill=False, sp_rows=None):
         if kernels.uses_tilelang():
-            return self._o_proj_tilelang(o, positions, sp_rows)
+            return self._o_proj_tilelang(o, sp_rows)
         from b12x.preparation import require_prepared
 
         rows = o.shape[0]

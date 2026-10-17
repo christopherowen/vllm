@@ -8,11 +8,13 @@ reference computes it::
     a = wo_a(o.view(T, groups, -1))                    (grouped, block-32 FP8, BF16 out)
     out = wo_b(a.flatten(1))                           (block-32 FP8, BF16 out)
 
-WO-A quantizes its input as the reference does (since its 2026-10-12 revision, for
-both V4.1 Flash checkpoints): each 32-value block of ``o`` to E4M3 with a UE8M0 scale
-and back to BF16, then the BF16 einsum on the weights ``convert.py`` dequantizes. One
-launch of the grouped W8A16 GEMM does both: it quantizes each activation tile as it
-loads it, expands each FP8 weight tile exactly to BF16 and accumulates in FP32.
+The first two lines run in the sparse MLA kernels' output store (``sparse_mla.
+wo_input``, since the reference's 2026-10-12 revision for both V4.1 Flash
+checkpoints), once per row: ``o`` arrives as WO-A's input. Quantizing there instead
+of in WO-A's tile loads keeps the GEMM from redoing it for every column tile (the
+release on 1017 measured 3% of prefill, 2026-10-17). WO-A is the BF16 einsum on the
+weights ``convert.py`` dequantizes: one launch of the grouped W8A16 GEMM expands each
+FP8 weight tile exactly to BF16 and accumulates in FP32.
 WO-B is the ordinary block-32 projection with MXFP8 activations (DeepSeek's E4M3 and
 one UE8M0 scale per 32), as the reference's ``linear`` quantizes them. WO-A's last
 kernel (the GEMM's epilogue, or the split-K reduce at decode) rounds ``a`` to BF16 and
@@ -42,7 +44,6 @@ from .linear import (
     _launch,
     _scratch,
 )
-from .rope import rope_
 
 # WO-A's W8A16 GEMM sums K in _WO_A_SHARDS shards at every row count, each from zero,
 # added in shard order, so a row's bits do not depend on the path. A bucket either
@@ -155,8 +156,8 @@ class _GroupedBF16:
 
 
 class TileLangWOProjection:
-    """Inverse RoPE, WO-A and WO-B of one attention layer (built after loading; its
-    layer declares the kernels with ``declare_kernels``)."""
+    """WO-A and WO-B of one attention layer (built after loading; its layer declares
+    the kernels with ``declare_kernels``)."""
 
     def __init__(self, wo_a: nn.Module, wo_b: nn.Module, *, groups: int):
         self.a = _GroupedBF16(wo_a, groups)
@@ -166,7 +167,7 @@ class TileLangWOProjection:
         self.hidden = wo_b.weight.shape[0]
 
     def declare_kernels(self) -> None:
-        """Declare WO-A's and WO-B's kernels (the inverse RoPE is the layer's)."""
+        """Declare WO-A's and WO-B's kernels."""
         self.a.declare_kernels()
         self.b.declare_kernels()
 
@@ -176,19 +177,12 @@ class TileLangWOProjection:
             "wo_a", self.a
         ) + l2_prefetch.linear_segments("wo_b", self.b)
 
-    def __call__(
-        self,
-        o: torch.Tensor,
-        positions: torch.Tensor,
-        cos_sin_cache: torch.Tensor,
-        out: torch.Tensor,
-    ) -> torch.Tensor:
-        """Project ``o`` ([T, heads, head_dim], contiguous BF16; its RoPE columns
-        are overwritten) into ``out`` ([T, hidden] BF16)."""
+    def __call__(self, o: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        """Project WO-A's input ``o`` ([T, heads, head_dim] contiguous BF16, as the
+        sparse MLA kernels store it) into ``out`` ([T, hidden] BF16)."""
         rows = o.shape[0]
         if not rows:
             return out
-        rope_(o, positions, cos_sin_cache, 1, True)
         scratch = (
             None if torch.compiler.is_compiling() else current_preallocated_workspace()
         )

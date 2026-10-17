@@ -266,7 +266,7 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
             scratch=scratch,
         )
 
-    def _attend(self, mode: str, q, output, *, scratch, **indices):
+    def _attend(self, mode: str, q, output, *, scratch, positions, **indices):
         indexed = {}
         if "indexed_indices" in indices:
             indexed = dict(
@@ -281,6 +281,8 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
             indices["swa_indices"],
             indices["swa_lengths"],
             self.attn_sink,
+            positions,
+            self.rotary_emb.cos_sin_cache,
             output,
             scratch=scratch or None,
             **indexed,

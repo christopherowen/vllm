@@ -4,6 +4,8 @@
 
 Caches use vLLM's page layout, including allocator padding past each page's
 records, so the kernels are checked against the strides they see in serving.
+The sparse MLA stores WO-A's input: its output rotated back and through
+``act_quant`` (``wo_input``), checked bit for bit on its own.
 """
 
 import pytest
@@ -17,11 +19,17 @@ if not (
     pytest.skip("TileLang V4.1 kernels target SM120/SM121", allow_module_level=True)
 
 tilelang = pytest.importorskip("tilelang")
+pytest.importorskip("tile_kernels")
+
+import tilelang.language as T  # noqa: E402
 
 from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
     assert_other_rows_equal,
     assert_rows_nan,
     assert_same_nonfinite,
+    mxfp8_values,
+    rope_table,
+    wo_input_reference,
 )
 from vllm.models.deepseek_v4_1.tilelang.indexer import (  # noqa: E402
     CANDIDATE_BLOCK,
@@ -38,8 +46,10 @@ from vllm.models.deepseek_v4_1.tilelang.indexer import (  # noqa: E402
 from vllm.models.deepseek_v4_1.tilelang.sparse_mla import (  # noqa: E402
     HEAD_DIM,
     IDX_GROUP,
+    ROPE_DIM,
     SWA_GROUP,
     SparseMlaV41Plan,
+    wo_input,
 )
 
 DEVICE = "cuda"
@@ -586,6 +596,10 @@ def _mla_case(idx_width, heads, rows, swa_width=128, swa_page=128, idx_page=128)
             ]
         ).to(torch.int32)
         case.update(idx=idx, idx_logical=idx_logical, idx_len=idx_len, table=table)
+    case.update(
+        positions=torch.randint(0, 4096, (rows,), generator=_gen(2), device=DEVICE),
+        rope=rope_table(),
+    )
     return case
 
 
@@ -620,6 +634,8 @@ def _mla_run(case, swa_pool=None, idx_pool=None, swa_idx=None, idx_logical=None)
             case["swa_idx"] if swa_idx is None else swa_idx,
             case["swa_len"],
             case["sinks"],
+            case["positions"],
+            case["rope"],
             out,
             kernel=kernel,
             **indexed,
@@ -637,21 +653,28 @@ def _mla_ref(case, swa=None):
             idx_len=case["idx_len"],
         )
     swa = case["swa"] if swa is None else swa
-    return _ref_mla(
+    out = _ref_mla(
         case["q"], swa, case["swa_idx"], case["swa_len"], case["sinks"], **ref_indexed
     )
+    return wo_input_reference(out, case["positions"], case["rope"])
 
 
 @pytest.mark.parametrize("idx_width", [0, 512])
 # Heads per rank: TP4 (16), TP3 (24 of 72 padded), TP1 (64).
 @pytest.mark.parametrize("heads", [16, 24, 64])
 def test_sparse_mla(idx_width, heads, rows=6):
+    """Every route's WO-A input, near the reference's: within one E4M3 step (an
+    attention output a rounding away from the reference's can land on the next MXFP8
+    value), exactly act_quant's values (requantizing changes nothing), the same bits
+    on every route."""
     case = _mla_case(idx_width, heads, rows)
     outs = _mla_run(case)
     ref = _mla_ref(case)
     torch.testing.assert_close(
-        outs["extend"].float(), ref.float(), rtol=2e-2, atol=2e-2
+        outs["extend"].float(), ref.float(), rtol=0.13, atol=2e-2
     )
+    flat = outs["extend"].view(rows, -1)
+    assert torch.equal(mxfp8_values(flat).bfloat16(), flat)
     for kernel, out in outs.items():
         assert torch.equal(out, outs["extend"]), f"{kernel} differs from extend"
 
@@ -761,11 +784,67 @@ def test_sparse_mla_routes_short_rows(heads, keys, rows=1024, swa_width=128, pag
         max_rows=rows, decode_max_rows=rows, split_max_rows=rows,
     )  # fmt: skip
     pool = _paged(swa, page)
+    positions = torch.randint(0, 4096, (rows,), generator=gen, device=DEVICE)
+    table = rope_table()
     outs = {}
     for kernel in plan.kernels:
         out = torch.empty((rows, heads, HEAD_DIM), dtype=torch.bfloat16, device=DEVICE)
-        plan.run(q, pool, swa_idx, swa_len, sinks, out, kernel=kernel)
+        plan.run(q, pool, swa_idx, swa_len, sinks, positions, table, out, kernel=kernel)
         outs[kernel] = out
     for kernel, out in outs.items():
         differ = int((out.view(torch.int16) != outs["extend"].view(torch.int16)).sum())
         assert differ == 0, f"{kernel} differs from extend in {differ} elements"
+
+
+@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
+def _wo_input_kernel(heads: int, block_heads: int, threads: int):
+    """``wo_input`` alone on ``[rows, heads, 512]`` BF16 rows, ``block_heads`` heads per
+    CTA, compiled as the sparse MLA kernels are (fast math)."""
+    rows, positions_max = T.dynamic("rows, positions_max")
+    blocks = block_heads * HEAD_DIM // 32
+
+    @T.prim_func
+    def kernel(
+        Src: T.Tensor([rows, heads, HEAD_DIM], T.bfloat16),
+        Positions: T.Tensor([rows], T.int64),
+        CosSin: T.Tensor([positions_max, ROPE_DIM], T.float32),
+        Out: T.Tensor([rows, heads, HEAD_DIM], T.bfloat16),
+    ):
+        with T.Kernel(heads // block_heads, rows, threads=threads) as (hb, row):
+            S = T.alloc_shared([block_heads, HEAD_DIM], T.bfloat16)
+            X = T.alloc_fragment([blocks, 32], T.float32)
+            amax = T.alloc_fragment([blocks], T.float32)
+            inv = T.alloc_fragment([blocks], T.float32)
+            scale = T.alloc_fragment([blocks], T.float32)
+            h0 = hb * block_heads
+            T.copy(Src[row, h0 : h0 + block_heads, :], S)
+            wo_input(S, block_heads, Positions[row], CosSin, X, amax, inv, scale)
+            T.copy(S, Out[row, h0 : h0 + block_heads, :])
+
+    return kernel
+
+
+# The extend kernel's head block (32 heads, 256 threads) and the decode merge's (one
+# head, 128 threads).
+@pytest.mark.parametrize(("block_heads", "threads"), [(32, 256), (1, 128)])
+def test_wo_input_is_the_reference_rotation_and_act_quant(block_heads, threads):
+    """The sparse MLA's output store gives WO-A's input bit for bit as the reference
+    prepares it: TileKernels' inverse rotation in BF16, then per_token_cast's values
+    (byte-identical to act_quant), blocks below the amax floor and a wide range of
+    magnitudes included."""
+    rows, heads = 37, 64
+    gen = _gen(21)
+    o = torch.randn((rows, heads, HEAD_DIM), generator=gen, device=DEVICE)
+    exponents = torch.randint(
+        -24, 8, (rows, heads, HEAD_DIM // 32, 1), generator=gen, device=DEVICE
+    )
+    o *= torch.exp2(exponents).repeat_interleave(32, -1).view(rows, heads, HEAD_DIM)
+    o = o.bfloat16()
+    o[::7, ::5] *= 1e-7  # blocks below the amax floor
+    positions = torch.randint(0, 4096, (rows,), generator=gen, device=DEVICE)
+    table = rope_table()
+    out = torch.empty_like(o)
+    _wo_input_kernel(heads, block_heads, threads)(o, positions, table, out)
+    want = wo_input_reference(o, positions, table)
+    differ = int((out.view(torch.int16) != want.view(torch.int16)).sum())
+    assert differ == 0, f"{differ} of {out.numel()} values differ from the reference"

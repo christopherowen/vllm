@@ -328,10 +328,10 @@ def _reference_cast(X, amax, inv, Q, S, row0, col0, rows, blocks, M):
 
 @T.macro
 def _reference_roundtrip(A_shared, A_q, X, amax, inv, scale, block_M, block_K):
-    """``A_q`` = the activation tile ``A_shared`` through the reference's
-    ``act_quant(x, 32, "ue8m0", inplace=True)``: per 32-element block of each row, the
-    E4M3 of ``x * 2^-e`` (``e`` as ``_reference_cast`` derives it) times ``2^e``, which
-    BF16 holds exactly."""
+    """``A_q`` = the ``[block_M, block_K]`` BF16 tile ``A_shared`` through the
+    reference's ``act_quant(x, 32, "ue8m0", inplace=True)``: per 32-element block of
+    each row, the E4M3 of ``x * 2^-e`` (``e`` as ``_reference_cast`` derives it)
+    times ``2^e``, which BF16 holds exactly. ``A_q`` may be ``A_shared``."""
     blocks = block_K // 32
     for r, e in T.Parallel(block_M * blocks, 32):
         X[r, e] = T.Cast(T.float32, A_shared[r // blocks, (r % blocks) * 32 + e])
@@ -476,11 +476,10 @@ def fp8w_bf16_gemm(
     launch: BF16 activations ``A[M, groups*K]`` against block-32 FP8 weights
     ``W[groups*N, K]`` (E4M3, one UE8M0 exponent per 32x32 block in ``E``), each weight
     tile expanded exactly to BF16 (an E4M3 value times a power of two fits BF16) and
-    multiplied on BF16 tensor cores with FP32 accumulation; BF16 out. Each activation
-    tile first goes through the reference's MXFP8 quantize-dequantize
-    (``_reference_roundtrip``). That is DeepSeek's reference WO-A:
-    ``act_quant(o, 32, "ue8m0", inplace=True)``, then the BF16 einsum on the FP8 weights
-    ``convert.py`` dequantizes.
+    multiplied on BF16 tensor cores with FP32 accumulation; BF16 out. This is DeepSeek's
+    reference WO-A: its BF16 einsum on the FP8 weights ``convert.py`` dequantizes, of
+    activations already through ``act_quant`` (the sparse MLA kernels store them so,
+    ``sparse_mla.wo_input``).
 
     Every M tile runs the same K loop, so a row's bits do not depend on its batch. With
     ``shards`` > 1 each K shard is summed from zero and the shards added in order, the
@@ -516,20 +515,12 @@ def fp8w_bf16_gemm(
             C_total = T.alloc_fragment(
                 (block_M, block_N) if shards > 1 else (1, 1), T.float32
             )
-            qa = block_M * (block_K // 32)
-            A_q = T.alloc_shared((block_M, block_K), T.bfloat16)
-            X_a = T.alloc_fragment((qa, 32), T.float32)
-            amax_a = T.alloc_fragment((qa,), T.float32)
-            inv_a = T.alloc_fragment((qa,), T.float32)
-            scale_a = T.alloc_fragment((qa,), T.float32)
             T.clear(C_local)
             if shards > 1:
                 T.clear(C_total)
             for ko in T.Pipelined(k_blocks, num_stages=num_stages):
-                _w8a16_step(A, W, E, A_shared, A_q, X_a, amax_a, inv_a,
-                            scale_a, W_shared, S_shared, B_shared,
-                            C_local, by, g, n0, ko, K, block_M,
-                            block_N, block_K)  # fmt: skip
+                _w8a16_step(A, W, E, A_shared, W_shared, S_shared, B_shared, C_local,
+                            by, g, n0, ko, K, block_M, block_N, block_K)  # fmt: skip
                 if shards > 1:  # noqa: SIM102
                     if (ko + 1) % shard_blocks == 0:
                         for i, j in T.Parallel(block_M, block_N):
@@ -594,12 +585,6 @@ def fp8w_bf16_gemm_cast(
             C_total = T.alloc_fragment(
                 (block_M, block_N) if shards > 1 else (1, 1), T.float32
             )
-            qa = block_M * (block_K // 32)
-            A_q = T.alloc_shared((block_M, block_K), T.bfloat16)
-            X_a = T.alloc_fragment((qa, 32), T.float32)
-            amax_a = T.alloc_fragment((qa,), T.float32)
-            inv_a = T.alloc_fragment((qa,), T.float32)
-            scale_a = T.alloc_fragment((qa,), T.float32)
             X = T.alloc_fragment((block_M * blocks, 32), T.float32)
             amax = T.alloc_fragment((block_M * blocks,), T.float32)
             inv = T.alloc_fragment((block_M * blocks,), T.float32)
@@ -607,10 +592,8 @@ def fp8w_bf16_gemm_cast(
             if shards > 1:
                 T.clear(C_total)
             for ko in T.Pipelined(k_blocks, num_stages=num_stages):
-                _w8a16_step(A, W, E, A_shared, A_q, X_a, amax_a, inv_a,
-                            scale_a, W_shared, S_shared, B_shared,
-                            C_local, by, g, n0, ko, K, block_M,
-                            block_N, block_K)  # fmt: skip
+                _w8a16_step(A, W, E, A_shared, W_shared, S_shared, B_shared, C_local,
+                            by, g, n0, ko, K, block_M, block_N, block_K)  # fmt: skip
                 if shards > 1:  # noqa: SIM102
                     if (ko + 1) % shard_blocks == 0:
                         for i, j in T.Parallel(block_M, block_N):
@@ -650,17 +633,14 @@ def _w8a16_weights(W, E, W_shared, S_shared, B_shared, n0, ko, block_N, block_K)
 
 @T.macro
 def _w8a16_step(
-    A, W, E, A_shared, A_q, X, amax, inv, scale, W_shared, S_shared, B_shared,
-    C_local, by, g, n0, ko, K, block_M, block_N, block_K,
+    A, W, E, A_shared, W_shared, S_shared, B_shared, C_local, by, g, n0, ko, K,
+    block_M, block_N, block_K,
 ):  # fmt: skip
-    """One K block of the W8A16 GEMM: the activation tile through the reference's MXFP8
-    quantize-dequantize (``_reference_roundtrip``; ``block_K`` is a multiple of 32 and
-    each group's K starts on a block, so the tile holds whole reference blocks), the
-    expanded weight tile, MMA."""
+    """One K block of the W8A16 GEMM: the activation tile, the expanded weight tile,
+    MMA."""
     T.copy(A[by * block_M, g * K + ko * block_K], A_shared)
-    _reference_roundtrip(A_shared, A_q, X, amax, inv, scale, block_M, block_K)
     _w8a16_weights(W, E, W_shared, S_shared, B_shared, n0, ko, block_N, block_K)
-    T.gemm(A_q, B_shared, C_local, transpose_B=True)
+    T.gemm(A_shared, B_shared, C_local, transpose_B=True)
 
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
@@ -702,18 +682,11 @@ def fp8w_bf16_gemm_partials(
             S_shared = T.alloc_shared((block_N // 32, block_K // 32), T.float32)
             B_shared = T.alloc_shared((block_N, block_K), T.bfloat16)
             C_local = T.alloc_fragment((block_M, block_N), T.float32)
-            qa = block_M * (block_K // 32)
-            A_q = T.alloc_shared((block_M, block_K), T.bfloat16)
-            X_a = T.alloc_fragment((qa, 32), T.float32)
-            amax_a = T.alloc_fragment((qa,), T.float32)
-            inv_a = T.alloc_fragment((qa,), T.float32)
-            scale_a = T.alloc_fragment((qa,), T.float32)
             T.clear(C_local)
             for kb in T.Pipelined(shard_blocks, num_stages=num_stages):
-                _w8a16_step(A, W, E, A_shared, A_q, X_a, amax_a, inv_a,
-                            scale_a, W_shared, S_shared, B_shared,
-                            C_local, by, g, n0, s * shard_blocks + kb, K, block_M,
-                            block_N, block_K)  # fmt: skip
+                _w8a16_step(A, W, E, A_shared, W_shared, S_shared, B_shared, C_local,
+                            by, g, n0, s * shard_blocks + kb, K, block_M, block_N,
+                            block_K)  # fmt: skip
             T.copy(
                 C_local,
                 P[s, by * block_M : (by + 1) * block_M, n0 : n0 + block_N],

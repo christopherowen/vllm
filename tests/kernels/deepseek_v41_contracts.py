@@ -12,6 +12,9 @@ checks compare positions and bits, so no tolerance can explain a failure away:
 - a non-finite input gives non-finite outputs in exactly the reference's positions,
   NaN for NaN and each infinity with its sign;
 - a poisoned row changes no other row's bits.
+
+It also holds the references several kernels' tests share: the reference's
+``act_quant`` values, the RoPE table and WO-A's input.
 """
 
 import torch
@@ -56,3 +59,46 @@ def assert_other_rows_equal(out: torch.Tensor, clean: torch.Tensor, rows, what="
         changed = (out[keep] != clean[keep]).flatten(1).any(1).nonzero().flatten()
         others = keep.nonzero().flatten()[changed][:8].tolist()
         raise AssertionError(f"{what}poisoning rows {rows} changed rows {others}")
+
+
+def mxfp8_values(x: torch.Tensor) -> torch.Tensor:
+    """DeepSeek's ``act_quant(x, 32, "ue8m0")`` values of the rows of ``x``, in FP64:
+    TileKernels' ``per_token_cast`` (byte-identical to ``act_quant``), E4M3 times
+    2^e."""
+    import tile_kernels
+
+    xq, sf = tile_kernels.quant.per_token_cast(
+        x, "e4m3", 32, round_sf=True, use_packed_ue8m0=True
+    )
+    exps = sf.contiguous().view(torch.uint8)[:, : x.shape[1] // 32].double()
+    return xq.double() * torch.exp2(exps - 127).repeat_interleave(32, -1)
+
+
+def rope_table(positions: int = 4096, rope_dim: int = 64) -> torch.Tensor:
+    """A V4.1 RoPE table on the GPU: FP32 rows of ``cos | sin`` of each position times
+    ``10000^(-2i / rope_dim)``."""
+    exponents = torch.arange(0, rope_dim, 2, device="cuda").double() / rope_dim
+    angles = torch.arange(positions, device="cuda").double()[:, None] * (
+        1.0 / 10000**exponents
+    )
+    return torch.cat((angles.cos(), angles.sin()), dim=-1).float()
+
+
+def wo_input_reference(
+    o: torch.Tensor, positions: torch.Tensor, table: torch.Tensor
+) -> torch.Tensor:
+    """WO-A's input from attention output ``o`` (``[rows, heads, 512]`` BF16) as the
+    reference prepares it: the trailing RoPE columns rotated back (TileKernels'
+    ``apply_rotary``, conjugate), then ``act_quant``'s values, in BF16."""
+    import tile_kernels
+
+    rows, heads, dim = o.shape
+    rotated = o.clone()
+    tile_kernels.transform.apply_rotary(
+        rotated[..., -table.shape[1] :],
+        table,
+        positions=positions,
+        interleaved=True,
+        conjugate=True,
+    )
+    return mxfp8_values(rotated.view(rows, -1)).bfloat16().view(rows, heads, dim)
