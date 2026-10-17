@@ -1077,6 +1077,12 @@ class JitWarmupRegistry:
     def __len__(self) -> int:
         return sum(len(registrations) for registrations in self._registrations.values())
 
+    def registrations(
+        self,
+    ) -> list[tuple[VllmJitKernel[Any], list[tuple[tuple[Any, ...], dict[str, Any]]]]]:
+        """Each registered kernel and its distinct registrations."""
+        return [(kernel, list(regs)) for kernel, regs in self._registrations.items()]
+
     def warmup(self) -> None:
         """Expand registrations and compile each wrapper/key pair once."""
         from tqdm import tqdm

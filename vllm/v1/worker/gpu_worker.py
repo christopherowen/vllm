@@ -278,6 +278,9 @@ class Worker(WorkerBase):
         # the worker-local registry while publishing native resources.
         self._b12x_session = None
         self._b12x_stage: str | None = None
+        # This rank's startup heartbeat in the distributed store (see
+        # startup_rendezvous): runs from distributed init until warm-up is done.
+        self._startup_heartbeat = None
         self._b12x_profile_batch: B12xPreparedBatch | None = None
         self._b12x_tuning_batch: B12xPreparedBatch | None = None
         self._b12x_tuning_cache = False
@@ -498,6 +501,7 @@ class Worker(WorkerBase):
                 self.local_rank,
                 current_platform.dist_backend,
             )
+            self._start_startup_heartbeat()
 
             if self.use_v2_model_runner:
                 logger.info_once("Using V2 Model Runner")
@@ -660,7 +664,9 @@ class Worker(WorkerBase):
 
     def _determine_available_memory(self) -> int:
         maybe_apply_startup_plan(self)
-        # Loading compiled each rank's kernels for as long as its cache needed.
+        # Every declared kernel compiles here, on this rank alone, for as long as
+        # its caches need; the ranks then meet on the host.
+        self._prepare_kernels()
         self._startup_rendezvous("memory profiling")
 
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
@@ -1151,6 +1157,10 @@ class Worker(WorkerBase):
 
             trigger_inductor_lazy_init(self.device)
 
+        if self._startup_heartbeat is not None:
+            self._startup_heartbeat.stop()
+            self._startup_heartbeat = None
+
         # All warmup is done — start monitoring for unexpected JIT
         # compilations that would cause latency spikes during inference.
         from vllm.utils.jit_monitor import activate as activate_jit_monitor
@@ -1385,24 +1395,81 @@ class Worker(WorkerBase):
         failure = getattr(communicator, "roce_failure", None)
         return None if failure is None else failure()
 
+    def _start_startup_heartbeat(self) -> None:
+        """Publish this rank's startup heartbeat (see ``startup_rendezvous``)."""
+        if get_world_group().world_size == 1:
+            return
+        from vllm.v1.worker.startup_rendezvous import StartupHeartbeat
+
+        store = torch.distributed.distributed_c10d._get_default_store()
+        self._startup_heartbeat = StartupHeartbeat(
+            store, get_world_group().rank, self._startup_progress
+        ).start()
+
+    def _startup_progress(self) -> str:
+        """What this rank's heartbeat reports besides its phase."""
+        if envs.VLLM_DS41_KERNEL_BACKEND != "tilelang":
+            return ""
+        from vllm.models.deepseek_v4_1.tilelang.prepare import PROGRESS
+
+        done, total = PROGRESS.snapshot()
+        return f"prepared {done}/{total} kernels" if total else ""
+
+    def _set_startup_phase(self, phase: str) -> None:
+        if self._startup_heartbeat is not None:
+            self._startup_heartbeat.phase = phase
+
+    def _prepare_kernels(self) -> None:
+        """Compile every declared JIT kernel before any distributed work.
+
+        DeepSeek V4.1's TileLang family declares each call its modules can make
+        while the model is built; the runner's JIT registry also holds the Triton
+        kernels its samplers registered. They compile here on this rank alone,
+        TileLang's in one thread pool, and TileLang's kernel cache is then frozen,
+        so profiling, warm-up, capture and serving compile nothing: a kernel that
+        was not declared fails by name on every rank alike.
+        """
+        registry = getattr(self.model_runner, "jit_warmup_registry", None)
+        if registry is None:
+            return
+        self._set_startup_phase("preparing kernels")
+        started = time.monotonic()
+        tilelang_calls = 0
+        if envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
+            from vllm.models.deepseek_v4_1.tilelang import prepare
+
+            tilelang_calls = prepare.prepare_declared(registry)
+        registry.warmup()
+        if tilelang_calls:
+            prepare.freeze("every declared kernel was prepared before memory profiling")
+        logger.info(
+            "Prepared %d TileLang calls and the registry's other kernels in %.1f s.",
+            tilelang_calls,
+            time.monotonic() - started,
+        )
+
     def _startup_rendezvous(self, phase: str) -> None:
         """Wait on the host until every rank reaches ``phase``.
 
-        On cold disks and JIT caches ranks finish loading and compiling minutes
-        apart. Without this, the first rank in waits for the others inside the
-        phase's first collective, spinning on the GPU, until its timeout stops
-        it. On the host the wait costs nothing and names a missing rank.
+        Ranks finish loading and preparing kernels at their own pace. The wait
+        lasts while every missing rank is alive, however long it takes, and fails
+        naming a rank whose heartbeat stopped (see ``startup_rendezvous``).
         """
         group = get_world_group()
         if group.world_size == 1:
             return
-        started = time.monotonic()
-        torch.distributed.monitored_barrier(
-            group=group.cpu_group,
-            timeout=timedelta(milliseconds=envs.VLLM_STARTUP_RENDEZVOUS_TIMEOUT_MS),
-            wait_all_ranks=True,
+        from vllm.v1.worker.startup_rendezvous import rendezvous
+
+        self._set_startup_phase(f"waiting before {phase}")
+        waited = rendezvous(
+            torch.distributed.distributed_c10d._get_default_store(),
+            group.rank,
+            group.world_size,
+            phase,
+            envs.VLLM_STARTUP_HEARTBEAT_TIMEOUT_S,
+            logger.info,
         )
-        waited = time.monotonic() - started
+        self._set_startup_phase(phase)
         if waited >= 1.0:
             logger.info("Waited %.1f s for every rank before %s.", waited, phase)
 
