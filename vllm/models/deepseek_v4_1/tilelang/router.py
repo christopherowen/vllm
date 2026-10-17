@@ -27,15 +27,19 @@ memory and each MoE layer runs one launch fewer. At prefill the gate runs its
 own GEMM and TileKernels routes the logits.
 """
 
+import functools
+
 import tilelang
 import tilelang.language as T
 import torch
 
 import vllm.envs as envs
+from vllm.config import get_current_vllm_config_or_none
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     FusedTopKBiasRouter,
 )
+from vllm.models.deepseek_v4_1.tilelang import prepare
 
 
 def _image_token_mask(input_ids: torch.Tensor, lo: int, count: int) -> torch.Tensor:
@@ -82,6 +86,68 @@ def _routing_mask(rows: int, *, ced_decoder: bool = False) -> torch.Tensor | Non
     return cached[1][:rows]
 
 
+def _routing_mask_variants(vllm_config) -> tuple[bool, ...]:
+    """Whether ``_routing_mask`` can return a mask (True) or None (False).
+
+    A mask needs ``VLLM_MOE_SKIP_PADDING``. The V2 model runner gives every
+    forward, the drafter's included, its padding rows; the V1 runner gives none,
+    so only a CED decoder layer's compact rows have a mask there. Without a
+    config (kernel tests) either can come.
+    """
+    if not envs.VLLM_MOE_SKIP_PADDING:
+        return (False,)
+    if vllm_config is not None and vllm_config.use_v2_model_runner:
+        return (True,)
+    return (False, True)
+
+
+def _topk_gate(
+    logits: torch.Tensor,
+    num_topk: int,
+    routed_scaling_factor: float,
+    mask: torch.Tensor | None,
+    bias: torch.Tensor,
+    image_bias: torch.Tensor | None,
+    image_token_mask: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """TileKernels' top-k gate as V4.1 routes: sqrtsoftplus with a correction
+    bias and no shared experts."""
+    from tile_kernels.moe import moe_topk_gate_forward
+
+    return moe_topk_gate_forward(
+        logits,
+        num_topk,
+        use_shared_as_routed=False,
+        num_shared_experts=0,
+        routed_scaling_factor=routed_scaling_factor,
+        ep_rank=0,
+        mask=mask,
+        bias=bias,
+        image_bias=image_bias,
+        image_token_mask=image_token_mask,
+    )
+
+
+@functools.cache
+def _warm_topk_gate(num_topk: int, num_experts: int, image: bool, mask: bool) -> None:
+    """TileKernels' top-k gate of ``num_topk`` of ``num_experts``, run once on a zero
+    row with the inputs the router passes (an image bias and mask, a routing mask),
+    so its kernel (keyed by which inputs exist, not by the rows) is compiled before
+    the cache freezes."""
+    logits = torch.zeros((1, num_experts), dtype=torch.float32, device="cuda")
+    bias = torch.zeros(num_experts, dtype=torch.float32, device="cuda")
+    flags = torch.zeros(1, dtype=torch.bool, device="cuda")
+    _topk_gate(
+        logits,
+        num_topk,
+        1.0,
+        mask=~flags if mask else None,
+        bias=bias,
+        image_bias=bias if image else None,
+        image_token_mask=flags if image else None,
+    )
+
+
 class TileKernelsRouter(FusedTopKBiasRouter):
     """V4.1 routing through TileKernels' TileLang top-k gate."""
 
@@ -106,8 +172,6 @@ class TileKernelsRouter(FusedTopKBiasRouter):
         *,
         input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        from tile_kernels.moe import moe_topk_gate_forward
-
         image_bias = image_token_mask = None
         if self.bias_vl is not None and self.image_sentinel_lo > 0:
             if input_ids is None:
@@ -116,13 +180,10 @@ class TileKernelsRouter(FusedTopKBiasRouter):
             image_token_mask = _image_token_mask(
                 input_ids, self.image_sentinel_lo, self.image_sentinel_count
             )
-        topk_ids, topk_weights = moe_topk_gate_forward(
+        topk_ids, topk_weights = _topk_gate(
             router_logits,
             self.top_k,
-            use_shared_as_routed=False,
-            num_shared_experts=0,
-            routed_scaling_factor=self.routed_scaling_factor,
-            ep_rank=0,
+            self.routed_scaling_factor,
             mask=_routing_mask(
                 router_logits.shape[0],
                 ced_decoder=getattr(self, "_ds41_is_ced_decoder", False),
@@ -296,6 +357,62 @@ class TileLangGateRouter(TileKernelsRouter):
         self._kernels: dict[tuple[bool, bool], object] = {}
         # Text-only layers pass no image tokens; one all-false mask serves them.
         self._no_image = None
+        vllm_config = get_current_vllm_config_or_none()
+        # The most rows one forward routes (the drafter sets its query rows); None
+        # (kernel tests) is unbounded.
+        self.max_rows: int | None = (
+            None
+            if vllm_config is None
+            else vllm_config.scheduler_config.max_num_batched_tokens
+        )
+        self._mask_variants = _routing_mask_variants(vllm_config)
+
+    def _partials_kernels(self) -> dict[tuple[bool, bool], prepare.TileLangCall]:
+        """``route_partials`` for each (image, routing mask) a decode step can pass,
+        keyed as ``_compute_routing`` looks it up; none when the gate does not
+        split."""
+        gate = self.gate
+        if gate.tilelang_shards == 1:
+            return {}
+        image = self.bias_vl is not None and self.image_sentinel_lo > 0
+        return {
+            (image, mask): prepare.call(
+                route_partials,
+                self.top_k,
+                gate.weight.shape[0],
+                gate.tilelang_shards,
+                image,
+                mask,
+            )
+            for mask in self._mask_variants
+        }
+
+    def _warm(self) -> None:
+        """TileKernels' top-k gate for rows past the gate's split rows, if a forward
+        can have them."""
+        gate = self.gate
+        if (
+            gate.tilelang_shards > 1
+            and self.max_rows is not None
+            and self.max_rows <= gate.tilelang_split_rows
+        ):
+            return
+        image = self.bias_vl is not None and self.image_sentinel_lo > 0
+        for mask in self._mask_variants:
+            _warm_topk_gate(self.top_k, gate.weight.shape[0], image, mask)
+
+    def declare_kernels(self) -> None:
+        """Declare the router's kernels (its layer calls this when preparing): the
+        decode rows' ``route_partials`` and the prefill rows' TileKernels gate. They
+        read the gate's split, set when the gate declares its own kernels."""
+
+        def bind() -> None:
+            for key, (function, args, kwargs) in self._partials_kernels().items():
+                self._kernels[key] = function(*args, **kwargs)
+
+        prepare.declare(
+            lambda: self._partials_kernels().values(), bind=bind, warm=self._warm
+        )
 
     def _compute_routing(
         self,
@@ -329,10 +446,6 @@ class TileLangGateRouter(TileKernelsRouter):
             ced_decoder=getattr(self, "_ds41_is_ced_decoder", False),
         )
         key = (image, route_mask is not None)
-        if key not in self._kernels:
-            self._kernels[key] = route_partials(
-                self.top_k, gate.weight.shape[0], gate.tilelang_shards, *key
-            )
         rows = x.shape[0]
         topk_ids = torch.empty(rows, self.top_k, dtype=torch.int64, device=x.device)
         topk_weights = torch.empty(

@@ -167,7 +167,9 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         shared = getattr(self.ffn, "shared_experts", None)
         if shared is not None:
-            shared.act_fn = kernels.shared_expert_activation(shared.act_fn)
+            shared.act_fn = kernels.shared_expert_activation(
+                shared.act_fn, shared.gate_up_proj.output_size_per_partition // 2
+            )
 
         # A CED decoder layer routes the compact decoder rows, whose padding
         # mask differs from the step's. Tag its router by layer, never by the
@@ -228,6 +230,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             ),
             requires_grad=False,
         )
+
+    def declare_kernels(self) -> None:
+        """Declare the MoE router's kernels (a router is not a module)."""
+        router = getattr(self.ffn.experts, "router", None)
+        declare = getattr(router, "declare_kernels", None)
+        if declare is not None:
+            declare()
 
     def build_l2_prefetch(self, nxt: "DeepseekV4DecoderLayer | None") -> str:
         """Install this layer's L2 prefetch windows; see ``l2_prefetch``."""
@@ -486,6 +495,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     "_sp_project_reduce_scatter_hook",
                     sp_prefill.project_reduce_scatter_current,
                 )
+        # Under SP prefill an Engram layer gates this rank's rows (its blocked gate).
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            if getattr(layer, "engram", None) is not None:
+                layer.engram.prefill_sp_min_rows = self.prefill_sp_min_rows
 
         # Hashing reads the runner's accepted-only lookback, never KV slot state.
         self.engram_hash: NgramHashState | None = None
@@ -620,6 +633,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     device=device,
                 ),
             }
+        )
+
+    def declare_kernels(self) -> None:
+        """Declare the TileLang kernels the forward reaches outside its modules: the
+        rank-order sum of the TP group's collectives and the L2 prefetch."""
+        from ..tilelang import collectives, prepare
+
+        prepare.declare(
+            lambda: [*collectives.rank_order_sum_calls(), *l2_prefetch.kernel_calls()]
         )
 
     def _build_l2_prefetch(self) -> None:

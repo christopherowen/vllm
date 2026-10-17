@@ -29,6 +29,8 @@ import tilelang
 import tilelang.language as T
 import torch
 
+from vllm.models.deepseek_v4_1.tilelang import prepare
+
 HEADS = 24
 ROW = 256
 SCALES = ROW // 32
@@ -43,7 +45,9 @@ _TIMING = (
 )
 
 # Control-block word offsets, as in engram_rows/_reader.c.
-_HEADER = _TIMING + r"""
+_HEADER = (
+    _TIMING
+    + r"""
 // Engram rows: the reader publishes a step by writing its sequence number into the
 // control block in mapped host memory; this stream wrote the step it staged there.
 #define ENGRAM_CTRL_IDS_SEQ 0
@@ -122,7 +126,8 @@ __device__ __forceinline__ void engram_release_rows(void *control) {
     asm volatile("st.release.sys.global.u32 [%0], %1;"
                  :: "l"(ctrl + ENGRAM_CTRL_CONSUMED_SEQ), "r"(staged) : "memory");
 }
-"""
+"""  # noqa: E501 (CUDA source)
+)
 
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
@@ -132,7 +137,9 @@ def engram_rows_wait_kernel():
         with T.Kernel(1, threads=32):
             T.import_source(_HEADER)
             if T.get_thread_binding() == 0:
-                T.call_extern("engram_wait_rows", T.address_of(control[0]), dtype="handle")
+                T.call_extern(
+                    "engram_wait_rows", T.address_of(control[0]), dtype="handle"
+                )
 
     return engram_rows_wait
 
@@ -177,7 +184,9 @@ def engram_rows_gather_kernel(
             lookup = t * HEADS + head
             owned = (t < num_tokens[0]) & (row >= shard_start) & (row < shard_end)
             if columns != (1 << HEADS) - 1:
-                owned = owned & (T.bitwise_and(T.shift_right(T.int32(columns), head), 1) == 1)
+                owned = owned & (
+                    T.bitwise_and(T.shift_right(T.int32(columns), head), 1) == 1
+                )
             if owned:
                 exponent = T.cast(scales[lookup, tx * vec // 32], T.uint32)
                 scale = T.reinterpret(T.shift_left(exponent, 23), T.float32)
@@ -185,13 +194,29 @@ def engram_rows_gather_kernel(
                 scale = T.if_then_else(exponent == 255, T.float32(float("nan")), scale)
                 for i in T.vectorized(vec):
                     out[t, head * ROW + tx * vec + i] = T.cast(
-                        T.cast(rows[lookup, tx * vec + i], T.float32) * scale, T.bfloat16
+                        T.cast(rows[lookup, tx * vec + i], T.float32) * scale,
+                        T.bfloat16,
                     )
             else:
                 for i in T.vectorized(vec):
                     out[t, head * ROW + tx * vec + i] = T.bfloat16(0)
 
     return engram_rows_gather
+
+
+def row_kernel_calls(
+    max_lookups: int, shard_start: int, shard_end: int, columns: int
+) -> list[prepare.TileLangCall]:
+    """The kernel calls ``engram_rows_gather`` makes for a reader of ``max_lookups``
+    rows a step (``rows.shape[0]``) and the rank's rows ``[shard_start, shard_end)``
+    of the hash columns in the mask ``columns``."""
+    return [
+        prepare.call(engram_rows_wait_kernel),
+        prepare.call(
+            engram_rows_gather_kernel, max_lookups, shard_start, shard_end, columns
+        ),
+        prepare.call(engram_rows_release_kernel),
+    ]
 
 
 @torch.library.custom_op("vllm::dsv41_engram_rows_gather", mutates_args=("out",))
@@ -214,12 +239,23 @@ def engram_rows_gather(
     engram_rows_wait_kernel()(control)
     tokens = out.shape[0]
     if tokens:
-        kernel = engram_rows_gather_kernel(rows.shape[0], shard_start, shard_end, columns)
+        kernel = engram_rows_gather_kernel(
+            rows.shape[0], shard_start, shard_end, columns
+        )
         kernel(ids[:tokens], num_tokens, rows, scales, out)
     engram_rows_release_kernel()(control)
 
 
 @engram_rows_gather.register_fake
-def _engram_rows_gather_fake(ids, num_tokens, rows, scales, control, out, shard_start, shard_end,
-                             columns=(1 << HEADS) - 1):
+def _engram_rows_gather_fake(
+    ids,
+    num_tokens,
+    rows,
+    scales,
+    control,
+    out,
+    shard_start,
+    shard_end,
+    columns=(1 << HEADS) - 1,
+):
     return None

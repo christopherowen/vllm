@@ -33,7 +33,6 @@ from vllm.utils.b12x import (
 )
 from vllm.v1.worker.workspace import retain_cuda_graph_capture_resource
 
-
 _FP8_BLOCK_ROWS = 32
 
 
@@ -73,13 +72,16 @@ class _PaddedColumnParallelLinear(ColumnParallelLinear):
         """This rank's column block of the product, not gathered."""
         return self.quant_method.apply(self, input_, None)
 
+
 logger = init_logger(__name__)
 DEAD_ID = -1
 
 # How long a forward's gather waits for a step's disk rows before it stops the
 # GPU with a record of the step (a liveness bound; the rows normally arrive
 # within a millisecond).
-ENGRAM_ROWS_TIMEOUT_S = float(os.environ.get("SPARK3_ENGRAM_ROWS_TIMEOUT_MS", "10000")) / 1000
+ENGRAM_ROWS_TIMEOUT_S = (
+    float(os.environ.get("SPARK3_ENGRAM_ROWS_TIMEOUT_MS", "10000")) / 1000
+)
 # Tests only: delay every disk read, to show the forward waits for its rows.
 ENGRAM_READ_DELAY_S = float(os.environ.get("SPARK3_ENGRAM_READ_DELAY_MS", "0")) / 1000
 # Debug only (off and free in serving): every row ID the host hashed early must equal
@@ -404,6 +406,24 @@ class NgramHashState(nn.Module):
     def ensure_cache(self):
         return True  # Hash history belongs to the runner, never the KV slot pool.
 
+    def declare_kernels(self) -> None:
+        """Declare the TileLang hash of every Engram layer. The runner's token ids
+        and the model state's lookback window are int32 (profiling's window takes
+        the ids' dtype)."""
+        if not kernels.uses_tilelang():
+            return
+        from vllm.models.deepseek_v4_1.tilelang import prepare
+        from vllm.models.deepseek_v4_1.tilelang.engram_hash import engram_hash_kernel
+
+        call = prepare.call(
+            engram_hash_kernel,
+            self._tl_geometry[0].shape[0],
+            self._tl_token_map.numel(),
+            "int32",
+            "int32",
+        )
+        prepare.declare(lambda: [call])
+
     def run_native(self, ids, mask, starts, history, out):
         """Hash ``ids`` for every Engram layer into ``out`` [T, layers, 24].
 
@@ -616,7 +636,10 @@ class ParallelEngramEmbedding(nn.Module):
             self._weight_allocation = None
             try:
                 self._weight_allocation = MappedHostAllocation(
-                    self.weight_shape, torch.float8_e4m3fn, caps.device, write_combined=True
+                    self.weight_shape,
+                    torch.float8_e4m3fn,
+                    caps.device,
+                    write_combined=True,
                 )
                 self._scale_allocation = MappedHostAllocation(
                     self.scale_shape, torch.uint8, caps.device, write_combined=True
@@ -670,7 +693,9 @@ class ParallelEngramEmbedding(nn.Module):
                 )
         self.register_buffer(
             "hashes",
-            torch.full((caps.max_tokens, 24), DEAD_ID, dtype=torch.int64, device=caps.device),
+            torch.full(
+                (caps.max_tokens, 24), DEAD_ID, dtype=torch.int64, device=caps.device
+            ),
             persistent=False,
         )
         self.register_buffer(
@@ -719,20 +744,40 @@ class ParallelEngramEmbedding(nn.Module):
             loaded.add(name)
         return loaded
 
+    def _disk_shard(self) -> dict[str, int]:
+        """The disk reader's rows: this rank's shard of the table, its hash columns
+        and the lookups of the largest step."""
+        return dict(
+            shard_start=min(self.shard_start, self.table_rows),
+            shard_end=min(self.shard_end, self.table_rows),
+            columns=self.column_mask,
+            max_lookups=self.caps.max_tokens * 24,
+        )
+
+    def declare_kernels(self) -> None:
+        """Declare a disk table's TileLang row kernels (the wait, the gather of its
+        reader's buffers and shard, and the release)."""
+        if self.table_memory != "disk":
+            return
+        from vllm.models.deepseek_v4_1.tilelang import prepare
+        from vllm.models.deepseek_v4_1.tilelang.engram_rows import row_kernel_calls
+
+        calls = row_kernel_calls(**self._disk_shard())
+        prepare.declare(lambda: calls)
+
     def open_disk_rows(self) -> None:
         """Start reading this rank's shard of the table from the checkpoint, once."""
         if self.table_memory != "disk" or self.disk_rows is not None:
             return
         planes = sorted(scale for _, _, scale in self._disk_sources)
         if planes != [False, True]:
-            raise ValueError("Disk Engram needs the table's weight and scale planes, once each")
+            raise ValueError(
+                "Disk Engram needs the table's weight and scale planes, once each"
+            )
         rows = EngramDiskRows(
             device=self.caps.device,
             table_rows=self.table_rows,
-            shard_start=min(self.shard_start, self.table_rows),
-            shard_end=min(self.shard_end, self.table_rows),
-            columns=self.column_mask,
-            max_lookups=self.caps.max_tokens * 24,
+            **self._disk_shard(),
             rows_timeout_s=ENGRAM_ROWS_TIMEOUT_S,
             delay_s=ENGRAM_READ_DELAY_S,
             check_early=ENGRAM_CHECK_EARLY_IDS,
@@ -812,6 +857,9 @@ class Engram(nn.Module):
         )
         self._disk_prepared = False
         self._disk_prepared_tokens = 0
+        # The smallest forward the model runs sequence-parallel (0: never); the
+        # model sets it.
+        self.prefill_sp_min_rows = 0
         projection_tp = getattr(layout, "projection_tp", False)
         projection_cls = (
             _PaddedColumnParallelLinear if projection_tp else ReplicatedLinear
@@ -977,20 +1025,57 @@ class Engram(nn.Module):
         )
         units = []
         if lookup_requests:
-            units.append(B12xPreparationUnit(
-                name="EngramLookup",
-                key=(id(self), workload.max_tokens),
-                requests=lookup_requests,
-                stage="weights",
-            ))
+            units.append(
+                B12xPreparationUnit(
+                    name="EngramLookup",
+                    key=(id(self), workload.max_tokens),
+                    requests=lookup_requests,
+                    stage="weights",
+                )
+            )
         if mix_requests:
-            units.append(B12xPreparationUnit(
-                name="EngramMix",
-                key=(id(self), workload.max_tokens),
-                requests=mix_requests,
-                stage="weights",
-            ))
+            units.append(
+                B12xPreparationUnit(
+                    name="EngramMix",
+                    key=(id(self), workload.max_tokens),
+                    requests=mix_requests,
+                    stage="weights",
+                )
+            )
         return tuple(units)
+
+    def declare_kernels(self) -> None:
+        """Declare the TileLang gate: on packed rows always, and on the column blocks
+        of a column-parallel projection when the model runs prefill sequence
+        parallel (the blocked gate, one block per rank). The model always passes
+        the image-token mask."""
+        if not kernels.uses_tilelang():
+            return
+        from vllm.models.deepseek_v4_1.tilelang import prepare
+        from vllm.models.deepseek_v4_1.tilelang.engram import (
+            engram_gate_blocked_kernel,
+            engram_gate_kernel,
+        )
+
+        calls = [
+            prepare.call(engram_gate_kernel, self.hc_mult, self.dim, self.eps, True)
+        ]
+        sequence_parallel = (
+            0 < self.prefill_sp_min_rows <= self.embed_tokens.caps.max_tokens
+        )
+        if sequence_parallel and isinstance(self.wkv, _PaddedColumnParallelLinear):
+            calls.append(
+                prepare.call(
+                    engram_gate_blocked_kernel,
+                    self.hc_mult,
+                    self.dim,
+                    self.eps,
+                    True,
+                    get_tensor_model_parallel_world_size(),
+                    self.wkv.output_size_per_partition,
+                )
+            )
+        prepare.declare(lambda: calls)
 
     def process_weights_after_loading(self):
         self.norm_weights.copy_(
@@ -1097,7 +1182,12 @@ class Engram(nn.Module):
             # The TileLang model passes DeepSeek's image-token mask (True skips).
             gate = engram_gate_blocked if blocked else engram_gate
             gate(
-                state, kv, self.norm_weights, token_mask, mix_out, self.eps,
+                state,
+                kv,
+                self.norm_weights,
+                token_mask,
+                mix_out,
+                self.eps,
                 self.hc_mult,
             )
             return out.view_as(hidden_states)

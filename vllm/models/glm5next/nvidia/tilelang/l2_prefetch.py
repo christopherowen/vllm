@@ -11,6 +11,8 @@ only; nothing is written.
 
 # No `from __future__ import annotations`: TileLang reads the prim_func
 # annotations eagerly, and the symbolic shape must resolve.
+import tilelang
+import tilelang.language as T
 import torch
 
 # createpolicy has no side effects (the compiler may hoist it); the prefetch does.
@@ -29,9 +31,10 @@ __device__ __forceinline__ void l2pf_bulk_prefetch(long long address, int bytes,
 """
 
 
-def _kernel(grid: int, block: int, chunk: int):
-    import tilelang.language as T
-
+@tilelang.jit(target="cuda")
+def l2_prefetch_kernel(grid: int, block: int, chunk: int):
+    """The prefetch of a shape-dynamic segment table by ``grid`` x ``block`` threads in
+    ``chunk``-byte requests; one kernel per (grid, block, chunk)."""
     nseg2 = T.dynamic("nseg2")
 
     @T.prim_func
@@ -48,26 +51,34 @@ def _kernel(grid: int, block: int, chunk: int):
                 nbytes = segs[2 * s + 1]
                 nchunks = (nbytes + (chunk - 1)) // chunk
                 # This thread's chunks: tid, tid + stride, ... below nchunks.
-                for k in T.serial(T.max((nchunks - tid + (stride - 1)) // stride, T.int64(0))):
+                for k in T.serial(
+                    T.max((nchunks - tid + (stride - 1)) // stride, T.int64(0))
+                ):
                     off = (tid + k * stride) * chunk
                     size = T.min(nbytes - off, T.int64(chunk)) // 16 * 16
                     if size > 0:
-                        T.call_extern("l2pf_bulk_prefetch", base + off, T.cast(size, T.int32),
-                                      policy[0], dtype="handle")
+                        T.call_extern(
+                            "l2pf_bulk_prefetch",
+                            base + off,
+                            T.cast(size, T.int32),
+                            policy[0],
+                            dtype="handle",
+                        )
 
     return l2_prefetch
 
 
 def compile_launcher(grid: int, block: int, chunk: int):
-    """Compile once for a shape-dynamic segment table; returns
-    (segs_tensor, cuda_stream_handle) -> None, like the CuTe launcher."""
-    import tilelang
-
-    kernel = tilelang.compile(_kernel(grid, block, chunk), target="cuda")
+    """Compile once for a shape-dynamic segment table (a cache hit once the kernel
+    was prepared); returns (segs_tensor, cuda_stream_handle) -> None, like the CuTe
+    launcher."""
+    kernel = l2_prefetch_kernel(grid, block, chunk)
 
     def launch(segs: torch.Tensor, stream_handle: int) -> None:
         # TileLang launches on the current stream of the call.
-        with torch.cuda.stream(torch.cuda.ExternalStream(stream_handle, device=segs.device)):
+        with torch.cuda.stream(
+            torch.cuda.ExternalStream(stream_handle, device=segs.device)
+        ):
             kernel(segs)
 
     return launch

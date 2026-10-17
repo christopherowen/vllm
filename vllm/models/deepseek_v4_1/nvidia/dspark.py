@@ -399,6 +399,16 @@ class DSparkDeepseekV4Model(nn.Module):
                 for i in range(self.num_dspark_layers)
             ]
         )
+        # A draft forward routes one query block per request, as DSparkSpeculator
+        # lays it out: the speculative tokens, plus the anchor unless the drafter
+        # predicts from it.
+        query_rows = vllm_config.speculative_config.num_speculative_tokens + (
+            0 if getattr(config, "sample_from_anchor", True) else 1
+        )
+        for layer in self.layers:
+            router = getattr(layer.ffn.experts, "router", None)
+            if hasattr(router, "max_rows"):
+                router.max_rows = vllm_config.scheduler_config.max_num_seqs * query_rows
 
         # Heads: final norm, and the Markov + confidence heads.
         # Loaded from the "final" MTP layer weights (mtp.*) in the target

@@ -142,7 +142,7 @@ class _Gate(torch.nn.Module):
         self.weight = torch.nn.Parameter(weight.to(torch.bfloat16), requires_grad=False)
         self.out_dtype = torch.float32
         self.quant_method = TileLangLinearMethod()
-        self.quant_method.process_weights_after_loading(self)
+        self.quant_method.declare_layer_kernels(self)  # standalone: prepares now
 
     def forward(self, x):
         return self.quant_method.apply(self, x), None
@@ -181,6 +181,7 @@ def test_gate_router_matches_the_gate_then_the_router(
         scoring_func="sqrtsoftplus",
     )
     fused = tilelang_router.TileLangGateRouter(gate=gate, **kwargs)
+    fused.declare_kernels()
     weights, ids = fused._compute_routing(None, x, None)
     logits, _ = gate(x)
     expected = tilelang_router.TileKernelsRouter(**kwargs)._compute_routing(
@@ -211,9 +212,9 @@ def test_gate_router_routes_image_tokens(plain_scratch):
         image_sentinel_lo=LO,
         image_sentinel_count=1,
     )
-    weights, ids = tilelang_router.TileLangGateRouter(
-        gate=gate, **kwargs
-    )._compute_routing(None, x, None, input_ids=input_ids)
+    fused = tilelang_router.TileLangGateRouter(gate=gate, **kwargs)
+    fused.declare_kernels()
+    weights, ids = fused._compute_routing(None, x, None, input_ids=input_ids)
     logits, _ = gate(x)
     expected = tilelang_router.TileKernelsRouter(**kwargs)._compute_routing(
         None, logits, None, input_ids=input_ids
@@ -257,6 +258,7 @@ def test_padding_rows_are_not_routed(plain_scratch, padded_step, gate_router):
     logits, _ = gate(x)
     if gate_router:
         router = tilelang_router.TileLangGateRouter(gate=gate, **kwargs)
+        router.declare_kernels()
         weights, ids = router._compute_routing(None, x, None)
     else:
         weights, ids = tilelang_router.TileKernelsRouter(**kwargs)._compute_routing(
@@ -289,9 +291,7 @@ def ced_step(monkeypatch):
     from vllm.models.deepseek_v4_1.ced import CEDState, gather_rows
 
     state = CEDState(6, 4096, (256, 512, 1024, 2048, 4096), "cuda")
-    starts = torch.tensor(
-        [0, 4, 8, 12, 16, 22, 353], dtype=torch.int32, device="cuda"
-    )
+    starts = torch.tensor([0, 4, 8, 12, 16, 22, 353], dtype=torch.int32, device="cuda")
     seq = torch.tensor([4000] * 5 + [3659], dtype=torch.int32, device="cuda")
     state.stage(starts, seq, [6] * 5 + [331], [False] * 6, [0] * 5 + [3328])
     indices = state.get_indices()

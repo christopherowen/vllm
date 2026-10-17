@@ -148,6 +148,19 @@ def warmup() -> bool:
     return ENABLED and _l2pf._get_launcher() is not None
 
 
+def kernel_calls() -> list:
+    """The TileLang prefetch kernel's call, as ``warmup`` makes it, when the windows
+    prefetch through it (``VLLM_L2_PREFETCH_KERNELS=tilelang``)."""
+    if not ENABLED or _l2pf._KERNELS != "tilelang":
+        return []
+    from vllm.models.deepseek_v4_1.tilelang import prepare
+    from vllm.models.glm5next.nvidia.tilelang.l2_prefetch import l2_prefetch_kernel
+
+    return [
+        prepare.call(l2_prefetch_kernel, _l2pf._GRID, _l2pf._BLOCK, _l2pf._CHUNK_BYTES)
+    ]
+
+
 def issue(plan: _l2pf.L2PrefetchPlan | None, num_tokens: int) -> None:
     if ENABLED and plan is not None and plan.segs is not None:
         _l2pf.L2Prefetcher.get(plan.segs.device).issue(plan, num_tokens)

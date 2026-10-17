@@ -18,6 +18,8 @@ import tilelang.language as T
 import torch
 from torch import nn
 
+from vllm.models.deepseek_v4_1.tilelang import prepare
+
 _VEC = 8
 
 
@@ -65,11 +67,27 @@ def _kernel(n: int, limit: float):
 
 
 class SiluAndMulClampFP32(nn.Module):
-    """Drop-in for ``SiluAndMulWithClamp`` with the reference's FP32 product."""
+    """Drop-in for ``SiluAndMulWithClamp`` with the reference's FP32 product.
 
-    def __init__(self, swiglu_limit: float):
+    ``width`` is the gate (and up) width its owner runs it on, ``[M, 2 * width]``
+    inputs; the module declares that kernel. Without it (kernel tests) nothing is
+    declared.
+    """
+
+    def __init__(self, swiglu_limit: float, width: int | None = None):
         super().__init__()
         self.limit = float(swiglu_limit)
+        self.width = width
+
+    def declare_kernels(self) -> None:
+        """Declare the kernel of the owner's width, and keep it in ``_kernel``."""
+        if self.width is None:
+            return
+        width, limit = self.width, self.limit
+        prepare.declare(
+            lambda: [prepare.call(swiglu_clamp_kernel, width, limit)],
+            bind=lambda: _kernel(width, limit),
+        )
 
     def forward(self, gate_up: torch.Tensor) -> torch.Tensor:
         n = gate_up.shape[-1] // 2

@@ -24,6 +24,8 @@ import tilelang
 import tilelang.language as T
 import torch
 
+from vllm.models.deepseek_v4_1.tilelang import prepare
+
 _VEC = 8  # BF16 per thread: one 16-byte access
 
 
@@ -109,6 +111,21 @@ def rank_order_sum_kernel(world: int, threads: int = 256):
                     store(out, xs, total, row)
 
     return collectives_rank_order_sum
+
+
+def rank_order_sum_calls() -> list[prepare.TileLangCall]:
+    """The rank-order sum the TP group's collectives launch, as ``rank_order_sum``
+    calls it: one part per rank, when the group's communicator all-reduces and
+    reduce-scatters in rank order (DS4.1's TileLang family on the RoCE policy,
+    ``rank_order_reduce_scatter``); ``RankOrderParts.sum`` adds as many parts."""
+    from vllm.distributed import get_tp_group
+
+    group = get_tp_group()
+    world = group.world_size
+    comm = group.device_communicator
+    if not 2 <= world <= 4 or not getattr(comm, "rank_order_reduce_scatter", False):
+        return []
+    return [prepare.call(rank_order_sum_kernel, world)]
 
 
 def rank_order_sum(
