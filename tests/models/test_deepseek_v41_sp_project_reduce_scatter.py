@@ -2,7 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A sequence-parallel projection reduce-scattered in slices lands every row where
 one projection and one reduce-scatter put it (one rank's view, the others'
-contributions stood in by zeros)."""
+contributions stood in by zeros); the row exchange gives each rank its rows of every
+block, over the cabled pairs only."""
+
+import collections
+import threading
 
 import pytest
 import torch
@@ -162,3 +166,84 @@ def test_row_exchange_gives_each_rank_its_rows_of_every_block(
         assert torch.equal(
             packed[:real], product[rows.start : rows.start + real, :width]
         )
+
+
+class _Fabric:
+    """PyNCCL ranks as threads: when every rank has ended a group, each receive takes
+    the next send from its peer to it (NCCL's per-pair order), shapes checked and
+    every send consumed. Records which pairs exchanged."""
+
+    def __init__(self, world: int):
+        self.world = world
+        self.barrier = threading.Barrier(world, timeout=30)
+        self.ops: list[list] = [[] for _ in range(world)]
+        self.pairs: set[frozenset] = set()
+
+    def comm(self, rank: int):
+        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+
+        comm = PyNcclCommunicator.__new__(PyNcclCommunicator)
+        comm.disabled, comm.world_size, comm.rank = False, self.world, rank
+        comm.group_start = lambda: None
+        comm.send = lambda t, peer, stream: self.ops[rank].append(("send", peer, t))
+        comm.recv = lambda t, peer, stream: self.ops[rank].append(("recv", peer, t))
+        comm.group_end = lambda: self._end(rank)
+        return comm
+
+    def _end(self, rank: int) -> None:
+        self.barrier.wait()
+        if rank == 0:
+            sends = collections.defaultdict(collections.deque)
+            for source, ops in enumerate(self.ops):
+                for kind, peer, tensor in ops:
+                    if kind == "send":
+                        sends[(source, peer)].append(tensor)
+            for destination, ops in enumerate(self.ops):
+                for kind, peer, tensor in ops:
+                    if kind == "recv":
+                        sent = sends[(peer, destination)].popleft()
+                        assert sent.shape == tensor.shape, (peer, destination)
+                        tensor.copy_(sent)
+                        self.pairs.add(frozenset((peer, destination)))
+            assert not any(sends.values()), "a send nobody received"
+            self.ops = [[] for _ in range(self.world)]
+        self.barrier.wait()
+
+
+@pytest.mark.parametrize("world", [3, 4])
+@pytest.mark.parametrize("short", [0, 3, 9, 10, 25])
+def test_row_all_to_all_over_cabled_pairs(world, short, rows=10):
+    """PyNCCL's ``all_to_all_rows``, every rank a thread: each rank receives every
+    rank's block of its real rows bit for bit and later rows stay unwritten, with the
+    last blocks short or empty; at four ranks (the switchless ring) only neighbours
+    exchange, since ranks two apart share no cable."""
+    total = max(1, world * rows - short)
+    fabric = _Fabric(world)
+    inputs = [torch.randn(total, 6) for _ in range(world)]
+    outputs = [torch.full((world, rows, 6), float("nan")) for _ in range(world)]
+    errors = []
+
+    def run(rank: int) -> None:
+        try:
+            fabric.comm(rank).all_to_all_rows(
+                outputs[rank], inputs[rank], rows, stream=object()
+            )
+        except BaseException as error:  # reported below, with the rank
+            errors.append((rank, error))
+            fabric.barrier.abort()
+
+    threads = [threading.Thread(target=run, args=(r,)) for r in range(world)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert not errors, errors
+    for me in range(world):
+        real = max(0, min(rows, total - me * rows))
+        for source in range(world):
+            got = outputs[me][source]
+            assert torch.equal(got[:real], inputs[source][me * rows : me * rows + real])
+            assert got[real:].isnan().all(), (me, source)
+    if world == 4:
+        ring = {frozenset((r, (r + 1) % 4)) for r in range(4)}
+        assert fabric.pairs <= ring, sorted(map(sorted, fabric.pairs - ring))

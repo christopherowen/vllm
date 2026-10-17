@@ -568,7 +568,8 @@ class PyNcclCommunicator:
         ``[r * rows, (r + 1) * rows)``, the last ranks' blocks short or empty when
         ``input_`` has fewer rows; ``output[s, :n]`` receives rank s's block for this
         rank (n its real rows, the same from every rank), and later rows are not
-        written. One grouped send/recv per peer."""
+        written. One grouped send/recv per peer; at four ranks, neighbours only
+        (``_all_to_all_rows_ring``)."""
         if self.disabled:
             return
         world, me, total = self.world_size, self.rank, input_.shape[0]
@@ -586,6 +587,9 @@ class PyNcclCommunicator:
         mine = real(me)
         if mine:
             output[me, :mine].copy_(input_[me * rows : me * rows + mine])
+        if world == 4:
+            self._all_to_all_rows_ring(output, input_, rows, real, stream)
+            return
         self.group_start()
         for peer in range(world):
             if peer == me:
@@ -594,6 +598,53 @@ class PyNcclCommunicator:
                 self.send(input_[peer * rows : peer * rows + real(peer)], peer, stream)
             if mine:
                 self.recv(output[peer, :mine], peer, stream)
+        self.group_end()
+
+    def _all_to_all_rows_ring(self, output, input_, rows, real, stream) -> None:
+        """``all_to_all_rows`` over a switchless four-node ring (sparknet's ring4
+        cable order): ranks two apart share no cable, so NCCL cannot connect them.
+        Each rank sends its neighbours their blocks and each half of the opposite
+        rank's block through one neighbour, which forwards it in a second group, as
+        the rank-order reduce-scatter does (``deepseek_v4_1.tilelang.collectives.
+        exchange_into``); the four links carry equal bytes. Blocks keep their real
+        lengths, the same on both ends of every transfer."""
+        me = self.rank
+        nxt, prv, opp = (me + 1) % 4, (me + 3) % 4, (me + 2) % 4
+
+        def block(rank: int) -> torch.Tensor:
+            return input_[rank * rows : rank * rows + real(rank)]
+
+        def half(rank: int) -> int:  # rows of a block for ``rank`` that go the next way
+            return -(-real(rank) // 2)
+
+        def send(tensor: torch.Tensor, peer: int) -> None:
+            if tensor.shape[0]:
+                self.send(tensor, peer, stream)
+
+        def recv(tensor: torch.Tensor, peer: int) -> None:
+            if tensor.shape[0]:
+                self.recv(tensor, peer, stream)
+
+        mine, tail = real(me), input_.shape[1:]
+        # In transit: the previous rank's block for the next rank (its first half),
+        # and the next rank's block for the previous rank (its second half).
+        relay_a = input_.new_empty((half(nxt), *tail))
+        relay_b = input_.new_empty((real(prv) - half(prv), *tail))
+        self.group_start()
+        send(block(nxt), nxt)
+        send(block(opp)[: half(opp)], nxt)
+        send(block(prv), prv)
+        send(block(opp)[half(opp) :], prv)
+        recv(output[prv, :mine], prv)
+        recv(relay_a, prv)
+        recv(output[nxt, :mine], nxt)
+        recv(relay_b, nxt)
+        self.group_end()
+        self.group_start()
+        send(relay_a, nxt)
+        send(relay_b, prv)
+        recv(output[opp, : half(me)], prv)
+        recv(output[opp, half(me) : mine], nxt)
         self.group_end()
 
     def group_start(self):
