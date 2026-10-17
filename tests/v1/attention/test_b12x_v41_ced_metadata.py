@@ -126,6 +126,7 @@ def test_prompt_logprobs_zero_keeps_every_prompt_row(monkeypatch):
     state.ced_state, starts, seq = _state([4096, 4096])
     state._ced_prompt_logprobs = set()
     state._ced_prefix_start = {}
+    state.disk_engram_models, state._prefill_tokens = (), {}
     batch = SimpleNamespace(
         num_reqs=2,
         req_ids=["logprobs", "ordinary"],
@@ -350,6 +351,8 @@ def test_dspark_compact_context_preserves_query_anchor_and_rejections(monkeypatc
     proposer.num_query_per_req = proposer.num_speculative_steps = 2
     proposer.max_num_reqs = 4
     proposer.max_num_tokens = proposer.max_model_len = 8192
+    proposer._is_padding = torch.ones(8192, dtype=torch.bool, device=device)
+    proposer._row_index = torch.arange(8192, device=device)
     proposer.sample_from_anchor = True
     proposer.dp_size = 1
     proposer.dp_rank = 0
@@ -444,6 +447,7 @@ def test_streaming_update_preserves_private_decoder_history(monkeypatch):
     state.ced_state, starts, seq = _state([1], [1025])
     state._ced_prompt_logprobs = set()
     state._ced_prefix_start = {"stream": 256}
+    state.disk_engram_models, state._prefill_tokens = (), {}
     batch = SimpleNamespace(
         num_reqs=1,
         req_ids=["stream"],
