@@ -90,8 +90,9 @@ def test_wo_projection():
 
     full = project(rows)
     # Reference: TileKernels' inverse rotation in BF16, then FP64 GEMMs: WO-A on the
-    # BF16 activations (DeepSeek's dequantized BF16 einsum), WO-B on MXFP8 ones (its
-    # linear), the intermediate rounded to BF16 as the kernel stores it.
+    # activations through act_quant (MXFP8 values; DeepSeek's quantize-dequantize, then
+    # its BF16 einsum on the dequantized weights), WO-B on MXFP8 ones (its linear), the
+    # intermediate rounded to BF16 as the kernel stores it.
     rotated = o.clone()
     tile_kernels.transform.apply_rotary(
         rotated[..., -ROPE:],
@@ -100,7 +101,7 @@ def test_wo_projection():
         interleaved=True,
         conjugate=True,
     )
-    x = rotated.view(rows, -1).double()
+    x = _mxfp8_values(rotated.view(rows, -1))
     w_a, width = _dequant(wo_a), HEADS // GROUPS * HEAD_DIM
     a = torch.cat(
         [
@@ -218,35 +219,32 @@ def _wo_a_bf16(layer, x):
     return out
 
 
-def test_wo_a_keeps_bf16_activations():
-    """WO-A within one BF16 rounding of the FP64 product of the BF16 activations and
-    the exactly dequantized weights, well inside what MXFP8 activations give, with the
-    same bits at every row count: decode rows split the K shards over CTAs and longer
-    steps add them inside the kernel, in the same order."""
+def test_wo_a_quantizes_its_input_as_act_quant():
+    """WO-A within one BF16 rounding of the FP64 product of its input through the
+    reference's act_quant (MXFP8 values) and the exactly dequantized weights, with the
+    same bits at every row count (decode rows split the K shards over CTAs and longer
+    steps add them inside the kernel, in the same order). Quantizing is idempotent, so
+    the kernel on its input and on that input already through TileKernels'
+    per_token_cast (byte-identical to act_quant) give the same bits: the in-kernel
+    quantization is the reference's, below the amax floor too."""
     width = HEADS // GROUPS * HEAD_DIM
     layer = _block32(GROUPS * RANK, width, 7)
     x = torch.randn((300, GROUPS * width), generator=_gen(8), device=DEVICE).bfloat16()
+    x[::5] *= 1e-7  # some blocks fall below the amax floor
     w = _dequant(layer)
 
     full = _wo_a_bf16(layer, x)
+    quantized = _mxfp8_values(x)
     ref = torch.cat(
         [
-            x[:, g * width : (g + 1) * width].double() @ w[g * RANK : (g + 1) * RANK].T
+            quantized[:, g * width : (g + 1) * width] @ w[g * RANK : (g + 1) * RANK].T
             for g in range(GROUPS)
         ],
         dim=1,
     )
     error = (full.double() - ref).abs()
     assert (error <= ref.abs() * 2**-8 + 1e-3 * ref.abs().max()).all()
-    quantized = torch.cat(
-        [
-            _mxfp8_values(x[:, g * width : (g + 1) * width])
-            @ w[g * RANK : (g + 1) * RANK].T
-            for g in range(GROUPS)
-        ],
-        dim=1,
-    )
-    assert error.mean() < 0.25 * (quantized - ref).abs().mean()
+    assert torch.equal(_wo_a_bf16(layer, quantized.bfloat16()), full)
     for rows in (1, 7, 16, 17, 33, 64, 65, 96, 97, 100, 128, 129, 200):
         assert torch.equal(_wo_a_bf16(layer, x[:rows]), full[:rows]), rows
 

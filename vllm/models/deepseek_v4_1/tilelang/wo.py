@@ -4,12 +4,15 @@
 reference computes it::
 
     o[..., -64:] = inverse_rope(o[..., -64:])          (BF16, in place)
+    o = act_quant(o, 32, "ue8m0", inplace=True)        (MXFP8 values, back in BF16)
     a = wo_a(o.view(T, groups, -1))                    (grouped, block-32 FP8, BF16 out)
     out = wo_b(a.flatten(1))                           (block-32 FP8, BF16 out)
 
-WO-A keeps the BF16 activations, as the reference does (``convert.py`` dequantizes
-``wo_a`` to BF16 and the projection is a BF16 einsum): one launch of the grouped
-W8A16 GEMM expands each FP8 weight tile exactly to BF16 and accumulates in FP32.
+WO-A quantizes its input as the reference does (since its 2026-10-12 revision, for
+both V4.1 Flash checkpoints): each 32-value block of ``o`` to E4M3 with a UE8M0 scale
+and back to BF16, then the BF16 einsum on the weights ``convert.py`` dequantizes. One
+launch of the grouped W8A16 GEMM does both: it quantizes each activation tile as it
+loads it, expands each FP8 weight tile exactly to BF16 and accumulates in FP32.
 WO-B is the ordinary block-32 projection with MXFP8 activations (DeepSeek's E4M3 and
 one UE8M0 scale per 32), as the reference's ``linear`` quantizes them. WO-A's last
 kernel (the GEMM's epilogue, or the split-K reduce at decode) rounds ``a`` to BF16 and
