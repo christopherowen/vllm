@@ -1435,21 +1435,24 @@ class Worker(WorkerBase):
         self._set_startup_phase("preparing kernels")
         started = time.monotonic()
         tilelang_calls = 0
-        if envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
-            from vllm.models.deepseek_v4_1.tilelang import prepare
+        # Declarations read the scheduler sizing and model configuration.
+        with set_current_vllm_config(self.vllm_config):
+            if envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
+                from vllm.models.deepseek_v4_1.tilelang import prepare
 
-            speculator = getattr(self.model_runner, "speculator", None)
-            with registry.activate():
-                prepare.declare_modules(
-                    self.model_runner.model, getattr(speculator, "model", None)
-                )
-            tilelang_calls = prepare.prepare_declared(registry)
-            with torch.inference_mode():
-                prepare.warm_declared(registry)
-        registry.warmup()
+                speculator = getattr(self.model_runner, "speculator", None)
+                with registry.activate():
+                    prepare.declare_modules(
+                        self.model_runner.model, getattr(speculator, "model", None)
+                    )
+                tilelang_calls = prepare.prepare_declared(registry)
+                with torch.inference_mode():
+                    prepare.warm_declared(registry)
+            registry.warmup()
         if tilelang_calls:
             prepare.freeze("every declared kernel was prepared before memory profiling")
-            prepare.bind_declared(registry)
+            with set_current_vllm_config(self.vllm_config):
+                prepare.bind_declared(registry)
             # Nothing compiles from here on: the JIT monitor reports (or, in error
             # mode, refuses) any other compile, Triton's included, from profiling on.
             from vllm.utils.jit_monitor import activate as activate_jit_monitor
