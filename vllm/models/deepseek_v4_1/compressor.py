@@ -180,37 +180,42 @@ class DeepseekCompressor(nn.Module):
         self._primer_slots = self._primer_counts = None
         set_b12x_preparation_provider(self, self)
 
-    def _ensure_capacity_buffers(self, caps) -> None:
-        """Allocate reusable serving/priming storage only during preparation."""
+    def _ensure_capacity_buffers(self, device, t, r) -> None:
+        """Allocate the reusable serving storage for ``t`` tokens and ``r``
+        requests once, before memory profiling: B12X allocates it while
+        preparing its plan, TileLang when its kernels are bound."""
         if self._values is not None:
-            if self._values.shape[0] != caps.max_tokens:
+            if self._values.shape[0] != t:
                 raise PreparationResourceUnavailableError(
                     "compressor capacity changed after preparation"
                 )
             return
-        device, t, r = caps.device, caps.max_tokens, caps.max_requests
 
         def alloc(shape, dtype):
             return torch.empty(shape, dtype=dtype, device=device)
 
-        self._values = alloc(
-            (t, 512), torch.float32 if caps.ratio == 2 else torch.bfloat16
-        )
+        ratio = self.compress_ratio
+        self._values = alloc((t, 512), torch.float32 if ratio == 2 else torch.bfloat16)
         self._latent = alloc((t, 512), torch.bfloat16)
         self._emitted = alloc((t,), torch.bool)
         self._slots = alloc((t,), SLOT_DTYPE)
         self._row_ids = torch.arange(r, dtype=torch.int64, device=device)
-        self._primer_starts = torch.empty((r + 1,), dtype=torch.int32, device=device)
-        self._primer_positions = torch.empty((r,), dtype=torch.int64, device=device)
-        self._primer_state_ids = torch.empty((r,), dtype=torch.int64, device=device)
-        self._primer_slots = torch.empty((t,), dtype=torch.int64, device=device)
-        self._primer_counts = torch.empty((2,), dtype=torch.int32, device=device)
-        if caps.ratio == 2:
+        if ratio == 2:
             self._gates = alloc((t, 512), torch.float32)
             self._pending_values = alloc((r, 512), torch.float32)
             self._pending_gates = alloc((r, 512), torch.float32)
             self._pending_tags = alloc((r,), torch.int64)
             self._local_ids = alloc((r,), torch.int64)
+
+    def _ensure_primer_buffers(self, device, t, r) -> None:
+        """Allocate the metadata of B12X's priming invocation."""
+        if self._primer_starts is not None:
+            return
+        self._primer_starts = torch.empty((r + 1,), dtype=torch.int32, device=device)
+        self._primer_positions = torch.empty((r,), dtype=torch.int64, device=device)
+        self._primer_state_ids = torch.empty((r,), dtype=torch.int64, device=device)
+        self._primer_slots = torch.empty((t,), dtype=torch.int64, device=device)
+        self._primer_counts = torch.empty((2,), dtype=torch.int32, device=device)
 
     def _reset_primer_state(self) -> None:
         """Restore all reusable mutable capacity storage after a trial."""
@@ -361,6 +366,10 @@ class DeepseekCompressor(nn.Module):
     def get_b12x_preparation_units(
         self, layer: object, workload: B12xWorkload
     ) -> tuple[B12xPreparationUnit, ...]:
+        # The TileLang compression and projection are declared kernels
+        # (declare_kernels); B12X prepares nothing for them.
+        if kernels.uses_tilelang():
+            return ()
         if workload.max_tokens > self.capacity:
             return ()
         if self.fused_wkv_wgate.weight.is_meta or self.norm.weight.is_meta:
@@ -379,7 +388,11 @@ class DeepseekCompressor(nn.Module):
         declaration = self._plan
 
         def make_call(state):
-            self._ensure_capacity_buffers(state.caps)
+            caps = state.caps
+            self._ensure_capacity_buffers(
+                caps.device, caps.max_tokens, caps.max_requests
+            )
+            self._ensure_primer_buffers(caps.device, caps.max_tokens, caps.max_requests)
             binding = self._primer_binding(state)
             return PreparedCall(
                 run=lambda: state.run(binding),
@@ -410,12 +423,8 @@ class DeepseekCompressor(nn.Module):
             prepare_call=make_call,
             benchmark_call=make_call,
         )
-        # The TileLang projection needs no B12X plan.
-        projection = (
-            () if kernels.uses_tilelang() else (self._projection_unit(workload),)
-        )
         return (
-            *projection,
+            self._projection_unit(workload),
             B12xPreparationUnit(
                 name="DeepseekCompressor",
                 key=(self.prefix, self.compress_ratio, self.capacity, self.requests),
@@ -442,16 +451,19 @@ class DeepseekCompressor(nn.Module):
 
     def declare_kernels(self) -> None:
         """Declare the TileLang compression kernels (the worker calls this after
-        loading); binding allocates ratio 1's placeholder operands, so the first
-        call, possibly under graph capture, allocates nothing."""
+        loading); binding allocates the serving storage and ratio 1's placeholder
+        operands before memory profiling, so the first call, possibly under graph
+        capture, allocates nothing."""
         if not kernels.uses_tilelang():
             return
         from vllm.models.deepseek_v4_1.tilelang import compress as tl
         from vllm.models.deepseek_v4_1.tilelang import prepare
 
         def bind() -> None:
+            device = self.fused_wkv_wgate.weight.device
+            self._ensure_capacity_buffers(device, self.capacity, self.requests)
             if self.compress_ratio == 1:
-                tl.placeholder(self.requests, self.fused_wkv_wgate.weight.device)
+                tl.placeholder(self.requests, device)
 
         prepare.declare(self._tilelang_calls, bind=bind)
 
@@ -487,15 +499,20 @@ class DeepseekCompressor(nn.Module):
         )  # fmt: skip
 
     def forward(self, hidden_states, metadata, state_metadata=None):
+        rows = hidden_states.shape[0]
+        if kernels.uses_tilelang():
+            if self._values is None:
+                raise PreparationResourceUnavailableError(
+                    "compressor kernels must be bound before forwarding"
+                )
+            self._project(hidden_states)
+            self._forward_tilelang(rows, metadata, state_metadata)
+            return self._latent[:rows], self._slots[:rows]
         if self._plan is None or self._plan.prepared is None:
             raise PreparationResourceUnavailableError(
                 "compressor plan must be prepared before forwarding"
             )
-        rows = hidden_states.shape[0]
         self._project(hidden_states)
-        if kernels.uses_tilelang():
-            self._forward_tilelang(rows, metadata, state_metadata)
-            return self._latent[:rows], self._slots[:rows]
         if self.compress_ratio == 2:
             if state_metadata is None:
                 raise RuntimeError("ratio2 compression requires request-state metadata")
