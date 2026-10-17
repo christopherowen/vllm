@@ -83,7 +83,7 @@ def op_boundary_violations(root=PACKAGE):
     violations = []
     for path in sorted(root.rglob("*.py")):
         text = path.read_text()
-        if "b12x" not in text:
+        if "b12x" not in text and "tilelang" not in text:
             continue
         tree = ast.parse(text, filename=str(path))
         for function in _op_functions(tree):

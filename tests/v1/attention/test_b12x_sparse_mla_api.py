@@ -222,17 +222,38 @@ def test_b12x_selector_routes_supported_attention_families() -> None:
     assert _get_sparse_mla_backend(config) is B12xGLMDSAMLASparseBackend
 
 
-def test_b12x_selector_routes_deepseek_v41() -> None:
-    config = SimpleNamespace(attention_config=SimpleNamespace(backend=None))
+@pytest.mark.parametrize("family", ["b12x", "tilelang"])
+def test_kernel_family_routes_deepseek_v41(monkeypatch, family) -> None:
+    """VLLM_DS41_KERNEL_BACKEND picks one kernel family for the whole model: its
+    attention backend and class, and (TileLang) the linear and MoE backends."""
+    from vllm import envs
+    from vllm.models.deepseek_v4_1.tilelang.attention import (
+        DeepseekV41TileLangAttention,
+    )
+
+    monkeypatch.setattr(envs, "VLLM_DS41_KERNEL_BACKEND", family, raising=False)
+    backend, attention_cls = {
+        "b12x": (AttentionBackendEnum.B12X, DeepseekV41B12xAttention),
+        "tilelang": (AttentionBackendEnum.TILELANG, DeepseekV41TileLangAttention),
+    }[family]
+    kernel = SimpleNamespace(linear_backend="auto", moe_backend="auto")
+    config = SimpleNamespace(
+        attention_config=SimpleNamespace(backend=None),
+        kernel_config=kernel,
+        speculative_config=None,
+    )
 
     DeepseekV41ForCausalLMConfig.verify_and_update_config(config)
 
-    assert config.attention_config.backend is AttentionBackendEnum.B12X
-    assert _select_dsv4_attn_cls(config) is DeepseekV41B12xAttention
-    assert DeepseekV41B12xBackend.get_name() == "B12X"
+    assert config.attention_config.backend is backend
+    assert _select_dsv4_attn_cls(config) is attention_cls
+    if family == "tilelang":
+        assert kernel.linear_backend == kernel.moe_backend == "tilelang"
+    else:
+        assert DeepseekV41B12xBackend.get_name() == "B12X"
 
     config.attention_config.backend = AttentionBackendEnum.FLASH_ATTN
-    with pytest.raises(ValueError, match="requires B12X"):
+    with pytest.raises(ValueError, match=f"requires the {backend.name} attention"):
         DeepseekV41ForCausalLMConfig.verify_and_update_config(config)
 
 
