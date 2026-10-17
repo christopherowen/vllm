@@ -20,8 +20,13 @@ from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
     assert_other_rows_equal,
     assert_rows_nan,
 )
+from vllm.models.deepseek_v4_1.tilelang import prepare  # noqa: E402
+from vllm.models.deepseek_v4_1.tilelang.linear import _calls  # noqa: E402
 from vllm.models.deepseek_v4_1.tilelang.moe import (  # noqa: E402
+    MoeDispatchV41Plan,
     MoeExpertsV41Plan,
+    carve,
+    moe_swiglu_cast,
     workspace_bytes,
 )
 
@@ -347,3 +352,97 @@ def test_moe_reference_separates_defects(rows):
     print(f"rows={rows}: {table}")
     for d, e in defects.items():
         assert 4 * kernel < e, f"{d} is within 4x of the kernel: {table}"
+
+
+def _tile_kernels_swiglu(intermediate, num_experts, block_M):
+    """TileKernels' ``swiglu_forward_and_per_token_cast`` kernel as vLLM called it
+    until ``moe_swiglu_cast`` (the image's TileKernels carries spark-ds41f's patch
+    0001: the clamp keeps a NaN)."""
+    from tile_kernels.quant.common import get_cast_output_config
+    from tile_kernels.quant.swiglu_forward_cuda import (
+        get_swiglu_forward_and_per_token_cast_kernel_cuda,
+    )
+    from tilelang import language as T
+
+    tile_kernels.config.set_token_alignment(block_M)
+    return get_swiglu_forward_and_per_token_cast_kernel_cuda(
+        intermediate,
+        num_experts,
+        block_M,
+        True,
+        False,
+        LIMIT,
+        False,
+        in_dtype=T.dtype(torch.bfloat16),
+        out_config=get_cast_output_config("e4m3", (1, 32), False, True, True),
+        num_sms=tile_kernels.config.get_num_sms(),
+        use_pdl=False,
+    )
+
+
+def _swiglu_case(rows, intermediate, num_experts, topk, block_M=32):
+    """A real dispatch layout of ``rows`` tokens and a gate/up output over it whose
+    values reach the clamp, the certificate's fallback (gates below -16) and the
+    smallest scales."""
+    dispatch = MoeDispatchV41Plan(
+        num_experts, topk, block_M, 512, torch.int32, torch.bfloat16
+    )
+    prepare.declare(lambda: _calls(dispatch.kernels()), bind=dispatch.bind)
+    ids, weights = _routes(rows, num_experts, topk, 11, torch.int32)
+    specs = dispatch.workspace_specs(rows)
+    layout = dispatch.dispatch(
+        ids,
+        weights,
+        carve(
+            torch.empty(workspace_bytes(specs), dtype=torch.uint8, device=DEVICE), specs
+        ),
+    )
+    layout_rows = layout["order"].shape[0]
+    gen = _gen(12)
+    h = torch.randn((layout_rows, 2 * intermediate), generator=gen, device=DEVICE) * 6
+    h[::7, : intermediate // 4] = -20.0  # gates below the fast exp's domain
+    h[3::11, 64:96] *= 1e-30  # blocks at the smallest scales
+    return layout, h.bfloat16().contiguous()
+
+
+def _swiglu_outputs(layout_rows, intermediate):
+    out = torch.zeros(
+        (layout_rows, intermediate), dtype=torch.float8_e4m3fn, device=DEVICE
+    )
+    sf = torch.zeros(
+        (layout_rows, (intermediate // 32 + 3) // 4 * 4),
+        dtype=torch.uint8,
+        device=DEVICE,
+    )
+    return out, sf
+
+
+@pytest.mark.parametrize("intermediate", [576, 768, 256])
+@pytest.mark.parametrize("rows", [1, 6, 16, 96, 700])
+def test_moe_swiglu_cast_equals_tile_kernels(
+    rows, intermediate, num_experts=384, topk=6
+):
+    """Every live row's E4M3 bytes and UE8M0 scales equal TileKernels' (TP4's 576 and
+    TP3's 768 columns a rank, decode and prefill sizes), and a NaN gate value reaches
+    its row's output in both."""
+    layout, h = _swiglu_case(rows, intermediate, num_experts, topk)
+    live = layout["order"] >= 0
+    ours, theirs = (
+        moe_swiglu_cast(intermediate, 32, LIMIT),
+        _tile_kernels_swiglu(intermediate, num_experts, 32),
+    )
+    for case in ("finite", "nan"):
+        if case == "nan":
+            first = int(torch.nonzero(live)[0])
+            h[first, 5] = NAN
+        a, a_sf = _swiglu_outputs(h.shape[0], intermediate)
+        b, b_sf = _swiglu_outputs(h.shape[0], intermediate)
+        ours(
+            h, a, a_sf, layout["order"], layout["layout_weights"], layout["tile_expert"]
+        )
+        theirs(h, b, b_sf, layout["psum"], layout["layout_weights"], 1.0, None)
+        cols = intermediate // 32
+        assert torch.equal(a[live].view(torch.uint8), b[live].view(torch.uint8)), case
+        assert torch.equal(a_sf[live, :cols], b_sf[live, :cols]), case
+        if case == "nan":
+            assert a[first].float().isnan().any()
