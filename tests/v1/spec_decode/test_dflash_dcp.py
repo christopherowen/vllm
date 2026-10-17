@@ -158,6 +158,8 @@ def test_dflash_uses_draft_group_dcp_slot_parameters(
         max_model_len=128,
         max_num_reqs=1,
         max_num_tokens=1,
+        _is_padding=torch.ones(1, dtype=torch.bool),
+        _row_index=torch.arange(1),
         hidden_states=torch.full((1, 1), -99.0),
         context_positions=torch.zeros(1, dtype=torch.int64),
         sample_indices=torch.zeros(1, dtype=torch.int64),

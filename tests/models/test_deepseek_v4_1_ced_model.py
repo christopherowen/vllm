@@ -242,6 +242,8 @@ def test_ced_global_context_and_full_row_output_abi(monkeypatch, compact):
     )
     monkeypatch.setattr(native, "gather_rows", _gather)
     monkeypatch.setattr(native, "scatter_rows", _scatter)
+    # L2 prefetch is on by default on GB10; this stand-in model has no prefetcher.
+    monkeypatch.setattr(native.l2_prefetch, "ENABLED", False)
     ids = torch.arange(8)
     positions = torch.arange(100, 108)
     inputs = torch.arange(16, dtype=torch.float32).reshape(8, 2) / 8

@@ -323,8 +323,10 @@ def test_budget_uses_request_specific_full_graph_costs():
     assert manager._batch_budget[2] == 2
 
 
-def test_profile_costs_excludes_each_shapes_cold_run():
+def test_profile_costs_excludes_each_shapes_cold_run(monkeypatch):
     """One-time preparation must not inflate the adaptive verifier's costs."""
+    # Measure, rather than load pinned curves from a deployment's cost directory.
+    monkeypatch.setattr(adaptive_module, "_COST_DIR", None)
     manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
     manager.req_states = SimpleNamespace(max_num_batched_tokens=16)
     curves: dict[str, object] = {}

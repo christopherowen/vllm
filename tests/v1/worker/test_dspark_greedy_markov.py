@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Exact full-vocabulary DSpark greedy tokens, including graph replay."""
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -52,6 +52,9 @@ def test_sequential_sharded_sampling_preserves_each_token(needs_distribution):
         draft_logits=object() if needs_distribution else None,
         acceptance_estimator=None,
         _sample_logits=Mock(side_effect=lambda logits, *args: logits.argmax(-1)),
+    )
+    spec._vocab_parallel_greedy = MethodType(
+        DSparkSpeculator._vocab_parallel_greedy, spec
     )
     DSparkSpeculator._sample_sequential(spec, 2, torch.zeros(4, 8))
     assert spec.draft_tokens.tolist() == [[0, 1], [0, 1]]
