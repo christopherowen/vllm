@@ -40,6 +40,7 @@ from torch import nn
 
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.models.deepseek_v4_1 import sp_prefill
+from vllm.models.deepseek_v4_1.tilelang import prepare
 from vllm.models.deepseek_v4_1.tilelang.collectives import RankOrderParts
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
@@ -386,14 +387,31 @@ def finalize(
     return mhc_finalize
 
 
+def _project_call(hidden: int, mode: str, world: int) -> prepare.TileLangCall:
+    """The ``project_streams`` call of a sublayer entry."""
+    return prepare.call(project_streams, hidden, mode, block_M=BLOCK_M, world=world)
+
+
+def _finalize_call(
+    hidden: int, k: int, rms_eps: float, hc_eps: float, iterations: int
+) -> prepare.TileLangCall:
+    """The ``finalize`` call of a sublayer entry projecting ``k`` stream columns."""
+    return prepare.call(finalize, hidden, k, rms_eps, hc_eps, iterations, rms_eps)
+
+
+def _make(call: prepare.TileLangCall):
+    function, args, kwargs = call
+    return function(*args, **kwargs)
+
+
 @cache
-def _project(hidden: int, mode: str, world: int = 1):
-    return project_streams(hidden, mode, block_M=BLOCK_M, world=world)
+def _project(hidden: int, mode: str, world: int):
+    return _make(_project_call(hidden, mode, world))
 
 
 @cache
 def _finalize(hidden: int, k: int, rms_eps: float, hc_eps: float, iterations: int):
-    return finalize(hidden, k, rms_eps, hc_eps, iterations, rms_eps)
+    return _make(_finalize_call(hidden, k, rms_eps, hc_eps, iterations))
 
 
 def _tile_kernels_mhc():
@@ -533,6 +551,19 @@ def _mhc_collapse_fake(state, mix, out):
     return None
 
 
+@cache
+def _warm_post_and_collapse(hidden: int) -> None:
+    """TileKernels' post and stream collapse, run once on one zero token, so their
+    eager kernels (keyed by the stream count, the hidden size and TileKernels' PDL
+    switch) are compiled before the cache freezes."""
+    x = torch.zeros((1, hidden), dtype=torch.bfloat16, device="cuda")
+    residual = torch.zeros((1, MULT, hidden), dtype=torch.bfloat16, device="cuda")
+    mix = torch.zeros((1, MULT), dtype=torch.float32, device="cuda")
+    comb = torch.zeros((1, MULT, MULT), dtype=torch.float32, device="cuda")
+    _mhc_post(x, residual, mix, comb, torch.empty_like(residual))
+    _mhc_collapse(residual, mix, torch.empty_like(x))
+
+
 class TileKernelsMHC(nn.Module):
     """V4.1 lagged mHC for a decoder layer, with ``B12xMHC``'s interface."""
 
@@ -544,15 +575,38 @@ class TileKernelsMHC(nn.Module):
         self.rms_eps = config.rms_norm_eps
         self.hc_eps = config.hc_eps
         self.iterations = config.hc_sinkhorn_iters
-        # Compile every kernel now, never during CUDA graph capture.
-        for mode in ("pre", "post_pre", "broadcast"):
-            _project(self.hidden_size, mode)
+
+    def _entries(self) -> list[tuple[str, int]]:
+        """The (mode, world) of every sublayer entry this layer can launch."""
+        entries = [(mode, 1) for mode in ("pre", "post_pre", "broadcast")]
         if sp_prefill.unreduced_enabled():
             # Sequence-parallel steps hand post_pre the ranks' unreduced parts.
-            world = get_tensor_model_parallel_world_size()
-            _project(self.hidden_size, "post_pre", world)
-        for k in (self.hidden_size, MULT * self.hidden_size):
-            _finalize(self.hidden_size, k, self.rms_eps, self.hc_eps, self.iterations)
+            entries.append(("post_pre", get_tensor_model_parallel_world_size()))
+        return entries
+
+    def declare_kernels(self) -> None:
+        """Declare every sublayer entry's kernels and warm TileKernels' post and
+        stream collapse, so that no forward (or CUDA graph capture) compiles."""
+        hidden = self.hidden_size
+        entries = self._entries()
+        # The broadcast entry projects one stream; the others all four.
+        widths = (hidden, MULT * hidden)
+        mix = (self.rms_eps, self.hc_eps, self.iterations)
+
+        def calls() -> list[prepare.TileLangCall]:
+            return [
+                *(_project_call(hidden, mode, world) for mode, world in entries),
+                *(_finalize_call(hidden, k, *mix) for k in widths),
+            ]
+
+        def bind() -> None:
+            # The forward's cached kernels, as its lookups name them.
+            for mode, world in entries:
+                _project(hidden, mode, world)
+            for k in widths:
+                _finalize(hidden, k, *mix)
+
+        prepare.declare(calls, bind=bind, warm=lambda: _warm_post_and_collapse(hidden))
 
     def pre(
         self,

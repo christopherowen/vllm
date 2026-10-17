@@ -179,6 +179,8 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
         moe = _kernels()
         w13, w2 = layer.w13_weight, layer.w2_weight  # [E, 2I, H/2], [E, H, I/2]
         limit = self.quant_config.gemm1_clamp_limit
+        # The plan's geometry; its kernels are declared when the worker prepares
+        # kernels (``declare_kernels``).
         self._plan = moe.MoeExpertsV41Plan(
             w13.shape[0],
             self.moe_config.experts_per_token,
@@ -203,6 +205,11 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
         self._tails = (tail13, tail2)
         self.quant_config._w1.scale = layer.w13_weight_scale
         self.quant_config._w2.scale = layer.w2_weight_scale
+
+    def declare_kernels(self) -> None:
+        """Declare the plan's kernels (the layer's MoE method calls this after
+        loading, when the worker prepares kernels)."""
+        self._plan.declare_kernels()
 
     # -- execution ----------------------------------------------------------
 

@@ -68,6 +68,13 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             return impl.fused_experts
         return None
 
+    def declare_layer_kernels(self, layer: "RoutedExperts") -> None:
+        """Let a modular kernel's experts declare their JIT kernels, after loading
+        (DeepSeek V4.1's kernel preparation calls this on every layer's method)."""
+        declare = getattr(self.modular_experts, "declare_kernels", None)
+        if declare is not None:
+            declare()
+
     @property
     def output_dtype(self) -> torch.dtype:
         """Dtype produced by the routed experts: a modular kernel's experts say."""

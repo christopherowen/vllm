@@ -25,6 +25,9 @@ from vllm.models.deepseek_v4_1.tilelang.moe import (  # noqa: E402
     workspace_bytes,
 )
 
+# Declaring a plan warms TileKernels' token cast for the scheduler's batch buckets.
+pytestmark = pytest.mark.usefixtures("default_vllm_config")
+
 DEVICE = "cuda"
 E2M1 = (
     0.0,
@@ -45,6 +48,13 @@ E2M1 = (
     -6.0,
 )
 LIMIT = 10.0
+
+
+def _plan(*args, **kwargs):
+    """A plan with its kernels declared: outside a runner, prepared and bound now."""
+    plan = MoeExpertsV41Plan(*args, **kwargs)
+    plan.declare_kernels()
+    return plan
 
 
 def _gen(seed):
@@ -107,9 +117,7 @@ def _reference(x, ids, weights, w13, w2, intermediate):
 def test_moe_experts(rows, idx_dtype, hidden, intermediate, num_experts=32, topk=6):
     w13_packed, w13_sf, w13 = _experts(num_experts, 2 * intermediate, hidden, 1)
     w2_packed, w2_sf, w2 = _experts(num_experts, hidden, intermediate, 2)
-    plan = MoeExpertsV41Plan(
-        num_experts, topk, hidden, intermediate, swiglu_limit=LIMIT
-    )
+    plan = _plan(num_experts, topk, hidden, intermediate, swiglu_limit=LIMIT)
     weights = plan.prepare_weights(w13_packed, w13_sf, w2_packed, w2_sf)
     x = (torch.randn((rows, hidden), generator=_gen(3), device=DEVICE) * 0.5).bfloat16()
     ids, route_weights = _routes(rows, num_experts, topk, 4, idx_dtype)
@@ -140,7 +148,7 @@ def test_moe_experts_fp32_output(
     w13_packed, w13_sf, _ = _experts(num_experts, 2 * intermediate, hidden, 1)
     w2_packed, w2_sf, _ = _experts(num_experts, hidden, intermediate, 2)
     plans = {
-        dtype: MoeExpertsV41Plan(
+        dtype: _plan(
             num_experts, topk, hidden, intermediate, swiglu_limit=LIMIT, out_dtype=dtype
         )
         for dtype in (torch.bfloat16, torch.float32)
@@ -175,7 +183,7 @@ def test_moe_experts_fold_shared(
     result does not depend on which of them a step takes."""
     w13_packed, w13_sf, _ = _experts(num_experts, 2 * intermediate, hidden, 1)
     w2_packed, w2_sf, _ = _experts(num_experts, hidden, intermediate, 2)
-    plan = MoeExpertsV41Plan(
+    plan = _plan(
         num_experts, topk, hidden, intermediate, swiglu_limit=LIMIT,
         out_dtype=torch.float32,
     )  # fmt: skip
@@ -204,7 +212,7 @@ def test_moe_experts_fold_deferred_shared(
     has the bits of the shared rows passed directly."""
     w13_packed, w13_sf, _ = _experts(num_experts, 2 * intermediate, hidden, 1)
     w2_packed, w2_sf, _ = _experts(num_experts, hidden, intermediate, 2)
-    plan = MoeExpertsV41Plan(
+    plan = _plan(
         num_experts, topk, hidden, intermediate, swiglu_limit=LIMIT,
         out_dtype=torch.float32,
     )  # fmt: skip
@@ -236,9 +244,7 @@ def test_moe_experts_fold_deferred_shared(
 def _case(rows, hidden=384, intermediate=576, num_experts=32, topk=6):
     w13_packed, w13_sf, w13 = _experts(num_experts, 2 * intermediate, hidden, 1)
     w2_packed, w2_sf, w2 = _experts(num_experts, hidden, intermediate, 2)
-    plan = MoeExpertsV41Plan(
-        num_experts, topk, hidden, intermediate, swiglu_limit=LIMIT
-    )
+    plan = _plan(num_experts, topk, hidden, intermediate, swiglu_limit=LIMIT)
     weights = plan.prepare_weights(w13_packed, w13_sf, w2_packed, w2_sf)
     x = (torch.randn((rows, hidden), generator=_gen(3), device=DEVICE) * 0.5).bfloat16()
     ids, route_weights = _routes(rows, num_experts, topk, 4, torch.int32)
