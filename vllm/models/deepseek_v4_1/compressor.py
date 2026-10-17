@@ -12,7 +12,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.models.deepseek_v4_1 import kernels
 from vllm.models.deepseek_v4_1.b12x_layers import B12xLinearMethod, B12xRMSNorm
-from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xBackend
+from vllm.models.deepseek_v4_1.sparse_mla import SLOT_DTYPE, DeepseekV41B12xBackend
 from vllm.triton_utils import tl, triton
 from vllm.utils.b12x import (
     B12xPreparationUnit,
@@ -198,7 +198,7 @@ class DeepseekCompressor(nn.Module):
         )
         self._latent = alloc((t, 512), torch.bfloat16)
         self._emitted = alloc((t,), torch.bool)
-        self._slots = alloc((t,), torch.int64)
+        self._slots = alloc((t,), SLOT_DTYPE)
         self._row_ids = torch.arange(r, dtype=torch.int64, device=device)
         self._primer_starts = torch.empty((r + 1,), dtype=torch.int32, device=device)
         self._primer_positions = torch.empty((r,), dtype=torch.int64, device=device)
@@ -380,8 +380,6 @@ class DeepseekCompressor(nn.Module):
 
         def make_call(state):
             self._ensure_capacity_buffers(state.caps)
-            if kernels.uses_tilelang():
-                self._prepare_tilelang(state.caps.device)
             binding = self._primer_binding(state)
             return PreparedCall(
                 run=lambda: state.run(binding),
@@ -426,18 +424,36 @@ class DeepseekCompressor(nn.Module):
             ),
         )
 
-    def _prepare_tilelang(self, device) -> None:
-        """Compile the TileLang compression kernels (and ratio 1's placeholder)
-        at preparation, never during graph capture."""
+    def _tilelang_calls(self) -> list:
+        """The TileLang compression kernels ``_forward_tilelang`` launches, as
+        ``prepare.call``s, for the step metadata's ``max_num_seqs`` requests."""
         from vllm.models.deepseek_v4_1.tilelang import compress as tl
+        from vllm.models.deepseek_v4_1.tilelang import prepare
 
-        if self.compress_ratio == 2:
-            page = self.state_cache.block_size
-            tl.compress_kernel(2, self.requests, page)
-            tl.gather_partial_state_kernel(self.requests, page)
-        else:
-            tl.compress_kernel(1, self.requests, 1)
-            tl.placeholder(self.requests, device)
+        if self.compress_ratio == 1:
+            return [prepare.call(tl.compress_kernel, 1, self.requests, 1)]
+        # The ring holds one state per token, so its metadata's page
+        # (``state_metadata.block_size``) is its block size.
+        page = self.state_cache.block_size
+        return [
+            prepare.call(tl.gather_partial_state_kernel, self.requests, page),
+            prepare.call(tl.compress_kernel, 2, self.requests, page),
+        ]
+
+    def declare_kernels(self) -> None:
+        """Declare the TileLang compression kernels (the worker calls this after
+        loading); binding allocates ratio 1's placeholder operands, so the first
+        call, possibly under graph capture, allocates nothing."""
+        if not kernels.uses_tilelang():
+            return
+        from vllm.models.deepseek_v4_1.tilelang import compress as tl
+        from vllm.models.deepseek_v4_1.tilelang import prepare
+
+        def bind() -> None:
+            if self.compress_ratio == 1:
+                tl.placeholder(self.requests, self.fused_wkv_wgate.weight.device)
+
+        prepare.declare(self._tilelang_calls, bind=bind)
 
     def _forward_tilelang(self, rows, metadata, state_metadata):
         """The TileLang compression: at ratio 2 the requests' carries from the state

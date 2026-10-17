@@ -178,6 +178,33 @@ class DeepseekV41B12xMetadata:
     num_decode_tokens: int = 0
 
 
+def _group_geometry(kv_cache_spec) -> tuple[int, int, bool]:
+    """A cache group's ``(tokens per state, states per page, request ring)``."""
+    return (
+        int(kv_cache_spec.tokens_per_state),
+        int(kv_cache_spec.num_states),
+        isinstance(kv_cache_spec, CircularBufferSpec),
+    )
+
+
+def tilelang_builder_kernels(kv_cache_spec, max_requests: int) -> list:
+    """The TileLang metadata kernels a builder of ``kv_cache_spec``'s group launches
+    for ``max_requests`` requests, as ``prepare.call``s. The attention layers that
+    own the group's caches declare them; the builder finds them prepared."""
+    from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
+    from vllm.models.deepseek_v4_1.tilelang import prepare
+
+    ratio, page, circular = _group_geometry(kv_cache_spec)
+    return [
+        prepare.call(tl_metadata.requests_kernel, max_requests),
+        prepare.call(tl_metadata.tokens_kernel, max_requests, page, ratio, circular),
+    ]
+
+
+# The slot-mapping rows a builder publishes: the cache writers' slot dtype.
+SLOT_DTYPE = torch.int64
+
+
 class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
 
@@ -186,9 +213,7 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
         self.tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.requests = vllm_config.scheduler_config.max_num_seqs
-        self.ratio = int(kv_cache_spec.tokens_per_state)
-        self.page = int(kv_cache_spec.num_states)
-        self.circular = isinstance(kv_cache_spec, CircularBufferSpec)
+        self.ratio, self.page, self.circular = _group_geometry(kv_cache_spec)
 
         def alloc(shape, dtype):
             return torch.empty(shape, dtype=dtype, device=device)
@@ -198,16 +223,15 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
         self.counts = alloc((2,), torch.int32)
         self.positions = alloc((self.tokens,), torch.int64)
         self.reqs = alloc((self.tokens,), torch.int32)
-        self.slots = alloc((self.tokens,), torch.int64)
+        self.slots = alloc((self.tokens,), SLOT_DTYPE)
         self.lengths = alloc((self.tokens,), torch.int32)
         if kernels.uses_tilelang():
-            from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
-
-            # Compiled with the builder, never during graph capture.
-            tl_metadata.requests_kernel(self.requests)
-            tl_metadata.tokens_kernel(
-                self.requests, self.page, self.ratio, self.circular
-            )
+            # The attention layers owning this group's caches declare these
+            # kernels; here, and at every rebuild, they are cache hits.
+            for function, args, kwargs in tilelang_builder_kernels(
+                kv_cache_spec, self.requests
+            ):
+                function(*args, **kwargs)
 
     def build(
         self,

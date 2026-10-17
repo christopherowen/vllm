@@ -26,6 +26,8 @@ import tilelang
 import tilelang.language as T
 import torch
 
+from . import prepare
+
 DIM = 512
 RECORD_BYTES = {"swa": 528, "indexed": 288}
 _GROUP = {"swa": 32, "indexed": 16}
@@ -195,10 +197,20 @@ def write_cache(
     word_bytes, _, word_torch = _WORD[cache_kind]
     if pages.stride(0) % word_bytes or pages.shape[1] % word_bytes:
         raise ValueError(f"cache pages are not whole {word_bytes}-byte words")
-    kernel = cache_writer_kernel(
-        cache_kind, page_size, str(slot_mapping.dtype).removeprefix("torch.")
-    )
+    function, args, kwargs = writer_call(cache_kind, page_size, slot_mapping.dtype)
+    kernel = function(*args, **kwargs)
     kernel(kv, pages, pages.view(word_torch), slot_mapping)
 
 
-__all__ = ["RECORD_BYTES", "cache_writer_kernel", "write_cache"]
+def writer_call(cache_kind: str, page_size: int, slot_dtype: torch.dtype):
+    """The kernel ``write_cache`` launches for ``slot_dtype`` slots, as a
+    ``prepare.call``."""
+    return prepare.call(
+        cache_writer_kernel,
+        cache_kind,
+        page_size,
+        str(slot_dtype).removeprefix("torch."),
+    )
+
+
+__all__ = ["RECORD_BYTES", "cache_writer_kernel", "write_cache", "writer_call"]

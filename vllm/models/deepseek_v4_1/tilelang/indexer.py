@@ -41,6 +41,7 @@ import tilelang
 import tilelang.language as T
 import torch
 
+from . import prepare
 from .gemm import SF_BLOCK
 
 INDEX_HEADS = 32
@@ -55,6 +56,24 @@ _KEY_NEG_INF = 0x007F
 def page_bytes(page_size: int) -> int:
     """Index-cache page bytes: ``[page_size, 64]`` data, ``[page_size, 4]`` UE8M0."""
     return page_size * (INDEX_DIM // 2 + INDEX_DIM // SF_BLOCK)
+
+
+def _make(kernel_call):
+    """The kernel of a ``prepare.call`` (a cache hit once it is prepared)."""
+    function, args, kwargs = kernel_call
+    return function(*args, **kwargs)
+
+
+def _score_call(width, page_size, candidates):
+    return prepare.call(indexer_score_v41, width, page_size, candidates)
+
+
+def quantize_call(page_size=None):
+    """The MXFP4 quantizer ``quantize_mxfp4`` launches, or with ``page_size`` the
+    index-key writer ``write_index_keys`` launches, as a ``prepare.call``."""
+    if page_size is None:
+        return prepare.call(mxfp4_quantize_v41)
+    return prepare.call(mxfp4_quantize_v41, True, page_size)
 
 
 def _row_extent(Lengths, Active, row, width):
@@ -364,7 +383,7 @@ def quantize_mxfp4(x, q, scales):
 
     ``q`` is ``[..., 64]`` packed E2M1; ``scales`` is ``[..., 4]`` UE8M0.
     """
-    mxfp4_quantize_v41()(
+    _make(quantize_call())(
         x.reshape(-1, INDEX_DIM),
         q.view(-1, INDEX_DIM // 2),
         scales.view(-1, INDEX_DIM // SF_BLOCK),
@@ -374,7 +393,7 @@ def quantize_mxfp4(x, q, scales):
 
 def write_index_keys(keys, pool, slots, page_size):
     """Quantize ``[rows, 128]`` keys into index-cache pages at ``slots`` (-1 skips)."""
-    kernel = mxfp4_quantize_v41(True, page_size)
+    kernel = _make(quantize_call(page_size))
     kernel(keys, slots.to(torch.int64), pool[:, : page_bytes(page_size)])
 
 
@@ -990,24 +1009,56 @@ class IndexerTopK:
 
     def __init__(self, width, topk=INDEX_TOPK, group=1, candidates=False):
         self.topk, self.group, self.candidates = topk, group, candidates
-        entries = tilelang.cdiv(width, group)
-        self.segments = tilelang.cdiv(entries, _SEGMENT_ENTRIES)
-        self.levels = []  # (kernel, input lists, output lists)
+        self.segments, first, levels = self.routes(width, topk, group, candidates)
         if self.segments == 1:
-            self.single = indexer_topk_segment_v41(width, topk, group, True, candidates)
-            return
-        self.stage1 = indexer_topk_segment_v41(width, topk, group, False, candidates)
+            self.single = _make(first)
+        else:
+            self.stage1 = _make(first)
+        # (kernel, input lists, output lists)
+        self.levels = [(_make(kernel), lists, out) for kernel, lists, out in levels]
+
+    @staticmethod
+    def routes(width, topk=INDEX_TOPK, group=1, candidates=False):
+        """``(segments, first, levels)``: the segment count, the first kernel (the
+        final segment kernel of a one-segment row, else stage 1) and the merge
+        levels ``(kernel, input lists, output lists)``, kernels as
+        ``prepare.call``s."""
+        entries = tilelang.cdiv(width, group)
+        segments = tilelang.cdiv(entries, _SEGMENT_ENTRIES)
+        levels = []
+        if segments == 1:
+            first = prepare.call(
+                indexer_topk_segment_v41, width, topk, group, True, candidates
+            )
+            return segments, first, levels
+        first = prepare.call(
+            indexer_topk_segment_v41, width, topk, group, False, candidates
+        )
         fan_in = max(2, _MERGE_KEYS // topk)
-        lists, span = self.segments, _SEGMENT_ENTRIES
+        lists, span = segments, _SEGMENT_ENTRIES
         while True:
             outputs = tilelang.cdiv(lists, fan_in)
-            kernel = indexer_topk_merge_v41(
-                width, topk, group, lists, span, fan_in, candidates
+            kernel = prepare.call(
+                indexer_topk_merge_v41,
+                width,
+                topk,
+                group,
+                lists,
+                span,
+                fan_in,
+                candidates,
             )
-            self.levels.append((kernel, lists, outputs))
+            levels.append((kernel, lists, outputs))
             if outputs == 1:
                 break
             lists, span = outputs, span * fan_in
+        return segments, first, levels
+
+    @classmethod
+    def calls(cls, width, topk=INDEX_TOPK, group=1, candidates=False) -> list:
+        """The kernel calls ``IndexerTopK(width, topk, group, candidates)`` makes."""
+        _, first, levels = cls.routes(width, topk, group, candidates)
+        return [first, *(kernel for kernel, _, _ in levels)]
 
     def scratch_specs(self, rows):
         """Two ping-pong winner buffers (values, entries) for the merge levels."""
@@ -1095,13 +1146,31 @@ class IndexerV41Plan:
         )
         self.width, self.page_size, self.topk = width, page_size, topk
         self.candidates, self.candidate_blocks = candidates, candidate_blocks
-        self.score = indexer_score_v41(width, page_size, candidates)
+        self.score = _make(_score_call(width, page_size, candidates))
         self.select = IndexerTopK(width, topk, 1, candidates)
         self.select_blocks = (
             IndexerTopK(width, CANDIDATE_BLOCKS, CANDIDATE_BLOCK)
             if candidate_blocks
             else None
         )
+
+    @staticmethod
+    def calls(
+        width,
+        page_size,
+        *,
+        topk=INDEX_TOPK,
+        candidates=False,
+        candidate_blocks=False,
+    ) -> list:
+        """The kernel calls ``IndexerV41Plan`` of these arguments makes."""
+        calls = [
+            _score_call(width, page_size, candidates),
+            *IndexerTopK.calls(width, topk, 1, candidates),
+        ]
+        if candidate_blocks:
+            calls.extend(IndexerTopK.calls(width, CANDIDATE_BLOCKS, CANDIDATE_BLOCK))
+        return calls
 
     def scratch_specs(self, rows):
         specs = [

@@ -24,11 +24,13 @@ from vllm.v1.worker.workspace import (
     retain_cuda_graph_capture_resource,
 )
 
+from . import prepare
 from .indexer import (
     CANDIDATE_BLOCK,
     CANDIDATE_BLOCKS,
     IndexerV41Plan,
     page_bytes,
+    quantize_call,
     quantize_mxfp4,
     write_index_keys,
 )
@@ -43,23 +45,36 @@ class DeepseekV41TileLangBackend(DeepseekV41B12xBackend):
         return "TILELANG"
 
 
+def _mla_options(heads, swa_width, idx_width, idx_page, swa_page, max_rows, device):
+    """``SparseMlaV41Plan``'s arguments for one layer shape."""
+    return (heads, swa_width, idx_width, idx_page), dict(
+        swa_page_size=swa_page, max_rows=max_rows, device=device
+    )
+
+
 # Plans are kernels only, so layers of one shape share them.
 @functools.cache
-def _mla_plan(heads, swa_width, idx_width, idx_page, swa_page, max_rows, device):
-    return SparseMlaV41Plan(
-        heads,
-        swa_width,
-        idx_width,
-        idx_page,
-        swa_page_size=swa_page,
-        max_rows=max_rows,
-        device=device,
-    )
+def _mla_plan(*shape):
+    args, kwargs = _mla_options(*shape)
+    return SparseMlaV41Plan(*args, **kwargs)
+
+
+def _mla_calls(*shape) -> list:
+    """The kernel calls ``_mla_plan(*shape)`` makes."""
+    args, kwargs = _mla_options(*shape)
+    return SparseMlaV41Plan.calls(*args, **kwargs)
 
 
 @functools.cache
 def _index_plan(width, page_size, candidates, candidate_blocks):
     return IndexerV41Plan(
+        width, page_size, candidates=candidates, candidate_blocks=candidate_blocks
+    )
+
+
+def _index_calls(width, page_size, candidates, candidate_blocks) -> list:
+    """The kernel calls ``_index_plan`` of these arguments makes."""
+    return IndexerV41Plan.calls(
         width, page_size, candidates=candidates, candidate_blocks=candidate_blocks
     )
 
@@ -75,8 +90,73 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
         # which this layer never launches.
         return ()
 
+    def declare_kernels(self) -> None:
+        """Also declare the sparse MLA, indexer and MXFP4 quantizer kernels; binding
+        builds the plans and reserves their scratch, before memory profiling."""
+        super().declare_kernels()
+        calls = self._plan_calls()
+        prepare.declare(lambda: calls, bind=self._bind_plans)
+
+    def _plan_args(self) -> tuple[tuple, dict, dict]:
+        """``_mla_plan``'s arguments, and per index mode ``_index_plan``'s
+        arguments and the chunk rows its scratch covers."""
+        self._attention_geometry()
+        mla = (
+            self.n_local_heads,
+            self.swa_width,
+            512 if self.compress_ratio else 0,
+            self._main_page,
+            self.swa_cache_layer.block_size,
+            self.capacity,
+            self.rotary_emb.cos_sin_cache.device,
+        )
+        index, chunks = {}, {}
+        if self.indexer is not None:
+            reindex = self.layer_id > self.candidate_source_layer
+            width = (
+                CANDIDATE_BLOCKS * CANDIDATE_BLOCK
+                if reindex
+                else self._index_width * self._index_page
+            )
+            full = (
+                width,
+                self._index_page,
+                reindex,
+                self.layer_id == self.candidate_source_layer,
+            )
+            index = {"decode": full, "prefill": full}
+            chunks = {"decode": self.DECODE_CHUNK, "prefill": self.INDEX_CHUNK}
+            if self._short_index_shape is not None:
+                rows, pages = self._short_index_shape
+                index["prefill_short"] = (
+                    pages * self._index_page,
+                    self._index_page,
+                    False,
+                    False,
+                )
+                chunks["prefill_short"] = rows
+        return mla, index, chunks
+
+    def _plan_calls(self) -> list:
+        """The kernels this layer's plans make (``_build_tilelang_plans``) and its
+        MXFP4 quantizers launch, as ``prepare.call``s."""
+        mla, index, _ = self._plan_args()
+        calls = _mla_calls(*mla)
+        # Decode and prefill share one plan.
+        for args in dict.fromkeys(index.values()):
+            calls.extend(_index_calls(*args))
+        if self.indexer is not None:
+            calls.append(quantize_call())  # _quantize_index_query
+        if self.compressor is not None:
+            calls.append(quantize_call(self._index_page))  # _write_index_keys
+        return calls
+
+    def _bind_plans(self) -> None:
+        self._tilelang_plans = self._build_tilelang_plans()
+
     def _tilelang(self) -> SimpleNamespace:
-        """This layer's plans, built and their scratch reserved on first use."""
+        """This layer's plans (built when its kernels are bound; the cache pages
+        are checked on first use)."""
         plans = self.__dict__.get("_tilelang_plans")
         if plans is None:
             if torch.cuda.is_current_stream_capturing():
@@ -84,6 +164,9 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
                     "V4.1 TileLang kernels must be built before CUDA graph capture"
                 )
             plans = self._tilelang_plans = self._build_tilelang_plans()
+        if not self.__dict__.get("_cache_pages_checked"):
+            self._check_cache_pages()
+            self._cache_pages_checked = True
         return plans
 
     def _check_cache_pages(self) -> None:
@@ -114,39 +197,9 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
                 )
 
     def _build_tilelang_plans(self) -> SimpleNamespace:
-        self._check_cache_pages()
-        device = self.rotary_emb.cos_sin_cache.device
-        mla = _mla_plan(
-            self.n_local_heads,
-            self.swa_width,
-            512 if self.compress_ratio else 0,
-            self._main_page,
-            self.swa_cache_layer.block_size,
-            self.capacity,
-            device,
-        )
-        index, chunks = {}, {}
-        if self.indexer is not None:
-            reindex = self.layer_id > self.candidate_source_layer
-            width = (
-                CANDIDATE_BLOCKS * CANDIDATE_BLOCK
-                if reindex
-                else self._index_width * self._index_page
-            )
-            full = _index_plan(
-                width,
-                self._index_page,
-                reindex,
-                self.layer_id == self.candidate_source_layer,
-            )
-            index = {"decode": full, "prefill": full}
-            chunks = {"decode": self.DECODE_CHUNK, "prefill": self.INDEX_CHUNK}
-            if self._short_index_shape is not None:
-                rows, pages = self._short_index_shape
-                index["prefill_short"] = _index_plan(
-                    pages * self._index_page, self._index_page, False, False
-                )
-                chunks["prefill_short"] = rows
+        mla_args, index_args, chunks = self._plan_args()
+        mla = _mla_plan(*mla_args)
+        index = {mode: _index_plan(*args) for mode, args in index_args.items()}
         # Reserve the largest scratch each phase borrows: indexing, then the
         # attention metadata arena with the decode route's segment workspace.
         workspace = current_workspace_manager()

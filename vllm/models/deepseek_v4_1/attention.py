@@ -36,10 +36,13 @@ from vllm.models.deepseek_v4_1.ced import CED_WINDOW, ced_decoder_start
 from vllm.models.deepseek_v4_1.compressor import DeepseekCompressor
 from vllm.models.deepseek_v4_1.quant_config import Block32FP8LinearMethod
 from vllm.models.deepseek_v4_1.sparse_mla import (
+    SLOT_DTYPE,
     DeepseekV41B12xBackend,
     DeepseekV41B12xMetadata,
     _chunk,
+    tilelang_builder_kernels,
 )
+from vllm.models.deepseek_v4_1.tilelang import prepare
 from vllm.models.deepseek_v41.common.rope import build_deepseek_v4_rope
 from vllm.triton_utils import tl, triton
 from vllm.utils.b12x import (
@@ -669,6 +672,21 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
 
     def _declare_attention(self, device):
         """Describe native code and simultaneous metadata without allocating."""
+        self._attention_geometry()
+        self._attention_declarations = {}
+        for mode, capacity in (
+            ("decode", self._decode_capacity),
+            ("extend", self.capacity),
+        ):
+            declaration = self._declare_mla(
+                mode, capacity, self._attention_workspace_specs[mode], device
+            )
+            if declaration is not None:
+                self._attention_declarations[mode] = declaration
+
+    def _attention_geometry(self) -> None:
+        """The metadata arena of each attention mode and the staging this layer
+        owns, from configuration alone."""
         # Page geometry stays as computed at construction, from the block size
         # the caches were allocated with. The engine later lowers
         # cache_config.block_size to its smallest prefix-cacheable group (the
@@ -688,7 +706,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             self.config.compilation_config.max_cudagraph_capture_size or 0,
         )
         self._attention_workspace_specs = {}
-        self._attention_declarations = {}
         self._decode_capacity = min(self.capacity, decode_rows)
         for mode, capacity in (
             ("decode", self._decode_capacity),
@@ -702,9 +719,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             if self.compress_ratio:
                 metadata_specs += (((capacity, self._main_width), torch.int32),)
             self._attention_workspace_specs[mode] = metadata_specs
-            declaration = self._declare_mla(mode, capacity, metadata_specs, device)
-            if declaration is not None:
-                self._attention_declarations[mode] = declaration
         if not hasattr(self, "_owns_topk_indices"):
             self._owns_topk_indices = (
                 self.topk_indices_buffer is None and self.is_index_source
@@ -742,14 +756,43 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             self._short_index_shape = (short_rows, short_width)
             specs.append(("_short_index_pages", self._short_index_shape, torch.int32))
         self._staging_specs = tuple(specs)
+
+    def declare_kernels(self) -> None:
+        """Declare every TileLang kernel this layer can launch, its WO projection's
+        included (the worker calls this after loading, before any distributed
+        work)."""
+        self._attention_geometry()
         if kernels.uses_tilelang():
-            self._compile_tilelang_metadata()
+            calls = self._tilelang_calls()
+            prepare.declare(lambda: calls)
+        declare_wo = getattr(self._wo_projection_weights, "declare_kernels", None)
+        if declare_wo is not None:
+            declare_wo()
 
-    def _compile_tilelang_metadata(self) -> None:
-        """Compile this layer's TileLang metadata kernels at preparation, never
-        during graph capture."""
+    def _owned_caches(self) -> list:
+        """The cache layers this layer allocates: one per KV-cache group it joins."""
+        caches = [self.swa_cache_layer]
+        if self.is_kv_source:
+            caches.append(self)
+        if self.indexer is not None and self.indexer.owns_k:
+            caches.append(self.indexer.k_cache)
+        if self.compressor is not None and self.compressor.state_cache is not None:
+            caches.append(self.compressor.state_cache)
+        return caches
+
+    def _tilelang_calls(self) -> list:
+        """The TileLang kernels of the shared layer paths, as ``prepare.call``s:
+        window metadata and index page tables, the metadata builders of the cache
+        groups this layer joins, the RoPE of every role (WO's inverse rotation
+        included) and the cache writers, each in its call site's call form."""
         from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
+        from vllm.models.deepseek_v4_1.tilelang.cache_writer import writer_call
+        from vllm.models.deepseek_v4_1.tilelang.rope import rope_call
 
+        calls = []
+        # _write_decode_metadata: the window metadata, with the main page table in
+        # the same launch on compressed layers. A CED decoder's rows start no
+        # earlier than their request's replay start when the step has one.
         replays = (
             (False, True) if self.is_ced_decoder and not self.is_draft else (False,)
         )
@@ -762,16 +805,50 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 replay,
             )
             if self.compress_ratio:
-                tl_metadata.decode_metadata_kernel(*args, self._main_width)
+                calls.append(
+                    prepare.call(
+                        tl_metadata.decode_metadata_kernel, *args, self._main_width
+                    )
+                )
             else:
-                tl_metadata.chunk_kernel(*args)
-        widths = {self._main_width} if self.compress_ratio else set()
+                calls.append(prepare.call(tl_metadata.chunk_kernel, *args))
+        # forward_mqa: the page tables of the index chunks, full or short.
         if self.indexer is not None:
-            widths.add(self._index_width)
-        if self._short_index_shape is not None:
-            widths.add(self._short_index_shape[1])
-        for width in widths:
-            tl_metadata.pages_kernel(width)
+            widths = {self._index_width}
+            if self._short_index_shape is not None:
+                widths.add(self._short_index_shape[1])
+            calls.extend(
+                prepare.call(tl_metadata.pages_kernel, width) for width in widths
+            )
+        # Each group's metadata builder: its spec as the KV-cache spec code makes
+        # it, for the scheduler's requests.
+        requests = self.config.scheduler_config.max_num_seqs
+        for cache in self._owned_caches():
+            calls.extend(
+                tilelang_builder_kernels(cache.get_kv_cache_spec(self.config), requests)
+            )
+        # _rope (heads, columns, ratio) by role; WO rotates its input back.
+        table_width = self.rotary_emb.cos_sin_cache.shape[1]
+        roles = [
+            (self.n_local_heads, self.head_dim, 1, False),  # q
+            (1, 512, 1, False),  # kv
+            (self.n_local_heads, self.head_dim, 1, True),  # WO's inverse
+        ]
+        if self.indexer is not None:
+            roles.append((self.indexer.heads, 128, 1, False))  # index query
+        if self.compressor is not None:
+            roles.append((1, 128, self.compress_ratio, False))  # index key
+            roles.append((1, 512, self.compress_ratio, False))  # latent
+        calls.extend(
+            rope_call(heads, dim, table_width, ratio, inverse)
+            for heads, dim, ratio, inverse in roles
+        )
+        # _write_v41_cache: SWA records of every layer, indexed records of the
+        # compressor's latents, at the builders' (and compressor's) slot dtype.
+        calls.append(writer_call("swa", self.swa_cache_layer.block_size, SLOT_DTYPE))
+        if self.compressor is not None:
+            calls.append(writer_call("indexed", self._main_page, SLOT_DTYPE))
+        return calls
 
     def _declare_mla(self, mode: str, capacity: int, metadata_specs, device):
         """Declare the native sparse-MLA plan for one mode, beside its metadata."""

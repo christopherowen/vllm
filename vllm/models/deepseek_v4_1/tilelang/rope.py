@@ -15,6 +15,8 @@ import tilelang
 import tilelang.language as T
 import torch
 
+from . import prepare
+
 _PAIRS = 4  # pairs per thread: 8 BF16, one 16-byte access
 
 
@@ -99,7 +101,10 @@ def rope_(
     heads = x.shape[1] if x.ndim == 3 else 1
     if not x.is_contiguous() or x.dtype != torch.bfloat16:
         raise ValueError("TileLang RoPE rotates contiguous BF16 rows in place")
-    kernel = rope_kernel(heads, x.shape[-1], cos_sin_cache.shape[1], ratio, inverse)
+    function, args, kwargs = rope_call(
+        heads, x.shape[-1], cos_sin_cache.shape[1], ratio, inverse
+    )
+    kernel = function(*args, **kwargs)
     kernel(x.view(rows, heads, x.shape[-1]), positions, cos_sin_cache)
 
 
@@ -108,4 +113,10 @@ def _rope_fake(x, positions, cos_sin_cache, ratio, inverse):
     return None
 
 
-__all__ = ["rope_", "rope_kernel"]
+def rope_call(heads: int, dim: int, rope_dim: int, ratio: int, inverse: bool):
+    """The kernel ``rope_`` launches for ``heads`` heads of ``dim`` columns (one for
+    ``[T, D]`` rows) and a ``rope_dim``-wide table, as a ``prepare.call``."""
+    return prepare.call(rope_kernel, heads, dim, rope_dim, ratio, inverse)
+
+
+__all__ = ["rope_", "rope_call", "rope_kernel"]

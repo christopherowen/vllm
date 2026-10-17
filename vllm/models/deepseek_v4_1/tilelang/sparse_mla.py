@@ -59,9 +59,13 @@ entries, instead of the 64x64 SM90 tiles in
 ``examples/deepseek_v4/sparse_attn_fwd_sm90.py``.
 """
 
+from types import SimpleNamespace
+
 import tilelang
 import tilelang.language as T
 import torch
+
+from . import prepare
 
 HEAD_DIM = 512
 SWA_RECORD_BYTES = 528  # 512 x E4M3 + 16 x UE8M0
@@ -716,10 +720,27 @@ class SparseMlaV41Plan:
     workspace the decode kernels need, which a caller can borrow from a shared
     workspace. ``run`` only launches kernels and can be captured in a CUDA
     graph.
+
+    The constructor takes ``routes``' arguments; ``calls`` lists the kernels a
+    plan of those arguments makes, for declaring them before it is built.
     """
 
-    def __init__(
-        self,
+    def __init__(self, *args, **kwargs):
+        routes = self.routes(*args, **kwargs)
+        self.max_rows = routes.max_rows
+        self.idx_width = routes.idx_width
+        self.swa_bytes = routes.swa_bytes
+        self.idx_bytes = routes.idx_bytes
+        self.decode_max_rows = routes.decode_max_rows
+        self.split_max_rows = routes.split_max_rows
+        self.kernels = {
+            name: function(*call_args, **call_kwargs)
+            for name, (function, call_args, call_kwargs) in routes.kernels.items()
+        }
+        self.segments, self.heads = routes.segments, routes.heads
+
+    @staticmethod
+    def routes(
         heads,
         swa_width,
         idx_width,
@@ -736,7 +757,9 @@ class SparseMlaV41Plan:
         block_I=32,
         threads=256,
         device="cuda",
-    ):
+    ) -> SimpleNamespace:
+        """The plan's segments, route bounds and kernels (``prepare.call``s by
+        route name) for one layer shape."""
         shape = (heads, swa_width, idx_width, idx_page_size)
         config = dict(
             sm_scale=sm_scale,
@@ -757,28 +780,54 @@ class SparseMlaV41Plan:
                 if split_block_H
                 else 0
             )
-        self.max_rows = max_rows
-        self.idx_width = idx_width
-        self.swa_bytes = swa_page_size * SWA_RECORD_BYTES
-        self.idx_bytes = idx_page_size * IDX_RECORD_BYTES
-        self.decode_max_rows = min(decode_max_rows, max_rows)
-        self.split_max_rows = min(split_max_rows, self.decode_max_rows)
-        self.kernels = {
-            "extend": sparse_mla_fwd_v41(
-                *shape, "extend", block_H=block_H, threads=threads, **config
+        decode_max_rows = min(decode_max_rows, max_rows)
+        split_max_rows = min(split_max_rows, decode_max_rows)
+        kernels = {
+            "extend": prepare.call(
+                sparse_mla_fwd_v41,
+                *shape,
+                "extend",
+                block_H=block_H,
+                threads=threads,
+                **config,
             )
         }
-        if self.decode_max_rows:
-            self.kernels["decode"] = sparse_mla_fwd_v41(
-                *shape, "decode", block_H=block_H, threads=threads, **config
+        if decode_max_rows:
+            kernels["decode"] = prepare.call(
+                sparse_mla_fwd_v41,
+                *shape,
+                "decode",
+                block_H=block_H,
+                threads=threads,
+                **config,
             )
-        if self.split_max_rows:
+        if split_max_rows:
             # One warp per 16x8 tile of the 16-head x block_I score block, at most four.
             split_threads = 32 * min(4, (split_block_H // 16) * (block_I // 8))
-            self.kernels["split"] = sparse_mla_fwd_v41(
-                *shape, "decode", block_H=split_block_H, threads=split_threads, **config
+            kernels["split"] = prepare.call(
+                sparse_mla_fwd_v41,
+                *shape,
+                "decode",
+                block_H=split_block_H,
+                threads=split_threads,
+                **config,
             )
-        self.segments, self.heads = segments, heads
+        return SimpleNamespace(
+            heads=heads,
+            max_rows=max_rows,
+            idx_width=idx_width,
+            swa_bytes=swa_page_size * SWA_RECORD_BYTES,
+            idx_bytes=idx_page_size * IDX_RECORD_BYTES,
+            segments=segments,
+            decode_max_rows=decode_max_rows,
+            split_max_rows=split_max_rows,
+            kernels=kernels,
+        )
+
+    @classmethod
+    def calls(cls, *args, **kwargs) -> list:
+        """The kernel calls ``SparseMlaV41Plan(*args, **kwargs)`` makes."""
+        return list(cls.routes(*args, **kwargs).kernels.values())
 
     def scratch_specs(self, rows, kernel=None):
         """``Partial`` and ``PartialStats`` for a decode launch; nothing for extend."""
