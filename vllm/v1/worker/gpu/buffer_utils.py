@@ -2,11 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Sequence
 from functools import partial
+from typing import Any
 
 import numpy as np
 import torch
 
 from vllm.logger import init_logger
+from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    TritonWarmupTensor,
+    triton_kernel_dispatcher_with_warmup,
+    triton_warmup_inputs,
+)
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import (
@@ -212,7 +218,7 @@ class StagedWriteTensor:
             )
 
         # Write diffs to the GPU buffer
-        _apply_write_kernel[(n,)](
+        _apply_write_launcher[(n,)](
             self.gpu,
             self.gpu.stride(0),
             indices_uva,
@@ -225,6 +231,10 @@ class StagedWriteTensor:
         )
         # Clear the staged writes
         self.clear_staged_writes()
+
+    def register_warmup(self) -> None:
+        """Register ``apply_write`` for this tensor's dtype and row stride."""
+        register_staged_write_warmup(self.dtype, self.gpu.stride(0))
 
     def clear_staged_writes(self) -> None:
         self._staged_write_indices.clear()
@@ -247,6 +257,11 @@ class FusedStagedWriter:
         self.starts = new_pool(max_writes)
         self.cu_lens = new_pool(max_writes)
         self.device = device
+
+    @staticmethod
+    def register_warmup() -> None:
+        """Register ``apply`` (int32 contents through per-group pointers)."""
+        _apply_write_launcher.register_warmup(dtype=None, output_stride=None)
 
     def apply(
         self,
@@ -282,7 +297,7 @@ class FusedStagedWriter:
         cu_lens_uva = self.cu_lens.copy_to_uva(cu_lens)
         contents_gpu = async_tensor_h2d(contents, device=self.device, dtype=torch.int32)
 
-        _apply_write_kernel[(len(group_ids),)](
+        _apply_write_launcher[(len(group_ids),)](
             output_ptrs,
             output_strides,
             indices_uva,
@@ -340,3 +355,48 @@ def _load_ptr(ptr_to_ptr, elem_dtype):
     ptr = tl.load(ptr_to_ptr)
     ptr = tl.cast(ptr, tl.pointer_type(elem_dtype))
     return tl.multiple_of(ptr, 16)
+
+
+def _apply_write_warmup_inputs(
+    *, dtype: torch.dtype | None, output_stride: int | None
+) -> dict[str, Any]:
+    """``dtype=None``: the fused multi-group write (``FusedStagedWriter``)."""
+    int32 = TritonWarmupTensor(torch.int32)
+    if dtype is None:
+        return triton_warmup_inputs(
+            _apply_write_kernel,
+            TritonWarmupTensor(torch.uint64),
+            TritonWarmupTensor(torch.int64),
+            int32,
+            int32,
+            int32,
+            int32,
+            int32,
+            grid=(1,),
+            BLOCK_SIZE=1024,
+            MULTI_GROUP=True,
+        )
+    return triton_warmup_inputs(
+        _apply_write_kernel,
+        TritonWarmupTensor(dtype),
+        output_stride,
+        int32,
+        int32,
+        TritonWarmupTensor(dtype),
+        int32,
+        None,
+        grid=(1,),
+        BLOCK_SIZE=1024,
+        MULTI_GROUP=False,
+    )
+
+
+_apply_write_launcher = triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_apply_write_warmup_inputs
+)(_apply_write_kernel)
+
+
+def register_staged_write_warmup(dtype: torch.dtype, output_stride: int) -> None:
+    """Register ``StagedWriteTensor.apply_write`` for a tensor of ``dtype`` whose
+    rows are ``output_stride`` elements apart (for tensors not built yet)."""
+    _apply_write_launcher.register_warmup(dtype=dtype, output_stride=output_stride)

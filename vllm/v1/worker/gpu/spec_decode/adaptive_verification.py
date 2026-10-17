@@ -40,6 +40,12 @@ _COST_DIR = os.environ.get("SPARK3_DSPARK_COST_DIR") or None
 # from the current drafts' confidences; the batch shape is unchanged. 0 = off.
 _DEAD_ROWS_TAU = float(os.environ.get("SPARK3_DSPARK_DEAD_ROWS_TAU", "0"))
 
+
+def dead_rows_enabled() -> bool:
+    """Whether an adaptive verification manager marks dead verification rows."""
+    return _DEAD_ROWS_TAU > 0
+
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.worker.gpu.attn_utils import AttentionCGSupportInfo
@@ -308,10 +314,15 @@ class AdaptiveVerificationManager:
             if not 0 < draft_budget < num_reqs * steps:
                 continue
             capacities = torch.full(
-                (num_reqs,), steps, dtype=self._batch_draft_capacity.dtype, device=device
+                (num_reqs,),
+                steps,
+                dtype=self._batch_draft_capacity.dtype,
+                device=device,
             )
             idx_mapping = torch.arange(num_reqs, dtype=torch.int64, device=device)
-            _assign_draft_token_budget(probs, idx_mapping, capacities, draft_budget, steps)
+            _assign_draft_token_budget(
+                probs, idx_mapping, capacities, draft_budget, steps
+            )
         torch.cuda.synchronize(device)
 
     def set_initial_cost_curves(

@@ -19,10 +19,10 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager
-import os
 from copy import deepcopy
 from typing import Any, NamedTuple
 
@@ -51,8 +51,12 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
     bind_routed_experts_capturer,
 )
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
+)
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.offloader import (
@@ -74,9 +78,13 @@ from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, async_tensor_h2d
 from vllm.v1.core.boundary_checkpoint import NUM_BOUNDARY_CHECKPOINT_SLOTS
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheSpec,
     MambaSpec,
     UniformTypeKVCacheSpecs,
+    iter_layer_specs,
 )
 from vllm.v1.outputs import (
     DraftTokenIds,
@@ -104,12 +112,20 @@ from vllm.v1.worker.gpu.attn_utils import (
     FastPrefillHelper,
     build_slot_mappings_by_layer,
     get_kv_cache_spec,
+    get_shared_kv_cache_layers,
     init_attn_backend,
     init_kv_cache,
+    select_kernel_block_sizes,
 )
-from vllm.v1.worker.gpu.block_table import BlockTables, slot_mapping_mode
+from vllm.v1.worker.gpu.block_table import (
+    BlockTables,
+    register_block_table_warmups,
+    slot_mapping_mode,
+)
 from vllm.v1.worker.gpu.boundary_checkpoint import BoundaryCheckpointState
 from vllm.v1.worker.gpu.buffer_utils import (
+    FusedStagedWriter,
+    register_staged_write_warmup,
     set_default_max_concurrency,
 )
 from vllm.v1.worker.gpu.cp_utils import maybe_prepare_dcp_local_seq_lens
@@ -131,6 +147,7 @@ from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
 from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
     InputBuffers,
+    assign_dummy_blocks,
     combine_sampled_and_draft_tokens,
     expand_idx_mapping,
     get_num_sampled_and_rejected,
@@ -138,7 +155,7 @@ from vllm.v1.worker.gpu.input_batch import (
     post_update_num_computed_tokens,
     prepare_pos_seq_lens,
     prepare_prefill_inputs,
-    assign_dummy_blocks,
+    register_input_batch_warmups,
     set_dummy_context,
 )
 from vllm.v1.worker.gpu.kv_connector import (
@@ -165,21 +182,26 @@ from vllm.v1.worker.gpu.sample.batch_shard import (
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
+from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
+    dead_rows_enabled,
     maybe_create_adaptive_verification_manager,
     resolve_adaptive_cudagraph_mode,
 )
-from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+    DFlashSpeculator,
+    DraftBlockTableLayout,
+)
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
     verify_supports_aux_hidden_states_over_pp,
 )
-from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.spec_decode.greedy_verification import (
     greedy_rejection_sample,
+    register_greedy_verification_warmups,
     vocab_parallel_argmax,
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
@@ -201,9 +223,11 @@ from vllm.v1.worker.gpu.ubatch_utils import (
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import (
     KVBlockZeroer,
+    add_kv_sharing_layers_to_kv_cache_groups,
     clear_layer_kv_caches,
     copy_kv_cache_blocks_inplace,
     get_uniform_decode_token_count,
+    register_zero_kv_blocks_warmup,
 )
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
@@ -473,10 +497,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             time_after_load - time_before_load,
         )
 
-        # Initialize the components that require the model.
-        self.model_state = init_model_state(
-            self.vllm_config, self.model, self.encoder_cache, self.device
-        )
+        # Initialize the components that require the model. Model states select
+        # input-preparation kernels that need JIT warmup.
+        with self.jit_warmup_registry.activate():
+            self.model_state = init_model_state(
+                self.vllm_config, self.model, self.encoder_cache, self.device
+            )
 
         self.decode_query_len = (
             self.num_speculative_steps
@@ -556,6 +582,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 mask_stride=self.decode_query_len,
                 num_bonus_tokens=self.model_state.num_new_sampled_tokens_per_step,
             )
+            # A step's Triton kernels (input preparation, sampling, verification,
+            # drafting), specialized on the runner's buffers, the loaded heads and
+            # the KV cache groups' block tables.
+            with self.jit_warmup_registry.activate():
+                self._register_step_warmups()
 
         if self.is_pooling_model and self.is_last_pp_rank:
             self.pooling_runner = PoolingRunner(self.model, self.vllm_config)
@@ -619,6 +650,34 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def get_kv_cache_spec(self):
         return get_kv_cache_spec(self.vllm_config)
 
+    def _block_table_max_model_len(self) -> int:
+        """The longest sequence a block-table row must index."""
+        if not self.is_encoder_decoder:
+            return self.max_model_len
+        # Cross-attention block tables need to index encoder tokens, which
+        # can exceed the decoder's max_model_len.
+        return max(
+            self.max_model_len,
+            self.scheduler_config.max_num_encoder_input_tokens,
+            getattr(self.model_config.hf_config, "max_source_positions", 0),
+        )
+
+    def _block_table_width(self, spec: KVCacheSpec, max_len: int) -> int:
+        """A KV cache group's block-table row length, in KV cache blocks."""
+        # Let each cache type account for CP. Attention KV is DCP-sharded,
+        # while Mamba/GDN recurrent state is replicated across DCP ranks.
+        max_num_blocks = spec.max_num_blocks_per_req(self.vllm_config, max_len)
+        # Preserve each cache type's alignment requirements after applying
+        # its topology-aware block-table width.
+        return get_block_table_width(
+            max_num_blocks,
+            spec.block_size,
+            token_alignment=spec.block_table_token_alignment,
+        )
+
+    def _group_cp_size(self, layer_spec: KVCacheSpec) -> int:
+        return 1 if getattr(layer_spec, "dcp_replicated", False) else self.dcp_size
+
     def initialize_kv_cache(
         self,
         kv_cache_config: KVCacheConfig,
@@ -630,15 +689,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
 
-        block_table_max_model_len = self.max_model_len
-        if self.is_encoder_decoder:
-            # Cross-attention block tables need to index encoder tokens, which
-            # can exceed the decoder's max_model_len.
-            block_table_max_model_len = max(
-                block_table_max_model_len,
-                self.scheduler_config.max_num_encoder_input_tokens,
-                getattr(self.model_config.hf_config, "max_source_positions", 0),
-            )
+        block_table_max_model_len = self._block_table_max_model_len()
 
         block_sizes = []
         max_num_blocks_per_group = []
@@ -654,22 +705,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             mapping_enabled, mapping_circular = slot_mapping_mode(layer_spec)
             slot_mapping_enabled.append(mapping_enabled)
             slot_mapping_circular.append(mapping_circular)
-            group_cp_sizes.append(
-                1 if getattr(layer_spec, "dcp_replicated", False) else self.dcp_size
+            group_cp_sizes.append(self._group_cp_size(layer_spec))
+            max_num_blocks_per_group.append(
+                self._block_table_width(spec, block_table_max_model_len)
             )
-            # Let each cache type account for CP. Attention KV is DCP-sharded,
-            # while Mamba/GDN recurrent state is replicated across DCP ranks.
-            max_num_blocks = spec.max_num_blocks_per_req(
-                self.vllm_config, block_table_max_model_len
-            )
-            # Preserve each cache type's alignment requirements after applying
-            # its topology-aware block-table width.
-            max_num_blocks = get_block_table_width(
-                max_num_blocks,
-                spec.block_size,
-                token_alignment=spec.block_table_token_alignment,
-            )
-            max_num_blocks_per_group.append(max_num_blocks)
 
         target_attn_layer_names = None
         layer_vllm_configs = {}
@@ -913,7 +952,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     order.append(index)
         torch.cuda.synchronize()
         results = [
-            {"shape": shape, "step_ms": [], "forward_ms": [], "drafter_ms": [], "modes": []}
+            {
+                "shape": shape,
+                "step_ms": [],
+                "forward_ms": [],
+                "drafter_ms": [],
+                "modes": [],
+            }
             for shape in shapes
         ]
         for index, (start, end) in zip(order, events):
@@ -929,7 +974,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 results[index]["modes"].append(
                     [sample.full_cudagraph, sample.num_target_tokens, sample.num_reqs]
                 )
-        return {"replays": replays, "warmup": warmup, "settle": settle, "shapes": results}
+        return {
+            "replays": replays,
+            "warmup": warmup,
+            "settle": settle,
+            "shapes": results,
+        }
 
     @torch.inference_mode()
     @step_eplb_after(is_dummy=True)
@@ -1948,7 +1998,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def _language_model(self) -> nn.Module:
         """The model that owns the LM head (a multimodal wrapper delegates to it)."""
         model = self.model
-        while getattr(model, "lm_head", None) is None and hasattr(model, "language_model"):
+        while getattr(model, "lm_head", None) is None and hasattr(
+            model, "language_model"
+        ):
             model = model.language_model
         return model
 
@@ -1979,6 +2031,184 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "on" if self._greedy_verification else "off",
             )
         return self._greedy_verification
+
+    def _register_step_warmups(self) -> None:
+        """Register the Triton kernels that input preparation, sampling, greedy
+        verification and the drafter launch: for the runner's buffers, the loaded
+        LM head's dtype and vocabulary shards, and the block tables of the KV cache
+        groups its spec gives (the KV cache does not exist yet)."""
+        from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+
+        assert self.sampler is not None
+        kv_cache_groups = get_kv_cache_groups(
+            self.vllm_config, self.get_kv_cache_spec()
+        )
+        add_kv_sharing_layers_to_kv_cache_groups(
+            get_shared_kv_cache_layers(self.vllm_config), kv_cache_groups
+        )
+        kernel_block_sizes = select_kernel_block_sizes(
+            kv_cache_groups, self.vllm_config
+        )
+        self._register_kv_cache_warmups(kv_cache_groups, kernel_block_sizes)
+        dead_rows = bool(
+            getattr(self.speculator, "enable_adaptive_verification", False)
+            and dead_rows_enabled()
+            and self.batch_sharder is None
+        )
+        register_input_batch_warmups(
+            max_num_reqs=self.input_buffers.seq_lens.shape[0],
+            next_prefill_tokens_stride=self.req_states.next_prefill_tokens.stride(0),
+            num_lookahead=self.req_states.next_prefill_tokens.shape[0],
+            all_token_ids_stride=self.req_states.all_token_ids.gpu.stride(0),
+            draft_tokens_stride=self.req_states.draft_tokens.stride(0),
+            num_speculative_steps=self.req_states.draft_tokens.shape[-1],
+            num_new_sampled_tokens=self.model_state.num_new_sampled_tokens_per_step,
+            dead_rows_confidence_stride=self.num_speculative_steps
+            if dead_rows
+            else None,
+            output_bin_counts_stride=self.sampler.penalties_state.output_bin_counts.stride(
+                0
+            ),
+        )
+        self.req_states.register_warmups()
+
+        language_model = self._language_model()
+        head = getattr(language_model, "lm_head", None)
+        processor = getattr(language_model, "logits_processor", None)
+        if isinstance(head, VocabParallelEmbedding) and isinstance(
+            processor, LogitsProcessor
+        ):
+            vocab_size = processor.org_vocab_size
+            # compute_logits gathers the padded vocabulary shards and drops the
+            # padding columns. Logits processing copies them to FP32 densely: rows
+            # vocab_size apart, or as gathered when there is a single row.
+            logits = ((processor.head_dtype, head.num_embeddings_padded),)
+            processed_strides = tuple(
+                dict.fromkeys((vocab_size, head.num_embeddings_padded))
+            )
+            if type(self.sampler) is Sampler:
+                self.sampler.register_warmups(
+                    logits=logits,
+                    processed_logits_strides=processed_strides,
+                    vocab_size=vocab_size,
+                )
+            if isinstance(self.rejection_sampler, RejectionSampler):
+                self.rejection_sampler.register_warmups(
+                    logits=logits,
+                    processed_logits=tuple(
+                        (torch.float32, stride) for stride in processed_strides
+                    ),
+                    vocab_size=vocab_size,
+                    has_draft_logits=getattr(self.speculator, "draft_logits", None)
+                    is not None,
+                )
+            if self.prompt_logprobs_worker is not None:
+                self.prompt_logprobs_worker.register_warmups(
+                    logits=logits,
+                    vocab_size=vocab_size,
+                    all_token_ids_stride=self.req_states.all_token_ids.gpu.stride(0),
+                )
+            if self.structured_outputs_worker is not None:
+                self.structured_outputs_worker.register_warmups(
+                    logits=logits,
+                    vocab_size=vocab_size,
+                    invalid_spec_tokens=self.speculative_config is not None,
+                )
+        if self.rejection_sampler is not None and self._greedy_verification_available():
+            assert head is not None and processor is not None
+            shard = head.shard_indices
+            register_greedy_verification_warmups(
+                logits_dtype=processor.head_dtype,
+                logits_stride=head.num_embeddings_per_partition,
+                vocab=shard.num_org_elements,
+                vocab_start=shard.org_vocab_start_index,
+                tp_size=get_tensor_model_parallel_world_size(),
+                num_speculative_steps=self.rejection_sampler.num_speculative_steps,
+            )
+        if isinstance(self.speculator, DFlashSpeculator):
+            self.speculator.register_warmups(
+                self._draft_block_table_layouts(kv_cache_groups, kernel_block_sizes)
+            )
+
+    def _register_kv_cache_warmups(
+        self, kv_cache_groups: list[KVCacheGroupSpec], kernel_block_sizes: list[int]
+    ) -> None:
+        """Register the block-table kernels and KV block zeroing for the KV cache
+        groups ``initialize_kv_cache`` will receive (their layout does not depend
+        on the number of blocks)."""
+        if not kv_cache_groups:
+            return
+        register_block_table_warmups(
+            max_num_reqs=self.max_num_reqs,
+            max_num_batched_tokens=self.max_num_tokens,
+            cp_rank=self.dcp_rank,
+            cp_size=self.dcp_size,
+            cp_interleave=self.parallel_config.cp_kv_cache_interleave_size,
+        )
+        if len(kv_cache_groups) > 1:
+            FusedStagedWriter.register_warmup()
+        else:
+            spec = kv_cache_groups[0].kv_cache_spec
+            register_staged_write_warmup(
+                torch.int32,
+                self._block_table_width(spec, self._block_table_max_model_len())
+                * (spec.block_size // kernel_block_sizes[0]),
+            )
+        kv_cache_config = KVCacheConfig(
+            num_blocks=0, kv_cache_tensors=[], kv_cache_groups=kv_cache_groups
+        )
+        if not kv_cache_config.needs_kv_cache_zeroing:
+            return
+        # KVBlockZeroer clears each attention layer's kernel-block page.
+        page_sizes = [
+            layer_spec.page_size_bytes
+            // (layer_spec.block_size // kernel_block_sizes[group_id])
+            for group_id, group in enumerate(kv_cache_groups)
+            if group.kv_cache_spec.has_layer_views
+            and group_id < len(kernel_block_sizes)
+            for layer_spec in iter_layer_specs(group.kv_cache_spec)
+            if isinstance(layer_spec, AttentionSpec)
+        ]
+        if page_sizes:
+            register_zero_kv_blocks_warmup(max(page_sizes) // 4)
+
+    def _draft_block_table_layouts(
+        self, kv_cache_groups: list[KVCacheGroupSpec], kernel_block_sizes: list[int]
+    ) -> list[DraftBlockTableLayout]:
+        """The block table of each KV cache group the drafter attends through, as
+        ``initialize_kv_cache`` lays it out for memory profiling's minimal KV
+        cache and for serving's."""
+        assert isinstance(self.speculator, DraftModelSpeculator)
+        max_len = self._block_table_max_model_len()
+        layouts = []
+        for group_id, group in enumerate(kv_cache_groups):
+            spec = group.kv_cache_spec
+            if (
+                not spec.has_layer_views
+                or self.speculator.draft_attn_layer_names.isdisjoint(group.layer_names)
+            ):
+                continue
+            layer_spec = (
+                spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
+            )
+            cp_size = self._group_cp_size(layer_spec)
+            kernel_block_size = kernel_block_sizes[group_id]
+            layouts.append(
+                DraftBlockTableLayout(
+                    group_id=group_id,
+                    width=self._block_table_width(spec, max_len)
+                    * (spec.block_size // kernel_block_size),
+                    kernel_block_size=kernel_block_size,
+                    cp_rank=self.dcp_rank if cp_size > 1 else 0,
+                    cp_size=cp_size,
+                    cp_interleave=(
+                        self.parallel_config.cp_kv_cache_interleave_size
+                        if cp_size > 1
+                        else 1
+                    ),
+                )
+            )
+        return layouts
 
     def _verifies_greedily(
         self, input_batch: InputBatch, grammar_output: GrammarOutput | None

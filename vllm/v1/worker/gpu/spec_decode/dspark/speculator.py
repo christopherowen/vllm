@@ -23,21 +23,30 @@ CUDA graphs (FULL, mirroring DFlash) cover the whole draft step: the parallel
 backbone forward AND the sequential Markov sampling.
 """
 
+from collections.abc import Sequence
 from typing import Any
 
 import torch
 
 from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
-from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
-from vllm.distributed import tensor_model_parallel_all_gather
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+    DFlashSpeculator,
+    DraftBlockTableLayout,
+)
 from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
     greedy_markov_shard_pair,
-    select_first_argmax,
+    register_greedy_markov_shard_pair_warmup,
+    register_select_first_argmax_warmup,
     sample_greedy_markov,
     scratch_shape,
+    select_first_argmax,
 )
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
 
@@ -201,6 +210,49 @@ class DSparkSpeculator(DFlashSpeculator):
             )
         return sampled
 
+    def _vocab_parallel_greedy(self, local_head: bool) -> bool:
+        """Whether greedy drafts over the full target vocabulary stay sharded:
+        each rank reduces its shard and only (max, index) pairs are gathered."""
+        return (
+            not local_head
+            and getattr(self.model, "vocab_parallel_greedy", False)
+            and self.draft_logits is None
+            and self.model.draft_id_to_target_id is None
+            and self.acceptance_estimator is None
+        )
+
+    def register_warmups(
+        self, block_table_layouts: Sequence[DraftBlockTableLayout]
+    ) -> None:
+        """Also register the vocabulary-parallel greedy reduction of each draft
+        position: its base logits and Markov bias are this rank's shards, written
+        in the draft head's dtype; draft position ``i`` is column ``i`` of both
+        the base logits' ``[requests, positions, shard]`` view and the draft
+        tokens."""
+        super().register_warmups(block_table_layouts)
+        local_head = getattr(self.model, "supports_local_draft_argmax", lambda: False)()
+        if self._draft_topk is not None or not self._vocab_parallel_greedy(local_head):
+            return
+        vocab_start, shard_vocab = self.model.draft_vocab_shard
+        dtype, head_width, markov_width = self.model.draft_logits_local_layout
+        n_spec = self.num_speculative_steps
+        for i in range(n_spec):
+            register_greedy_markov_shard_pair_warmup(
+                base_dtype=dtype,
+                base_stride=n_spec * head_width,
+                base_aligned=i * head_width * dtype.itemsize % 16 == 0,
+                bias_dtype=dtype,
+                bias_stride=markov_width,
+                vocab=shard_vocab,
+                vocab_start=vocab_start,
+            )
+            register_select_first_argmax_warmup(
+                ranks=get_tensor_model_parallel_world_size(),
+                output_dtype=self.draft_tokens.dtype,
+                output_stride=self.draft_tokens.stride(0),
+                output_aligned=i * self.draft_tokens.element_size() % 16 == 0,
+            )
+
     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
         if self._draft_topk is not None:
             self._sample_sequential_topk(num_reqs, head_hidden)
@@ -213,15 +265,7 @@ class DSparkSpeculator(DFlashSpeculator):
         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
         # Draft-vocab logits; sampled ids are remapped to target vocab below.
         local_head = getattr(self.model, "supports_local_draft_argmax", lambda: False)()
-        # Greedy drafts over full target vocabularies can stay sharded: each
-        # rank reduces its shard and only (max, index) pairs are gathered.
-        vocab_parallel = (
-            not local_head
-            and getattr(self.model, "vocab_parallel_greedy", False)
-            and self.draft_logits is None
-            and self.model.draft_id_to_target_id is None
-            and self.acceptance_estimator is None
-        )
+        vocab_parallel = self._vocab_parallel_greedy(local_head)
         if local_head:
             base_logits = self.model.compute_local_draft_logits(sample_hidden)
         elif vocab_parallel:

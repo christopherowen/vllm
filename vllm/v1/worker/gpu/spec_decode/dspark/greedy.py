@@ -2,8 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Allocation-free greedy reduction of base logits and sequential Markov bias."""
 
+from typing import Any
+
 import torch
 
+from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    TritonWarmupTensor,
+    triton_kernel_dispatcher_with_warmup,
+    triton_warmup_inputs,
+)
 from vllm.triton_utils import tl, triton
 
 _BLOCK = 2048
@@ -113,10 +120,157 @@ def _select_first_argmax(
 ):
     row = tl.program_id(0)
     rank = tl.arange(0, BLOCK)
-    value = tl.load(pairs + row * 2 * RANKS + 2 * rank, rank < RANKS, other=-float("inf"))
-    index = tl.load(pairs + row * 2 * RANKS + 2 * rank + 1, rank < RANKS, other=1073741824.0)
+    value = tl.load(
+        pairs + row * 2 * RANKS + 2 * rank, rank < RANKS, other=-float("inf")
+    )
+    index = tl.load(
+        pairs + row * 2 * RANKS + 2 * rank + 1, rank < RANKS, other=1073741824.0
+    )
     _, result = tl.reduce((value, index.to(tl.int32)), 0, _first_argmax)
     tl.store(output + row * output_stride, result)
+
+
+def _partial_argmax_warmup_inputs(
+    *,
+    base_dtype: torch.dtype,
+    base_stride: int,
+    base_aligned: bool,
+    bias_dtype: torch.dtype,
+    bias_stride: int,
+    vocab: int,
+) -> dict[str, Any]:
+    parts = triton.cdiv(vocab, _BLOCK)
+    return triton_warmup_inputs(
+        _partial_argmax,
+        TritonWarmupTensor(base_dtype, aligned=base_aligned),
+        TritonWarmupTensor(bias_dtype),
+        TritonWarmupTensor(torch.float32),
+        TritonWarmupTensor(torch.int32),
+        base_stride,
+        bias_stride,
+        vocab,
+        parts,
+        _BLOCK,
+        grid=(1,),
+    )
+
+
+def _partial_argmax_logits_warmup_inputs(
+    *, dtype: torch.dtype, stride: int, vocab: int
+) -> dict[str, Any]:
+    return triton_warmup_inputs(
+        _partial_argmax_logits,
+        TritonWarmupTensor(dtype),
+        TritonWarmupTensor(torch.float32),
+        TritonWarmupTensor(torch.int32),
+        stride,
+        vocab,
+        triton.cdiv(vocab, _BLOCK),
+        _BLOCK,
+        grid=(1,),
+    )
+
+
+def _finish_argmax_pair_warmup_inputs(
+    *, vocab: int, vocab_start: int
+) -> dict[str, Any]:
+    parts = triton.cdiv(vocab, _BLOCK)
+    return triton_warmup_inputs(
+        _finish_argmax_pair,
+        TritonWarmupTensor(torch.float32),
+        TritonWarmupTensor(torch.int32),
+        TritonWarmupTensor(torch.float32),
+        vocab_start,
+        parts,
+        triton.next_power_of_2(parts),
+        grid=(1,),
+    )
+
+
+def _select_first_argmax_warmup_inputs(
+    *,
+    ranks: int,
+    output_dtype: torch.dtype,
+    output_stride: int,
+    output_aligned: bool,
+) -> dict[str, Any]:
+    return triton_warmup_inputs(
+        _select_first_argmax,
+        TritonWarmupTensor(torch.float32),
+        TritonWarmupTensor(output_dtype, aligned=output_aligned),
+        output_stride,
+        ranks,
+        triton.next_power_of_2(ranks),
+        grid=(1,),
+    )
+
+
+_partial_argmax_launcher = triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_partial_argmax_warmup_inputs
+)(_partial_argmax)
+_partial_argmax_logits_launcher = triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_partial_argmax_logits_warmup_inputs
+)(_partial_argmax_logits)
+_finish_argmax_pair_launcher = triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_finish_argmax_pair_warmup_inputs
+)(_finish_argmax_pair)
+_select_first_argmax_launcher = triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_select_first_argmax_warmup_inputs
+)(_select_first_argmax)
+
+
+def register_greedy_markov_shard_pair_warmup(
+    *,
+    base_dtype: torch.dtype,
+    base_stride: int,
+    base_aligned: bool,
+    bias_dtype: torch.dtype,
+    bias_stride: int,
+    vocab: int,
+    vocab_start: int,
+) -> None:
+    """Register the kernels ``greedy_markov_shard_pair`` launches for one layout
+    of its inputs: rows ``base_stride`` and ``bias_stride`` elements apart, the
+    base logits' first element 16-byte aligned or not, ``vocab`` columns of the
+    shard starting at global index ``vocab_start``; FP32/int32 scratch."""
+    _partial_argmax_launcher.register_warmup(
+        base_dtype=base_dtype,
+        base_stride=base_stride,
+        base_aligned=base_aligned,
+        bias_dtype=bias_dtype,
+        bias_stride=bias_stride,
+        vocab=vocab,
+    )
+    _finish_argmax_pair_launcher.register_warmup(vocab=vocab, vocab_start=vocab_start)
+
+
+def register_greedy_shard_pair_warmup(
+    *, logits_dtype: torch.dtype, logits_stride: int, vocab: int, vocab_start: int
+) -> None:
+    """Register the kernels ``greedy_shard_pair`` launches for freshly allocated
+    logits of ``logits_dtype`` whose rows are ``logits_stride`` elements apart."""
+    _partial_argmax_logits_launcher.register_warmup(
+        dtype=logits_dtype, stride=logits_stride, vocab=vocab
+    )
+    _finish_argmax_pair_launcher.register_warmup(vocab=vocab, vocab_start=vocab_start)
+
+
+def register_select_first_argmax_warmup(
+    *,
+    ranks: int,
+    output_dtype: torch.dtype,
+    output_stride: int,
+    output_aligned: bool,
+) -> None:
+    """Register ``select_first_argmax`` for ``ranks`` freshly gathered pairs per
+    row and an output column of ``output_dtype``, ``output_stride`` elements per
+    row, whose first element is 16-byte aligned or not."""
+    _select_first_argmax_launcher.register_warmup(
+        ranks=ranks,
+        output_dtype=output_dtype,
+        output_stride=output_stride,
+        output_aligned=output_aligned,
+    )
 
 
 def greedy_markov_shard_pair(
@@ -147,7 +301,7 @@ def greedy_markov_shard_pair(
     parts = triton.cdiv(vocab, _BLOCK)
     if min(partial_values.numel(), partial_indices.numel()) < rows * parts:
         raise ValueError("DSpark greedy scratch is smaller than the logits require")
-    _partial_argmax[(rows, parts)](
+    _partial_argmax_launcher[(rows, parts)](
         base_logits,
         markov_bias,
         partial_values,
@@ -158,7 +312,7 @@ def greedy_markov_shard_pair(
         parts,
         _BLOCK,
     )
-    _finish_argmax_pair[(rows,)](
+    _finish_argmax_pair_launcher[(rows,)](
         partial_values,
         partial_indices,
         pairs,
@@ -187,7 +341,7 @@ def greedy_shard_pair(
     parts = triton.cdiv(vocab, _BLOCK)
     if min(partial_values.numel(), partial_indices.numel()) < rows * parts:
         raise ValueError("greedy scratch is smaller than the logits require")
-    _partial_argmax_logits[(rows, parts)](
+    _partial_argmax_logits_launcher[(rows, parts)](
         logits,
         partial_values,
         partial_indices,
@@ -196,7 +350,7 @@ def greedy_shard_pair(
         parts,
         _BLOCK,
     )
-    _finish_argmax_pair[(rows,)](
+    _finish_argmax_pair_launcher[(rows,)](
         partial_values,
         partial_indices,
         pairs,
@@ -211,7 +365,7 @@ def select_first_argmax(pairs: torch.Tensor, output: torch.Tensor) -> None:
     maximum's global index, written to ``output`` (one per row)."""
     rows, width = pairs.shape
     ranks = width // 2
-    _select_first_argmax[(rows,)](
+    _select_first_argmax_launcher[(rows,)](
         pairs,
         output,
         output.stride(0),
@@ -258,7 +412,7 @@ def sample_greedy_markov(
     parts = triton.cdiv(vocab, _BLOCK)
     if min(partial_values.numel(), partial_indices.numel()) < rows * parts:
         raise ValueError("DSpark greedy scratch is smaller than the logits require")
-    _partial_argmax[(rows, parts)](
+    _partial_argmax_launcher[(rows, parts)](
         base_logits,
         markov_bias,
         partial_values,

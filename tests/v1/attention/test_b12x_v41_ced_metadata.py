@@ -207,7 +207,7 @@ def test_frozen_packing_graph_replays_new_live_rows(monkeypatch):
         packed = gather_rows(source, indices)
         restored = scatter_rows(packed, indices, 256)
     # Replay cannot consult Python or compile another packing specialization.
-    monkeypatch.setattr(ced, "_copy_rows", None)
+    monkeypatch.setattr(ced, "_copy_rows_launcher", None)
     indices.fill_(-1)
     indices[:2] = torch.tensor([31, 127], device="cuda")
     source.add_(1000)
@@ -516,6 +516,7 @@ def test_startup_warmup_covers_live_compaction_without_jit(monkeypatch):
 
     from triton import knobs
 
+    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
     from vllm.models.deepseek_v4_1 import ced
 
     # Isolate compilation state so earlier tests cannot hide a missing warmup.
@@ -524,7 +525,11 @@ def test_startup_warmup_covers_live_compaction_without_jit(monkeypatch):
             kernel, "device_caches", defaultdict(kernel.device_caches.default_factory)
         )
     state = CEDState(4, 8192, (128, 256, 384, 512, 8192), "cuda")
-    state.warmup(hidden_size=8, hc_mult=4)
+    # The packings compile with the runner's JIT warmup, as under the worker.
+    registry = JitWarmupRegistry(None)
+    with registry.activate():
+        state.warmup(hidden_size=8, hc_mult=4)
+    registry.warmup()
 
     def forbid_compile(**kwargs):
         raise AssertionError(
@@ -554,3 +559,6 @@ def test_startup_warmup_covers_live_compaction_without_jit(monkeypatch):
         expected_rows = torch.zeros_like(source)
         expected_rows[expected] = 1
         torch.testing.assert_close(result, expected_rows)
+        # The decoder's routing mask gathers the step's padding mask.
+        is_padding = torch.zeros(sum(lengths), dtype=torch.bool, device="cuda")
+        assert not gather_rows(is_padding, indices).any()

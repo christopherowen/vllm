@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from typing import Any
 
 import numpy as np
@@ -8,6 +8,11 @@ import torch
 
 from vllm.config import SpeculativeConfig
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
+from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    TritonWarmupTensor,
+    triton_kernel_dispatcher_with_warmup,
+    triton_warmup_inputs,
+)
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
@@ -17,11 +22,15 @@ from vllm.v1.worker.gpu.input_batch import (
     get_num_sampled_and_rejected,
 )
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
-from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
+from vllm.v1.worker.gpu.sample.logprob import (
+    compute_topk_scores,
+    register_topk_scores_warmup,
+)
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
+    register_rejection_sample_warmups,
     rejection_sample,
 )
 
@@ -74,6 +83,26 @@ def _flatten_sampled_kernel(
         tl.store(flat_sampled_ptr + start_idx + i, token_id)
 
 
+def _flatten_sampled_warmup_inputs(*, sampled_stride: int) -> dict[str, Any]:
+    int64 = TritonWarmupTensor(torch.int64)
+    int32 = TritonWarmupTensor(torch.int32)
+    return triton_warmup_inputs(
+        _flatten_sampled_kernel,
+        int64,
+        int64,
+        sampled_stride,
+        int32,
+        int32,
+        grid=(1,),
+        num_warps=1,
+    )
+
+
+_flatten_sampled_launcher = triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_flatten_sampled_warmup_inputs
+)(_flatten_sampled_kernel)
+
+
 class RejectionSampler:
     def __init__(
         self,
@@ -104,6 +133,39 @@ class RejectionSampler:
         elif rejection_sample_method == "block":
             self.use_block_verification = True
 
+    def register_warmups(
+        self,
+        *,
+        logits: Sequence[tuple[torch.dtype, int]],
+        processed_logits: Sequence[tuple[torch.dtype, int]],
+        vocab_size: int,
+        has_draft_logits: bool,
+    ) -> None:
+        """Register verification of target logits given as ``(dtype, row stride)``
+        pairs, raw (``logits``) or after sampling parameters (``processed_logits``),
+        and the logprobs of verified tokens. Draft logits and watermarking are not
+        covered: their kernels keep compiling at first use."""
+        if has_draft_logits or self.watermark_key is not None:
+            return
+        register_rejection_sample_warmups(
+            logits=(*logits, *processed_logits),
+            vocab_size=vocab_size,
+            num_speculative_steps=self.num_speculative_steps,
+            synthetic_mode=self.synthetic_conditional_rates is not None,
+            use_block_verification=self.use_block_verification,
+            use_fp64=self.sampler.use_fp64_gumbel,
+        )
+        _flatten_sampled_launcher.register_warmup(
+            sampled_stride=self.num_speculative_steps + 1
+        )
+        use_processed = self.sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
+        register_topk_scores_warmup(
+            logits=processed_logits if use_processed else logits,
+            vocab_size=vocab_size,
+            logits_mode=self.sampler.logprobs_mode
+            in ("raw_logits", "processed_logits"),
+        )
+
     def _get_logprobs_tensors(
         self,
         sampled: torch.Tensor,
@@ -121,7 +183,7 @@ class RejectionSampler:
         flat_sampled = torch.zeros(
             num_logits, dtype=sampled.dtype, device=sampled.device
         )
-        _flatten_sampled_kernel[(num_reqs,)](
+        _flatten_sampled_launcher[(num_reqs,)](
             flat_sampled,
             sampled,
             sampled.stride(0),

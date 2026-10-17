@@ -16,12 +16,14 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
 from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample, register_sampling_warmups
 from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
 from vllm.v1.worker.gpu.sample.logprob import (
     LogprobTokenIdsState,
     compute_topk_scores,
+    register_topk_scores_warmup,
 )
+from vllm.v1.worker.gpu.sample.min_p import register_min_p_warmup
 from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
 from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
@@ -91,6 +93,42 @@ class Sampler:
             or states.min_p.np[req_idx] != 0.0
             or states.top_k.np[req_idx] != states.vocab_size
             or states.top_p.np[req_idx] != 1.0
+        )
+
+    def register_warmups(
+        self,
+        *,
+        logits: tuple[tuple[torch.dtype, int], ...],
+        processed_logits_strides: tuple[int, ...],
+        vocab_size: int,
+    ) -> None:
+        """Register the kernels sampling launches, for ``vocab_size``-wide raw
+        logits given as ``(dtype, row stride)`` pairs and their processed FP32
+        copies (rows ``processed_logits_strides`` apart), and the staged writes of
+        the per-request sampling state."""
+        processed = tuple(
+            (torch.float32, stride) for stride in processed_logits_strides
+        )
+        for logits_stride in processed_logits_strides:
+            register_min_p_warmup(logits_stride=logits_stride, vocab_size=vocab_size)
+        register_sampling_warmups(
+            logits=(*logits, *processed),
+            processed_logits_strides=processed_logits_strides,
+            vocab_size=vocab_size,
+            use_fp64=self.use_fp64_gumbel,
+        )
+        self.penalties_state.register_warmups(processed_logits_strides)
+        self.logit_bias_state.register_warmups(processed_logits_strides, vocab_size)
+        self.bad_words_state.register_warmups(processed_logits_strides)
+        self.logprob_token_ids_state.register_warmups()
+        if self.trace_replay_state is not None:
+            self.trace_replay_state.trace_token_ids.register_warmup()
+        register_topk_scores_warmup(
+            logits=processed
+            if self.logprobs_mode in PROCESSED_LOGPROBS_MODES
+            else logits,
+            vocab_size=vocab_size,
+            logits_mode=self.logprobs_mode in ("raw_logits", "processed_logits"),
         )
 
     def apply_staged_writes(self) -> None:

@@ -29,6 +29,7 @@ from vllm.v1.hisparse.binding import (
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
+    KVCacheGroupSpec,
     KVCacheSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -327,6 +328,40 @@ def init_attn_backend(
                     builder.set_workspace_buffer(attn_backend_workspace)
     attn_cg_support_info = get_attn_cg_support(attn_groups, vllm_config)
     return attn_groups, attn_cg_support_info, kernel_block_sizes
+
+
+def select_kernel_block_sizes(
+    kv_cache_groups: list[KVCacheGroupSpec], vllm_config: VllmConfig
+) -> list[int]:
+    """The kernel block size ``init_attn_backend`` selects for each KV cache group
+    (KV-sharing layers already in their targets' groups), from the layers'
+    backends alone: no metadata builder is created and no layer is changed."""
+    layer_type = cast(type[Any], AttentionLayerBase)
+    attn_groups: list[list[AttentionGroup]] = []
+    for kv_cache_group_id, kv_cache_group in enumerate(kv_cache_groups):
+        if not kv_cache_group.kv_cache_spec.has_layer_views:
+            attn_groups.append([])
+            continue
+        attn_layers = get_layers_from_vllm_config(
+            vllm_config, layer_type, kv_cache_group.layer_names
+        )
+        attn_groups.append(
+            [
+                AttentionGroup(
+                    layer.get_attn_backend(),
+                    [layer_name],
+                    kv_cache_group.kv_cache_spec,
+                    kv_cache_group_id,
+                )
+                for layer_name, layer in attn_layers.items()
+            ]
+        )
+    return prepare_kernel_block_sizes(
+        KVCacheConfig(
+            num_blocks=0, kv_cache_tensors=[], kv_cache_groups=kv_cache_groups
+        ),
+        attn_groups,
+    )
 
 
 def get_attn_cg_support(

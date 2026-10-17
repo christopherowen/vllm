@@ -1,16 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from typing import Any
 
 import numpy as np
 import torch
 
 from vllm.config.model import LogprobsMode
+from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    TritonWarmupTensor,
+    triton_kernel_dispatcher_with_warmup,
+    triton_warmup_inputs,
+)
 from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.worker.gpu.input_batch import InputBatch
-from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
+from vllm.v1.worker.gpu.sample.logprob import (
+    compute_topk_scores,
+    register_topk_scores_warmup,
+)
 
 
 class PromptLogprobsWorker:
@@ -32,6 +41,24 @@ class PromptLogprobsWorker:
 
     def remove_request(self, req_id: str) -> None:
         self.in_progress_prompt_logprobs.pop(req_id, None)
+
+    def register_warmups(
+        self,
+        *,
+        logits: Sequence[tuple[torch.dtype, int]],
+        vocab_size: int,
+        all_token_ids_stride: int,
+    ) -> None:
+        """Register the prompt token gather and the scores of prompt logits from
+        ``logits_fn`` (``(dtype, row stride)`` pairs)."""
+        _prompt_logprobs_token_ids_launcher.register_warmup(
+            all_token_ids_stride=all_token_ids_stride
+        )
+        register_topk_scores_warmup(
+            logits=logits,
+            vocab_size=vocab_size,
+            logits_mode=self.logprobs_mode in ("raw_logits", "processed_logits"),
+        )
 
     def compute_prompt_logprobs(
         self,
@@ -175,6 +202,28 @@ def _prompt_logprobs_token_ids_kernel(
         )
 
 
+def _prompt_logprobs_token_ids_warmup_inputs(
+    *, all_token_ids_stride: int
+) -> dict[str, Any]:
+    int32 = TritonWarmupTensor(torch.int32)
+    return triton_warmup_inputs(
+        _prompt_logprobs_token_ids_kernel,
+        TritonWarmupTensor(torch.int64),
+        int32,
+        TritonWarmupTensor(torch.int64),
+        int32,
+        int32,
+        all_token_ids_stride,
+        grid=(1,),
+        BLOCK_SIZE=1024,
+    )
+
+
+_prompt_logprobs_token_ids_launcher = triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_prompt_logprobs_token_ids_warmup_inputs
+)(_prompt_logprobs_token_ids_kernel)
+
+
 def get_prompt_logprobs_token_ids(
     num_tokens: int,
     query_start_loc: torch.Tensor,
@@ -184,7 +233,7 @@ def get_prompt_logprobs_token_ids(
 ) -> torch.Tensor:
     token_ids = torch.empty(num_tokens, dtype=torch.int64, device=idx_mapping.device)
     num_reqs = idx_mapping.shape[0]
-    _prompt_logprobs_token_ids_kernel[(num_reqs,)](
+    _prompt_logprobs_token_ids_launcher[(num_reqs,)](
         token_ids,
         query_start_loc,
         idx_mapping,

@@ -9,8 +9,16 @@ import torch.nn as nn
 from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    TritonWarmupTensor,
+    triton_kernel_dispatcher_with_warmup,
+    triton_warmup_inputs,
+)
 from vllm.models.deepseek_v4_1.ced import (
-    CED_WINDOW, CEDState, ced_decoder_start, gather_rows,
+    CED_WINDOW,
+    CEDState,
+    ced_decoder_start,
+    gather_rows,
 )
 from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadata
 from vllm.triton_utils import tl, triton
@@ -53,6 +61,28 @@ def _gather_lookback_kernel(
         other=-1,
     )
     tl.store(lookback_ptr + batch_idx * DEPTH + offs, ids, mask=offs < DEPTH)
+
+
+def _gather_lookback_warmup_inputs(
+    *, depth: int, all_token_ids_stride: int
+) -> dict[str, Any]:
+    return triton_warmup_inputs(
+        _gather_lookback_kernel,
+        TritonWarmupTensor(torch.int32),
+        TritonWarmupTensor(torch.int64),
+        TritonWarmupTensor(torch.int32),
+        TritonWarmupTensor(torch.int32),
+        all_token_ids_stride,
+        1,
+        grid=(1,),
+        DEPTH=depth,
+        BLOCK_DEPTH=triton.next_power_of_2(depth),
+    )
+
+
+_gather_lookback_launcher = triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_gather_lookback_warmup_inputs
+)(_gather_lookback_kernel)
 
 
 class DeepseekV41ModelState(DefaultModelState):
@@ -129,6 +159,10 @@ class DeepseekV41ModelState(DefaultModelState):
             # Persistent so a captured graph can read it on replay.
             self.lookback_token_ids = torch.full(
                 (self.max_num_reqs, depth), -1, dtype=torch.int32, device=device
+            )
+            # The runner's token history is [max_num_reqs, max_model_len].
+            _gather_lookback_launcher.register_warmup(
+                depth=depth, all_token_ids_stride=self.max_model_len
             )
         from .model import DeepseekV4Model
 
@@ -276,7 +310,7 @@ class DeepseekV41ModelState(DefaultModelState):
             return model_inputs
         all_token_ids = req_states.all_token_ids.gpu
         depth = window.shape[1]
-        _gather_lookback_kernel[(window.shape[0],)](
+        _gather_lookback_launcher[(window.shape[0],)](
             window,
             input_batch.idx_mapping,
             req_states.num_computed_tokens.gpu,

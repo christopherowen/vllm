@@ -273,7 +273,7 @@ def test_large_dsv4_launch_geometry(monkeypatch):
             captured_grids.append(grid)
             return lambda *args, **kwargs: None
 
-    monkeypatch.setattr(worker_utils, "_zero_kv_blocks_kernel", FakeKernel())
+    monkeypatch.setattr(worker_utils, "_zero_kv_blocks_launcher", FakeKernel())
     monkeypatch.setattr(
         worker_utils,
         "async_tensor_h2d",

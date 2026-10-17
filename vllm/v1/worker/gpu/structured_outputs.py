@@ -1,8 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Sequence
+from typing import Any
+
 import numpy as np
 import torch
 
+from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    TritonWarmupTensor,
+    triton_kernel_dispatcher_with_warmup,
+    triton_warmup_inputs,
+)
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d
@@ -61,6 +69,27 @@ class StructuredOutputsWorker:
         self.mask_stride = mask_stride
         self.num_bonus_tokens = num_bonus_tokens
 
+    def register_warmups(
+        self,
+        *,
+        logits: Sequence[tuple[torch.dtype, int]],
+        vocab_size: int,
+        invalid_spec_tokens: bool,
+    ) -> None:
+        """Register the bitmask kernel for raw logits (``(dtype, row stride)``
+        pairs), and its form that also invalidates rejected draft inputs when the
+        scheduler can report invalid speculative tokens."""
+        for logits_dtype, logits_stride in logits:
+            for invalid in (False, True) if invalid_spec_tokens else (False,):
+                _apply_grammar_bitmask_launcher.register_warmup(
+                    logits_dtype=logits_dtype,
+                    logits_stride=logits_stride,
+                    bitmask_stride=self.grammar_bitmask.stride(0),
+                    vocab_size=vocab_size,
+                    mask_stride=self.mask_stride,
+                    invalid_spec_tokens=invalid,
+                )
+
     def apply_grammar_bitmask(
         self,
         logits: torch.Tensor,
@@ -110,7 +139,7 @@ class StructuredOutputsWorker:
         vocab_size = logits.shape[-1]
         BLOCK_SIZE = 8192
         grid = (num_masks, triton.cdiv(vocab_size, BLOCK_SIZE))
-        _apply_grammar_bitmask_kernel[grid](
+        _apply_grammar_bitmask_launcher[grid](
             logits,
             logits.stride(0),
             logits_indices,
@@ -179,3 +208,35 @@ def _apply_grammar_bitmask_kernel(
         -float("inf"),
         mask=position_is_active & bitmask & (block_offset < vocab_size),
     )
+
+
+def _apply_grammar_bitmask_warmup_inputs(
+    *,
+    logits_dtype: torch.dtype,
+    logits_stride: int,
+    bitmask_stride: int,
+    vocab_size: int,
+    mask_stride: int,
+    invalid_spec_tokens: bool,
+) -> dict[str, Any]:
+    int32 = TritonWarmupTensor(torch.int32)
+    return triton_warmup_inputs(
+        _apply_grammar_bitmask_kernel,
+        TritonWarmupTensor(logits_dtype),
+        logits_stride,
+        int32,
+        int32,
+        int32 if invalid_spec_tokens else None,
+        TritonWarmupTensor(torch.int64) if invalid_spec_tokens else None,
+        int32,
+        bitmask_stride,
+        vocab_size,
+        grid=(1,),
+        MASK_STRIDE=mask_stride,
+        BLOCK_SIZE=8192,
+    )
+
+
+_apply_grammar_bitmask_launcher = triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_apply_grammar_bitmask_warmup_inputs
+)(_apply_grammar_bitmask_kernel)

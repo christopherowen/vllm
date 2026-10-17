@@ -1,9 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Sequence
+from typing import Any
+
 import numpy as np
 import torch
 
+from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    TritonWarmupTensor,
+    triton_kernel_dispatcher_with_warmup,
+    triton_warmup_inputs,
+)
 from vllm.sampling_params import MAX_LOGPROB_TOKEN_IDS, SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
@@ -80,6 +88,66 @@ def _ranks_kernel(
     tl.store(output_ptr + req_idx, n)
 
 
+def _topk_log_softmax_warmup_inputs(
+    *, logits_dtype: torch.dtype, logits_stride: int, vocab_size: int
+) -> dict[str, Any]:
+    return triton_warmup_inputs(
+        _topk_log_softmax_kernel,
+        TritonWarmupTensor(torch.float32),
+        TritonWarmupTensor(logits_dtype),
+        logits_stride,
+        TritonWarmupTensor(torch.int64),
+        1,
+        vocab_size,
+        grid=(1,),
+        BLOCK_SIZE=1024,
+        TOPK_BLOCK_SIZE=_MAX_TOPK_BLOCK,
+    )
+
+
+def _ranks_warmup_inputs(
+    *, logits_dtype: torch.dtype, logits_stride: int, vocab_size: int
+) -> dict[str, Any]:
+    return triton_warmup_inputs(
+        _ranks_kernel,
+        TritonWarmupTensor(torch.int64),
+        TritonWarmupTensor(logits_dtype),
+        logits_stride,
+        TritonWarmupTensor(torch.int64),
+        vocab_size,
+        grid=(1,),
+        BLOCK_SIZE=8192,
+    )
+
+
+_topk_log_softmax_launcher = triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_topk_log_softmax_warmup_inputs
+)(_topk_log_softmax_kernel)
+_ranks_launcher = triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_ranks_warmup_inputs
+)(_ranks_kernel)
+
+
+def register_topk_scores_warmup(
+    *, logits: Sequence[tuple[torch.dtype, int]], vocab_size: int, logits_mode: bool
+) -> None:
+    """Register ``compute_topk_scores`` (without per-request token ids) for
+    ``vocab_size``-wide logits given as ``(dtype, row stride)`` pairs: the
+    selected tokens' ranks, and their log-softmax unless ``logits_mode``."""
+    for logits_dtype, logits_stride in logits:
+        if not logits_mode:
+            _topk_log_softmax_launcher.register_warmup(
+                logits_dtype=logits_dtype,
+                logits_stride=logits_stride,
+                vocab_size=vocab_size,
+            )
+        _ranks_launcher.register_warmup(
+            logits_dtype=logits_dtype,
+            logits_stride=logits_stride,
+            vocab_size=vocab_size,
+        )
+
+
 def compute_token_logprobs(
     logits: torch.Tensor, token_ids: torch.Tensor
 ) -> torch.Tensor:
@@ -93,7 +161,7 @@ def compute_token_logprobs(
     # The requested count is runtime data, including the single selected token
     # for prompt_logprobs=0. One bounded gather tile covers every count without
     # creating inference-time JIT specializations.
-    _topk_log_softmax_kernel[(batch_size,)](
+    _topk_log_softmax_launcher[(batch_size,)](
         logprobs,
         logits,
         logits.stride(0),
@@ -169,7 +237,7 @@ def compute_topk_scores(
         scores = scores.masked_fill(~valid_mask, float("-inf"))
 
     token_ranks = torch.empty(batch_size, dtype=torch.int64, device=logits.device)
-    _ranks_kernel[(batch_size,)](
+    _ranks_launcher[(batch_size,)](
         token_ranks,
         logits,
         logits.stride(0),
@@ -264,6 +332,9 @@ class LogprobTokenIdsState:
     def apply_staged_writes(self) -> None:
         self.num_token_ids.copy_to_uva()
         self.token_ids.apply_write()
+
+    def register_warmups(self) -> None:
+        self.token_ids.register_warmup()
 
     def max_num_token_ids(self, idx_mapping_np: np.ndarray) -> int:
         return int(self.num_token_ids.np[idx_mapping_np].max(initial=0))

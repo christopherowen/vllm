@@ -1,9 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
+from typing import Any
 
 import torch
 
+from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    TritonWarmupTensor,
+    triton_kernel_dispatcher_with_warmup,
+    triton_warmup_inputs,
+)
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheSpec
@@ -195,7 +201,7 @@ class BlockTables:
             assert len(out) == self.num_kv_cache_groups
         num_reqs = idx_mapping.shape[0]
         # Launch kernel with num_reqs_padded to fuse zeroing of padded rows.
-        _gather_block_tables_kernel[(self.num_kv_cache_groups, num_reqs_padded)](
+        _gather_block_tables_launcher[(self.num_kv_cache_groups, num_reqs_padded)](
             idx_mapping,
             self.block_table_ptrs,
             out_ptrs,
@@ -233,7 +239,7 @@ class BlockTables:
         num_reqs = idx_mapping.shape[0]
         num_groups = self.num_kv_cache_groups
         slot_mappings = self.slot_mappings if out is None else out
-        _compute_slot_mappings_kernel[(num_groups, num_reqs + 1)](
+        _compute_slot_mappings_launcher[(num_groups, num_reqs + 1)](
             slot_mappings.shape[1],
             idx_mapping,
             query_start_loc,
@@ -402,3 +408,85 @@ def _compute_slot_mappings_kernel(
 
         slot_ids = tl.where(mapping_enabled, slot_ids, PAD_ID)
         tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)
+
+
+def _gather_block_tables_warmup_inputs(*, max_num_reqs: int) -> dict[str, Any]:
+    pointers = TritonWarmupTensor(torch.uint64)
+    return triton_warmup_inputs(
+        _gather_block_tables_kernel,
+        TritonWarmupTensor(torch.int64),
+        pointers,
+        pointers,
+        TritonWarmupTensor(torch.int64),
+        TritonWarmupTensor(torch.int32),
+        max_num_reqs,
+        1,
+        grid=(1,),
+        BLOCK_SIZE=1024,
+    )
+
+
+def _compute_slot_mappings_warmup_inputs(
+    *,
+    max_num_reqs: int,
+    max_num_batched_tokens: int,
+    cp_rank: int,
+    cp_size: int,
+    cp_interleave: int,
+) -> dict[str, Any]:
+    int32 = TritonWarmupTensor(torch.int32)
+    int64 = TritonWarmupTensor(torch.int64)
+    boolean = TritonWarmupTensor(torch.bool)
+    return triton_warmup_inputs(
+        _compute_slot_mappings_kernel,
+        max_num_batched_tokens,
+        int64,
+        int32,
+        int64,
+        TritonWarmupTensor(torch.uint64),
+        int64,
+        int32,
+        max_num_reqs,
+        int32,
+        int32,
+        boolean,
+        boolean,
+        int32,
+        int64,
+        max_num_batched_tokens,
+        cp_rank,
+        grid=(1,),
+        CP_SIZE=cp_size,
+        CP_INTERLEAVE=cp_interleave,
+        PAD_ID=PAD_SLOT_ID,
+        TRITON_BLOCK_SIZE=1024,
+    )
+
+
+_gather_block_tables_launcher = triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_gather_block_tables_warmup_inputs
+)(_gather_block_tables_kernel)
+_compute_slot_mappings_launcher = triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_compute_slot_mappings_warmup_inputs
+)(_compute_slot_mappings_kernel)
+
+
+def register_block_table_warmups(
+    *,
+    max_num_reqs: int,
+    max_num_batched_tokens: int,
+    cp_rank: int,
+    cp_size: int,
+    cp_interleave: int,
+) -> None:
+    """Register the gather of a step's block tables and its slot mappings for
+    ``BlockTables`` with at least one KV cache group (per-group geometry is tensor
+    data, not part of the kernels' keys)."""
+    _gather_block_tables_launcher.register_warmup(max_num_reqs=max_num_reqs)
+    _compute_slot_mappings_launcher.register_warmup(
+        max_num_reqs=max_num_reqs,
+        max_num_batched_tokens=max_num_batched_tokens,
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+        cp_interleave=cp_interleave,
+    )

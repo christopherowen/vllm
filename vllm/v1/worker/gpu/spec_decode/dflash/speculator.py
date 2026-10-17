@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
-from collections.abc import Mapping
-from typing import Any
+from collections.abc import Mapping, Sequence
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -13,6 +13,11 @@ from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    TritonWarmupTensor,
+    triton_kernel_dispatcher_with_warmup,
+    triton_warmup_inputs,
+)
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -36,6 +41,17 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
+class DraftBlockTableLayout(NamedTuple):
+    """One draft KV cache group's block table, as ``BlockTables`` lays it out."""
+
+    group_id: int
+    width: int
+    kernel_block_size: int
+    cp_rank: int
+    cp_size: int
+    cp_interleave: int
+
+
 class DFlashSpeculator(DraftModelSpeculator):
     _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
 
@@ -56,7 +72,9 @@ class DFlashSpeculator(DraftModelSpeculator):
         # forward context (VLLM_MOE_SKIP_PADDING). Every row starts as padding,
         # so CUDA graph capture routes no dummy row; each step marks its live
         # rows. Persistent: captured graphs read it on replay.
-        self._is_padding = torch.ones(self.max_num_tokens, dtype=torch.bool, device=device)
+        self._is_padding = torch.ones(
+            self.max_num_tokens, dtype=torch.bool, device=device
+        )
         self._row_index = torch.arange(self.max_num_tokens, device=device)
 
         # Multimodal inputs not currently supported.
@@ -198,6 +216,36 @@ class DFlashSpeculator(DraftModelSpeculator):
             bind_auxiliary_stream(target_model, self.hidden_states)
         self._setup_vocab_parallel_drafting(model)
         return model
+
+    def register_warmups(
+        self, block_table_layouts: Sequence[DraftBlockTableLayout]
+    ) -> None:
+        """Register the Triton kernels ``propose`` launches with the runner's JIT
+        warmup: input preparation for each draft KV cache group's block table,
+        given in ``draft_kv_cache_group_ids`` order before the KV cache exists."""
+        max_num_tokens = min(
+            self.max_num_tokens, self.max_num_reqs * self.num_query_per_req
+        )
+        for i, layout in enumerate(block_table_layouts):
+            _prepare_dflash_inputs_launcher.register_warmup(
+                block_table_stride=layout.width,
+                block_size=layout.kernel_block_size,
+                cp_rank=layout.cp_rank,
+                cp_size=layout.cp_size,
+                cp_interleave=layout.cp_interleave,
+                # Rows of BlockTables.slot_mappings and of _context_slot_mappings
+                # are max_num_batched_tokens int64 entries apart.
+                query_slot_mapping_aligned=layout.group_id * self.max_num_tokens % 2
+                == 0,
+                context_slot_mapping_aligned=i * self.max_num_tokens % 2 == 0,
+                parallel_drafting_token_id=self.parallel_drafting_token_id,
+                num_query_per_req=self.num_query_per_req,
+                num_speculative_steps=self.num_speculative_steps,
+                max_num_reqs=self.max_num_reqs,
+                max_num_tokens=max_num_tokens,
+                max_model_len=self.max_model_len,
+                sample_from_anchor=self.sample_from_anchor,
+            )
 
     def _setup_vocab_parallel_drafting(self, model: nn.Module) -> None:
         """Keep draft logits vocab-sharded (VLLM_DFLASH_VOCAB_PARALLEL_DRAFT=1).
@@ -976,6 +1024,76 @@ def _prepare_dflash_inputs_kernel(
                 tl.store(out_query_slot_mapping_ptr + block, PAD_SLOT_ID, mask=mask)
 
 
+_PREPARE_BLOCK_SIZE = 256
+
+
+def _prepare_dflash_inputs_warmup_inputs(
+    *,
+    block_table_stride: int,
+    block_size: int,
+    cp_rank: int,
+    cp_size: int,
+    cp_interleave: int,
+    query_slot_mapping_aligned: bool,
+    context_slot_mapping_aligned: bool,
+    parallel_drafting_token_id: int,
+    num_query_per_req: int,
+    num_speculative_steps: int,
+    max_num_reqs: int,
+    max_num_tokens: int,
+    max_model_len: int,
+    sample_from_anchor: bool,
+) -> dict[str, Any]:
+    int32 = TritonWarmupTensor(torch.int32)
+    int64 = TritonWarmupTensor(torch.int64)
+    float32 = TritonWarmupTensor(torch.float32)
+    return triton_warmup_inputs(
+        _prepare_dflash_inputs_kernel,
+        int32,
+        int64,
+        int32,
+        int32,
+        TritonWarmupTensor(torch.int64, aligned=query_slot_mapping_aligned),
+        int64,
+        TritonWarmupTensor(torch.int64, aligned=context_slot_mapping_aligned),
+        int64,
+        int64,
+        int32,
+        float32,
+        int64,
+        int64,
+        int32,
+        int64,
+        int64,
+        int32,
+        int32,
+        int32,
+        float32,
+        int64,
+        int32,
+        block_table_stride,
+        parallel_drafting_token_id,
+        block_size,
+        num_query_per_req,
+        num_speculative_steps,
+        max_num_reqs,
+        max_num_tokens,
+        max_model_len,
+        cp_rank,
+        grid=(1,),
+        SAMPLE_FROM_ANCHOR=sample_from_anchor,
+        PAD_SLOT_ID=PAD_SLOT_ID,
+        CP_SIZE=cp_size,
+        CP_INTERLEAVE=cp_interleave,
+        BLOCK_SIZE=_PREPARE_BLOCK_SIZE,
+    )
+
+
+_prepare_dflash_inputs_launcher = triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_prepare_dflash_inputs_warmup_inputs
+)(_prepare_dflash_inputs_kernel)
+
+
 def prepare_dflash_inputs(
     input_buffers: InputBuffers,
     query_slot_mapping: torch.Tensor,
@@ -1021,9 +1139,9 @@ def prepare_dflash_inputs(
     max_tokens_per_req = max_target_query_len + num_query_per_req
     # Live context/query lengths control the grid, never the compiled tile.
     # A length-derived constexpr causes first-request JIT after graph warmup.
-    BLOCK_SIZE = 256
+    BLOCK_SIZE = _PREPARE_BLOCK_SIZE
     num_blocks = triton.cdiv(max_tokens_per_req, BLOCK_SIZE)
-    _prepare_dflash_inputs_kernel[(num_reqs, num_blocks)](
+    _prepare_dflash_inputs_launcher[(num_reqs, num_blocks)](
         input_buffers.input_ids,
         input_buffers.positions,
         input_buffers.query_start_loc,

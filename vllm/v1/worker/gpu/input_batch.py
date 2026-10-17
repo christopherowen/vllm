@@ -2,11 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 import torch
 
+from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    TritonWarmupTensor,
+    triton_kernel_dispatcher_with_warmup,
+    triton_warmup_inputs,
+)
 from vllm.triton_utils import tl, triton
 from vllm.utils import random_uuid
 from vllm.utils.math_utils import cdiv
@@ -258,7 +263,11 @@ def set_dummy_context(
     input_batch.positions.copy_(torch.from_numpy(local_pos + context_len))
 
     assign_dummy_blocks(
-        block_tables, input_block_tables, num_reqs, context_len + query_len, num_kv_blocks
+        block_tables,
+        input_block_tables,
+        num_reqs,
+        context_len + query_len,
+        num_kv_blocks,
     )
 
 
@@ -364,7 +373,7 @@ def prepare_prefill_inputs(
 ) -> None:
     num_reqs = idx_mapping.shape[0]
     num_lookahead = next_prefill_tokens.shape[0]
-    _prepare_prefill_inputs_kernel[(num_reqs,)](
+    _prepare_prefill_inputs_launcher[(num_reqs,)](
         input_ids,
         next_prefill_tokens,
         next_prefill_tokens.stride(0),
@@ -427,7 +436,7 @@ def prepare_pos_seq_lens(
     num_reqs = idx_mapping.shape[0]
     # NOTE(woosuk): We do +1 because the last thread block is used
     # to pad unused seq_lens as 0 for full CUDA graphs.
-    _prepare_pos_seq_lens_kernel[(num_reqs + 1,)](
+    _prepare_pos_seq_lens_launcher[(num_reqs + 1,)](
         pos,
         seq_lens,
         idx_mapping,
@@ -567,7 +576,7 @@ def combine_sampled_and_draft_tokens(
         dtype=torch.int64,
         device=input_ids.device,
     )
-    _combine_sampled_and_draft_tokens_kernel[(num_reqs,)](
+    _combine_sampled_and_draft_tokens_launcher[(num_reqs,)](
         input_ids,
         idx_mapping,
         last_sampled_tokens,
@@ -644,7 +653,7 @@ def get_num_sampled_and_rejected(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_reqs = idx_mapping.shape[0]
     num_rejected = torch.empty_like(num_sampled)
-    _get_num_sampled_and_rejected_kernel[(num_reqs,)](
+    _get_num_sampled_and_rejected_launcher[(num_reqs,)](
         num_sampled,
         num_rejected,
         seq_lens,
@@ -778,7 +787,7 @@ def post_update(
     boundary_capture: torch.Tensor | None = None,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
-    _post_update_kernel[(num_reqs,)](
+    _post_update_launcher[(num_reqs,)](
         idx_mapping,
         num_computed_tokens,
         last_sampled_tokens,
@@ -871,7 +880,7 @@ def expand_idx_mapping(
     expanded_local_pos = torch.empty(
         total_num_logits, dtype=torch.int32, device=idx_mapping.device
     )
-    _expand_idx_mapping_kernel[(num_reqs,)](
+    _expand_idx_mapping_launcher[(num_reqs,)](
         idx_mapping,
         expanded_idx_mapping,
         expanded_local_pos,
@@ -879,3 +888,221 @@ def expand_idx_mapping(
         BLOCK_SIZE=triton.next_power_of_2(max_expand_len),
     )
     return expanded_idx_mapping, expanded_local_pos
+
+
+def _prepare_prefill_inputs_warmup_inputs(
+    *, next_prefill_tokens_stride: int, num_lookahead: int, all_token_ids_stride: int
+) -> dict[str, Any]:
+    int32 = TritonWarmupTensor(torch.int32)
+    return triton_warmup_inputs(
+        _prepare_prefill_inputs_kernel,
+        int32,
+        int32,
+        next_prefill_tokens_stride,
+        num_lookahead,
+        TritonWarmupTensor(torch.int64),
+        int32,
+        int32,
+        all_token_ids_stride,
+        int32,
+        int32,
+        grid=(1,),
+        BLOCK_SIZE=1024,
+        LOOKAHEAD_BLOCK=triton.next_power_of_2(num_lookahead),
+    )
+
+
+def _prepare_pos_seq_lens_warmup_inputs(*, max_num_reqs: int) -> dict[str, Any]:
+    int32 = TritonWarmupTensor(torch.int32)
+    int64 = TritonWarmupTensor(torch.int64)
+    return triton_warmup_inputs(
+        _prepare_pos_seq_lens_kernel,
+        int64,
+        int32,
+        int64,
+        int32,
+        int32,
+        max_num_reqs,
+        grid=(1,),
+        BLOCK_SIZE=1024,
+    )
+
+
+def _combine_sampled_and_draft_tokens_warmup_inputs(
+    *,
+    draft_tokens_stride: int,
+    num_speculative_steps: int,
+    num_new_sampled_tokens: int,
+    dead_rows_confidence_stride: int | None,
+) -> dict[str, Any]:
+    int32 = TritonWarmupTensor(torch.int32)
+    int64 = TritonWarmupTensor(torch.int64)
+    dead_rows = dead_rows_confidence_stride is not None
+    return triton_warmup_inputs(
+        _combine_sampled_and_draft_tokens_kernel,
+        int32,
+        int64,
+        int64,
+        int32,
+        int32,
+        int32,
+        int64,
+        draft_tokens_stride,
+        int32,
+        int64,
+        *(
+            (
+                TritonWarmupTensor(torch.float32),
+                dead_rows_confidence_stride,
+                TritonWarmupTensor(torch.uint8),
+                int32,
+                0.0,
+            )
+            if dead_rows
+            else (int32, 0, int32, int32, 0.0)
+        ),
+        grid=(1,),
+        NUM_NEW_SAMPLED_TOKENS=num_new_sampled_tokens,
+        DEAD_ROWS=dead_rows,
+        BLOCK_SIZE=triton.next_power_of_2(
+            num_speculative_steps + num_new_sampled_tokens
+        ),
+    )
+
+
+def _get_num_sampled_and_rejected_warmup_inputs(*, dead_rows: bool) -> dict[str, Any]:
+    int32 = TritonWarmupTensor(torch.int32)
+    return triton_warmup_inputs(
+        _get_num_sampled_and_rejected_kernel,
+        int32,
+        int32,
+        int32,
+        int32,
+        TritonWarmupTensor(torch.int64),
+        int32,
+        int32,
+        grid=(1,),
+        DEAD_ROWS=dead_rows,
+    )
+
+
+def _post_update_warmup_inputs(
+    *,
+    output_bin_counts_stride: int | None,
+    sampled_tokens_stride: int,
+    all_token_ids_stride: int,
+) -> dict[str, Any]:
+    int32 = TritonWarmupTensor(torch.int32)
+    int64 = TritonWarmupTensor(torch.int64)
+    return triton_warmup_inputs(
+        _post_update_kernel,
+        int64,
+        int32,
+        int64,
+        int32 if output_bin_counts_stride is not None else None,
+        output_bin_counts_stride if output_bin_counts_stride is not None else 0,
+        int64,
+        sampled_tokens_stride,
+        int32,
+        int32,
+        int32,
+        int32,
+        all_token_ids_stride,
+        int32,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        grid=(1,),
+        NUM_CAPTURES=0,
+        BOUNDARY_METADATA_WIDTH=0,
+        num_warps=1,
+    )
+
+
+def _expand_idx_mapping_warmup_inputs(*, max_expand_len: int) -> dict[str, Any]:
+    int64 = TritonWarmupTensor(torch.int64)
+    int32 = TritonWarmupTensor(torch.int32)
+    return triton_warmup_inputs(
+        _expand_idx_mapping_kernel,
+        int64,
+        int64,
+        int32,
+        int32,
+        grid=(1,),
+        BLOCK_SIZE=triton.next_power_of_2(max_expand_len),
+    )
+
+
+_prepare_prefill_inputs_launcher = triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_prepare_prefill_inputs_warmup_inputs
+)(_prepare_prefill_inputs_kernel)
+_prepare_pos_seq_lens_launcher = triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_prepare_pos_seq_lens_warmup_inputs
+)(_prepare_pos_seq_lens_kernel)
+_combine_sampled_and_draft_tokens_launcher = triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_combine_sampled_and_draft_tokens_warmup_inputs
+)(_combine_sampled_and_draft_tokens_kernel)
+_get_num_sampled_and_rejected_launcher = triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_get_num_sampled_and_rejected_warmup_inputs
+)(_get_num_sampled_and_rejected_kernel)
+_post_update_launcher = triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_post_update_warmup_inputs
+)(_post_update_kernel)
+_expand_idx_mapping_launcher = triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_expand_idx_mapping_warmup_inputs
+)(_expand_idx_mapping_kernel)
+
+
+def register_input_batch_warmups(
+    *,
+    max_num_reqs: int,
+    next_prefill_tokens_stride: int,
+    num_lookahead: int,
+    all_token_ids_stride: int,
+    draft_tokens_stride: int,
+    num_speculative_steps: int,
+    num_new_sampled_tokens: int,
+    dead_rows_confidence_stride: int | None,
+    output_bin_counts_stride: int | None,
+) -> None:
+    """Register the kernels that prepare a step's inputs from the request states
+    and commit its sampled tokens, for the runner's persistent buffers: rows of
+    ``max_num_reqs`` requests, the request states' strides, and the dead-row
+    variants when adaptive verification marks dead rows (its confidences are
+    ``dead_rows_confidence_stride`` apart). Sampled tokens are one column per
+    request from the sampler, ``num_speculative_steps + 1`` from verification.
+    """
+    _prepare_prefill_inputs_launcher.register_warmup(
+        next_prefill_tokens_stride=next_prefill_tokens_stride,
+        num_lookahead=num_lookahead,
+        all_token_ids_stride=all_token_ids_stride,
+    )
+    _prepare_pos_seq_lens_launcher.register_warmup(max_num_reqs=max_num_reqs)
+    dead_row_variants: tuple[int | None, ...] = (None,)
+    if dead_rows_confidence_stride is not None:
+        dead_row_variants += (dead_rows_confidence_stride,)
+    for confidence_stride in dead_row_variants:
+        _combine_sampled_and_draft_tokens_launcher.register_warmup(
+            draft_tokens_stride=draft_tokens_stride,
+            num_speculative_steps=num_speculative_steps,
+            num_new_sampled_tokens=num_new_sampled_tokens,
+            dead_rows_confidence_stride=confidence_stride,
+        )
+        _get_num_sampled_and_rejected_launcher.register_warmup(
+            dead_rows=confidence_stride is not None
+        )
+    sampled_tokens_strides = (1,)
+    if num_speculative_steps > 0:
+        sampled_tokens_strides += (num_speculative_steps + 1,)
+        _expand_idx_mapping_launcher.register_warmup(
+            max_expand_len=num_speculative_steps + num_new_sampled_tokens
+        )
+    for sampled_tokens_stride in sampled_tokens_strides:
+        _post_update_launcher.register_warmup(
+            output_bin_counts_stride=output_bin_counts_stride,
+            sampled_tokens_stride=sampled_tokens_stride,
+            all_token_ids_stride=all_token_ids_stride,
+        )

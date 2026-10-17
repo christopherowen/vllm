@@ -1,7 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Sequence
+from typing import Any
+
 import torch
 
+from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    TritonWarmupTensor,
+    triton_kernel_dispatcher_with_warmup,
+    triton_warmup_inputs,
+)
 from vllm.triton_utils import tl, tldevice, triton
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_block_argmax, tl_rand32
 from vllm.v1.worker.gpu.sample.watermark import philox_gumbel_block_argmax
@@ -1022,6 +1030,275 @@ def _insert_resampled_kernel(
     )
 
 
+_VOCAB_BLOCK_SIZE = 8192
+_RESAMPLE_BLOCK_SIZE = 1024
+
+
+def _compute_local_logits_stats_warmup_inputs(
+    *,
+    logits_dtype: torch.dtype,
+    logits_stride: int,
+    vocab_size: int,
+    num_speculative_steps: int,
+) -> dict[str, Any]:
+    float32 = TritonWarmupTensor(torch.float32)
+    num_blocks = triton.cdiv(vocab_size, _VOCAB_BLOCK_SIZE)
+    return triton_warmup_inputs(
+        _compute_local_logits_stats_kernel,
+        TritonWarmupTensor(torch.int64),
+        num_blocks,
+        float32,
+        num_blocks,
+        float32,
+        num_blocks,
+        float32,
+        num_blocks,
+        float32,
+        num_blocks,
+        TritonWarmupTensor(logits_dtype),
+        logits_stride,
+        None,
+        0,
+        0,
+        TritonWarmupTensor(torch.int64),
+        TritonWarmupTensor(torch.int32),
+        float32,
+        vocab_size,
+        num_speculative_steps,
+        grid=(1,),
+        BLOCK_SIZE=_VOCAB_BLOCK_SIZE,
+        HAS_DRAFT_LOGITS=False,
+    )
+
+
+def _compute_cumulative_log_p_warmup_inputs(
+    *, logits_dtype: torch.dtype, logits_stride: int, vocab_size: int
+) -> dict[str, Any]:
+    float32 = TritonWarmupTensor(torch.float32)
+    num_blocks = triton.cdiv(vocab_size, _VOCAB_BLOCK_SIZE)
+    return triton_warmup_inputs(
+        _compute_cumulative_log_p_kernel,
+        float32,
+        TritonWarmupTensor(logits_dtype),
+        logits_stride,
+        float32,
+        num_blocks,
+        float32,
+        num_blocks,
+        TritonWarmupTensor(torch.int32),
+        None,
+        0,
+        0,
+        float32,
+        num_blocks,
+        float32,
+        num_blocks,
+        TritonWarmupTensor(torch.int32),
+        TritonWarmupTensor(torch.int64),
+        float32,
+        num_blocks,
+        grid=(1,),
+        PADDED_VOCAB_NUM_BLOCKS=triton.next_power_of_2(num_blocks),
+        HAS_DRAFT_LOGITS=False,
+        num_warps=1,
+    )
+
+
+def _rejection_warmup_inputs(
+    *,
+    logits_dtype: torch.dtype,
+    logits_stride: int,
+    vocab_size: int,
+    num_speculative_steps: int,
+    synthetic_mode: bool,
+    use_block_verification: bool,
+) -> dict[str, Any]:
+    int32 = TritonWarmupTensor(torch.int32)
+    int64 = TritonWarmupTensor(torch.int64)
+    float32 = TritonWarmupTensor(torch.float32)
+    num_blocks = triton.cdiv(vocab_size, _VOCAB_BLOCK_SIZE)
+    return triton_warmup_inputs(
+        _rejection_kernel,
+        int64,
+        num_speculative_steps + 1,
+        int32,
+        float32,
+        float32,
+        TritonWarmupTensor(logits_dtype),
+        logits_stride,
+        int64,
+        num_blocks,
+        float32,
+        num_blocks,
+        float32,
+        num_blocks,
+        int32,
+        None,
+        0,
+        0,
+        float32,
+        num_blocks,
+        float32,
+        num_blocks,
+        int32,
+        int64,
+        float32,
+        int64,
+        int64,
+        float32 if synthetic_mode else None,
+        float32 if use_block_verification else None,
+        None,
+        0,
+        num_blocks,
+        float32,
+        float32,
+        0,
+        grid=(1,),
+        PADDED_VOCAB_NUM_BLOCKS=triton.next_power_of_2(num_blocks),
+        HAS_DRAFT_LOGITS=False,
+        SYNTHETIC_MODE=synthetic_mode,
+        USE_BLOCK_VERIFICATION=use_block_verification,
+        VP_DRAFT=False,
+        num_warps=1,
+    )
+
+
+def _resample_warmup_inputs(
+    *,
+    logits_dtype: torch.dtype,
+    logits_stride: int,
+    vocab_size: int,
+    use_block_verification: bool,
+    use_fp64: bool,
+) -> dict[str, Any]:
+    int32 = TritonWarmupTensor(torch.int32)
+    int64 = TritonWarmupTensor(torch.int64)
+    float32 = TritonWarmupTensor(torch.float32)
+    num_blocks = triton.cdiv(vocab_size, _RESAMPLE_BLOCK_SIZE)
+    return triton_warmup_inputs(
+        _resample_kernel,
+        int64,
+        num_blocks,
+        TritonWarmupTensor(torch.float64 if use_fp64 else torch.float32),
+        num_blocks,
+        TritonWarmupTensor(logits_dtype),
+        logits_stride,
+        float32,
+        None,
+        0,
+        0,
+        float32,
+        int32,
+        int32,
+        int64,
+        int32,
+        float32,
+        int64,
+        int64,
+        float32 if use_block_verification else None,
+        None,
+        0,
+        None,
+        0,
+        0,
+        vocab_size,
+        grid=(1,),
+        BLOCK_SIZE=_RESAMPLE_BLOCK_SIZE,
+        HAS_DRAFT_LOGITS=False,
+        USE_FP64=use_fp64,
+        USE_BLOCK_VERIFICATION=use_block_verification,
+        CONTEXT_WIDTH=1,
+        WATERMARK=False,
+    )
+
+
+def _insert_resampled_warmup_inputs(
+    *, num_speculative_steps: int, vocab_size: int, use_fp64: bool
+) -> dict[str, Any]:
+    num_blocks = triton.cdiv(vocab_size, _RESAMPLE_BLOCK_SIZE)
+    return triton_warmup_inputs(
+        _insert_resampled_kernel,
+        TritonWarmupTensor(torch.int64),
+        num_speculative_steps + 1,
+        TritonWarmupTensor(torch.int32),
+        TritonWarmupTensor(torch.int64),
+        num_blocks,
+        TritonWarmupTensor(torch.float64 if use_fp64 else torch.float32),
+        num_blocks,
+        num_blocks,
+        TritonWarmupTensor(torch.int32),
+        TritonWarmupTensor(torch.int64),
+        TritonWarmupTensor(torch.float32),
+        grid=(1,),
+        PADDED_RESAMPLE_NUM_BLOCKS=triton.next_power_of_2(num_blocks),
+    )
+
+
+_compute_local_logits_stats_launcher = triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_compute_local_logits_stats_warmup_inputs
+)(_compute_local_logits_stats_kernel)
+_compute_cumulative_log_p_launcher = triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_compute_cumulative_log_p_warmup_inputs
+)(_compute_cumulative_log_p_kernel)
+_rejection_launcher = triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_rejection_warmup_inputs
+)(_rejection_kernel)
+_resample_launcher = triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_resample_warmup_inputs
+)(_resample_kernel)
+_insert_resampled_launcher = triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_insert_resampled_warmup_inputs
+)(_insert_resampled_kernel)
+
+
+def register_rejection_sample_warmups(
+    *,
+    logits: Sequence[tuple[torch.dtype, int]],
+    vocab_size: int,
+    num_speculative_steps: int,
+    synthetic_mode: bool,
+    use_block_verification: bool,
+    use_fp64: bool,
+) -> None:
+    """Register ``rejection_sample`` without draft logits or watermarking, for
+    ``vocab_size``-wide target logits given as ``(dtype, row stride)`` pairs, with
+    the input batch's int32 drafts and offsets and int64 indices and positions.
+    """
+    for logits_dtype, logits_stride in logits:
+        _compute_local_logits_stats_launcher.register_warmup(
+            logits_dtype=logits_dtype,
+            logits_stride=logits_stride,
+            vocab_size=vocab_size,
+            num_speculative_steps=num_speculative_steps,
+        )
+        if use_block_verification:
+            _compute_cumulative_log_p_launcher.register_warmup(
+                logits_dtype=logits_dtype,
+                logits_stride=logits_stride,
+                vocab_size=vocab_size,
+            )
+        _rejection_launcher.register_warmup(
+            logits_dtype=logits_dtype,
+            logits_stride=logits_stride,
+            vocab_size=vocab_size,
+            num_speculative_steps=num_speculative_steps,
+            synthetic_mode=synthetic_mode,
+            use_block_verification=use_block_verification,
+        )
+        _resample_launcher.register_warmup(
+            logits_dtype=logits_dtype,
+            logits_stride=logits_stride,
+            vocab_size=vocab_size,
+            use_block_verification=use_block_verification,
+            use_fp64=use_fp64,
+        )
+    _insert_resampled_launcher.register_warmup(
+        num_speculative_steps=num_speculative_steps,
+        vocab_size=vocab_size,
+        use_fp64=use_fp64,
+    )
+
+
 def rejection_sample(
     # [num_logits, V]
     target_logits: torch.Tensor,
@@ -1104,7 +1381,7 @@ def rejection_sample(
     # Compute the per-vocab-block logits stats, such as target argmax
     # (for greedy requests), and target max + softmax exponential
     # (for non-greedy requests).
-    VOCAB_BLOCK_SIZE = 8192
+    VOCAB_BLOCK_SIZE = _VOCAB_BLOCK_SIZE
     vocab_num_blocks = triton.cdiv(vocab_size, VOCAB_BLOCK_SIZE)
     padded_vocab_num_blocks = triton.next_power_of_2(vocab_num_blocks)
     target_local_argmax = target_logits.new_empty(
@@ -1122,7 +1399,7 @@ def rejection_sample(
     draft_local_sumexp = target_logits.new_empty(
         num_logits, vocab_num_blocks, dtype=torch.float32
     )
-    _compute_local_logits_stats_kernel[(num_logits, vocab_num_blocks)](
+    _compute_local_logits_stats_launcher[(num_logits, vocab_num_blocks)](
         target_local_argmax,
         target_local_argmax.stride(0),
         target_local_max,
@@ -1159,7 +1436,7 @@ def rejection_sample(
         # cumulative_log_p[start + i] = log(p_{i+1}), the cumulative ratio after
         # the (i+1)-th draft token.
         cumulative_log_p = target_logits.new_empty(num_logits, dtype=torch.float32)
-        _compute_cumulative_log_p_kernel[(num_reqs,)](
+        _compute_cumulative_log_p_launcher[(num_reqs,)](
             cumulative_log_p,
             target_logits,
             target_logits.stride(0),
@@ -1233,7 +1510,7 @@ def rejection_sample(
     num_sampled = sampled.new_empty(num_reqs, dtype=torch.int32)
     target_rejected_logsumexp = target_logits.new_empty(num_reqs, dtype=torch.float32)
     draft_rejected_logsumexp = target_logits.new_empty(num_reqs, dtype=torch.float32)
-    _rejection_kernel[(num_reqs,)](
+    _rejection_launcher[(num_reqs,)](
         sampled,
         sampled.stride(0),
         num_sampled,
@@ -1294,7 +1571,7 @@ def rejection_sample(
             use_fp64=use_fp64,
         )
         resample_num_blocks = resampled_local_max.shape[1]
-        _insert_resampled_kernel[(num_reqs,)](
+        _insert_resampled_launcher[(num_reqs,)](
             sampled,
             sampled.stride(0),
             num_sampled,
@@ -1311,7 +1588,7 @@ def rejection_sample(
         return sampled, num_sampled
 
     # Resample the rejected/bonus tokens.
-    RESAMPLE_BLOCK_SIZE = 1024
+    RESAMPLE_BLOCK_SIZE = _RESAMPLE_BLOCK_SIZE
     resample_num_blocks = triton.cdiv(vocab_size, RESAMPLE_BLOCK_SIZE)
     padded_resample_num_blocks = triton.next_power_of_2(resample_num_blocks)
     resampled_local_argmax = target_logits.new_empty(
@@ -1322,7 +1599,7 @@ def rejection_sample(
         resample_num_blocks,
         dtype=torch.float64 if use_fp64 else torch.float32,
     )
-    _resample_kernel[(num_reqs, resample_num_blocks)](
+    _resample_launcher[(num_reqs, resample_num_blocks)](
         resampled_local_argmax,
         resampled_local_argmax.stride(0),
         resampled_local_max,
@@ -1357,7 +1634,7 @@ def rejection_sample(
     )
 
     # Insert the resampled tokens into the output sampled.
-    _insert_resampled_kernel[(num_reqs,)](
+    _insert_resampled_launcher[(num_reqs,)](
         sampled,
         sampled.stride(0),
         num_sampled,

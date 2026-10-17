@@ -84,6 +84,11 @@ class RequestState:
             device=device,
         )
 
+    def register_warmups(self) -> None:
+        """Register the staged writes of the request state."""
+        for tensor in (self.all_token_ids, self.total_len, self.num_computed_tokens):
+            tensor.register_warmup()
+
     @property
     def num_reqs(self) -> int:
         return len(self.req_id_to_index)

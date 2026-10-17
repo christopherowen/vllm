@@ -17,6 +17,11 @@ from vllm.model_executor.layers.mamba.mamba_mixer2 import share_replayssm_ring_t
 from vllm.model_executor.layers.utils import warmup_rocm_skinny_gemm_workspaces
 from vllm.model_executor.models.interfaces import MultiModalEmbeddings
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    TritonWarmupTensor,
+    triton_kernel_dispatcher_with_warmup,
+    triton_warmup_inputs,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
@@ -99,6 +104,37 @@ def _zero_kv_blocks_kernel(
         ptr + block_offset + cols,
         tl.zeros([BLOCK_SIZE], dtype=tl.int32),
         mask=cols < page_size_el,
+    )
+
+
+def zero_kv_blocks_block_size(max_page_size_el: int) -> int:
+    """``_zero_kv_blocks_kernel``'s BLOCK_SIZE for the largest page, in int32s."""
+    return min(1 << (max_page_size_el - 1).bit_length(), 1024)
+
+
+def _zero_kv_blocks_warmup_inputs(*, block_size: int) -> dict[str, Any]:
+    int64 = TritonWarmupTensor(torch.int64)
+    return triton_warmup_inputs(
+        _zero_kv_blocks_kernel,
+        TritonWarmupTensor(torch.uint64),
+        int64,
+        int64,
+        int64,
+        grid=(1,),
+        BLOCK_SIZE=block_size,
+    )
+
+
+_zero_kv_blocks_launcher = triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_zero_kv_blocks_warmup_inputs
+)(_zero_kv_blocks_kernel)
+
+
+def register_zero_kv_blocks_warmup(max_page_size_el: int) -> None:
+    """Register KV block zeroing for a cache whose largest kernel-block page is
+    ``max_page_size_el`` int32 elements."""
+    _zero_kv_blocks_launcher.register_warmup(
+        block_size=zero_kv_blocks_block_size(max_page_size_el)
     )
 
 
@@ -216,7 +252,7 @@ class KVBlockZeroer:
             return
 
         max_page_size_el = max(seg_page_sizes)
-        blk_size = min(1 << (max_page_size_el - 1).bit_length(), 1024)
+        blk_size = zero_kv_blocks_block_size(max_page_size_el)
         self._meta = (
             torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
             torch.tensor(seg_block_strides, dtype=torch.int64, device=self.device),
@@ -241,7 +277,7 @@ class KVBlockZeroer:
         n_blocks = len(block_ids)
         idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
         grid = (n_blocks, n_segs, max_chunks)
-        _zero_kv_blocks_kernel[grid](
+        _zero_kv_blocks_launcher[grid](
             seg_addrs,
             seg_block_strides,
             seg_page_sizes,

@@ -1,8 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import Any
+
 import numpy as np
 import torch
 
+from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    TritonWarmupTensor,
+    triton_kernel_dispatcher_with_warmup,
+    triton_warmup_inputs,
+)
 from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
@@ -77,6 +84,22 @@ class PenaltiesState:
         self.repetition_penalty.copy_to_uva()
         self.frequency_penalty.copy_to_uva()
         self.presence_penalty.copy_to_uva()
+
+    def register_warmups(self, logits_strides: tuple[int, ...]) -> None:
+        """Register the penalties for processed FP32 logits with each row stride
+        in ``logits_strides``, and the prompt/output bin counts of new requests."""
+        for logits_stride in logits_strides:
+            _penalties_launcher.register_warmup(
+                logits_stride=logits_stride,
+                prompt_bin_mask_stride=self.prompt_bin_mask.stride(0),
+                output_bin_counts_stride=self.output_bin_counts.stride(0),
+                vocab_size=self.vocab_size,
+            )
+        _bincount_launcher.register_warmup(
+            all_token_ids_stride=self.req_states.all_token_ids.gpu.stride(0),
+            prompt_bin_mask_stride=self.prompt_bin_mask.stride(0),
+            output_bin_counts_stride=self.output_bin_counts.stride(0),
+        )
 
     def apply_penalties(
         self,
@@ -197,7 +220,7 @@ def apply_penalties(
     num_tokens, vocab_size = logits.shape
     BLOCK_SIZE = 8192
     num_blocks = triton.cdiv(vocab_size, BLOCK_SIZE)
-    _penalties_kernel[(num_tokens, num_blocks)](
+    _penalties_launcher[(num_tokens, num_blocks)](
         logits,
         logits.stride(0),
         expanded_idx_mapping,
@@ -283,7 +306,7 @@ def bincount(
     num_tokens = expanded_idx_mapping.shape[0]
     BLOCK_SIZE = 1024
     num_blocks = triton.cdiv(max_prefill_len, BLOCK_SIZE)
-    _bincount_kernel[(num_tokens, num_blocks)](
+    _bincount_launcher[(num_tokens, num_blocks)](
         expanded_idx_mapping,
         all_token_ids,
         all_token_ids.stride(0),
@@ -295,6 +318,66 @@ def bincount(
         output_bin_counts.stride(0),
         BLOCK_SIZE=BLOCK_SIZE,
     )
+
+
+def _penalties_warmup_inputs(
+    *,
+    logits_stride: int,
+    prompt_bin_mask_stride: int,
+    output_bin_counts_stride: int,
+    vocab_size: int,
+) -> dict[str, Any]:
+    int32 = TritonWarmupTensor(torch.int32)
+    float32 = TritonWarmupTensor(torch.float32)
+    return triton_warmup_inputs(
+        _penalties_kernel,
+        float32,
+        logits_stride,
+        TritonWarmupTensor(torch.int64),
+        int32,
+        int32,
+        float32,
+        float32,
+        float32,
+        int32,
+        prompt_bin_mask_stride,
+        int32,
+        output_bin_counts_stride,
+        vocab_size,
+        grid=(1,),
+        BLOCK_SIZE=8192,
+    )
+
+
+def _bincount_warmup_inputs(
+    *,
+    all_token_ids_stride: int,
+    prompt_bin_mask_stride: int,
+    output_bin_counts_stride: int,
+) -> dict[str, Any]:
+    int32 = TritonWarmupTensor(torch.int32)
+    return triton_warmup_inputs(
+        _bincount_kernel,
+        int32,
+        int32,
+        all_token_ids_stride,
+        int32,
+        int32,
+        int32,
+        prompt_bin_mask_stride,
+        int32,
+        output_bin_counts_stride,
+        grid=(1,),
+        BLOCK_SIZE=1024,
+    )
+
+
+_penalties_launcher = triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_penalties_warmup_inputs
+)(_penalties_kernel)
+_bincount_launcher = triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_bincount_warmup_inputs
+)(_bincount_kernel)
 
 
 def use_penalty(sampling_params: SamplingParams) -> bool:
