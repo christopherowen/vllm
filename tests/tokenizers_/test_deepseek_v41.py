@@ -11,7 +11,11 @@ import pytest
 from tests.tokenizers_.test_deepseek_v4 import FakeHfTokenizer
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.tokenizers.deepseek_v41 import get_deepseek_v41_tokenizer
-from vllm.tokenizers.deepseek_v41_encoding import encode_messages
+from vllm.tokenizers.deepseek_v41_encoding import (
+    IMAGE_PLACEHOLDER,
+    encode_messages,
+    order_tool_results,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -251,3 +255,140 @@ def test_reminder_does_not_enable_arbitrary_message_roles():
             [{"role": "SYSTEM", "content": "Hello"}],
             tokenize=False,
         )
+
+
+@pytest.mark.parametrize("role", ["user", "tool", "assistant"])
+def test_image_token_in_text_is_a_request_error(role):
+    """Image tokens come only from image parts, in string content, text parts and
+    reasoning alike (DeepSeek's reference rejects them before merging)."""
+    message = {"role": role, "content": f"hi {IMAGE_PLACEHOLDER}"}
+    if role == "tool":
+        message["tool_call_id"] = "c1"
+    with pytest.raises(ValueError, match="image special token"):
+        render([message])
+    with pytest.raises(ValueError, match="image placeholder"):
+        render(
+            [{"role": "user", "content": [{"type": "text", "text": IMAGE_PLACEHOLDER}]}]
+        )
+    with pytest.raises(ValueError, match="reasoning_content contains image"):
+        render(
+            [
+                {"role": "user", "content": "q"},
+                {
+                    "role": "assistant",
+                    "content": "a",
+                    "reasoning_content": IMAGE_PLACEHOLDER,
+                },
+                {"role": "user", "content": "q2"},
+            ]
+        )
+
+
+def _call(name):
+    return {
+        "id": name,
+        "type": "function",
+        "function": {"name": name, "arguments": "{}"},
+    }
+
+
+def _tool(name, *, image=False):
+    content = [{"type": "text", "text": f"result {name}"}]
+    if image:
+        content.append({"type": "image_url", "image_url": {"url": f"{name}.png"}})
+    return {"role": "tool", "tool_call_id": name, "content": content}
+
+
+def test_tool_messages_take_call_order_within_their_merged_turn():
+    """order_tool_results permutes a merged turn's tool messages into the calls'
+    order and leaves everything else in place, so the encoder reorders nothing."""
+    user = {"role": "user", "content": "also look at this"}
+    messages = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "tool_calls": [_call("a"), _call("b"), _call("c")]},
+        _tool("c"),
+        user,
+        _tool("a"),
+        _tool("unknown"),
+        _tool("b"),
+    ]
+    original = copy.deepcopy(messages)
+    ordered = order_tool_results(messages)
+    assert [m.get("tool_call_id") for m in ordered] == [
+        None, None, "a", None, "unknown", "b", "c"
+    ]  # fmt: skip
+    assert ordered[3] is user
+    assert messages == original
+    assert render(ordered) == render(messages)
+    # A completed turn is untouched, and a single result has nothing to order.
+    single = [{"role": "user", "content": "q"}, _tool("x")]
+    assert order_tool_results(single) == single
+
+
+def test_tool_result_images_follow_prompt_order(monkeypatch):
+    """Tool results answered out of call order render in call order, and the
+    renderer hands media collection the messages in that order, so each image
+    follows its own placeholder (DeepSeek's 2026-10-16 encoding fix)."""
+    from vllm.renderers import deepseek_v41
+    from vllm.renderers.deepseek_v4 import DeepseekV4Renderer
+
+    messages = [
+        {
+            "role": "user",
+            "content": [{"type": "image_url", "image_url": {"url": "h.png"}}],
+        },
+        {"role": "assistant", "tool_calls": [_call("a"), _call("b")]},
+        _tool("b", image=True),
+        _tool("a", image=True),
+    ]
+    assert render(messages, thinking=False).endswith(
+        f"<｜User｜><tool_result>result a\n\n{IMAGE_PLACEHOLDER}</tool_result>\n\n"
+        f"<tool_result>result b\n\n{IMAGE_PLACEHOLDER}</tool_result>"
+        "<｜Assistant｜></think>"
+    )
+    seen = []
+    monkeypatch.setattr(
+        DeepseekV4Renderer, "render_messages", lambda self, m, params: seen.append(m)
+    )
+    renderer = deepseek_v41.DeepseekV41Renderer.__new__(
+        deepseek_v41.DeepseekV41Renderer
+    )
+    renderer.render_messages(messages, None)
+    urls = [
+        part["image_url"]["url"]
+        for message in seen[0]
+        if isinstance(message.get("content"), list)
+        for part in message["content"]
+        if part.get("type") == "image_url"
+    ]
+    assert urls == ["h.png", "a.png", "b.png"]
+
+
+def test_current_turn_reasoning_survives_tool_results():
+    """Reasoning is dropped for completed turns but kept across the current turn's
+    tool results; the next user message completes the turn."""
+    messages = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1", "reasoning_content": "r1"},
+        {"role": "user", "content": "q2"},
+        {
+            "role": "assistant",
+            "reasoning_content": "r2",
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "value"},
+    ]
+    prompt = render(messages)
+    assert "<｜User｜>q1<｜Assistant｜></think>a1<｜end▁of▁sentence｜>" in prompt
+    assert "r1" not in prompt
+    assert "<think>r2</think>" in prompt
+    assert prompt.endswith("<tool_result>value</tool_result><｜Assistant｜><think>")
+    next_turn = render(messages + [{"role": "user", "content": "q3"}])
+    assert "r2" not in next_turn
+    assert next_turn.endswith("q3<｜Assistant｜><think>")

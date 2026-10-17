@@ -168,6 +168,59 @@ def sort_tool_results_by_call_order(
     return messages
 
 
+def order_tool_results(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Reorder OpenAI-format tool messages as merge_tool_messages and
+    sort_tool_results_by_call_order arrange their tool_result blocks.
+
+    Messages that merge into one user message form a group; the group's tool
+    messages take its tool positions in the order the preceding assistant called
+    them (stably, unknown ids first), and every other message keeps its place.
+    Encoding the result reorders nothing, so media collected from it is in prompt
+    order, as the reference collects images only after sorting tool results.
+    """
+    order: List[Dict[str, Any]] = list(messages)
+    call_order: Dict[str, int] = {}
+    groups: List[tuple] = []  # (message indices, call order when the group closes)
+    group: List[int] = []
+    group_task = None
+    for idx, msg in enumerate(order):
+        role = msg.get("role")
+        if role == "tool" and group:
+            group.append(idx)
+        elif role == "tool":
+            group, group_task = [idx], None
+        elif role == "user" and group and group_task is None:
+            group.append(idx)
+        elif role == "user":
+            if group:
+                groups.append((group, dict(call_order)))
+            group, group_task = [idx], msg.get("task")
+        else:
+            if group:
+                groups.append((group, dict(call_order)))
+            group, group_task = [], None
+            if role == "assistant" and msg.get("tool_calls"):
+                call_order = {}
+                for position, call in enumerate(msg["tool_calls"]):
+                    call_id = call.get("id") or call.get("function", {}).get("id", "")
+                    if call_id:
+                        call_order[call_id] = position
+    if group:
+        groups.append((group, dict(call_order)))
+    for indices, calls in groups:
+        tool_positions = [i for i in indices if order[i].get("role") == "tool"]
+        if len(tool_positions) < 2 or not calls:
+            continue
+        tools = sorted(
+            (order[i] for i in tool_positions),
+            key=lambda m: calls.get(m.get("tool_call_id", ""), 0),
+        )
+        for position, msg in zip(tool_positions, tools):
+            order[position] = msg
+    return order
+
+
 SYSTEM_SP_TOKEN = "<｜System｜>"
 
 tool_calls_block_name: str = " calls"
@@ -300,11 +353,18 @@ def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
 
     V4.1 supports mid-conversation system messages, which count as user
     messages for the purposes of the assistant generation header.
+    User messages containing only tool results do not start a new turn.
     """
     last_user_index = -1
     for idx in range(len(messages) - 1, -1, -1):
         role = messages[idx].get("role")
         if role == "user" or (role == "system" and idx > 0):
+            content_blocks = messages[idx].get("content_blocks")
+            if content_blocks and not any(
+                block.get("type") in ("text", "image", "image_url")
+                for block in content_blocks
+            ):
+                continue
             last_user_index = idx
             break
     return last_user_index

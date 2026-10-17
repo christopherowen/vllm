@@ -37,12 +37,30 @@ def _normalize_messages(
         if "reasoning" in message:
             message["reasoning_content"] = message["reasoning"]
         content = message.get("content")
+        # Image tokens come only from image parts, as the reference requires.
+        if isinstance(content, str) and IMAGE_PLACEHOLDER in content:
+            raise ValueError(
+                f"Message content contains image special token '{IMAGE_PLACEHOLDER}'. "
+                "Images should be provided as image content blocks."
+            )
+        reasoning = message.get("reasoning_content")
+        if isinstance(reasoning, str) and IMAGE_PLACEHOLDER in reasoning:
+            raise ValueError(
+                f"reasoning_content contains image special token '{IMAGE_PLACEHOLDER}'"
+            )
         if isinstance(content, list):
             parts = []
             for block in content:
                 part_type = block.get("type")
                 if part_type in ("text", "input_text", "output_text"):
-                    parts.append(block.get("text", ""))
+                    text = block.get("text", "")
+                    if IMAGE_PLACEHOLDER in text:
+                        raise ValueError(
+                            "Text block contains image placeholder "
+                            f"'{IMAGE_PLACEHOLDER}'. Images should be separate "
+                            "content blocks."
+                        )
+                    parts.append(text)
                 elif part_type in ("image_url", "input_image", "image_pil"):
                     parts.append(IMAGE_PLACEHOLDER)
                 else:
