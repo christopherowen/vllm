@@ -92,13 +92,12 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
         layer.packed_bf16_exceptions = packed.exceptions
         layer._already_called_process_weights_after_loading = True
         if self.tilelang:
-            from vllm.models.deepseek_v4_1.tilelang.vocab import prepare_packed_head
-
             # The model's head dtype: FP32 logits as DeepSeek's reference head, or
-            # the model dtype.
+            # the model dtype. The projection is declared with it when the worker
+            # prepares kernels (declare_layer_kernels).
             model_config = get_current_vllm_config().model_config
-            prepare_packed_head(
-                layer, model_config.head_dtype if model_config else torch.bfloat16
+            layer.tilelang_vocab_dtype = (
+                model_config.head_dtype if model_config else torch.bfloat16
             )
         logger.info_once(
             "Packed the BF16 LM head exactly into 12 bits per weight: "
@@ -107,6 +106,15 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
             packed.exponent_base + 14,
             packed.exceptions,
         )
+
+    def declare_layer_kernels(self, layer: torch.nn.Module) -> None:
+        """With the TileLang backend, declare the packed head's projection: once the
+        head is packed, since its kernels depend on the exponent base packing found."""
+        if not self.tilelang or not hasattr(layer, "packed_bf16_exponent_base"):
+            return
+        from vllm.models.deepseek_v4_1.tilelang.vocab import prepare_packed_head
+
+        prepare_packed_head(layer, layer.tilelang_vocab_dtype)
 
     @staticmethod
     def packed_weight(layer: torch.nn.Module):

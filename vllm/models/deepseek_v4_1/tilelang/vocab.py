@@ -15,8 +15,8 @@ list order. Neither depends on the token count or the tile, so a token's
 logits are the same bits in any batch.
 
 Plain BF16 heads (DS4.1's 256-wide DSpark Markov projection) run TileLang's
-BF16 GEMM with the same token tiles. Every head's kernels are compiled when
-it is prepared, one per token tile.
+BF16 GEMM with the same token tiles. Every head declares one kernel per token
+tile; its owner declares it when the worker prepares kernels, after loading.
 """
 
 import tilelang
@@ -24,6 +24,7 @@ import tilelang.language as T
 import torch
 from torch import nn
 
+from . import prepare
 from .gemm import bf16_gemm
 
 GROUP = 128  # columns per code group
@@ -206,15 +207,13 @@ def packed_vocab_projection(
 _OUT = {torch.bfloat16: T.bfloat16, torch.float32: T.float32}
 
 
-def prepare_packed_head(
-    layer: nn.Module, out_dtype: torch.dtype = torch.bfloat16
-) -> None:
-    """Compile a packed head's projection for every token tile, writing ``out_dtype``
-    logits (BF16, or FP32 as DeepSeek's reference head computes them)."""
+def _packed_head_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dict:
+    """A packed head's projection for every token tile, as calls (its exponent base
+    comes from the packed weights)."""
     n, k = int(layer.weight.shape[0]), layer.packed_bf16_in_features
-    layer.tilelang_vocab_dtype = out_dtype
-    layer.tilelang_vocab = {
-        block_M: packed_vocab_projection(
+    return {
+        block_M: prepare.call(
+            packed_vocab_projection,
             n,
             k,
             layer.packed_bf16_exponent_base,
@@ -226,21 +225,52 @@ def prepare_packed_head(
     }
 
 
-def prepare_bf16_head(
-    layer: nn.Module, out_dtype: torch.dtype = torch.bfloat16
-) -> None:
-    """Compile a BF16 head's projection for every token tile, writing ``out_dtype``."""
+def _bf16_head_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dict:
+    """A BF16 head's projection for every token tile, as calls."""
     n, k = map(int, layer.weight.shape)
     kernels = {}
     for block_M in ROW_TILES:
         config = dict(BF16_HEAD_CONFIGS[block_M])
         if k % config["block_K"]:
             config["block_K"] = 64
-        kernels[block_M] = bf16_gemm(
-            n, k, block_M=block_M, num_stages=2, out_dtype=_OUT[out_dtype], **config
+        kernels[block_M] = prepare.call(
+            bf16_gemm,
+            n,
+            k,
+            block_M=block_M,
+            num_stages=2,
+            out_dtype=_OUT[out_dtype],
+            **config,
         )
+    return kernels
+
+
+def _declare_head(layer: nn.Module, kernels: dict, out_dtype: torch.dtype) -> None:
     layer.tilelang_vocab_dtype = out_dtype
-    layer.tilelang_vocab = kernels
+
+    def bind() -> None:
+        layer.tilelang_vocab = {
+            block_M: function(*args, **kwargs)
+            for block_M, (function, args, kwargs) in kernels.items()
+        }
+
+    prepare.declare(lambda: list(kernels.values()), bind=bind)
+
+
+def prepare_packed_head(
+    layer: nn.Module, out_dtype: torch.dtype = torch.bfloat16
+) -> None:
+    """Declare a packed head's projection for every token tile, writing ``out_dtype``
+    logits (BF16, or FP32 as DeepSeek's reference head computes them). The head must
+    be packed: the kernels depend on its exponent base."""
+    _declare_head(layer, _packed_head_kernels(layer, out_dtype), out_dtype)
+
+
+def prepare_bf16_head(
+    layer: nn.Module, out_dtype: torch.dtype = torch.bfloat16
+) -> None:
+    """Declare a BF16 head's projection for every token tile, writing ``out_dtype``."""
+    _declare_head(layer, _bf16_head_kernels(layer, out_dtype), out_dtype)
 
 
 def project_head(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:

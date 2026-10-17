@@ -344,9 +344,10 @@ def _warm_casts(k: int) -> None:
         _warm_cast(k, CAST_SMALL_BATCH_ROWS + 1)
 
 
-def _declare_block32(layer, groups: int = 1) -> None:
+def _declare_block32(layer, groups: int = 1, cast: bool = True) -> None:
     """Configure a block-32 FP8 projection of ``layer.weight`` (E4M3 ``[N, K]``),
-    register it for the custom op, and declare its kernels."""
+    register it for the custom op, and declare its kernels. ``cast=False``: the
+    caller hands the GEMMs MXFP8 activations (WO-B), so no per-token cast launches."""
     n, k = layer.weight.shape
     kernels = _block32_kernels(n, k, groups)
     layer.tilelang_groups = groups
@@ -364,7 +365,9 @@ def _declare_block32(layer, groups: int = 1) -> None:
             setattr(layer, f"tilelang_{name}", kernel)
 
     prepare.declare(
-        lambda: _calls(kernels), bind=bind, warm=lambda: _warm_casts(k * groups)
+        lambda: _calls(kernels),
+        bind=bind,
+        warm=(lambda: _warm_casts(k * groups)) if cast else None,
     )
 
 

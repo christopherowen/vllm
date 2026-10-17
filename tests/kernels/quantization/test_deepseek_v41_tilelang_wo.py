@@ -23,7 +23,8 @@ from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
 )
 from vllm.models.deepseek_v4_1.tilelang.linear import (  # noqa: E402
     _block32_linear,
-    _prepare_block32,
+    _block32_scale_words,
+    _declare_block32,
 )
 from vllm.models.deepseek_v4_1.tilelang.wo import TileLangWOProjection  # noqa: E402
 from vllm.v1.worker.workspace import use_preallocated_workspace  # noqa: E402
@@ -73,6 +74,7 @@ def test_wo_projection():
     wo_a = _block32(GROUPS * RANK, HEADS // GROUPS * HEAD_DIM, 1)
     wo_b = _block32(HIDDEN, GROUPS * RANK, 2)
     wo = TileLangWOProjection(wo_a, wo_b, groups=GROUPS)
+    wo.declare_kernels()  # standalone: prepared and bound now
     rows = max(ROWS)
     gen = _gen(3)
     o = torch.randn((rows, HEADS, HEAD_DIM), generator=gen, device=DEVICE).bfloat16()
@@ -124,6 +126,7 @@ def test_wo_projection_nan_row(count):
         _block32(HIDDEN, GROUPS * RANK, 2),
         groups=GROUPS,
     )
+    wo.declare_kernels()
     gen = _gen(13)
     o = torch.randn((count, HEADS, HEAD_DIM), generator=gen, device=DEVICE).bfloat16()
     positions = torch.randint(0, 4096, (count,), generator=gen, device=DEVICE)
@@ -144,11 +147,12 @@ def test_wo_projection_nan_row(count):
 
 
 @pytest.mark.parametrize("count", ROWS)
-def test_grouped_gemm_equals_groups(count):
+def test_grouped_gemm_equals_groups(count, default_vllm_config):
     """One grouped launch gives each group's ordinary GEMM bit for bit."""
     width = HEADS // GROUPS * HEAD_DIM
     grouped = _block32(GROUPS * RANK, width, 4)
-    _prepare_block32(grouped, GROUPS)
+    _block32_scale_words(grouped)
+    _declare_block32(grouped, GROUPS)
     x = torch.randn(
         (count, GROUPS * width), generator=_gen(5), device=DEVICE
     ).bfloat16()
@@ -162,7 +166,8 @@ def test_grouped_gemm_equals_groups(count):
             part.weight_scale_inv = grouped.weight_scale_inv[
                 g * RANK // 32 : (g + 1) * RANK // 32
             ]
-            _prepare_block32(part)
+            _block32_scale_words(part)
+            _declare_block32(part)
             single = torch.empty((count, RANK), dtype=torch.bfloat16, device=DEVICE)
             _block32_linear(
                 x[:, g * width : (g + 1) * width].contiguous(),
@@ -189,14 +194,26 @@ def _wo_a_bf16(layer, x):
     e = layer.weight_scale_inv.view(torch.uint8)
     out = torch.empty((rows, n), dtype=torch.bfloat16, device=DEVICE)
     if tile["split"]:
-        partials = torch.empty((_WO_A_SHARDS, rows, n), dtype=torch.float32, device=DEVICE)
+        partials = torch.empty(
+            (_WO_A_SHARDS, rows, n), dtype=torch.float32, device=DEVICE
+        )
         gemm.fp8w_bf16_gemm_partials(
-            n // GROUPS, k, GROUPS, _WO_A_SHARDS, block_M=tile["block_M"], **_WO_A_COMMON
+            n // GROUPS,
+            k,
+            GROUPS,
+            _WO_A_SHARDS,
+            block_M=tile["block_M"],
+            **_WO_A_COMMON,
         )(x, layer.weight, e, partials)
         gemm.splitk_reduce(n, _WO_A_SHARDS)(partials, out)
     else:
         gemm.fp8w_bf16_gemm(
-            n // GROUPS, k, GROUPS, shards=_WO_A_SHARDS, block_M=tile["block_M"], **_WO_A_COMMON
+            n // GROUPS,
+            k,
+            GROUPS,
+            shards=_WO_A_SHARDS,
+            block_M=tile["block_M"],
+            **_WO_A_COMMON,
         )(x, layer.weight, e, out)
     return out
 
@@ -243,6 +260,7 @@ def test_wo_a_casts_as_per_token_cast():
     width = HEADS // GROUPS * HEAD_DIM
     layer = _block32(GROUPS * RANK, width, 9)
     wo_a = _GroupedBF16(layer, GROUPS)
+    wo_a.declare_kernels()
     x = torch.randn((300, GROUPS * width), generator=_gen(10), device=DEVICE).bfloat16()
     x[::5] *= 1e-7  # some rows' outputs fall below the amax floor
     for rows in (1, 7, 16, 17, 33, 64, 65, 96, 97, 100, 128, 129, 200, 300):
@@ -250,10 +268,18 @@ def test_wo_a_casts_as_per_token_cast():
         ref_q, ref_sf = tile_kernels.quant.per_token_cast(
             a, "e4m3", 32, round_sf=True, use_packed_ue8m0=True
         )
-        xq = torch.empty((rows, GROUPS * RANK), dtype=torch.float8_e4m3fn, device=DEVICE)
+        xq = torch.empty(
+            (rows, GROUPS * RANK), dtype=torch.float8_e4m3fn, device=DEVICE
+        )
         sf = torch.empty((rows, GROUPS * RANK // 32), dtype=torch.uint8, device=DEVICE)
         specs = wo_a.partial_specs(rows)
-        partials = torch.empty(specs[0][0], dtype=specs[0][1], device=DEVICE) if specs else None
+        partials = (
+            torch.empty(specs[0][0], dtype=specs[0][1], device=DEVICE)
+            if specs
+            else None
+        )
         wo_a(x[:rows], xq, sf, partials)
         assert torch.equal(xq.view(torch.uint8), ref_q.view(torch.uint8)), rows
-        assert torch.equal(sf, ref_sf.contiguous().view(torch.uint8)[:, : sf.shape[1]]), rows
+        assert torch.equal(
+            sf, ref_sf.contiguous().view(torch.uint8)[:, : sf.shape[1]]
+        ), rows

@@ -128,6 +128,8 @@ class LogitsProcessor(PluggableLayer):
         kernel_config = get_current_vllm_config().kernel_config
         # DS4.1's TileLang family projects its vocabulary heads with TileLang.
         self.use_tilelang_vocab_projection = kernel_config.linear_backend == "tilelang"
+        # BF16 heads registered here, whose TileLang kernels this processor declares.
+        self._tilelang_vocab_heads: list[VocabParallelEmbedding] = []
         self._b12x_vocab_projection = get_b12x_bf16_vocab_projection()
         self._b12x_vocab_plans: dict[int, dict[int, object]] = {}
         self._b12x_vocab_heads: dict[int, VocabParallelEmbedding] = {}
@@ -151,18 +153,19 @@ class LogitsProcessor(PluggableLayer):
     ) -> None:
         """Register the loaded LM head; preparation happens in worker lifecycle.
 
-        With the TileLang backend, a BF16 head's kernels are compiled here; a
-        packed head's are compiled when it is packed.
+        With the TileLang backend, the first processor to register a BF16 head
+        fixes its logits dtype here and declares its kernels when the worker
+        prepares kernels (``declare_kernels``); a packed head's method declares
+        the packed head's kernels.
         """
         if self.use_tilelang_vocab_projection:
             if (
                 not _is_packed_head(lm_head)
-                and not hasattr(lm_head, "tilelang_vocab")
+                and not hasattr(lm_head, "tilelang_vocab_dtype")
                 and _is_plain_bf16_head(lm_head)
             ):
-                from vllm.models.deepseek_v4_1.tilelang.vocab import prepare_bf16_head
-
-                prepare_bf16_head(lm_head, self.head_dtype or lm_head.weight.dtype)
+                lm_head.tilelang_vocab_dtype = self.head_dtype or lm_head.weight.dtype
+                self._tilelang_vocab_heads.append(lm_head)
             return
         if _is_packed_head(lm_head):
             if (
@@ -186,6 +189,15 @@ class LogitsProcessor(PluggableLayer):
         self._b12x_vocab_heads[id(lm_head)] = lm_head
         object.__setattr__(lm_head, "_b12x_vocab_projection_owner", self)
         set_b12x_preparation_provider(self, self)
+
+    def declare_kernels(self) -> None:
+        """Declare the TileLang projections of the BF16 heads registered here."""
+        if not self._tilelang_vocab_heads:
+            return
+        from vllm.models.deepseek_v4_1.tilelang.vocab import prepare_bf16_head
+
+        for head in self._tilelang_vocab_heads:
+            prepare_bf16_head(head, head.tilelang_vocab_dtype)
 
     def _b12x_vocab_name(self, head: VocabParallelEmbedding, tokens: int) -> str:
         return f"logits.vocab.{id(self):x}.{id(head):x}.m{tokens}"

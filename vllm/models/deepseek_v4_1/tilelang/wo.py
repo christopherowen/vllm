@@ -23,8 +23,22 @@ from torch import nn
 from vllm.v1.worker.workspace import current_preallocated_workspace
 
 from .. import l2_prefetch
-from .gemm import fp8w_bf16_gemm_cast, fp8w_bf16_gemm_partials, splitk_reduce_cast
-from .linear import _activation_specs, _block32_gemm, _prepare_block32, _scratch
+from . import prepare
+from .gemm import (
+    SPLIT_FP8,
+    fp8w_bf16_gemm_cast,
+    fp8w_bf16_gemm_partials,
+    splitk_reduce_cast,
+)
+from .linear import (
+    _activation_specs,
+    _block32_gemm,
+    _block32_scale_words,
+    _calls,
+    _declare_block32,
+    _launch,
+    _scratch,
+)
 from .rope import rope_
 
 # WO-A's W8A16 GEMM sums K in _WO_A_SHARDS shards at every row count, each from zero,
@@ -53,7 +67,13 @@ class _Weight:
     def __init__(self, layer: nn.Module, groups: int):
         self.weight = layer.weight.detach()
         self.weight_scale_inv = layer.weight_scale_inv.detach()
-        _prepare_block32(self, groups)
+        self.groups = groups
+        _block32_scale_words(self)
+
+    def declare_kernels(self) -> None:
+        """Declare the GEMMs; the caller hands them MXFP8 activations, so there is
+        no per-token cast to prepare."""
+        _declare_block32(self, self.groups, cast=False)
         # Verification steps stay on decode tiles to 128 rows: one 96-row tile to 96
         # (WIDE_DECODE), two of 64 rows past it.
         self.tilelang_decode_rows = 128
@@ -66,29 +86,49 @@ class _GroupedBF16:
     def __init__(self, layer: nn.Module, groups: int):
         self.weight = layer.weight.detach()
         self.tilelang_weight_sf = layer.weight_scale_inv.detach().view(torch.uint8)
+        self.columns = self.weight.shape[0]
+        self.groups = groups
+
+    def _kernels(self) -> dict:
+        """Every kernel of WO-A, as calls: one per row bucket, and the split path's
+        reduce."""
         n, k = self.weight.shape
-        self.columns = n
-        self.kernels = {
-            bucket: fp8w_bf16_gemm_partials(
-                n // groups,
-                k,
-                groups,
-                _WO_A_SHARDS,
-                block_M=tile["block_M"],
-                **_WO_A_COMMON,
-            )
-            if tile["split"]
-            else fp8w_bf16_gemm_cast(
-                n // groups,
-                k,
-                groups,
-                shards=_WO_A_SHARDS,
-                block_M=tile["block_M"],
-                **_WO_A_COMMON,
-            )
-            for bucket, tile in _WO_A_TILES.items()
+        groups = self.groups
+        return {
+            "kernels": {
+                bucket: prepare.call(
+                    fp8w_bf16_gemm_partials,
+                    n // groups,
+                    k,
+                    groups,
+                    _WO_A_SHARDS,
+                    block_M=tile["block_M"],
+                    **_WO_A_COMMON,
+                )
+                if tile["split"]
+                else prepare.call(
+                    fp8w_bf16_gemm_cast,
+                    n // groups,
+                    k,
+                    groups,
+                    shards=_WO_A_SHARDS,
+                    block_M=tile["block_M"],
+                    **_WO_A_COMMON,
+                )
+                for bucket, tile in _WO_A_TILES.items()
+            },
+            "reduce": prepare.call(splitk_reduce_cast, n, _WO_A_SHARDS),
         }
-        self.reduce = splitk_reduce_cast(n, _WO_A_SHARDS)
+
+    def declare_kernels(self) -> None:
+        """Declare WO-A's kernels, bound as ``kernels`` and ``reduce``."""
+        kernels = self._kernels()
+
+        def bind() -> None:
+            for name, kernel in _launch(kernels).items():
+                setattr(self, name, kernel)
+
+        prepare.declare(lambda: _calls(kernels), bind=bind)
 
     @staticmethod
     def bucket(rows: int):
@@ -112,12 +152,20 @@ class _GroupedBF16:
 
 
 class TileLangWOProjection:
+    """Inverse RoPE, WO-A and WO-B of one attention layer (built after loading; its
+    layer declares the kernels with ``declare_kernels``)."""
+
     def __init__(self, wo_a: nn.Module, wo_b: nn.Module, *, groups: int):
         self.a = _GroupedBF16(wo_a, groups)
         self.b = _Weight(wo_b, 1)
-        if self.b.tilelang_shards > 1:
+        if SPLIT_FP8.get(tuple(self.b.weight.shape)):
             raise ValueError("WO-B takes WO-A's MXFP8 output: no split-K path")
         self.hidden = wo_b.weight.shape[0]
+
+    def declare_kernels(self) -> None:
+        """Declare WO-A's and WO-B's kernels (the inverse RoPE is the layer's)."""
+        self.a.declare_kernels()
+        self.b.declare_kernels()
 
     def l2_segments(self) -> list:
         """The bytes both GEMMs read, WO-A first: each weight and its scale words."""
@@ -145,7 +193,10 @@ class TileLangWOProjection:
         # input in whole decode tiles.
         partial_specs = self.a.partial_specs(rows)
         views = _scratch(
-            (*partial_specs, *_activation_specs(rows, self.a.columns, self.b.tilelang_decode_rows)),
+            (
+                *partial_specs,
+                *_activation_specs(rows, self.a.columns, self.b.tilelang_decode_rows),
+            ),
             scratch,
         )
         partials = views[0] if partial_specs else None

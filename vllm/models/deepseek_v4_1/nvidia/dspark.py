@@ -33,7 +33,6 @@ from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.linear import ReplicatedLinear
-from vllm.models.deepseek_v4_1.common.engram import _PaddedColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -48,6 +47,7 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_padding_mask,
     sp_shard,
 )
+from vllm.models.deepseek_v4_1.common.engram import _PaddedColumnParallelLinear
 from vllm.utils.b12x import (
     B12xPreparationUnit,
     B12xWorkload,
@@ -84,6 +84,7 @@ def _vocab_parallel_greedy() -> bool:
     if os.environ.get("SPARK3_DSPARK_VOCAB_PARALLEL", "0") != "1":
         return False
     return get_tensor_model_parallel_world_size() > 1
+
 
 # MoE expert scale suffix differs by expert dtype (mirrors deepseek_v4 loaders):
 # fp4 experts register ``.weight_scale``; block-fp8 experts ``.weight_scale_inv``.
@@ -366,7 +367,9 @@ class DSparkDeepseekV4Model(nn.Module):
             os.environ.get("SPARK3_DSPARK_MAIN_PROJ_TP", "0") == "1"
             and get_tensor_model_parallel_world_size() > 1
         )
-        main_proj_cls = _PaddedColumnParallelLinear if main_proj_tp else ReplicatedLinear
+        main_proj_cls = (
+            _PaddedColumnParallelLinear if main_proj_tp else ReplicatedLinear
+        )
         self.main_proj = main_proj_cls(
             config.hidden_size * len(self.target_layer_ids),
             config.hidden_size,
@@ -422,6 +425,15 @@ class DSparkDeepseekV4Model(nn.Module):
                 config.hidden_size + config.dspark_markov_rank,
                 prefix=maybe_prefix(prefix, "confidence_head"),
             )
+
+    def declare_kernels(self) -> None:
+        """Declare the context KV projections' TileLang kernels (built after loading).
+
+        The draft layers' modules declare their own kernels, WO included, and the
+        Markov head's are declared by the logits processor it is registered with.
+        """
+        for projection in self._context_kv_projections:
+            projection.declare_kernels()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         assert self.embed_tokens is not None
