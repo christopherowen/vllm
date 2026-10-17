@@ -1438,10 +1438,18 @@ class Worker(WorkerBase):
         if envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
             from vllm.models.deepseek_v4_1.tilelang import prepare
 
+            speculator = getattr(self.model_runner, "speculator", None)
+            with registry.activate():
+                prepare.declare_modules(
+                    self.model_runner.model, getattr(speculator, "model", None)
+                )
             tilelang_calls = prepare.prepare_declared(registry)
+            with torch.inference_mode():
+                prepare.warm_declared(registry)
         registry.warmup()
         if tilelang_calls:
             prepare.freeze("every declared kernel was prepared before memory profiling")
+            prepare.bind_declared(registry)
         logger.info(
             "Prepared %d TileLang calls and the registry's other kernels in %.1f s.",
             tilelang_calls,

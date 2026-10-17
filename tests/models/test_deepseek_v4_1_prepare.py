@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek V4.1 TileLang kernels are declared into the runner's JIT registry."""
 
+import tilelang
+
 from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
 from vllm.models.deepseek_v4_1.tilelang import prepare
 
@@ -17,40 +19,45 @@ def _rope(heads, dim):
 def test_declared_calls_are_collected_once_each():
     registry = JitWarmupRegistry(vllm_config=None)
     with registry.activate():
-        prepare.declare(_gemm, lambda: [prepare.call(1024, 512, block_M=16)])
+        prepare.declare(lambda: [prepare.call(_gemm, 1024, 512, block_M=16)])
         # A second owner declaring the same call (another layer of the same shape).
         prepare.declare(
-            _gemm,
             lambda: [
-                prepare.call(1024, 512, block_M=16),
-                prepare.call(1024, 512, block_M=32),
-            ],
+                prepare.call(_gemm, 1024, 512, block_M=16),
+                prepare.call(_gemm, 1024, 512, block_M=32),
+                prepare.call(_rope, 8, 512),
+            ]
         )
-        prepare.declare(_rope, lambda: [prepare.call(8, 512)])
-    calls = prepare.declared_calls(registry)
-    assert sorted(
-        (fn.__name__, args, tuple(sorted(kw.items()))) for fn, args, kw in calls
-    ) == [
+    calls = sorted(
+        (fn.__name__, args, tuple(sorted(kw.items())))
+        for fn, args, kw in prepare.declared_calls(registry)
+    )
+    assert calls == [
         ("_gemm", (1024, 512), (("block_M", 16),)),
         ("_gemm", (1024, 512), (("block_M", 32),)),
         ("_rope", (8, 512), ()),
     ]
 
 
-def test_declaring_outside_a_collecting_registry_is_a_no_op():
-    prepare.declare(_rope, lambda: [prepare.call(8, 512)])  # no active registry
-
-
-def test_calls_are_listed_when_preparing_not_when_declaring():
+def test_calls_are_listed_and_kernels_bound_when_preparing():
     registry = JitWarmupRegistry(vllm_config=None)
-    listed = []
+    events = []
 
     def calls():
-        listed.append(True)
-        return [prepare.call(4, 128)]
+        events.append("listed")
+        return [prepare.call(_rope, 4, 128)]
 
     with registry.activate():
-        prepare.declare(_rope, calls)
-    assert not listed
+        prepare.declare(calls, bind=lambda: events.append("bound"))
+    assert events == []
     prepare.declared_calls(registry)
-    assert listed
+    prepare.bind_declared(registry)
+    assert events == ["listed", "bound"]
+
+
+def test_standalone_declaration_prepares_and_binds_now(monkeypatch):
+    prepared = []
+    monkeypatch.setattr(tilelang, "prepare", lambda calls, **kw: prepared.extend(calls))
+    bound = []
+    prepare.declare(lambda: [prepare.call(_rope, 2, 64)], bind=lambda: bound.append(1))
+    assert prepared == [(_rope, (2, 64), {})] and bound == [1]

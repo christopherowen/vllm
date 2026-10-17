@@ -1043,6 +1043,11 @@ class JitWarmupRegistry:
             self._active.reset(token)
 
     @classmethod
+    def active(cls) -> JitWarmupRegistry | None:
+        """The registry collecting registrations in this context, if any."""
+        return cls._active.get()
+
+    @classmethod
     def register(
         cls,
         kernel: VllmJitKernel[Any],

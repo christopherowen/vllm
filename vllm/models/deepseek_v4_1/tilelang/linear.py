@@ -14,6 +14,7 @@ The kernels run inside custom ops, which keeps them opaque to torch.compile,
 and borrow activation scratch from vLLM's workspace.
 """
 
+import functools
 import math
 from weakref import WeakValueDictionary
 
@@ -22,6 +23,7 @@ from torch import nn
 
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.models.deepseek_v4_1.quant_config import Block32FP8LinearMethod
+from vllm.models.deepseek_v4_1.tilelang import prepare
 from vllm.v1.worker.workspace import (
     current_preallocated_workspace,
     current_workspace_manager,
@@ -234,58 +236,143 @@ def _bf16_linear_fake(x, out, key, scratch):
     return None
 
 
-def _prepare_block32(layer, groups: int = 1) -> None:
-    """Compile the GEMMs of ``layer.weight`` (E4M3 ``[N, K]``) and its 32x32 block
-    scales ``layer.weight_scale_inv``, and register the layer for the custom op.
+def _block32_kernels(n: int, k: int, groups: int = 1) -> dict:
+    """Every kernel of a block-32 FP8 projection of an E4M3 ``[n, k]`` weight, as the
+    calls ``_bind_block32`` makes.
 
-    With ``groups`` > 1 the weight stacks ``groups`` blocks of ``N / groups`` rows,
-    each applied to its own K columns of ``groups * K``-wide activations.
+    With ``groups`` > 1 the weight stacks ``groups`` blocks of ``n / groups`` rows,
+    each applied to its own K columns of ``groups * k``-wide activations.
     """
-    n, k = layer.weight.shape
+    split = SPLIT_FP8.get((n, k)) if groups == 1 else None
+    if split:
+        # A narrow projection: split-K decode rows, and prefill tiles that add the
+        # same shards in the same order.
+        shards = split["shards"]
+        return {
+            "partials": {
+                bucket: prepare.call(
+                    mxfp8_gemm_partials, n, k, shards, block_M=min(bucket, 64), **config
+                )
+                for bucket, config in split["decode"].items()
+            },
+            "reduce": prepare.call(splitk_reduce, n, shards),
+            "prefill": prepare.call(
+                mxfp8_gemm, n, k, **split["prefill"], shards=shards
+            ),
+        }
     part = n // groups
-    # The 32x32 block scales become per-row words of four K32 exponents.
-    layer.tilelang_weight_sf = pack_scale_words(
-        layer.weight_scale_inv.view(torch.uint8), rows=n
+    wide = WIDE_DECODE.get((n, k), {}) if groups == 1 else {}
+    # The wide decode table can name a tile taller than DECODE_ROWS (WO-B's 96).
+    heights = sorted({*DECODE_TILE_ROWS, *wide.values()})
+    return {
+        "decode": {
+            block_M: prepare.call(
+                mxfp8_gemm_decode,
+                part,
+                k,
+                **fp8_decode_config(part, k, block_M, groups),
+                padded_rows=True,
+                groups=groups,
+            )
+            for block_M in heights
+        },
+        "prefill": prepare.call(
+            mxfp8_gemm, part, k, **fp8_prefill_config(part, k, groups), groups=groups
+        ),
+    }
+
+
+def _calls(kernels: dict) -> list[prepare.TileLangCall]:
+    """The calls of a ``*_kernels`` table (values are calls or dicts of calls)."""
+    out = []
+    for value in kernels.values():
+        out.extend(value.values() if isinstance(value, dict) else [value])
+    return out
+
+
+def _launch(kernels: dict) -> dict:
+    """A ``*_kernels`` table with each call made (prepared: cache hits)."""
+
+    def make(entry):
+        function, args, kwargs = entry
+        return function(*args, **kwargs)
+
+    return {
+        name: {key: make(c) for key, c in value.items()}
+        if isinstance(value, dict)
+        else make(value)
+        for name, value in kernels.items()
+    }
+
+
+def _max_rows() -> int:
+    from vllm.config import get_current_vllm_config
+
+    return get_current_vllm_config().scheduler_config.max_num_batched_tokens
+
+
+@functools.cache
+def _warm_cast(k: int, rows: int) -> None:
+    """TileKernels' MXFP8 per-token cast of ``rows`` x ``k`` BF16 activations, run once
+    on zeros, so its kernel (keyed by K, the row stride and the small-batch bucket)
+    is compiled before the cache freezes."""
+    x = torch.zeros((rows, k), dtype=torch.bfloat16, device="cuda")
+    xq, sf = (
+        torch.empty(shape, dtype=dtype, device="cuda")
+        for shape, dtype in _activation_specs(rows, k)
     )
+    _tile_kernels().quant.per_token_cast(
+        x,
+        "e4m3",
+        SF_BLOCK,
+        round_sf=True,
+        use_packed_ue8m0=True,
+        out=(xq[:rows], sf[:rows]),
+    )
+
+
+# TileKernels' per-token cast compiles a small-batch kernel for calls of at most this
+# many rows (SMALL_BATCH_THRESHOLD, a local of per_token_cast_impl; a test reads it).
+CAST_SMALL_BATCH_ROWS = 4096
+
+
+def _warm_casts(k: int) -> None:
+    """Each of TileKernels' cast buckets the projection can launch: small batches
+    always, large ones when a forward can exceed the small-batch rows."""
+    _warm_cast(k, 1)
+    if _max_rows() > CAST_SMALL_BATCH_ROWS:
+        _warm_cast(k, CAST_SMALL_BATCH_ROWS + 1)
+
+
+def _declare_block32(layer, groups: int = 1) -> None:
+    """Configure a block-32 FP8 projection of ``layer.weight`` (E4M3 ``[N, K]``),
+    register it for the custom op, and declare its kernels."""
+    n, k = layer.weight.shape
+    kernels = _block32_kernels(n, k, groups)
     layer.tilelang_groups = groups
     layer.tilelang_wide = WIDE_DECODE.get((n, k), {}) if groups == 1 else {}
     layer.tilelang_decode_rows = max(layer.tilelang_wide, default=DECODE_ROWS)
     split = SPLIT_FP8.get((n, k)) if groups == 1 else None
     layer.tilelang_shards = split["shards"] if split else 1
     if split:
-        # A narrow projection: split-K decode rows, and prefill tiles that add the
-        # same shards in the same order.
         layer.tilelang_split_rows = split["rows"]
-        layer.tilelang_partials = {
-            bucket: mxfp8_gemm_partials(
-                n, k, split["shards"], block_M=min(bucket, 64), **config
-            )
-            for bucket, config in split["decode"].items()
-        }
-        layer.tilelang_reduce = splitk_reduce(n, split["shards"])
-        layer.tilelang_prefill = mxfp8_gemm(
-            n, k, **split["prefill"], shards=split["shards"]
-        )
-        layer.tilelang_key = id(layer)
-        _LAYERS[layer.tilelang_key] = layer
-        return
-    # The wide decode table can name a tile taller than DECODE_ROWS (WO-B's 96).
-    heights = sorted({*DECODE_TILE_ROWS, *layer.tilelang_wide.values()})
-    layer.tilelang_decode = {
-        block_M: mxfp8_gemm_decode(
-            part,
-            k,
-            **fp8_decode_config(part, k, block_M, groups),
-            padded_rows=True,
-            groups=groups,
-        )
-        for block_M in heights
-    }
-    layer.tilelang_prefill = mxfp8_gemm(
-        part, k, **fp8_prefill_config(part, k, groups), groups=groups
-    )
     layer.tilelang_key = id(layer)
     _LAYERS[layer.tilelang_key] = layer
+
+    def bind() -> None:
+        for name, kernel in _launch(kernels).items():
+            setattr(layer, f"tilelang_{name}", kernel)
+
+    prepare.declare(
+        lambda: _calls(kernels), bind=bind, warm=lambda: _warm_casts(k * groups)
+    )
+
+
+def _block32_scale_words(layer) -> None:
+    """The 32x32 block scales become per-row words of four K32 exponents."""
+    layer.tilelang_weight_sf = pack_scale_words(
+        layer.weight_scale_inv.view(torch.uint8), rows=layer.weight.shape[0]
+    )
 
 
 def _apply_block32(layer, x: torch.Tensor) -> torch.Tensor:
@@ -304,8 +391,11 @@ def _apply_block32(layer, x: torch.Tensor) -> torch.Tensor:
 class TileLangFP8LinearMethod(Block32FP8LinearMethod):
     """Checkpoint block-32 FP8 weights with MXFP8 activations."""
 
+    def declare_layer_kernels(self, layer):
+        _declare_block32(layer)
+
     def process_weights_after_loading(self, layer):
-        _prepare_block32(layer)
+        _block32_scale_words(layer)
 
     def get_workspace_size(self, layer, num_tokens: int) -> int:
         return _spec_bytes(
@@ -333,29 +423,56 @@ class TileLangBlock32Rows:
             raise ValueError(f"rows from {start} do not start on a 32-row scale block")
         self.weight = layer.weight[start:]
         self.weight_scale_inv = layer.weight_scale_inv[start // 32 :]
-        _prepare_block32(self)
+        _block32_scale_words(self)
+
+    def declare_kernels(self) -> None:
+        """Declare the projection's kernels (its owner calls this when preparing)."""
+        _declare_block32(self)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         return _apply_block32(self, x)
 
 
+def _out_dtype(layer: nn.Module) -> str:
+    """The layer's output dtype as the GEMMs name it (set after construction)."""
+    return _TORCH_TO_TL[getattr(layer, "out_dtype", torch.bfloat16)]
+
+
+def _bf16_kernels(layer: nn.Module) -> dict:
+    """Every kernel of a BF16 projection of ``layer.weight``, as calls."""
+    n, k = layer.weight.shape
+    out_dtype = _out_dtype(layer)
+    shards = bf16_shards(n, k)
+    kernels = {
+        "gemm": prepare.call(bf16_gemm, n, k, out_dtype=out_dtype, shards=shards)
+    }
+    if shards > 1:
+        kernels["partials"] = {
+            block_M: prepare.call(bf16_gemm_partials, n, k, shards, block_M=block_M)
+            for block_M in PARTIAL_ROW_TILES
+        }
+        kernels["reduce"] = prepare.call(splitk_reduce, n, shards, out_dtype=out_dtype)
+    return kernels
+
+
 class TileLangLinearMethod(UnquantizedLinearMethod):
     """BF16 weights, BF16 or FP32 output (``layer.out_dtype``)."""
 
-    def process_weights_after_loading(self, layer: nn.Module) -> None:
+    def declare_layer_kernels(self, layer: nn.Module) -> None:
         n, k = layer.weight.shape
-        out_dtype = _TORCH_TO_TL[getattr(layer, "out_dtype", torch.bfloat16)]
-        shards = layer.tilelang_shards = bf16_shards(n, k)
+        layer.tilelang_shards = bf16_shards(n, k)
         layer.tilelang_split_rows = BF16_SPLIT_ROWS.get((n, k), DECODE_ROWS)
-        layer.tilelang_gemm = bf16_gemm(n, k, out_dtype=out_dtype, shards=shards)
-        if shards > 1:
-            layer.tilelang_partials = {
-                block_M: bf16_gemm_partials(n, k, shards, block_M=block_M)
-                for block_M in PARTIAL_ROW_TILES
-            }
-            layer.tilelang_reduce = splitk_reduce(n, shards, out_dtype=out_dtype)
         layer.tilelang_key = id(layer)
         _LAYERS[layer.tilelang_key] = layer
+
+        def bind() -> None:
+            for name, kernel in _launch(_bf16_kernels(layer)).items():
+                setattr(layer, f"tilelang_{name}", kernel)
+
+        prepare.declare(lambda: _calls(_bf16_kernels(layer)), bind=bind)
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        """The checkpoint weight is used as loaded."""
 
     def apply(
         self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
@@ -395,7 +512,6 @@ class TileLangScaledLinearMethod(TileLangLinearMethod):
         if not torch.equal(scaled / self.scale, weight):
             raise ValueError(f"{self.scale} does not scale this weight exactly")
         weight.copy_(scaled)
-        super().process_weights_after_loading(layer)
 
 
 class TileLangSplitLinearMethod(UnquantizedLinearMethod):
@@ -413,24 +529,39 @@ class TileLangSplitLinearMethod(UnquantizedLinearMethod):
             raise ValueError("the split projection has one or two parts")
         self.parts = parts
 
-    def process_weights_after_loading(self, layer: nn.Module) -> None:
-        super().process_weights_after_loading(layer)
+    def _split(self, layer: nn.Module) -> dict:
         n, k = layer.weight.shape
-        if n % self.parts:
-            raise ValueError(f"{n} rows do not split into {self.parts} parts")
-        out_dtype = _TORCH_TO_TL[getattr(layer, "out_dtype", torch.bfloat16)]
         split = SPLIT_BF16.get((n, k)) or dict(shards=bf16_shards(n, k), blocked=False)
-        shards, blocked = split["shards"], split["blocked"]
         decode = split.get("decode", {})
         if any("block_K" in config for config in decode.values()):
             raise ValueError(
                 "split-K decode tiles keep block_K (it sets the sum order)"
             )
-        layer.tilelang_parts = self.parts
-        layer.tilelang_shards = shards
+        return dict(shards=split["shards"], blocked=split["blocked"], decode=decode)
+
+    def _kernels(self, layer: nn.Module) -> dict:
+        """Every kernel of the split projection, as calls."""
+        n, k = layer.weight.shape
+        out_dtype = _out_dtype(layer)
+        split = self._split(layer)
+        shards, blocked, decode = split["shards"], split["blocked"], split["decode"]
+        if self.parts == 2:
+            gemm = prepare.call(
+                bf16_gemm_two,
+                n // 2,
+                k,
+                out_dtype=out_dtype,
+                shards=shards,
+                blocked=blocked,
+            )
+        else:
+            gemm = prepare.call(
+                bf16_gemm, n, k, out_dtype=out_dtype, shards=shards, blocked=blocked
+            )
         # Decode rows: one launch per call (the last CTA of a tile adds the shards).
-        layer.tilelang_splitk = {
-            block_M: bf16_gemm_splitk(
+        splitk = {
+            block_M: prepare.call(
+                bf16_gemm_splitk,
                 n,
                 k,
                 shards,
@@ -442,24 +573,33 @@ class TileLangSplitLinearMethod(UnquantizedLinearMethod):
             )
             for block_M in PARTIAL_ROW_TILES
         }
-        # One zeroed counter per tile of the narrowest decode tile; every call
-        # leaves them zeroed.
-        block_N = min(config.get("block_N", 64) for config in (*decode.values(), {}))
-        layer.tilelang_counters = torch.zeros(
-            (-(-SPLIT_DECODE_ROWS // PARTIAL_ROW_TILES[0])) * (-(-n // block_N)),
-            dtype=torch.int32,
-            device=layer.weight.device,
-        )
-        if self.parts == 2:
-            layer.tilelang_gemm = bf16_gemm_two(
-                n // 2, k, out_dtype=out_dtype, shards=shards, blocked=blocked
-            )
-        else:
-            layer.tilelang_gemm = bf16_gemm(
-                n, k, out_dtype=out_dtype, shards=shards, blocked=blocked
-            )
+        return {"gemm": gemm, "splitk": splitk}
+
+    def declare_layer_kernels(self, layer: nn.Module) -> None:
+        n, k = layer.weight.shape
+        if n % self.parts:
+            raise ValueError(f"{n} rows do not split into {self.parts} parts")
+        layer.tilelang_parts = self.parts
+        layer.tilelang_shards = self._split(layer)["shards"]
         layer.tilelang_key = id(layer)
         _LAYERS[layer.tilelang_key] = layer
+
+        def bind() -> None:
+            for name, kernel in _launch(self._kernels(layer)).items():
+                setattr(layer, f"tilelang_{name}", kernel)
+            # One zeroed counter per tile of the narrowest decode tile; every
+            # call leaves them zeroed.
+            decode = self._split(layer)["decode"]
+            block_N = min(
+                config.get("block_N", 64) for config in (*decode.values(), {})
+            )
+            layer.tilelang_counters = torch.zeros(
+                (-(-SPLIT_DECODE_ROWS // PARTIAL_ROW_TILES[0])) * (-(-n // block_N)),
+                dtype=torch.int32,
+                device=layer.weight.device,
+            )
+
+        prepare.declare(lambda: _calls(self._kernels(layer)), bind=bind)
 
     def get_workspace_size(self, layer, num_tokens: int) -> int:
         rows = min(num_tokens, SPLIT_DECODE_ROWS)
