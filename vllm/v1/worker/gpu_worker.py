@@ -652,7 +652,13 @@ class Worker(WorkerBase):
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
-        """Profile model memory through the ordinary vLLM admission path."""
+        """Profile model memory through the ordinary vLLM admission path; a
+        one-shot collective that stops the GPU while profiling is named as the
+        error's cause, as in a serving step."""
+        with _collective_cause(self._roce_failure):
+            return self._determine_available_memory()
+
+    def _determine_available_memory(self) -> int:
         maybe_apply_startup_plan(self)
         # Loading compiled each rank's kernels for as long as its cache needed.
         self._startup_rendezvous("memory profiling")
@@ -959,7 +965,10 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
-        with set_current_vllm_config(self.vllm_config):
+        with (
+            set_current_vllm_config(self.vllm_config),
+            _collective_cause(self._roce_failure),
+        ):
             return self._compile_or_warm_up_model_after_preparation()
 
     def _compile_or_warm_up_model_after_preparation(self) -> CompilationTimes:

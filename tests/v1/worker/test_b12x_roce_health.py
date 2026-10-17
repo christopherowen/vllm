@@ -8,6 +8,7 @@ completion: immediately for a synchronous output (or ``None``), and only after
 ``get_output()`` for an asynchronous output.
 """
 
+import contextlib
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -139,3 +140,24 @@ def test_errors_without_a_stopped_collective_pass_unchanged(monkeypatch):
     ):
         raise error
     assert raised.value is error
+
+
+def test_profiling_and_warm_up_name_a_stopped_collective(monkeypatch):
+    """Memory profiling and warm-up run the model outside execute_model; a
+    collective that stops the GPU there is named as the cause too."""
+    worker = _worker_with_failure(monkeypatch, REPORT)
+
+    def stopped(*args, **kwargs):
+        raise RuntimeError("CUDA error: unspecified launch failure")
+
+    monkeypatch.setattr(Worker, "_determine_available_memory", stopped)
+    with pytest.raises(RuntimeError, match="saw nothing from rank 2") as raised:
+        worker.determine_available_memory()
+    assert "unspecified launch failure" in str(raised.value.__cause__)
+    monkeypatch.setattr(Worker, "_compile_or_warm_up_model_after_preparation", stopped)
+    monkeypatch.setattr(
+        gpu_worker_module, "set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    worker.vllm_config = None
+    with pytest.raises(RuntimeError, match="saw nothing from rank 2"):
+        worker.compile_or_warm_up_model()
