@@ -887,6 +887,10 @@ def _topk_topp_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
     split_enabled = current_platform.is_cuda_alike()
     mode: Any = WarmupChoices((True, False), (True, True), (False, True))
     logits_stride: Any = WarmupChoices(16, 2)
+    # Logits rows are the vocab-parallel head's padded rows (a multiple of 64) or a
+    # contiguous copy (the vocab size): unaligned only for a vocab size that is
+    # not a multiple of 16, so only then is the unaligned variant reachable.
+    _when(logits_stride == 16 or vocab_size % 16 != 0)
     batch_size: Any = WarmupIntRange(1, _max_sampler_batch_size(vllm_config) + 1)
     topk_enabled = mode[0]
     topp_enabled = mode[1]
@@ -1047,6 +1051,10 @@ def _topp_split_stats_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
     vocab_size = vllm_config.model_config.get_vocab_size()
     num_sm = num_compute_units()
     logits_stride: Any = WarmupChoices(16, 2)
+    # Logits rows are the vocab-parallel head's padded rows (a multiple of 64) or a
+    # contiguous copy (the vocab size): unaligned only for a vocab size that is
+    # not a multiple of 16, so only then is the unaligned variant reachable.
+    _when(logits_stride == 16 or vocab_size % 16 != 0)
     batch_size: Any = WarmupIntRange(
         1, min(_max_sampler_batch_size(vllm_config), _SPLIT_MAX_BATCH) + 1
     )
@@ -1336,6 +1344,10 @@ def _topp_split_step_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
     vocab_size = vllm_config.model_config.get_vocab_size()
     num_sm = num_compute_units()
     logits_stride: Any = WarmupChoices(16, 2)
+    # Logits rows are the vocab-parallel head's padded rows (a multiple of 64) or a
+    # contiguous copy (the vocab size): unaligned only for a vocab size that is
+    # not a multiple of 16, so only then is the unaligned variant reachable.
+    _when(logits_stride == 16 or vocab_size % 16 != 0)
     batch_size: Any = WarmupIntRange(
         1, min(_max_sampler_batch_size(vllm_config), _SPLIT_MAX_BATCH) + 1
     )
@@ -1518,6 +1530,10 @@ def _topp_split_mask_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
     vocab_size = vllm_config.model_config.get_vocab_size()
     num_sm = num_compute_units()
     logits_stride: Any = WarmupChoices(16, 2)
+    # Logits rows are the vocab-parallel head's padded rows (a multiple of 64) or a
+    # contiguous copy (the vocab size): unaligned only for a vocab size that is
+    # not a multiple of 16, so only then is the unaligned variant reachable.
+    _when(logits_stride == 16 or vocab_size % 16 != 0)
     batch_size: Any = WarmupIntRange(
         1, min(_max_sampler_batch_size(vllm_config), _SPLIT_MAX_BATCH) + 1
     )
