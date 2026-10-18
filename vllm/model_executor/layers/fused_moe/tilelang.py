@@ -190,19 +190,22 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
             out_dtype=self.output_dtype,
         )
         # Tile-major copies replace the checkpoint layout, so each GEMM tile's
-        # weights and scales are contiguous. A K that ends 64 past a multiple
+        # weights and scale codes are contiguous. A K that ends 64 past a multiple
         # of 128 (TP4's 576-wide rows) keeps its last 64 columns as compact tails.
-        (t13, tail13, words13), (t2, tail2, words2) = self._plan.prepare_weights(
-            w13, layer.w13_weight_scale, w2, layer.w2_weight_scale
+        (t13, tail13, codes13, base13), (t2, tail2, codes2, base2) = (
+            self._plan.prepare_weights(
+                w13, layer.w13_weight_scale, w2, layer.w2_weight_scale
+            )
         )
         for name, tensor in (
             ("w13_weight", t13),
-            ("w13_weight_scale", words13),
+            ("w13_weight_scale", codes13),
             ("w2_weight", t2),
-            ("w2_weight_scale", words2),
+            ("w2_weight_scale", codes2),
         ):
             replace_parameter(layer, name, tensor)
         self._tails = (tail13, tail2)
+        self._bases = (base13, base2)
         self.quant_config._w1.scale = layer.w13_weight_scale
         self.quant_config._w2.scale = layer.w2_weight_scale
 
@@ -275,7 +278,11 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
         if not topk_ids.is_contiguous():
             raise TypeError("TileLang MoE topk_ids must be contiguous")
         tail13, tail2 = self._tails
-        weights = ((w1, tail13, self.w1_scale), (w2, tail2, self.w2_scale))
+        base13, base2 = self._bases
+        weights = (
+            (w1, tail13, self.w1_scale, base13),
+            (w2, tail2, self.w2_scale, base2),
+        )
         workspace = workspace2.view(-1).view(torch.uint8)
         shared = None
         if self.fold_shared:
