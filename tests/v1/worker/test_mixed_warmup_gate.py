@@ -34,11 +34,14 @@ def test_mixed_warmup_skipped_for_single_seq(max_num_reqs):
 @pytest.mark.parametrize("fail_warmup", [False, True])
 def test_kernel_warmup_restores_uncalibrated_adaptive_manager(monkeypatch, fail_warmup):
     """Startup must warm fixed drafts before calibration and retain its manager."""
-    manager = SimpleNamespace(cost_tables=None)
+    manager = SimpleNamespace(row_cost=0.02)
     rejection_sampler = SimpleNamespace(enable_adaptive_verification=True)
     runner = SimpleNamespace(
         adaptive_verification=manager,
         rejection_sampler=rejection_sampler,
+        # A sharded runner skips the dead-row kernel warmup, which needs a real
+        # runner's buffers; this test is about restoring the adaptive manager.
+        batch_sharder=object(),
     )
 
     def run_steps(model_runner, execute, sample):
@@ -54,5 +57,5 @@ def test_kernel_warmup_restores_uncalibrated_adaptive_manager(monkeypatch, fail_
     else:
         warmup.warmup_kernels(runner, _fail, _fail)
     assert runner.adaptive_verification is manager
-    assert manager.cost_tables is None
+    assert manager.row_cost == 0.02
     assert rejection_sampler.enable_adaptive_verification

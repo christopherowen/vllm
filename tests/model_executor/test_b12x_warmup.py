@@ -964,7 +964,7 @@ def test_parallel_draft_counts_reach_owners_and_collectives(monkeypatch, query_l
 
 def test_workload_prepares_every_adaptive_verification_profile_shape():
     from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
-        AdaptiveVerificationManager,
+        preparation_tail_sizes,
     )
 
     capture_sizes = (1, 2, 4, 8, 16, 24, 32, 48, 64)
@@ -973,11 +973,8 @@ def test_workload_prepares_every_adaptive_verification_profile_shape():
     )
     worker.scheduler_config.max_num_batched_tokens = 4096
     worker.vllm_config.speculative_config.enable_adaptive_verification = True
-    manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
-    manager.req_states = SimpleNamespace(max_num_batched_tokens=4096)
-    profiled = {
-        batch["num_tokens"] for batch in manager.batches_to_profile(list(capture_sizes))
-    }
+    # Startup runs the captured sizes and, once each, the eager tail past them.
+    profiled = {*capture_sizes, *preparation_tail_sizes(capture_sizes, 4096)}
     tail = {96, 128, 256, 512, 1024, 2048, 4096}
     assert profiled == {*capture_sizes, *tail}
     for stage in ("weights", "state"):

@@ -558,11 +558,13 @@ class SpeculativeConfig:
     """Whether to adaptively size the draft-verification budget from per-request
     confidence. Currently only supported for method="dspark"."""
 
-    adaptive_verification_cost_scale: float = Field(default=1.0, gt=0.0)
-    """Scale the incremental target-verification cost used by DSpark adaptive
-    verification. Values above 1.0 trim more aggressively; values below 1.0
-    retain more drafts. The unavoidable zero-draft verification cost is not
-    scaled."""
+    adaptive_verification_row_cost: float = Field(default=0.02, gt=0.0, lt=1.0)
+    """DSpark adaptive verification sizes each step's draft budget to maximise
+    expected tokens (sampling requests plus the admitted drafts' survival
+    probabilities) per unit of step cost, the cost being ``1 + row_cost * rows``:
+    this is one verification row's cost as a fraction of a step's fixed cost.
+    A recipe constant, so the draft schedule is a rule of the inputs, the same
+    on every build and boot, with no measured costs."""
 
     @staticmethod
     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
@@ -1720,11 +1722,11 @@ class SpeculativeConfig:
                 "materializes. Disable one of them."
             )
 
-        if self.adaptive_verification_cost_scale != 1.0 and (
+        if self.adaptive_verification_row_cost != 0.02 and (
             self.method != "dspark" or not self.enable_adaptive_verification
         ):
             raise ValueError(
-                "adaptive_verification_cost_scale requires DSpark adaptive verification"
+                "adaptive_verification_row_cost requires DSpark adaptive verification"
             )
 
         if (

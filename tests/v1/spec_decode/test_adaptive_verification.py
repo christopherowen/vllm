@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections import Counter
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+from pydantic import ValidationError
 
+from vllm.config import SpeculativeConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.attention.backend import AttentionCGSupport
-from vllm.v1.worker.gpu.async_utils import StepTimingSample
 from vllm.v1.worker.gpu.attn_utils import AttentionCGSupportInfo
 from vllm.v1.worker.gpu.spec_decode import adaptive_verification as adaptive_module
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
@@ -23,7 +23,7 @@ from vllm.v1.worker.gpu.structured_outputs import _build_grammar_mapping
 
 
 def make_manager(
-    confidences: np.ndarray, verify_cost_ms: np.ndarray
+    confidences: np.ndarray, row_cost: float = 0.02
 ) -> AdaptiveVerificationManager:
     num_reqs, num_steps = confidences.shape
     manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
@@ -35,10 +35,9 @@ def make_manager(
         num_computed_tokens_np=np.ones(num_reqs, dtype=np.int32),
         prefill_len=SimpleNamespace(np=np.ones(num_reqs, dtype=np.int32)),
     )
-    manager.cost_tables = (np.zeros(num_reqs + 1), verify_cost_ms)
     manager._max_total_logits = 1 << 30
     manager.num_bonus_tokens = 1
-    manager.cost_scale = 1.0
+    manager.row_cost = row_cost
     return manager
 
 
@@ -66,10 +65,11 @@ def test_resolve_adaptive_cudagraph_mode(mode, piecewise_capture_available, expe
 def test_confidence_snapshot_agrees_before_cpu_and_gpu_budgeting(
     monkeypatch, world_size, expected_budget
 ):
-    # One FP32 ULP across a utility threshold changes the graph's token count.
+    # One FP32 ULP across the budget's decision changes the graph's token count:
+    # at row cost 1 one draft pays exactly when its survival exceeds 0.5.
     local = torch.tensor([[np.nextafter(np.float32(0.5), np.float32(0.0))]])
     leader = torch.tensor([[np.nextafter(np.float32(0.5), np.float32(1.0))]])
-    manager = make_manager(local.numpy().copy(), np.array([1.0, 1.0, 1.5]))
+    manager = make_manager(local.numpy().copy(), row_cost=1.0)
     manager.req_states.device = torch.device("cpu")
     manager._confidence_probs = torch.empty_like(local)
     manager._pending_resets = []
@@ -238,193 +238,12 @@ def test_glm53_adaptive_manager_accepts_real_target_backends(monkeypatch):
     assert not B12xMLASparseBackend.supports_device_cpu_query_lens_mismatch()
 
 
-def test_budget_stops_where_marginal_drafts_stop_paying_for_themselves():
-    # Verification is cheap up to two extra tokens, then jumps 100x; only the
-    # highest-confidence draft is worth the cheap slot.
-    manager = make_manager(
-        np.array([[0.1, 0.1], [0.9, 0.9]], dtype=np.float32),
-        np.array([1.0, 1.0, 1.0, 1.0, 100.0, 100.0, 100.0]),
-    )
-
-    manager.get_num_tokens(
-        {"low": 3, "high": 3},
-        {"low": [1, 2], "high": [3, 4]},
-    )
-    valid_drafts, num_non_draft_tokens, draft_budget = manager._batch_budget
-
-    assert draft_budget == 1
-    assert valid_drafts == {"low": 2, "high": 2}
-    assert num_non_draft_tokens == {"low": 1, "high": 1}
-
-
-def test_cost_scale_controls_incremental_verification_cost():
-    manager = make_manager(
-        np.array([[0.9, 0.9]], dtype=np.float32),
-        np.array([1.0, 1.0, 1.5, 2.0]),
-    )
-
-    assert manager.get_num_tokens({"low": 3}, {"low": [1, 2]}) == 3
-
-    manager.cost_scale = 3.0
-    assert manager.get_num_tokens({"low": 3}, {"low": [1, 2]}) == 1
-
-
-def test_profiled_batches_seed_cost_curves_via_consumer():
-    manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
-    manager.req_states = SimpleNamespace(max_num_batched_tokens=4096, max_num_reqs=64)
-    manager.num_speculative_steps = 7
-    manager.num_bonus_tokens = 1
-    curves: dict[str, object] = {}
-    manager.set_cost_curves = lambda draft, verify, *, verify_curves_by_num_reqs=None: (
-        curves.update(
-            draft=draft,
-            verify=verify,
-            verify_by_reqs=verify_curves_by_num_reqs,
-        )
-    )
-
-    timings = [
-        StepTimingSample(
-            forward_ms=float(batch["num_tokens"]),
-            drafter_ms=1.0,
-            num_target_tokens=batch["num_tokens"],
-            num_reqs=batch["num_tokens"] // 8,
-            # Only the captured sizes replay a graph; the tail sizes run eager.
-            full_cudagraph=batch["num_tokens"] <= 1024,
-        )
-        for batch in manager.batches_to_profile([8, 1024])
-    ]
-    manager.set_initial_cost_curves(timings)
-
-    # Tail beyond the last capture size: 1.5x then doubling to the max.
-    assert curves["verify"] == [
-        (8, 8.0),
-        (1024, 1024.0),
-        (1536, 1536.0),
-        (2048, 2048.0),
-        (4096, 4096.0),
-    ]
-    # Eager batches must not contribute to the draft curve: keyed by request
-    # count they would land inside the captured range and, once made monotonic,
-    # smear that eager cost across every larger request count.
-    assert curves["draft"] == [(1, 1.0), (128, 1.0)]
-    assert curves["verify_by_reqs"] == {1: [(8, 8.0)], 128: [(1024, 1024.0)]}
-
-
-def test_budget_uses_request_specific_full_graph_costs():
-    manager = make_manager(
-        np.array([[0.9, 0.9]], dtype=np.float32),
-        np.array([1.0, 1.0, 100.0, 100.0]),
-    )
-    manager.verify_cost_tables_by_num_reqs = {1: np.ones(4)}
-
-    assert manager.get_num_tokens({"low": 3}, {"low": [1, 2]}) == 3
-    assert manager._batch_budget is not None
-    assert manager._batch_budget[2] == 2
-
-
-def test_profile_costs_excludes_each_shapes_cold_run(monkeypatch):
-    """One-time preparation must not inflate the adaptive verifier's costs."""
-    # Measure, rather than load pinned curves from a deployment's cost directory.
-    monkeypatch.setattr(adaptive_module, "_COST_DIR", None)
-    manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
-    manager.req_states = SimpleNamespace(max_num_batched_tokens=16)
-    curves: dict[str, object] = {}
-    manager.set_cost_curves = lambda draft, verify, **kwargs: curves.update(
-        draft=draft, verify=verify, **kwargs
-    )
-    seen: Counter[tuple[int, int]] = Counter()
-    measured_shapes = []
-
-    class TimingCollector:
-        def __init__(self):
-            self.samples = None
-
-        @contextmanager
-        def collect(self):
-            self.samples = []
-            try:
-                yield self.samples
-            finally:
-                self.samples = None
-
-    timing = TimingCollector()
-
-    def run_dummy(num_tokens, context_len, profile_num_reqs=2):
-        shape = (num_tokens, profile_num_reqs)
-        cost = 1000.0 if not seen[shape] else float(num_tokens + profile_num_reqs)
-        seen[shape] += 1
-        if timing.samples is not None:
-            measured_shapes.append(shape)
-            timing.samples.append(
-                StepTimingSample(
-                    cost, cost, num_tokens, profile_num_reqs, num_tokens <= 8
-                )
-            )
-
-    manager.profile_costs(
-        run_dummy, timing, [1, 2, 8], [(1, 1), (2, 1), (8, 1), (8, 2)]
-    )
-
-    assert curves["verify_curves_by_num_reqs"] == {
-        1: [(1, 2.0), (2, 3.0), (8, 9.0)],
-        2: [(8, 10.0)],
-    }
-    assert curves["verify"] == [(1, 2.0), (2, 3.0), (8, 9.5), (12, 14.0), (16, 18.0)]
-    assert curves["draft"] == [(1, 3.0), (2, 10.0)]
-    # Every shape is sampled in each round instead of consecutive shape blocks.
-    for start in range(0, len(measured_shapes), len(seen)):
-        assert set(measured_shapes[start : start + len(seen)]) == set(seen)
-
-
-def test_sparse_full_graph_costs_follow_request_padding(monkeypatch):
-    manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
-    manager.req_states = SimpleNamespace(max_num_reqs=32, max_num_batched_tokens=512)
-    manager._cudagraph_limit = 256
-    monkeypatch.setattr(
-        adaptive_module,
-        "get_tp_group",
-        lambda: SimpleNamespace(broadcast_object=lambda value, src: value),
-    )
-    full_curves = {
-        1: [(1, 1.0), (2, 1.1), (4, 1.2), (8, 1.3)],
-        2: [(2, 2.0), (4, 2.1), (8, 2.2), (16, 2.3)],
-        4: [(4, 4.0)],
-        8: [(8, 8.0)],
-        16: [(16, 16.0)],
-        24: [(24, 24.0)],
-        32: [(32, 32.0), (64, 64.0), (128, 128.0), (256, 256.0)],
-    }
-    manager.set_cost_curves(
-        [(1, 1.0), (32, 1.0)],
-        [(8, 1.0), (256, 256.0), (384, 768.0), (512, 1024.0)],
-        verify_curves_by_num_reqs=full_curves,
-    )
-    tables = manager.verify_cost_tables_by_num_reqs
-    # A four-request graph cannot serve 32 verification rows. Its single
-    # profiled point must not make every larger padded graph cost 4 ms.
-    assert tables[4][4] == 4.0
-    assert tables[4][5] == 8.0
-    assert tables[4][32] == 32.0
-    assert tables[16][17] == 24.0
-    assert tables[24][192] == 256.0
-    # There is no exact twelve-request graph: use compatible padded shapes.
-    assert tables[12][12] == 16.0
-    assert tables[12][25] == 32.0
-    # Keep the exact C1/C2 specializations and the measured eager tail.
-    assert tables[1][8] == 1.3
-    assert tables[2][16] == 2.3
-    for table in tables.values():
-        np.testing.assert_array_equal(table[257:], manager.cost_tables[1][257:])
-
-
 def test_compact_batch_preserves_totals_and_bounds():
     # The CPU placeholder layout must keep the batch total equal to the GPU
     # total and every verification row within decode_query_len, or downstream
     # CPU metadata desyncs from the reallocated GPU boundaries.
     manager = make_manager(
         np.array([[0.9, 0.9], [0.9, 0.9], [1.0, 1.0]], dtype=np.float32),
-        np.array([1.0] * 44 + [100.0] * 3),
     )
     manager.req_states.req_id_to_index["prefill"] = 2
     manager.req_states.num_computed_tokens_np = np.zeros(3, dtype=np.int32)
@@ -449,7 +268,6 @@ def test_budget_caps_at_one_rejection_sampler_chunk():
     # layout, so the budget must keep total logits within a single chunk.
     manager = make_manager(
         np.array([[0.9, 0.9], [0.9, 0.9]], dtype=np.float32),
-        np.ones(7),
     )
     manager._max_total_logits = 3  # 2 bonus logits + at most 1 draft
     manager.get_num_tokens(
@@ -472,7 +290,6 @@ def test_zero_budget_rebuilds_cpu_cu_num_logits():
     # offsets stay uniform rather than skipping non-verification rows.
     manager = make_manager(
         np.array([[0.9, 0.9], [0.9, 0.9], [1.0, 1.0]], dtype=np.float32),
-        np.ones(64),
     )
     manager.req_states.req_id_to_index["prefill"] = 2
     manager.req_states.num_computed_tokens_np = np.zeros(3, dtype=np.int32)
@@ -510,7 +327,6 @@ def test_zero_budget_keeps_one_grammar_row_per_scheduled_draft():
     # `num_masks == len(mapping)` assert in apply_grammar_bitmask.
     manager = make_manager(
         np.array([[0.9, 0.9], [0.9, 0.9], [1.0, 1.0]], dtype=np.float32),
-        np.ones(64),
     )
     manager.req_states.req_id_to_index["prefill"] = 2
     manager.req_states.num_computed_tokens_np = np.zeros(3, dtype=np.int32)
@@ -580,13 +396,11 @@ def _run_tp_confidence_consistency(rank, port):
                 torch.zeros(3, dtype=torch.int32, device=device),
                 num_bonus_tokens=1,
                 max_total_logits=6,
+                # The third draft pays exactly when its survival exceeds 0.24.
+                row_cost=0.24 / 1.56,
             )
             manager.add_request(0)
             manager.add_request(1)
-            manager.cost_tables = (
-                np.array([0.0, 0.2, 0.2]),
-                np.array([0.0, 0.9, 1.0, 1.48, 1.48, 3.0, 3.0]),
-            )
             batch = SimpleNamespace(
                 num_reqs=1,
                 idx_mapping=torch.tensor([0], dtype=torch.int32, device=device),
@@ -611,10 +425,6 @@ def _run_tp_confidence_consistency(rank, port):
             # A shared total is insufficient: each request's GPU allocation
             # must agree too, even when local confidence rankings are reversed.
             manager._max_total_logits = 3
-            manager.cost_tables = (
-                np.array([0.0, 0.2, 0.2]),
-                np.array([0.0, 0.9, 1.0, 1.1, 3.0, 3.0, 3.0]),
-            )
             batch = SimpleNamespace(
                 num_reqs=2,
                 idx_mapping=torch.tensor([0, 1], dtype=torch.int32, device=device),
@@ -669,7 +479,6 @@ def test_budget_probes_after_steps_without_drafts():
     """
     manager = make_manager(
         np.array([[1e-9, 1e-9]], dtype=np.float32),
-        np.array([1.0, 2.0, 3.0, 4.0]),
     )
     idle = getattr(adaptive_module, "EXPLORE_AFTER_IDLE_STEPS", 32)
     budgets = []
@@ -679,118 +488,58 @@ def test_budget_probes_after_steps_without_drafts():
     assert budgets == ([0] * (idle - 1) + [1]) * 2
 
 
-def _pinning_manager() -> AdaptiveVerificationManager:
+def test_budget_admits_the_drafts_that_pay_for_their_rows():
+    # Survival is the running product of a request's confidences: low 0.1, 0.01;
+    # high 0.9, 0.81. Two sampling requests, two non-draft rows; at row cost 0.2
+    # expected tokens per unit cost peak with the high request's two drafts.
+    manager = make_manager(
+        np.array([[0.1, 0.1], [0.9, 0.9]], dtype=np.float32), row_cost=0.2
+    )
+
+    manager.get_num_tokens(
+        {"low": 3, "high": 3},
+        {"low": [1, 2], "high": [3, 4]},
+    )
+    valid_drafts, num_non_draft_tokens, draft_budget = manager._batch_budget
+
+    assert draft_budget == 2
+    assert valid_drafts == {"low": 2, "high": 2}
+    assert num_non_draft_tokens == {"low": 1, "high": 1}
+
+
+@pytest.mark.parametrize(("row_cost", "budget"), [(0.02, 2), (5.0, 1), (20.0, 0)])
+def test_row_cost_alone_sets_the_budget(row_cost, budget):
+    manager = make_manager(np.array([[0.9, 0.9]], dtype=np.float32), row_cost)
+    tokens = manager.get_num_tokens({"low": 3}, {"low": [1, 2]})
+    assert manager._batch_budget[2] == budget
+    assert tokens == 1 + budget
+
+
+@pytest.mark.parametrize("row_cost", [0.0, -0.5, 1.0, 1.5])
+def test_adaptive_verification_row_cost_is_a_fraction(row_cost):
+    with pytest.raises(ValidationError):
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=1,
+            adaptive_verification_row_cost=row_cost,
+        )
+
+
+def test_adaptive_verification_row_cost_requires_adaptive_dspark():
+    with pytest.raises(
+        ValueError,
+        match="requires DSpark adaptive verification",
+    ):
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=1,
+            adaptive_verification_row_cost=0.03,
+        )
+
+
+def test_warm_tail_shapes_runs_each_eager_size_once_untimed():
     manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
-    manager.num_speculative_steps = 3
-    manager.req_states = SimpleNamespace(max_num_reqs=8, max_num_batched_tokens=64)
-    manager.curves = {}
-    manager.set_cost_curves = lambda draft, verify, **kwargs: manager.curves.update(
-        draft=draft, verify=verify, **kwargs
-    )
-    return manager
-
-
-def _tp_group(rank: int, answer=lambda value: value):
-    return SimpleNamespace(
-        rank_in_group=rank,
-        world_size=3,
-        broadcast_object=lambda value, src: answer(value),
-    )
-
-
-_CAPTURE_SIZES = [1, 2, 8]
-_FULL_SHAPES = [(1, 1), (2, 1), (8, 1), (8, 2)]
-
-
-def _profile(manager: AdaptiveVerificationManager, cost: float = 1.0):
-    """profile_costs on fake dummy runs; returns (shape, timed) per run."""
+    manager.req_states = SimpleNamespace(max_num_batched_tokens=1024)
     runs = []
-
-    class TimingCollector:
-        samples = None
-
-        @contextmanager
-        def collect(self):
-            self.samples = []
-            try:
-                yield self.samples
-            finally:
-                self.samples = None
-
-    timing = TimingCollector()
-
-    def run_dummy(num_tokens, context_len, profile_num_reqs=None):
-        runs.append(((num_tokens, profile_num_reqs), timing.samples is not None))
-        if timing.samples is not None:
-            num_reqs = profile_num_reqs or min(num_tokens, 8)
-            timing.samples.append(
-                StepTimingSample(
-                    cost * num_tokens,
-                    cost,
-                    num_tokens,
-                    num_reqs,
-                    full_cudagraph=profile_num_reqs is not None,
-                )
-            )
-
-    manager.profile_costs(run_dummy, timing, _CAPTURE_SIZES, _FULL_SHAPES)
-    return runs
-
-
-def test_pinned_cost_curves_skip_the_profile(monkeypatch, tmp_path):
-    monkeypatch.setattr(adaptive_module, "_COST_DIR", str(tmp_path))
-    monkeypatch.setattr(adaptive_module, "get_tp_group", lambda: _tp_group(0))
-    first = _pinning_manager()
-    runs = _profile(first)
-    assert any(timed for _, timed in runs)
-    assert len(list(tmp_path.glob("dspark-costs-*.json"))) == 1
-
-    # A later boot with the same shapes reads the first profile and times
-    # nothing; only the shapes past the capture limit run, once.
-    second = _pinning_manager()
-    runs = _profile(second, cost=9.0)
-    assert runs == [((n, None), False) for n in (12, 16, 32, 64)]
-    assert second.curves == first.curves
-
-    # Other shapes get their own profile and file.
-    third = _pinning_manager()
-    third.req_states.max_num_batched_tokens = 128
-    assert any(timed for _, timed in _profile(third))
-    assert len(list(tmp_path.glob("dspark-costs-*.json"))) == 2
-
-
-def test_pin_key_names_the_profiled_shapes(monkeypatch, tmp_path):
-    """The key computed before profiling is the one the curves imply, so
-    tables pinned from a profile keep matching."""
-    monkeypatch.setattr(adaptive_module, "_COST_DIR", str(tmp_path))
-    monkeypatch.setattr(adaptive_module, "get_tp_group", lambda: _tp_group(0))
-    manager = _pinning_manager()
-    _profile(manager)
-    key = manager._pin_key(_CAPTURE_SIZES, _FULL_SHAPES)
-    curves = manager.curves
-    assert key["draft_sizes"] == [x for x, _ in curves["draft"]]
-    assert key["verify_sizes"] == [x for x, _ in curves["verify"]]
-    assert key["full_shapes"] == {
-        str(n): [x for x, _ in curve]
-        for n, curve in sorted(curves["verify_curves_by_num_reqs"].items())
-    }
-
-
-def test_pinned_cost_curves_only_from_rank_zero(monkeypatch, tmp_path):
-    monkeypatch.setattr(adaptive_module, "_COST_DIR", str(tmp_path))
-    # Without rank 0's curves, rank 1 profiles but never writes.
-    monkeypatch.setattr(
-        adaptive_module, "get_tp_group", lambda: _tp_group(1, lambda value: None)
-    )
-    assert any(timed for _, timed in _profile(_pinning_manager()))
-    assert not list(tmp_path.iterdir())
-
-    # With them, it skips the profile like rank 0, whatever it holds itself.
-    pinned = ([[1, 2.0]], [[4, 40.0]], {"1": [[4, 40.0]]})
-    monkeypatch.setattr(
-        adaptive_module, "get_tp_group", lambda: _tp_group(1, lambda value: pinned)
-    )
-    manager = _pinning_manager()
-    assert not any(timed for _, timed in _profile(manager))
-    assert manager.curves["draft"] == [(1, 2.0)]
-    assert manager.curves["verify_curves_by_num_reqs"] == {1: [(4, 40.0)]}
+    manager.warm_tail_shapes(lambda **kwargs: runs.append(kwargs), [1, 2, 8])
+    assert runs == [{"num_tokens": n} for n in (12, 16, 32, 64, 128, 256, 512, 1024)]

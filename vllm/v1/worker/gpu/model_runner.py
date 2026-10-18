@@ -753,10 +753,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_bonus_tokens=self.model_state.num_new_sampled_tokens_per_step,
             max_total_logits=get_max_chunk_logits(self.vocab_size),
             vllm_config=self.vllm_config,
-            adaptive_verification_cost_scale=(
-                self.speculative_config.adaptive_verification_cost_scale
+            adaptive_verification_row_cost=(
+                self.speculative_config.adaptive_verification_row_cost
                 if self.speculative_config is not None
-                else 1.0
+                else 0.02
             ),
             target_layer_names=target_attn_layer_names,
             additional_attn_cg_support=additional_attn_cg_support,
@@ -1396,11 +1396,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         with use_workspace_lane(self._draft_workspace_lane):
                             self.speculator.capture()
                     if self.adaptive_verification is not None:
-                        self.adaptive_verification.profile_costs(
+                        self.adaptive_verification.warm_tail_shapes(
                             self._dummy_run,
-                            self.step_timing,
                             self.cudagraph_manager.captured_token_counts(),
-                            self.cudagraph_manager.captured_full_batch_shapes(),
                         )
                         self.adaptive_verification.load_draft_budget_kernels()
                     self.kv_connector.reset_capture_state()
