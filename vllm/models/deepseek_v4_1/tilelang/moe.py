@@ -586,6 +586,7 @@ def grouped_fp8_fp4_gemm(
     num_stages: int = 3,
     threads: int = 128,
     out_dtype: T.dtype = T.bfloat16,
+    coded_scales: bool = False,
 ):
     """``C[r] = (A[row(r)] * SFA) @ (B[e] * SFB[e])^T``, ``e`` the expert of row ``r``.
 
@@ -602,6 +603,13 @@ def grouped_fp8_fp4_gemm(
     and the scale words by ``cp.async``. The tail block multiplies only its 64
     columns, so no operand or scale is padded (TP4's 576-wide expert rows are
     four tiles and a tail).
+
+    With ``coded_scales`` the weights' scales come from ``pack_scale_codes`` in
+    ``tile_codes`` layout: ``SFB`` holds each tile's ``block_N`` 4-bit-delta codes
+    per K block contiguously (one 16-byte ``cp.async`` per 8 rows) and ``SFBase``
+    each row's base exponent. Every thread expands its row's code into the scale
+    word the MMA reads, after the stage lands; the words, and so every output bit,
+    are the uncoded ones, from half the scale bytes.
     """
     block_K = FP4_TMA_K
     tail = K % block_K
@@ -625,6 +633,8 @@ def grouped_fp8_fp4_gemm(
     n_blocks = N // block_N
     b_shape = (num_experts * n_blocks * k_full, block_N, block_K)
     bt_shape = (num_experts * n_blocks, block_N, tail // 2)
+    code_chunks = block_N * 2 // 16  # 16-byte copies of one stage's codes
+    assert not coded_scales or (block_N % 8 == 0 and code_chunks <= threads)
 
     @T.macro
     def load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared, SFB_shared,
@@ -680,19 +690,30 @@ def grouped_fp8_fp4_gemm(
                     1,
                     sfa_row[c] >= 0,
                 )
-        for c in T.unroll(sfb_copies):
-            j = c * threads + tx
-            if j < block_N:
+        if coded_scales:
+            # SFB_shared is this stage's codes here; the words are expanded later.
+            if tx < code_chunks:
                 T.ptx_cp_async(
-                    T.access_ptr(SFB_shared[s, j, 0], "w", 1),
-                    T.access_ptr(SFB[expert, bx * block_N + j, ko], "r", 1),
-                    1,
+                    T.access_ptr(SFB_shared[s, tx * 8], "w", 8),
+                    T.access_ptr(
+                        SFB[(expert * n_blocks + bx) * k_blocks + ko, tx * 8], "r", 8
+                    ),
+                    8,  # elements: eight 2-byte codes, one 16-byte copy
                 )
+        else:
+            for c in T.unroll(sfb_copies):
+                j = c * threads + tx
+                if j < block_N:
+                    T.ptx_cp_async(
+                        T.access_ptr(SFB_shared[s, j, 0], "w", 1),
+                        T.access_ptr(SFB[expert, bx * block_N + j, ko], "r", 1),
+                        1,
+                    )
         T.ptx_commit_group()
         T.barrier_arrive(loaded[s])
 
     @T.macro
-    def body(A, SFA, B, BT, SFB, Order, TileExpert, C):
+    def body(A, SFA, B, BT, SFB, SFBase, Order, TileExpert, C):
         with T.Kernel(T.ceildiv(N, block_N), tiles, threads=threads) as (bx, t):
             A_shared = T.alloc_shared((stages, block_M, block_K), T.float8_e4m3fn)
             B_shared = T.alloc_shared(
@@ -700,6 +721,14 @@ def grouped_fp8_fp4_gemm(
             )
             SFA_shared = T.alloc_shared((stages, block_M, 1), T.uint32)
             SFB_shared = T.alloc_shared((stages, block_N, 1), T.uint32)
+            # The coded path's codes and per-row base words; the uncoded path
+            # allocates neither.
+            SFC_shared = (
+                T.alloc_shared((stages, block_N), T.uint16) if coded_scales else None
+            )
+            base_words = (
+                T.alloc_local((sfb_copies,), T.uint32) if coded_scales else None
+            )
             rows_shared = T.alloc_shared((block_M,), T.int32)
             a_row = T.alloc_local((a_copies,), T.int32)
             sfa_row = T.alloc_local((sfa_copies,), T.int32)
@@ -723,12 +752,20 @@ def grouped_fp8_fp4_gemm(
                 ]
             for c in T.unroll(sfa_copies):
                 sfa_row[c] = rows_shared[T.min(c * threads + tx, block_M - 1)]
+            if coded_scales:
+                for c in T.unroll(sfb_copies):
+                    j = c * threads + tx
+                    if j < block_N:
+                        base_words[c] = T.cast(
+                            SFBase[expert, bx * block_N + j], T.uint32
+                        ) * T.uint32(0x01010101)
+            sf_dest = SFC_shared if coded_scales else SFB_shared
 
             T.clear(C_local)
             for p in T.unroll(stages - 1):
                 if p < k_blocks:
                     load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
-                         SFB_shared, a_row, sfa_row, loaded, expert, bx, tx, p,
+                         sf_dest, a_row, sfa_row, loaded, expert, bx, tx, p,
                          p)  # fmt: skip
                 else:
                     T.ptx_commit_group()
@@ -738,14 +775,25 @@ def grouped_fp8_fp4_gemm(
                 nxt = ko + stages - 1
                 if nxt < k_blocks:
                     load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
-                         SFB_shared, a_row, sfa_row, loaded, expert, bx, tx, nxt,
+                         sf_dest, a_row, sfa_row, loaded, expert, bx, tx, nxt,
                          nxt % stages)  # fmt: skip
                 else:
                     T.ptx_commit_group()
                 T.ptx_wait_group(stages - 1)
                 T.barrier_wait(loaded[ko % stages], (ko // stages) % 2)
-                T.sync_threads()
                 s = ko % stages
+                if coded_scales:
+                    for c in T.unroll(sfb_copies):
+                        j = c * threads + tx
+                        if j < block_N:
+                            code = T.cast(SFC_shared[s, j], T.uint32)
+                            SFB_shared[s, j, 0] = (
+                                (code & T.uint32(0xF))
+                                | ((code >> 4) & T.uint32(0xF)) << 8
+                                | ((code >> 8) & T.uint32(0xF)) << 16
+                                | ((code >> 12) & T.uint32(0xF)) << 24
+                            ) + base_words[c]
+                T.sync_threads()
                 if ko < k_full:
                     T.mma_gemm_blockscaled(
                         A_shared[s, :, :],
@@ -776,7 +824,14 @@ def grouped_fp8_fp4_gemm(
                 if rows_shared[i] >= 0:
                     C[t * block_M + i, bx * block_N + j] = C_local[i, j]
 
-    if tail:
+    sfb_spec = (
+        T.Tensor((num_experts * n_blocks * k_blocks, block_N), T.uint16)
+        if coded_scales
+        else T.Tensor((num_experts, N, sf_words), T.uint32)
+    )
+    base_spec = T.Tensor((num_experts, N), T.uint8)
+
+    if tail and coded_scales:
 
         @T.prim_func
         def moe_grouped_fp8_fp4_gemm(
@@ -784,12 +839,43 @@ def grouped_fp8_fp4_gemm(
             SFA: T.Tensor((a_rows, sf_words), T.uint32),
             B: T.Tensor(b_shape, T.float4_e2m1fn),
             BT: T.Tensor(bt_shape, T.uint8),
-            SFB: T.Tensor((num_experts, N, sf_words), T.uint32),
+            SFB: sfb_spec,
+            SFBase: base_spec,
             Order: T.Tensor((tiles * block_M,), T.int32),
             TileExpert: T.Tensor((tiles,), T.int32),
             C: T.Tensor((tiles * block_M, N), out_dtype),
         ):
-            body(A, SFA, B, BT, SFB, Order, TileExpert, C)
+            body(A, SFA, B, BT, SFB, SFBase, Order, TileExpert, C)
+
+    elif coded_scales:
+
+        @T.prim_func
+        def moe_grouped_fp8_fp4_gemm(
+            A: T.Tensor((a_rows, K), T.float8_e4m3fn),
+            SFA: T.Tensor((a_rows, sf_words), T.uint32),
+            B: T.Tensor(b_shape, T.float4_e2m1fn),
+            SFB: sfb_spec,
+            SFBase: base_spec,
+            Order: T.Tensor((tiles * block_M,), T.int32),
+            TileExpert: T.Tensor((tiles,), T.int32),
+            C: T.Tensor((tiles * block_M, N), out_dtype),
+        ):
+            body(A, SFA, B, None, SFB, SFBase, Order, TileExpert, C)
+
+    elif tail:
+
+        @T.prim_func
+        def moe_grouped_fp8_fp4_gemm(
+            A: T.Tensor((a_rows, K), T.float8_e4m3fn),
+            SFA: T.Tensor((a_rows, sf_words), T.uint32),
+            B: T.Tensor(b_shape, T.float4_e2m1fn),
+            BT: T.Tensor(bt_shape, T.uint8),
+            SFB: sfb_spec,
+            Order: T.Tensor((tiles * block_M,), T.int32),
+            TileExpert: T.Tensor((tiles,), T.int32),
+            C: T.Tensor((tiles * block_M, N), out_dtype),
+        ):
+            body(A, SFA, B, BT, SFB, None, Order, TileExpert, C)
 
     else:
 
@@ -798,12 +884,12 @@ def grouped_fp8_fp4_gemm(
             A: T.Tensor((a_rows, K), T.float8_e4m3fn),
             SFA: T.Tensor((a_rows, sf_words), T.uint32),
             B: T.Tensor(b_shape, T.float4_e2m1fn),
-            SFB: T.Tensor((num_experts, N, sf_words), T.uint32),
+            SFB: sfb_spec,
             Order: T.Tensor((tiles * block_M,), T.int32),
             TileExpert: T.Tensor((tiles,), T.int32),
             C: T.Tensor((tiles * block_M, N), out_dtype),
         ):
-            body(A, SFA, B, None, SFB, Order, TileExpert, C)
+            body(A, SFA, B, None, SFB, None, Order, TileExpert, C)
 
     return moe_grouped_fp8_fp4_gemm
 
@@ -1006,6 +1092,21 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
                             Out[row, col + j] = stored[j]
 
     return moe_swiglu_cast_kernel
+
+
+def tile_codes(codes: torch.Tensor, block_N: int) -> torch.Tensor:
+    """``pack_scale_codes``' ``[E, N, words]`` codes in the coded GEMM's layout:
+    ``[E * N / block_N * words, block_N]``, each tile's codes for one K block
+    contiguous, so a stage loads them in 16-byte copies."""
+    E, N, words = codes.shape
+    return (
+        codes.view(torch.int16)
+        .view(E, N // block_N, block_N, words)
+        .permute(0, 1, 3, 2)
+        .reshape(-1, block_N)
+        .contiguous()
+        .view(torch.uint16)
+    )
 
 
 def _spans(specs):

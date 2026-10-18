@@ -21,12 +21,20 @@ from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
     assert_rows_nan,
 )
 from vllm.models.deepseek_v4_1.tilelang import prepare  # noqa: E402
+from vllm.models.deepseek_v4_1.tilelang.gemm import (  # noqa: E402
+    expand_scale_codes,
+    pack_scale_codes,
+    pack_scale_words,
+)
 from vllm.models.deepseek_v4_1.tilelang.linear import _calls  # noqa: E402
 from vllm.models.deepseek_v4_1.tilelang.moe import (  # noqa: E402
     MoeDispatchV41Plan,
     MoeExpertsV41Plan,
     carve,
+    grouped_fp8_fp4_gemm,
     moe_swiglu_cast,
+    tile_codes,
+    tile_expert_weights,
     workspace_bytes,
 )
 
@@ -446,3 +454,74 @@ def test_moe_swiglu_cast_equals_tile_kernels(
         assert torch.equal(a_sf[live, :cols], b_sf[live, :cols]), case
         if case == "nan":
             assert a[first].float().isnan().any()
+
+
+@pytest.mark.parametrize("k", [5120, 576, 768, 256])
+def test_scale_codes_are_the_words_exactly(k):
+    """A row base and 4-bit deltas give back every scale word byte for byte (padding
+    bytes aside), at the experts' K widths; a row spanning 17 exponents is refused."""
+    gen = _gen(21)
+    base = torch.randint(100, 130, (8, 64, 1), generator=gen, device=DEVICE)
+    deltas = torch.randint(0, 16, (8, 64, k // 32), generator=gen, device=DEVICE)
+    exps = (base + deltas).to(torch.uint8)
+    codes, row_base = pack_scale_codes(exps)
+    words = pack_scale_words(exps)
+    got = expand_scale_codes(codes, row_base)
+    n = k // 32
+    assert torch.equal(
+        got.view(torch.uint8).view(8, 64, -1)[..., :n],
+        words.view(torch.uint8).view(8, 64, -1)[..., :n],
+    )
+    exps[0, 0, 0] = exps[0, 0, 1] + 16
+    with pytest.raises(ValueError):
+        pack_scale_codes(exps)
+
+
+@pytest.mark.parametrize("n, k, gather", [(512, 512, True), (384, 576, False)])
+@pytest.mark.parametrize("rows", [1, 12, 300])
+def test_coded_scales_give_the_uncoded_gemm_bits(rows, n, k, gather):
+    """The grouped GEMM with coded weight scales writes the uncoded GEMM's bits."""
+    experts, topk, block_N = 32, 6, 128
+    gen = _gen(22)
+    packed = torch.randint(
+        0, 256, (experts, n, k // 2), generator=gen, device=DEVICE, dtype=torch.uint8
+    )
+    base = torch.randint(110, 126, (experts, n, 1), generator=gen, device=DEVICE)
+    exps = (
+        base + torch.randint(0, 8, (experts, n, k // 32), generator=gen, device=DEVICE)
+    ).to(torch.uint8)
+    tiles, tails = tile_expert_weights(packed.view(torch.int8), block_N)
+    codes, row_base = pack_scale_codes(exps)
+    dispatch = MoeDispatchV41Plan(experts, topk, 32, k, torch.int32, torch.bfloat16)
+    prepare.declare(lambda: _calls(dispatch.kernels()), bind=dispatch.bind)
+    ids, weights = _routes(rows, experts, topk, 23, torch.int32)
+    specs = dispatch.workspace_specs(rows)
+    layout = dispatch.dispatch(
+        ids,
+        weights,
+        carve(
+            torch.empty(workspace_bytes(specs), dtype=torch.uint8, device=DEVICE), specs
+        ),
+    )
+    order, tile_expert = layout["order"], layout["tile_expert"]
+    a_rows = rows if gather else order.shape[0]
+    x = (torch.randn((a_rows, k), generator=gen, device=DEVICE) * 0.5).bfloat16()
+    xq, sf = tile_kernels.quant.per_token_cast(
+        x, "e4m3", 32, round_sf=True, use_packed_ue8m0=True
+    )
+    x_words = sf.contiguous().view(torch.uint32)
+    extra = (tails,) if tails is not None else ()
+    plain = grouped_fp8_fp4_gemm(experts, n, k, topk, gather, 32, block_N)
+    coded = grouped_fp8_fp4_gemm(
+        experts, n, k, topk, gather, 32, block_N, coded_scales=True
+    )
+    out1 = torch.zeros((order.shape[0], n), dtype=torch.bfloat16, device=DEVICE)
+    out2 = torch.zeros_like(out1)
+    words = pack_scale_words(exps)
+    plain(xq, x_words, tiles, *extra, words, order, tile_expert, out1)
+    coded(
+        xq, x_words, tiles, *extra, tile_codes(codes, block_N), row_base, order,
+        tile_expert, out2,
+    )  # fmt: skip
+    live = order >= 0
+    assert torch.equal(out1[live].view(torch.int16), out2[live].view(torch.int16))

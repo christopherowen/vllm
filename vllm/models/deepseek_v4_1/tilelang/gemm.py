@@ -281,7 +281,9 @@ def splitk_reduce(
     M = T.dynamic("M")
 
     @T.prim_func
-    def gemm_splitk_reduce(P: T.Tensor((shards, M, N), T.float32), C: T.Tensor((M, N), out_dtype)):
+    def gemm_splitk_reduce(
+        P: T.Tensor((shards, M, N), T.float32), C: T.Tensor((M, N), out_dtype)
+    ):
         with T.Kernel(T.ceildiv(N, block_N), M, threads=threads) as (bx, m):
             acc = T.alloc_fragment((block_N,), T.float32)
             # Columns past N (a narrow projection's last block) are skipped.
@@ -314,11 +316,15 @@ def _reference_cast(X, amax, inv, Q, S, row0, col0, rows, blocks, M):
     bits, E4M3 of ``x * 2^-e``, and the UE8M0 byte ``e + 127`` into ``S``."""
     T.reduce_absmax(X, amax, dim=1)
     for r in T.Parallel(rows * blocks):
-        bits = T.reinterpret(T.max(amax[r], T.float32(_AMAX_FLOOR)) * T.float32(_FP8_MAX_INV), T.uint32)
+        bits = T.reinterpret(
+            T.max(amax[r], T.float32(_AMAX_FLOOR)) * T.float32(_FP8_MAX_INV), T.uint32
+        )
         exponent = T.Cast(T.int32, ((bits - T.uint32(1)) >> 23) + T.uint32(1)) - 127
         inv[r] = T.reinterpret(T.Cast(T.uint32, 127 - exponent) << 23, T.float32)
         if row0 + r // blocks < M:
-            S[row0 + r // blocks, col0 // 32 + r % blocks] = T.Cast(T.uint8, exponent + 127)
+            S[row0 + r // blocks, col0 // 32 + r % blocks] = T.Cast(
+                T.uint8, exponent + 127
+            )
     for r, e in T.Parallel(rows * blocks, 32):
         if row0 + r // blocks < M:
             Q[row0 + r // blocks, col0 + (r % blocks) * 32 + e] = T.Cast(
@@ -378,7 +384,9 @@ def splitk_reduce_cast(N: int, shards: int, block_M: int = 4, threads: int = 128
                     X[r, e] += P[s, m, bx * 128 + (r % blocks) * 32 + e]
             for r, e in T.Parallel(block_M * blocks, 32):
                 X[r, e] = T.Cast(T.float32, T.Cast(T.bfloat16, X[r, e]))
-            _reference_cast(X, amax, inv, Q, S, by * block_M, bx * 128, block_M, blocks, M)
+            _reference_cast(
+                X, amax, inv, Q, S, by * block_M, bx * 128, block_M, blocks, M
+            )
 
     return gemm_splitk_reduce_cast
 
@@ -609,7 +617,9 @@ def fp8w_bf16_gemm_cast(
             else:
                 T.copy(C_local, C_shared)
             for r, e in T.Parallel(block_M * blocks, 32):
-                X[r, e] = T.Cast(T.float32, C_shared[r // blocks, (r % blocks) * 32 + e])
+                X[r, e] = T.Cast(
+                    T.float32, C_shared[r // blocks, (r % blocks) * 32 + e]
+                )
             _reference_cast(X, amax, inv, Q, S, by * block_M, n0, block_M, blocks, M)
 
     return gemm_fp8w_bf16_cast
@@ -1016,6 +1026,47 @@ def pack_scale_words(exponents: torch.Tensor, rows: int | None = None) -> torch.
     if pad:
         exponents = torch.nn.functional.pad(exponents, (0, pad), value=127)
     return exponents.contiguous().view(torch.uint32)
+
+
+def pack_scale_codes(exponents: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``[..., K / 32]`` UE8M0 bytes as a base exponent per row and 4-bit codes.
+
+    Returns ``(codes, base)``: ``codes[..., ceil(K / 128)]`` (uint16) holds, for each
+    word of ``pack_scale_words``, its four exponents minus the row's ``base[...]``
+    (uint8, the row's smallest exponent), a nibble each, low nibble first. Spreading a
+    code's nibbles into bytes and adding ``base`` to each gives that word byte for byte
+    (``expand_scale_codes``); padding exponents (rows whose count is not a multiple of
+    four) code as 0 and are unread. The routed experts' scales span at most 8 values
+    in a row (DeepSeek-V4.1-Flash, both checkpoints sampled), so the codes are exact;
+    a row spanning more than 16 is refused rather than approximated.
+    """
+    e = exponents.view(torch.uint8)
+    base = e.amin(dim=-1)
+    deltas = e.to(torch.int32) - base.unsqueeze(-1).to(torch.int32)
+    span = int(deltas.max()) if deltas.numel() else 0
+    if span > 15:
+        raise ValueError(
+            f"a row's scale exponents span {span + 1} values; 4-bit codes hold 16"
+        )
+    pad = -e.shape[-1] % 4
+    if pad:
+        deltas = torch.nn.functional.pad(deltas, (0, pad), value=0)
+    d = deltas.view(*deltas.shape[:-1], -1, 4)
+    codes = d[..., 0] | (d[..., 1] << 4) | (d[..., 2] << 8) | (d[..., 3] << 12)
+    return codes.to(torch.int16).view(torch.uint16).contiguous(), base.contiguous()
+
+
+def expand_scale_codes(codes: torch.Tensor, base: torch.Tensor) -> torch.Tensor:
+    """The uint32 words ``pack_scale_codes`` encodes; padding bytes read as ``base``."""
+    c = codes.view(torch.int16).to(torch.int32) & 0xFFFF
+    spread = (
+        (c & 0xF)
+        | ((c >> 4) & 0xF) << 8
+        | ((c >> 8) & 0xF) << 16
+        | ((c >> 12) & 0xF) << 24
+    )
+    words = spread + base.to(torch.int32).unsqueeze(-1) * 0x01010101
+    return words.to(torch.int32).view(torch.uint32)
 
 
 # SMs of one GB10; a decode split-K grid aims to cover them once.
