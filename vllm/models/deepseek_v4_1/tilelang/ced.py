@@ -118,6 +118,16 @@ def copy_rows_kernel(
     for dim in tail:
         width *= dim
 
+    def column_offset(col):
+        # Build the strided address at specialization time; a TIR loop variable
+        # cannot index Python's layout tuples.
+        result = 0
+        divisor = 1
+        for dim, stride in zip(reversed(tail), reversed(strides[1:])):
+            result = result + (col // divisor % dim) * stride
+            divisor *= dim
+        return result
+
     @T.prim_func
     def ced_copy_rows(
         source: T.Tensor((source_span,), dtype),
@@ -142,14 +152,7 @@ def copy_rows_kernel(
                     )
                     if valid:
                         source_row = row if scatter else index
-                        source_offset = source_row * strides[0]
-                        remainder = col
-                        for reverse in T.unroll(len(tail)):
-                            axis = len(tail) - 1 - reverse
-                            source_offset += (remainder % tail[axis]) * strides[
-                                axis + 1
-                            ]
-                            remainder = remainder // tail[axis]
+                        source_offset = source_row * strides[0] + column_offset(col)
                         if scatter:
                             output[index * width + col] = source[source_offset]
                         else:
@@ -162,7 +165,11 @@ def copy_rows_kernel(
 
 def copy_rows(source, row_indices, output, scatter: bool):
     """Copy logical rows from a possibly strided source without copying its storage."""
-    span = 1 + sum((n - 1) * s for n, s in zip(source.shape, source.stride()))
+    span = (
+        1 + sum((n - 1) * s for n, s in zip(source.shape, source.stride()))
+        if source.numel()
+        else 0
+    )
     flat_source = source.as_strided((span,), (1,))
     copy_rows_kernel(
         str(source.dtype).removeprefix("torch."),
