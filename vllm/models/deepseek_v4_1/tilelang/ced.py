@@ -14,12 +14,48 @@ _PASS = {tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
         tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
     }
 )
-def requests_kernel(max_requests: int, compact: bool = True):
+def requests_kernel(max_requests: int, compact: bool = True, single: bool = False):
     starts_len = T.dynamic("starts_len")
     seq_len = T.dynamic("seq_len")
     chunks = (max_requests + 31) // 32
     scan_steps = min(5, (max_requests - 1).bit_length())
     last_lane = min(max_requests, 32) - 1
+
+    if compact and single:
+
+        @T.prim_func
+        def ced_single(
+            starts: T.Tensor((starts_len,), T.int32),
+            seq: T.Tensor((seq_len,), T.int32),
+            limits: T.Tensor((max_requests,), T.int32),
+            prefix: T.Tensor((max_requests,), T.int64),
+            out_starts: T.Tensor((max_requests + 1,), T.int32),
+            positions: T.Tensor((max_requests,), T.int64),
+            replay: T.Tensor((max_requests,), T.int64),
+            counts: T.Tensor((2,), T.int32),
+            nr: T.int32,
+        ):
+            with T.Kernel(T.ceildiv(max_requests + 1, 128), threads=128) as bx:
+                r = bx * 128 + T.get_thread_binding()
+                q = starts[1] - starts[0]
+                kept = T.min(q, limits[0])
+                if r <= max_requests:
+                    out_starts[r] = T.if_then_else(r == 0, 0, kept)
+                if r < max_requests:
+                    if r == 0:
+                        position = T.cast(seq[0], T.int64) - kept
+                        positions[0] = position
+                        replay[0] = T.max(
+                            prefix[0], T.if_then_else(q > kept, position, 0)
+                        )
+                    else:
+                        positions[r] = -1
+                        replay[r] = 0
+                if r == 0:
+                    counts[0] = kept
+                    counts[1] = 1
+
+        return ced_single
 
     if not compact:
 
@@ -121,7 +157,7 @@ def requests(
     *,
     compact=True,
 ):
-    requests_kernel(positions.shape[0], compact)(
+    requests_kernel(positions.shape[0], compact, nr == 1)(
         starts, seq, limits, prefix, out_starts, positions, replay, counts, nr
     )
 
