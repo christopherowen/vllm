@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek-V4.1 TileLang sparse-MLA metadata against the Triton kernels, exactly."""
 
+import math
+
 import pytest
 import torch
 
@@ -87,6 +89,36 @@ DEVICE = "cuda"
 R, CAP, COLS = 16, 1024, 40
 
 
+def _triton_copy(source, indices, rows, scatter):
+    """Triton's row copy, which the TileLang copy replaced (the benchmark's copy)."""
+    from benchmarks.kernels.ced_reference import _copy_rows
+
+    tail = tuple(source.shape[1:])
+    width = math.prod(tail)
+    output = source.new_zeros((rows, *tail))
+    _copy_rows[(triton.cdiv((source.shape[0] if scatter else rows) * width, 512),)](
+        source,
+        indices,
+        output,
+        source.shape[0],
+        rows,
+        tail,
+        source.stride(),
+        width,
+        scatter,
+        512,
+    )
+    return output
+
+
+def gather_rows(source, indices):
+    return _triton_copy(source, indices, indices.numel(), False)
+
+
+def scatter_rows(source, indices, rows):
+    return _triton_copy(source, indices, rows, True)
+
+
 @pytest.mark.parametrize(
     "dtype",
     [
@@ -103,7 +135,6 @@ R, CAP, COLS = 16, 1024, 40
 )
 @pytest.mark.parametrize("transpose", [False, True])
 def test_ced_row_copy_preserves_strides_invalid_indices_and_scatter(dtype, transpose):
-    from vllm.models.deepseek_v4_1.ced import gather_rows, scatter_rows
     from vllm.models.deepseek_v4_1.tilelang import ced
 
     source = torch.arange(7 * 3 * 5, device=DEVICE).reshape(7, 3, 5).to(dtype)
@@ -122,7 +153,6 @@ def test_ced_row_copy_preserves_strides_invalid_indices_and_scatter(dtype, trans
 @pytest.mark.parametrize("rows", [1, 48, 4048])
 @pytest.mark.parametrize("tail", [(5120,), (4, 5120)])
 def test_ced_row_copy_serving_widths(rows, tail):
-    from vllm.models.deepseek_v4_1.ced import gather_rows, scatter_rows
     from vllm.models.deepseek_v4_1.tilelang import ced
 
     source = torch.randn((rows, *tail), dtype=torch.bfloat16, device=DEVICE)
@@ -152,7 +182,6 @@ def test_ced_row_copy_serving_widths(rows, tail):
 def test_ced_row_copy_serving_layouts_skip_invalid_rows(dtype, tail, rows):
     """The serving layouts with the plan's -1 padding and out-of-range indices,
     across a block boundary, against the Triton copies."""
-    from vllm.models.deepseek_v4_1.ced import gather_rows, scatter_rows
     from vllm.models.deepseek_v4_1.tilelang import ced
 
     source = torch.randint(-100, 100, (rows, *tail), device=DEVICE).to(dtype)
@@ -190,7 +219,6 @@ def test_ced_row_copy_serving_layouts_skip_invalid_rows(dtype, tail, rows):
 def test_ced_row_copy_views_of_wider_rows(dtype, width, columns):
     """Column views of wider rows: the row stride is an argument, and the copies
     match Triton's."""
-    from vllm.models.deepseek_v4_1.ced import gather_rows, scatter_rows
     from vllm.models.deepseek_v4_1.tilelang import ced
 
     wide = torch.randint(-100, 100, (300, width), device=DEVICE).to(dtype)

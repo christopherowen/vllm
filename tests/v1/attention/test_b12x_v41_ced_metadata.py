@@ -208,7 +208,7 @@ def test_frozen_packing_graph_replays_new_live_rows(monkeypatch):
         packed = gather_rows(source, indices)
         restored = scatter_rows(packed, indices, 256)
     # Replay cannot consult Python or compile another packing specialization.
-    monkeypatch.setattr(ced, "_copy_rows_launcher", None)
+    monkeypatch.setattr(ced.ced_kernels, "copy_rows", None)
     indices.fill_(-1)
     indices[:2] = torch.tensor([31, 127], device="cuda")
     source.add_(1000)
@@ -517,7 +517,6 @@ def test_large_full_capture_decodes_small_live_prefix(monkeypatch):
 @cuda
 def test_startup_warmup_covers_live_compaction_without_jit(monkeypatch):
     import importlib
-    from collections import defaultdict
 
     import tilelang.cache
     from triton import knobs
@@ -529,11 +528,13 @@ def test_startup_warmup_covers_live_compaction_without_jit(monkeypatch):
     cache_module = importlib.import_module(tilelang.cache.freeze.__module__)
     monkeypatch.setattr(cache_module, "_frozen_reason", None)
     # Isolate compilation state so earlier tests cannot hide a missing warmup.
-    monkeypatch.setattr(
-        ced._copy_rows,
-        "device_caches",
-        defaultdict(ced._copy_rows.device_caches.default_factory),
-    )
+    for kernel in (
+        ced.ced_kernels.requests_kernel,
+        ced.ced_kernels.indices_kernel,
+        ced.ced_kernels.copy_rows_kernel,
+    ):
+        monkeypatch.setattr(kernel, "_kernel_cache", {})
+        monkeypatch.setattr(kernel, "_call_form_cache", type(kernel._call_form_cache)())
     state = CEDState(4, 8192, (128, 256, 384, 512, 8192), "cuda")
     # The packings compile with the runner's JIT warmup, as under the worker.
     registry = JitWarmupRegistry(None)

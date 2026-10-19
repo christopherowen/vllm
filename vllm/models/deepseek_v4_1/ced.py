@@ -8,15 +8,7 @@ from bisect import bisect_left
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
-import numpy as np
 import torch
-
-from vllm.model_executor.warmup.jit_warmup_triton_helper import (
-    TritonWarmupTensor,
-    triton_kernel_dispatcher_with_warmup,
-    triton_warmup_inputs,
-)
-from vllm.triton_utils import tl, triton
 
 from .tilelang import ced as ced_kernels
 from .tilelang import prepare
@@ -42,99 +34,12 @@ def ced_decoder_start(hf_config: Any) -> int | None:
     return None
 
 
-@triton.jit(do_not_specialize=["source_rows", "output_rows"])
-def _copy_rows(
-    Source,
-    Indices,
-    Output,
-    source_rows,
-    output_rows,
-    DIMS: tl.constexpr,
-    STRIDES: tl.constexpr,
-    WIDTH: tl.constexpr,
-    SCATTER: tl.constexpr,
-    B: tl.constexpr,
-):
-    offset = tl.program_id(0).to(tl.int64) * B + tl.arange(0, B).to(tl.int64)
-    row = offset // WIDTH
-    col = offset % WIDTH
-    limit = source_rows if SCATTER else output_rows
-    index = tl.load(Indices + row, row < limit, other=-1).to(tl.int64)
-    valid = (row < limit) & (index >= 0)
-    valid &= index < (output_rows if SCATTER else source_rows)
-    source_row = row if SCATTER else index
-    source_offset = source_row * STRIDES[0]
-    remainder = col
-    for axis in tl.static_range(len(DIMS) - 1, -1, -1):
-        source_offset += (remainder % DIMS[axis]) * STRIDES[axis + 1]
-        remainder = remainder // DIMS[axis]
-    value = tl.load(Source + source_offset, valid, other=0)
-    if SCATTER:
-        tl.store(Output + index * WIDTH + col, value, valid)
-    else:
-        tl.store(Output + offset, value, row < output_rows)
-
-
-def _copy_rows_warmup_inputs(
-    *, layouts: tuple[tuple[torch.dtype, tuple[int, ...], bool], ...]
-) -> list[dict[str, Any]]:
-    cases = []
-    for dtype, tail, scatter in layouts:
-        rows = TritonWarmupTensor(dtype, shape=(4, *tail))
-        cases.append(
-            triton_warmup_inputs(
-                _copy_rows,
-                rows,
-                TritonWarmupTensor(torch.int64),
-                rows,
-                4,
-                4,
-                tail,
-                rows.stride(),
-                int(np.prod(tail)),
-                scatter,
-                512,
-                grid=(1,),
-            )
-        )
-    return cases
-
-
-_copy_rows_launcher = triton_kernel_dispatcher_with_warmup(
-    warmup_inputs=_copy_rows_warmup_inputs
-)(_copy_rows)
-
-
-def register_copy_rows_warmup(
-    layouts: tuple[tuple[torch.dtype, tuple[int, ...], bool], ...],
-) -> None:
-    """Register ``gather_rows`` / ``scatter_rows`` for contiguous, 16-byte aligned
-    sources of each ``(dtype, shape[1:], scatter)`` layout with int64 indices."""
-    _copy_rows_launcher.register_warmup(layouts=layouts)
-
-
 @torch.library.custom_op("vllm::dsv41_gather_rows", mutates_args=())
 def gather_rows(source: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
     """Gather first-axis rows, zeroing invalid indices (including graph padding)."""
     output = source.new_empty((indices.numel(), *source.shape[1:]))
-    width = (
-        source.numel() // source.shape[0]
-        if source.shape[0]
-        else int(np.prod(source.shape[1:]))
-    )
     if output.numel():
-        _copy_rows_launcher[(triton.cdiv(output.numel(), 512),)](
-            source,
-            indices,
-            output,
-            source.shape[0],
-            indices.numel(),
-            tuple(source.shape[1:]),
-            source.stride(),
-            width,
-            False,
-            512,
-        )
+        ced_kernels.copy_rows(source, indices, output, scatter=False)
     return output
 
 
@@ -149,24 +54,8 @@ def scatter_rows(
 ) -> torch.Tensor:
     """Restore the full-row ABI; discarded rows are always zero."""
     output = source.new_zeros((full_rows, *source.shape[1:]))
-    width = (
-        source.numel() // source.shape[0]
-        if source.shape[0]
-        else int(np.prod(source.shape[1:]))
-    )
     if source.numel():
-        _copy_rows_launcher[(triton.cdiv(source.numel(), 512),)](
-            source,
-            indices,
-            output,
-            source.shape[0],
-            full_rows,
-            tuple(source.shape[1:]),
-            source.stride(),
-            width,
-            True,
-            512,
-        )
+        ced_kernels.copy_rows(source, indices, output, scatter=True)
     return output
 
 
@@ -221,8 +110,9 @@ class CEDState:
         self.plan: CEDPlan | None = None
 
     def warmup(self, hidden_size: int, hc_mult: int) -> None:
-        """Resolve the row mapping before graph capture, and register both packing
-        directions with the runner's JIT warmup (compiled before memory profiling).
+        """Resolve the row mapping before graph capture, and declare the metadata
+        kernels and both packing directions for preparation (compiled before memory
+        profiling).
         """
         device = self.indices.device
         if torch.cuda.is_current_stream_capturing():
@@ -233,24 +123,22 @@ class CEDState:
         starts = torch.tensor([0, count], dtype=torch.int32, device=device)
         seq = torch.tensor([count], dtype=torch.int32, device=device)
         rows, streams, mixes = (hidden_size,), (hc_mult, hidden_size), (hc_mult,)
-        register_copy_rows_warmup(
-            (
-                # Gathered: the decoder boundary's rows, mixes, positions and token
-                # ids, the decoder's attention metadata, the step's padding mask
-                # and the drafter's context rows, positions and slots.
-                (torch.int32, (), False),
-                (torch.int64, (), False),
-                (torch.bool, (), False),
-                (torch.bfloat16, rows, False),
-                (torch.bfloat16, streams, False),
-                (torch.float32, mixes, False),
-                (torch.float32, (hc_mult, hc_mult), False),
-                # Scattered back to every row: hidden states (collapsed, or the MTP
-                # buffer's streams) and a pipeline stage's pre-mix.
-                (torch.bfloat16, rows, True),
-                (torch.bfloat16, streams, True),
-                (torch.float32, mixes, True),
-            )
+        copies = (
+            # Gathered: the decoder boundary's rows, mixes, positions and token
+            # ids, the decoder's attention metadata, the step's padding mask and
+            # the drafter's context rows, positions and slots.
+            (torch.int32, (), False),
+            (torch.int64, (), False),
+            (torch.bool, (), False),
+            (torch.bfloat16, rows, False),
+            (torch.bfloat16, streams, False),
+            (torch.float32, mixes, False),
+            (torch.float32, (hc_mult, hc_mult), False),
+            # Scattered back to every row: hidden states (collapsed, or the MTP
+            # buffer's streams) and a pipeline stage's pre-mix.
+            (torch.bfloat16, rows, True),
+            (torch.bfloat16, streams, True),
+            (torch.float32, mixes, True),
         )
 
         def warm_metadata():
@@ -261,6 +149,17 @@ class CEDState:
         prepare.declare(
             lambda: [
                 prepare.call(ced_kernels.indices_kernel, self.max_requests),
+                # Packed rows of each layout. A source view of wider rows would
+                # stop its first CED step with KernelNotPreparedError.
+                *(
+                    prepare.call(
+                        ced_kernels.copy_rows_kernel,
+                        *ced_kernels.packed_copy_rows_key(
+                            str(dtype).removeprefix("torch."), tail, scatter
+                        ),
+                    )
+                    for dtype, tail, scatter in copies
+                ),
                 # Unchanged rows, then a compaction of one request and of several.
                 *(
                     prepare.call(
