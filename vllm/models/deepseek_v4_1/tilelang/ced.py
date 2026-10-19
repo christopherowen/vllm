@@ -60,3 +60,48 @@ def requests(starts, seq, limits, prefix, out_starts, positions, replay, counts,
     requests_kernel(positions.shape[0])(
         starts, seq, limits, prefix, out_starts, positions, replay, counts, nr
     )
+
+
+@tilelang.jit(pass_configs=_PASS)
+def indices_kernel(max_requests: int):
+    starts_len = T.dynamic("starts_len")
+    capacity = T.dynamic("capacity")
+    steps = max(1, (max_requests + 1).bit_length())
+
+    @T.prim_func
+    def ced_indices(
+        starts: T.Tensor((starts_len,), T.int32),
+        compact_starts: T.Tensor((max_requests + 1,), T.int32),
+        indices: T.Tensor((capacity,), T.int64),
+        nr: T.int32,
+        nt: T.int32,
+    ):
+        with T.Kernel(T.ceildiv(capacity, 128), threads=128) as bx:
+            row = bx * 128 + T.get_thread_binding()
+            bounds = T.alloc_local((2,), T.int32)
+            if row < capacity:
+                bounds[0] = 0
+                bounds[1] = nr
+                for _ in T.serial(steps):
+                    if bounds[0] < bounds[1]:
+                        mid = (bounds[0] + bounds[1]) // 2
+                        end = T.if_then_else(mid < nr, compact_starts[mid + 1], nt)
+                        if end <= row:
+                            bounds[0] = mid + 1
+                        else:
+                            bounds[1] = mid
+                request = bounds[0]
+                if request < nr:
+                    indices[row] = (
+                        T.cast(starts[request + 1], T.int64)
+                        - compact_starts[request + 1]
+                        + row
+                    )
+                else:
+                    indices[row] = -1
+
+    return ced_indices
+
+
+def indices(starts, compact_starts, output, nr, nt):
+    indices_kernel(compact_starts.shape[0] - 1)(starts, compact_starts, output, nr, nt)

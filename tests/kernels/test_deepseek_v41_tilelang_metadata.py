@@ -72,6 +72,33 @@ DEVICE = "cuda"
 R, CAP, COLS = 16, 1024, 40
 
 
+@pytest.mark.parametrize("lengths", [[], [0], [1], [129], [0, 257, 0, 1], [4096] * 8])
+@pytest.mark.parametrize("padding", [0, 1, 127])
+def test_ced_indices_preserves_last_rows_and_padding(lengths, padding):
+    """Compacted rows map to each request's suffix; padded rows map to -1."""
+    from vllm.models.deepseek_v4_1.ced import _decoder_indices
+    from vllm.models.deepseek_v4_1.tilelang import ced
+
+    nr = len(lengths)
+    starts = torch.tensor(
+        [0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32, device=DEVICE
+    )
+    kept = [min(n, 128) for n in lengths]
+    nt = sum(kept)
+    compact = torch.full((17,), nt, dtype=torch.int32, device=DEVICE)
+    compact[: nr + 1] = torch.tensor(
+        [0, *torch.tensor(kept).cumsum(0).tolist()], dtype=torch.int32, device=DEVICE
+    )
+    capacity = max(1, nt + padding)
+    reference = torch.full((capacity,), 7, dtype=torch.int64, device=DEVICE)
+    actual = torch.full_like(reference, 7)
+    _decoder_indices[(triton.cdiv(capacity, 128),)](
+        starts, compact, reference, nr, nt, capacity, 128
+    )
+    ced.indices(starts, compact, actual, nr, nt)
+    assert torch.equal(reference, actual)
+
+
 def _step(lengths, seed, padding=5):
     g = torch.Generator().manual_seed(seed)
     starts = [0]
