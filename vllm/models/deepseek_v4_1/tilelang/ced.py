@@ -204,6 +204,7 @@ def copy_rows_kernel(
             T.ceildiv((source_rows if scatter else output_rows) * width, 512),
             threads=128,
         ) as bx:
+            source_offset = T.alloc_var(T.int64)
             for i in T.Parallel(512):
                 offset = T.cast(bx * 512 + i, T.int64)
                 row = offset // width
@@ -215,8 +216,9 @@ def copy_rows_kernel(
                         index < (output_rows if scatter else source_rows)
                     )
                     if valid:
-                        source_row = row if scatter else index
-                        source_offset = source_row * strides[0] + column_offset(col)
+                        source_offset = (row if scatter else index) * strides[
+                            0
+                        ] + column_offset(col)
                         if scatter:
                             output[index * width + col] = source[source_offset]
                         else:
