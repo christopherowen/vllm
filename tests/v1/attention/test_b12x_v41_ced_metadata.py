@@ -529,10 +529,11 @@ def test_startup_warmup_covers_live_compaction_without_jit(monkeypatch):
     cache_module = importlib.import_module(tilelang.cache.freeze.__module__)
     monkeypatch.setattr(cache_module, "_frozen_reason", None)
     # Isolate compilation state so earlier tests cannot hide a missing warmup.
-    for kernel in (ced._decoder_requests, ced._copy_rows):
-        monkeypatch.setattr(
-            kernel, "device_caches", defaultdict(kernel.device_caches.default_factory)
-        )
+    monkeypatch.setattr(
+        ced._copy_rows,
+        "device_caches",
+        defaultdict(ced._copy_rows.device_caches.default_factory),
+    )
     state = CEDState(4, 8192, (128, 256, 384, 512, 8192), "cuda")
     # The packings compile with the runner's JIT warmup, as under the worker.
     registry = JitWarmupRegistry(None)

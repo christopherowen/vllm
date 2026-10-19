@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from .sparse_mla import DeepseekV41B12xMetadata
 
 CED_WINDOW = 128
+KEEP_ALL = 2**31 - 1
 
 
 def ced_decoder_start(hf_config: Any) -> int | None:
@@ -200,41 +201,6 @@ def plan_ced(query_lengths, keep_full, capacities: tuple[int, ...]) -> CEDPlan |
     )
 
 
-@triton.jit(do_not_specialize=["nr"])
-def _decoder_requests(
-    Starts,
-    Seq,
-    KeepFull,
-    PrefixStart,
-    OutStarts,
-    RequestPositions,
-    ReplayStart,
-    Counts,
-    nr,
-    R: tl.constexpr,
-    B: tl.constexpr,
-    WINDOW: tl.constexpr,
-):
-    r = tl.arange(0, B)
-    valid = r < nr
-    start = tl.load(Starts + r, valid, other=0)
-    end = tl.load(Starts + r + 1, valid, other=0)
-    seq = tl.load(Seq + r, valid, other=0).to(tl.int64)
-    full = tl.load(KeepFull + r, valid, other=0)
-    q = end - start
-    kept = tl.where(full, q, tl.minimum(q, WINDOW))
-    cumulative = tl.cumsum(kept)
-    count = tl.sum(kept)
-    tl.store(OutStarts + r, tl.where(valid, cumulative - kept, count), r <= R)
-    tl.store(OutStarts + nr, count)
-    tl.store(RequestPositions + r, tl.where(valid, seq - kept, -1), r < R)
-    prefix = tl.load(PrefixStart + r, valid, other=0)
-    replay = tl.maximum(prefix, tl.where(q > kept, seq - kept, 0))
-    tl.store(ReplayStart + r, replay, r < R)
-    tl.store(Counts, count)
-    tl.store(Counts + 1, nr)
-
-
 class CEDState:
     """Stable per-model staging buffers shared by dummy, capture, and runtime."""
 
@@ -250,7 +216,7 @@ class CEDState:
         )
         self.replay_start = torch.empty_like(self.request_positions)
         self.counts = torch.empty(2, dtype=torch.int32, device=device)
-        self.keep_full = torch.empty(max_requests, dtype=torch.bool, device=device)
+        self.limits = torch.empty(max_requests, dtype=torch.int32, device=device)
         self.prefix_start = torch.empty_like(self.request_positions)
         self.plan: CEDPlan | None = None
 
@@ -293,7 +259,16 @@ class CEDState:
             self.replay_start.zero_()
 
         prepare.declare(
-            lambda: [prepare.call(ced_kernels.indices_kernel, self.max_requests)],
+            lambda: [
+                prepare.call(ced_kernels.indices_kernel, self.max_requests),
+                # Unchanged rows, then a compaction of one request and of several.
+                *(
+                    prepare.call(
+                        ced_kernels.requests_kernel, self.max_requests, compact, single
+                    )
+                    for compact, single in ((False, False), (True, True), (True, False))
+                ),
+            ],
             warm=warm_metadata,
         )
 
@@ -309,27 +284,29 @@ class CEDState:
         self.plan = plan_ced(query_lengths, keep_full, self.capacities)
         # Fresh pinned sources remain owned by the async-copy allocator until
         # transfer completion; reusing a CPU staging buffer could race overlap.
-        keep_host = torch.tensor(
-            keep_full, dtype=torch.bool, device="cpu", pin_memory=True
+        # A request keeps at most its limit of rows: all of them, or the window.
+        limits_host = torch.tensor(
+            [KEEP_ALL if full else CED_WINDOW for full in keep_full],
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=True,
         )
         prefix_host = torch.tensor(
             prefix_start, dtype=torch.int64, device="cpu", pin_memory=True
         )
-        self.keep_full[:nr].copy_(keep_host, non_blocking=True)
+        self.limits[:nr].copy_(limits_host, non_blocking=True)
         self.prefix_start[:nr].copy_(prefix_host, non_blocking=True)
-        _decoder_requests[(1,)](
+        ced_kernels.requests(
             starts,
             seq,
-            self.keep_full,
+            self.limits,
             self.prefix_start,
             self.starts,
             self.request_positions,
             self.replay_start,
             self.counts,
             nr,
-            self.max_requests,
-            triton.next_power_of_2(self.max_requests + 1),
-            CED_WINDOW,
+            compact=self.plan is not None,
         )
         if self.plan is not None:
             ced_kernels.indices(
