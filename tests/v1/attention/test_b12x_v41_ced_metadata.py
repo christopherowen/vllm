@@ -539,7 +539,7 @@ def test_startup_warmup_covers_live_compaction_without_jit(monkeypatch):
     # The packings compile with the runner's JIT warmup, as under the worker.
     registry = JitWarmupRegistry(None)
     with registry.activate():
-        state.warmup(hidden_size=8, hc_mult=4)
+        state.warmup(hidden_size=8, hc_mult=4, pipeline=False)
     registry.warmup()
     from vllm.models.deepseek_v4_1.tilelang import prepare
 

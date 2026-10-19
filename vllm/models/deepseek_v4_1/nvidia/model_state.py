@@ -142,8 +142,12 @@ class DeepseekV41ModelState(DefaultModelState):
                 self.max_num_reqs, self.max_num_tokens, capacities, device
             )
             hf = self.model_config.hf_config
-            self.ced_state.warmup(hf.hidden_size, hf.hc_mult)
             parallel = vllm_config.parallel_config
+            self.ced_state.warmup(
+                hf.hidden_size,
+                hf.hc_mult,
+                pipeline=parallel.pipeline_parallel_size > 1,
+            )
             if (
                 is_breakable_cudagraph_enabled()
                 and self.max_num_tokens == 4096
