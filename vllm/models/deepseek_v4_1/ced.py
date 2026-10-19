@@ -18,6 +18,9 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 )
 from vllm.triton_utils import tl, triton
 
+from .tilelang import ced as ced_kernels
+from .tilelang import prepare
+
 if TYPE_CHECKING:
     from .sparse_mla import DeepseekV41B12xMetadata
 
@@ -232,28 +235,6 @@ def _decoder_requests(
     tl.store(Counts + 1, nr)
 
 
-@triton.jit(do_not_specialize=["nr", "nt", "capacity"])
-def _decoder_indices(Starts, CompactStarts, Indices, nr, nt, capacity, B: tl.constexpr):
-    row = tl.program_id(0) * B + tl.arange(0, B)
-    lo = tl.full((B,), 0, tl.int32)
-    hi = tl.full((B,), nr, tl.int32)
-    while tl.sum((lo < hi).to(tl.int32), 0) > 0:
-        mid = (lo + hi) // 2
-        end = tl.load(CompactStarts + mid + 1, mid < nr, other=nt)
-        right = end <= row
-        active = lo < hi
-        lo = tl.where(active & right, mid + 1, lo)
-        hi = tl.where(active & ~right, mid, hi)
-    valid = lo < nr
-    compact_end = tl.load(CompactStarts + lo + 1, valid, other=0)
-    original_end = tl.load(Starts + lo + 1, valid, other=0).to(tl.int64)
-    tl.store(
-        Indices + row,
-        tl.where(valid, original_end - compact_end + row, -1),
-        row < capacity,
-    )
-
-
 class CEDState:
     """Stable per-model staging buffers shared by dummy, capture, and runtime."""
 
@@ -285,7 +266,6 @@ class CEDState:
         count = CED_WINDOW + 1
         starts = torch.tensor([0, count], dtype=torch.int32, device=device)
         seq = torch.tensor([count], dtype=torch.int32, device=device)
-        self.stage(starts, seq, [count], [False], [0])
         rows, streams, mixes = (hidden_size,), (hc_mult, hidden_size), (hc_mult,)
         register_copy_rows_warmup(
             (
@@ -306,8 +286,16 @@ class CEDState:
                 (torch.float32, mixes, True),
             )
         )
-        self.plan = None
-        self.replay_start.zero_()
+
+        def warm_metadata():
+            self.stage(starts, seq, [count], [False], [0])
+            self.plan = None
+            self.replay_start.zero_()
+
+        prepare.declare(
+            lambda: [prepare.call(ced_kernels.indices_kernel, self.max_requests)],
+            warm=warm_metadata,
+        )
 
     def stage(
         self,
@@ -344,14 +332,12 @@ class CEDState:
             CED_WINDOW,
         )
         if self.plan is not None:
-            _decoder_indices[(triton.cdiv(self.plan.capacity, 128),)](
+            ced_kernels.indices(
                 starts,
                 self.starts,
-                self.indices,
+                self.indices[: self.plan.capacity],
                 nr,
                 self.plan.num_tokens,
-                self.plan.capacity,
-                128,
             )
 
     def get_indices(self) -> torch.Tensor | None:

@@ -524,7 +524,7 @@ def test_startup_warmup_covers_live_compaction_without_jit(monkeypatch):
     from vllm.models.deepseek_v4_1 import ced
 
     # Isolate compilation state so earlier tests cannot hide a missing warmup.
-    for kernel in (ced._decoder_requests, ced._decoder_indices, ced._copy_rows):
+    for kernel in (ced._decoder_requests, ced._copy_rows):
         monkeypatch.setattr(
             kernel, "device_caches", defaultdict(kernel.device_caches.default_factory)
         )
@@ -534,6 +534,10 @@ def test_startup_warmup_covers_live_compaction_without_jit(monkeypatch):
     with registry.activate():
         state.warmup(hidden_size=8, hc_mult=4)
     registry.warmup()
+    from vllm.models.deepseek_v4_1.tilelang import prepare
+
+    prepare.warm_declared(registry)
+    prepare.freeze("CED index warmup test")
 
     def forbid_compile(**kwargs):
         raise AssertionError(
