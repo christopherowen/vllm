@@ -72,6 +72,27 @@ DEVICE = "cuda"
 R, CAP, COLS = 16, 1024, 40
 
 
+@pytest.mark.parametrize(
+    "dtype", [torch.int64, torch.int32, torch.float32, torch.bfloat16, torch.bool]
+)
+@pytest.mark.parametrize("transpose", [False, True])
+def test_ced_row_copy_preserves_strides_invalid_indices_and_scatter(dtype, transpose):
+    from vllm.models.deepseek_v4_1.ced import gather_rows, scatter_rows
+    from vllm.models.deepseek_v4_1.tilelang import ced
+
+    source = torch.arange(7 * 3 * 5, device=DEVICE).reshape(7, 3, 5).to(dtype)
+    if transpose:
+        source = source.transpose(1, 2)
+    indices = torch.tensor([6, 1, -1, 3, 99], device=DEVICE)
+    expected = gather_rows(source, indices)
+    output = torch.empty_like(expected)
+    ced.copy_rows(source, indices, output, False)
+    assert torch.equal(expected, output)
+    restored = torch.zeros((7, *source.shape[1:]), dtype=dtype, device=DEVICE)
+    ced.copy_rows(output, indices, restored, True)
+    assert torch.equal(scatter_rows(output, indices, 7), restored)
+
+
 @pytest.mark.parametrize("lengths", [[], [0], [1], [129], [0, 257, 0, 1], [4096] * 8])
 @pytest.mark.parametrize("padding", [0, 1, 127])
 def test_ced_indices_preserves_last_rows_and_padding(lengths, padding):
