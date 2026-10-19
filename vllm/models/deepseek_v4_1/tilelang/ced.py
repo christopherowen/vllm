@@ -207,7 +207,12 @@ def indices(starts, compact_starts, output, nr, nt):
     indices_kernel(compact_starts.shape[0] - 1)(starts, compact_starts, output, nr, nt)
 
 
-@tilelang.jit(pass_configs=_PASS)
+@tilelang.jit(
+    pass_configs={
+        **_PASS,
+        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
+    }
+)
 def copy_rows_kernel(
     dtype: str, tail: tuple[int, ...], strides: tuple[int, ...], scatter: bool
 ):
@@ -217,6 +222,8 @@ def copy_rows_kernel(
     width = 1
     for dim in tail:
         width *= dim
+
+    layout = T.Fragment((512,), forward_fn=lambda i: (i // 4, i % 4))
 
     def column_offset(col):
         # Build the strided address at specialization time; a TIR loop variable
@@ -241,7 +248,7 @@ def copy_rows_kernel(
             threads=128,
         ) as bx:
             source_offset = T.alloc_var(T.int64)
-            for i in T.Parallel(512):
+            for i in T.Parallel(512, loop_layout=layout):
                 offset = T.cast(bx * 512 + i, T.int64)
                 row = offset // width
                 col = offset % width
