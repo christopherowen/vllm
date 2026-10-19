@@ -516,13 +516,18 @@ def test_large_full_capture_decodes_small_live_prefix(monkeypatch):
 
 @cuda
 def test_startup_warmup_covers_live_compaction_without_jit(monkeypatch):
+    import importlib
     from collections import defaultdict
 
+    import tilelang.cache
     from triton import knobs
 
     from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
     from vllm.models.deepseek_v4_1 import ced
 
+    # Freeze only this test's scope; another kernel test must be able to prepare.
+    cache_module = importlib.import_module(tilelang.cache.freeze.__module__)
+    monkeypatch.setattr(cache_module, "_frozen_reason", None)
     # Isolate compilation state so earlier tests cannot hide a missing warmup.
     for kernel in (ced._decoder_requests, ced._copy_rows):
         monkeypatch.setattr(
