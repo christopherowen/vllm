@@ -88,7 +88,18 @@ R, CAP, COLS = 16, 1024, 40
 
 
 @pytest.mark.parametrize(
-    "dtype", [torch.int64, torch.int32, torch.float32, torch.bfloat16, torch.bool]
+    "dtype",
+    [
+        torch.int64,
+        torch.int32,
+        torch.float32,
+        torch.bfloat16,
+        torch.bool,
+        torch.uint8,
+        torch.int8,
+        torch.float16,
+        torch.float64,
+    ],
 )
 @pytest.mark.parametrize("transpose", [False, True])
 def test_ced_row_copy_preserves_strides_invalid_indices_and_scatter(dtype, transpose):
@@ -196,6 +207,16 @@ def test_ced_row_copy_views_of_wider_rows(dtype, width, columns):
     restored = torch.zeros((300, *source.shape[1:]), dtype=dtype, device=DEVICE)
     ced.copy_rows(output, indices, restored, True)
     assert torch.equal(scatter_rows(output, indices, 300), restored)
+
+
+def test_ced_row_copy_packed_key_matches_contiguous_sources():
+    from vllm.models.deepseek_v4_1.tilelang import ced
+
+    for tail in [(), (4,), (4, 4), (4, 5120)]:
+        source = torch.empty((3, *tail), device=DEVICE)
+        assert ced.packed_copy_rows_key("float32", tail, True) == ced.copy_rows_key(
+            "float32", tail, source.stride()[1:], source.stride(0), True
+        )
 
 
 def test_ced_row_copy_preconditions():

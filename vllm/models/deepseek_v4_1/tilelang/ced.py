@@ -220,7 +220,18 @@ def indices(starts, compact_starts, output, nr, nt):
     indices_kernel(compact_starts.shape[0] - 1)(starts, compact_starts, output, nr, nt)
 
 
-_ITEMSIZE = {"bool": 1, "int32": 4, "int64": 8, "float32": 4, "bfloat16": 2}
+_ITEMSIZE = {
+    "bool": 1,
+    "int8": 1,
+    "uint8": 1,
+    "int16": 2,
+    "float16": 2,
+    "bfloat16": 2,
+    "int32": 4,
+    "float32": 4,
+    "int64": 8,
+    "float64": 8,
+}
 _THREADS = 128
 
 # Predicated global loads for the row copies (zero when off), in the form of
@@ -406,6 +417,26 @@ def copy_rows_kernel(
     return ced_copy_rows
 
 
+def copy_rows_key(dtype: str, tail, tail_strides, row_stride: int, scatter: bool):
+    """``copy_rows_kernel``'s arguments for a source layout: what the copy launches
+    and what an owner declares for preparation."""
+    return (
+        dtype,
+        tuple(tail),
+        tuple(tail_strides),
+        row_stride == math.prod(tail),
+        scatter,
+    )
+
+
+def packed_copy_rows_key(dtype: str, tail, scatter: bool):
+    """``copy_rows_key`` for a source of packed rows of shape ``tail``."""
+    strides = [1]
+    for dim in reversed(tail[1:]):
+        strides.insert(0, strides[0] * dim)
+    return copy_rows_key(dtype, tail, strides[: len(tail)], math.prod(tail), scatter)
+
+
 def copy_rows(source, row_indices, output, scatter: bool):
     """Copy logical rows from a possibly strided source without copying its storage.
 
@@ -434,7 +465,7 @@ def copy_rows(source, row_indices, output, scatter: bool):
         else 0
     )
     flat_source = source.as_strided((span,), (1,))
-    copy_rows_kernel(dtype, tail, tail_strides, row_stride == math.prod(tail), scatter)(
+    copy_rows_kernel(*copy_rows_key(dtype, tail, tail_strides, row_stride, scatter))(
         flat_source,
         row_indices,
         output.view(-1),
