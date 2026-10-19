@@ -19,6 +19,55 @@ from vllm.models.deepseek_v4_1.sparse_mla import _requests, _tokens  # noqa: E40
 from vllm.models.deepseek_v4_1.tilelang import metadata  # noqa: E402
 from vllm.triton_utils import triton  # noqa: E402
 
+
+@pytest.mark.parametrize("max_requests", [1, 8, 16, 32])
+@pytest.mark.parametrize("nr", [0, 1, 3])
+def test_ced_requests_preserves_compaction_and_replay_bounds(max_requests, nr):
+    """Per-request limits preserve the old 128/full-row metadata, including padding."""
+    from vllm.models.deepseek_v4_1.ced import _decoder_requests
+    from vllm.models.deepseek_v4_1.tilelang import ced
+
+    nr = min(nr, max_requests)
+    for lengths in ([0] * nr, [1] * nr, [129 + i * 511 for i in range(nr)]):
+        starts = torch.tensor(
+            [0, *torch.tensor(lengths).cumsum(0).tolist()],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        seq = torch.full((max_requests,), 5000, dtype=torch.int32, device="cuda")
+        prefix = torch.arange(max_requests, dtype=torch.int64, device="cuda") * 17
+        full = torch.arange(max_requests, device="cuda") % 2 == 0
+        limits = torch.where(full, 2**31 - 1, 128).to(torch.int32)
+        outputs = []
+        for implementation in ("triton", "tilelang"):
+            out = torch.full((max_requests + 1,), 7, dtype=torch.int32, device="cuda")
+            positions = torch.full((max_requests,), 7, dtype=torch.int64, device="cuda")
+            replay = torch.full_like(positions, 7)
+            counts = torch.full((2,), 7, dtype=torch.int32, device="cuda")
+            if implementation == "triton":
+                _decoder_requests[(1,)](
+                    starts,
+                    seq,
+                    full,
+                    prefix,
+                    out,
+                    positions,
+                    replay,
+                    counts,
+                    nr,
+                    max_requests,
+                    triton.next_power_of_2(max_requests + 1),
+                    128,
+                )
+            else:
+                ced.requests(
+                    starts, seq, limits, prefix, out, positions, replay, counts, nr
+                )
+            outputs.append((out, positions, replay, counts))
+        for reference, actual in zip(*outputs):
+            assert torch.equal(reference, actual)
+
+
 DEVICE = "cuda"
 R, CAP, COLS = 16, 1024, 40
 
