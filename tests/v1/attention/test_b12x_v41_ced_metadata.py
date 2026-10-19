@@ -12,6 +12,7 @@ from vllm.models.deepseek_v4_1.ced import (
     CEDState,
     ced_decoder_start,
     gather_rows,
+    nonfinal_limits,
     plan_ced,
     scatter_rows,
 )
@@ -36,6 +37,78 @@ def test_short_continuation_does_not_replay_old_rows():
     plan = plan_ced([1, 4096], [False, False], (128, 256, 512, 8192))
     assert plan.capacity == 256
     assert plan.num_tokens == 129
+
+
+def test_limits_shrink_rows_but_keep_the_window_bound():
+    capacities = (8, 128, 256, 512, 8192)
+    plan = plan_ced([7, 4096], [False, False], capacities, [128, 1])
+    assert (plan.capacity, plan.num_tokens) == (8, 8)
+    # The decoder keeps the mode and plans of the same step without the limit.
+    assert plan.max_query_len == 128
+    assert plan_ced([7, 4096], [False, False], capacities).num_tokens == 135
+
+
+def test_nonfinal_limits_skip_only_unread_chunks():
+    def limits(q, start, total, full=False, ok=True, align=4096, remaining=200):
+        return nonfinal_limits(
+            [7, q],
+            [900, start],
+            [900, total],
+            [False, full],
+            [True, ok],
+            min_remaining=remaining,
+            chunk_align=align,
+        )
+
+    assert limits(4096, 0, 4296) == [128, 1]
+    assert limits(4096, 4096, 8392) == [128, 1]
+    # Fewer than min_remaining rows follow: the next chunk may replay into this one.
+    assert limits(4096, 0, 4295) is None
+    # The final chunk, and chunks off the scheduler's aligned boundaries.
+    assert limits(4096, 0, 4096) is None
+    assert limits(4000, 96, 9000, align=4096) == [128, 1]
+    assert limits(4000, 0, 9000) is None
+    # Prompt logprobs, multimodal requests and untruncated chunks keep their rows.
+    assert limits(4096, 0, 9000, full=True) is None
+    assert limits(4096, 0, 9000, ok=False) is None
+    assert limits(128, 3968, 9000) is None
+
+
+@pytest.mark.parametrize(
+    ("backend", "spec", "align", "aligned", "expected"),
+    [
+        ("tilelang", "dspark", 4048, True, (199, 4048)),
+        ("tilelang", None, 4048, True, None),
+        ("b12x", "dspark", 4048, True, None),
+        ("tilelang", "mtp", 4048, True, None),
+        ("tilelang", "dspark", 198, True, None),
+        ("tilelang", "dspark", 4048, False, None),
+    ],
+)
+def test_nonfinal_skip_policy(monkeypatch, backend, spec, align, aligned, expected):
+    from vllm.models.deepseek_v4_1.nvidia.model_state import _nonfinal_skip_policy
+
+    monkeypatch.setenv("VLLM_DS41_KERNEL_BACKEND", backend)
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            long_prefill_token_threshold=align, enable_chunked_prefill=True
+        ),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(sliding_window=128)),
+        speculative_config=None
+        if spec is None
+        else SimpleNamespace(
+            use_dspark=lambda: spec == "dspark",
+            draft_model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(sliding_window=128)
+            ),
+            num_speculative_tokens=5,
+        ),
+    )
+    if expected is None:
+        with pytest.raises(ValueError):
+            _nonfinal_skip_policy(config, aligned_chunks=aligned)
+    else:
+        assert _nonfinal_skip_policy(config, aligned_chunks=aligned) == expected
 
 
 def _state(lengths, seq_lens=None, full=None, prefix=None):
@@ -126,6 +199,8 @@ def test_prompt_logprobs_zero_keeps_every_prompt_row(monkeypatch):
     state.ced_state, starts, seq = _state([4096, 4096])
     state._ced_prompt_logprobs = set()
     state._ced_prefix_start = {}
+    state._ced_skip_min_rows, state._ced_chunk_align = 0, 0
+    state._ced_mm_requests, state._ced_expected_chunk = set(), {}
     state.disk_engram_models, state._prefill_tokens = (), {}
     batch = SimpleNamespace(
         num_reqs=2,
@@ -140,6 +215,7 @@ def test_prompt_logprobs_zero_keeps_every_prompt_row(monkeypatch):
             req_id="logprobs",
             num_computed_tokens=0,
             sampling_params=SimpleNamespace(prompt_logprobs=0),
+            mm_features=[],
         ),
     )
     state._stage_ced(batch)
@@ -158,6 +234,72 @@ def test_prefix_hit_short_chunk_has_no_unwritten_decoder_history():
     state, _, _ = _state([128, 17], [4224, 9017], prefix=[4096, 0])
     assert state.get_indices() is None
     assert state.replay_start.tolist() == [4096, 0, 0, 0]
+
+
+@cuda
+def test_nonfinal_chunk_keeps_its_last_row():
+    state, starts, seq = _state([7, 4096], [900, 4096])
+    state.stage(starts, seq, [7, 4096], [False, False], [0, 0], [128, 1])
+    expected = torch.tensor([0, 1, 2, 3, 4, 5, 6, 4102], device="cuda")
+    torch.testing.assert_close(state.get_indices(), expected)
+    assert state.counts.tolist() == [8, 2]
+    assert state.starts[:3].tolist() == [0, 7, 8]
+    # The kept row replays only itself; the decode row keeps its whole window.
+    assert state.replay_start[:2].tolist() == [0, 4095]
+    assert state.request_positions[:2].tolist() == [893, 4095]
+
+
+@cuda
+def test_skipped_chunks_require_the_complete_successor(monkeypatch):
+    from vllm.models.deepseek_v4_1.nvidia.model_state import DeepseekV41ModelState
+    from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+
+    monkeypatch.setattr(DefaultModelState, "add_request", lambda *args: None)
+    monkeypatch.setattr(DefaultModelState, "remove_request", lambda *args: None)
+    state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
+    state.ced_state = CEDState(4, 8192, (128, 256, 384, 512, 8192), "cuda")
+    state._ced_prompt_logprobs, state._ced_prefix_start = set(), {}
+    state._ced_skip_min_rows, state._ced_chunk_align = 200, 4096
+    state._ced_mm_requests, state._ced_expected_chunk = set(), {}
+    state.disk_engram_models, state._prefill_tokens = (), {}
+    state.add_request(
+        0,
+        SimpleNamespace(
+            req_id="long",
+            num_computed_tokens=0,
+            sampling_params=None,
+            mm_features=[],
+        ),
+    )
+
+    def step(start, rows):
+        starts = torch.tensor([0, rows], dtype=torch.int32, device="cuda")
+        seq = torch.tensor([start + rows], dtype=torch.int32, device="cuda")
+        state._stage_ced(
+            SimpleNamespace(
+                num_reqs=1,
+                req_ids=["long"],
+                query_start_loc=starts,
+                seq_lens=seq,
+                num_scheduled_tokens=np.array([rows]),
+                num_computed_prefill_tokens_np=np.array([start]),
+                prefill_len_np=np.array([12288]),
+                has_prefill=True,
+            )
+        )
+        return state.get_ced_indices().tolist(), state.ced_state.replay_start[0].item()
+
+    assert step(0, 4096) == ([4095], 4095)
+    assert state._ced_expected_chunk == {"long": (4096, 4096)}
+    with pytest.raises(RuntimeError, match="CED successor chunk"):
+        step(4096, 64)
+    assert state._ced_expected_chunk == {"long": (4096, 4096)}
+    assert step(4096, 4096) == ([4095], 8191)
+    # The final chunk keeps its window; the floor is below it, so it changes nothing.
+    indices, replay = step(8192, 4096)
+    assert indices == list(range(3968, 4096)) and replay == 12160
+    state.remove_request("long")
+    assert state._ced_expected_chunk == {}
 
 
 @cuda
@@ -447,6 +589,8 @@ def test_streaming_update_preserves_private_decoder_history(monkeypatch):
     state.ced_state, starts, seq = _state([1], [1025])
     state._ced_prompt_logprobs = set()
     state._ced_prefix_start = {"stream": 256}
+    state._ced_skip_min_rows, state._ced_chunk_align = 0, 0
+    state._ced_mm_requests, state._ced_expected_chunk = set(), {}
     state.disk_engram_models, state._prefill_tokens = (), {}
     batch = SimpleNamespace(
         num_reqs=1,
@@ -456,7 +600,10 @@ def test_streaming_update_preserves_private_decoder_history(monkeypatch):
         num_scheduled_tokens=np.array([1]),
     )
     updated = SimpleNamespace(
-        req_id="stream", num_computed_tokens=1024, sampling_params=None
+        req_id="stream",
+        num_computed_tokens=1024,
+        sampling_params=None,
+        mm_features=[],
     )
     state.prepare_streaming_update("stream")
     state.remove_request("stream")
@@ -482,6 +629,8 @@ def test_large_full_capture_decodes_small_live_prefix(monkeypatch):
     state.ced_state, starts, seq = _state([256])
     state._ced_prompt_logprobs = set()
     state._ced_prefix_start = {}
+    state._ced_skip_min_rows, state._ced_chunk_align = 0, 0
+    state._ced_mm_requests, state._ced_expected_chunk = set(), {}
     state.lookback_token_ids = None
     state.disk_engram_models = ()
     state.device = torch.device("cuda")

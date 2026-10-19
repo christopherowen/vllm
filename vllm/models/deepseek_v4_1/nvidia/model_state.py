@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -19,9 +20,11 @@ from vllm.models.deepseek_v4_1.ced import (
     CEDState,
     ced_decoder_start,
     gather_rows,
+    nonfinal_limits,
 )
 from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadata
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.backends.mla.compressor_utils import get_dspark_swa_index_width
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.input_batch import InputBatch
@@ -85,6 +88,41 @@ _gather_lookback_launcher = triton_kernel_dispatcher_with_warmup(
 )(_gather_lookback_kernel)
 
 
+def _nonfinal_skip_policy(
+    vllm_config: VllmConfig, *, aligned_chunks: bool
+) -> tuple[int, int]:
+    """Validate the serving contract before enabling CED's nonfinal row skip."""
+    scheduler = vllm_config.scheduler_config
+    spec = vllm_config.speculative_config
+    if (
+        envs.VLLM_DS41_KERNEL_BACKEND != "tilelang"
+        or not aligned_chunks
+        or not scheduler.enable_chunked_prefill
+        or spec is None
+        or not spec.use_dspark()
+    ):
+        raise ValueError(
+            "CED skip requires TileLang, aligned chunked prefill and DSpark"
+        )
+    align = scheduler.long_prefill_token_threshold
+    hf = vllm_config.model_config.hf_config
+    window = getattr(spec.draft_model_config.hf_config, "sliding_window", None)
+    reach = max(
+        CED_WINDOW,
+        int(hf.sliding_window),
+        get_dspark_swa_index_width(
+            hf.sliding_window if window is None else window,
+            spec.num_speculative_tokens,
+        ),
+    )
+    min_remaining = reach + 2 + spec.num_speculative_tokens
+    if align < min_remaining:
+        raise ValueError(
+            f"CED skip needs a chunk threshold of at least {min_remaining}"
+        )
+    return min_remaining, align
+
+
 class DeepseekV41ModelState(DefaultModelState):
     """DefaultModelState plus the engram lookback window.
 
@@ -114,6 +152,12 @@ class DeepseekV41ModelState(DefaultModelState):
         self.ced_state: CEDState | None = None
         self._ced_prompt_logprobs: set[str] = set()
         self._ced_prefix_start: dict[str, int] = {}
+        # Each skipped chunk must be followed by its complete aligned successor.
+        # Validate that promise before any GPU work, rather than changing replay
+        # windows to hide a shortened successor and silently changing the output.
+        self._ced_skip_min_rows, self._ced_chunk_align = 0, 0
+        self._ced_mm_requests: set[str] = set()
+        self._ced_expected_chunk: dict[str, tuple[int, int]] = {}
         self._ced_batch: InputBatch | None = None
         self.max_cudagraph_query_len: int | None = None
         if ced_decoder_start(self.model_config.hf_config) is not None:
@@ -140,6 +184,11 @@ class DeepseekV41ModelState(DefaultModelState):
             )
             self.ced_state = CEDState(
                 self.max_num_reqs, self.max_num_tokens, capacities, device
+            )
+            from vllm.v1.core.sched.scheduler import ALIGN_PREFILL_CHUNKS
+
+            self._ced_skip_min_rows, self._ced_chunk_align = _nonfinal_skip_policy(
+                vllm_config, aligned_chunks=ALIGN_PREFILL_CHUNKS
             )
             hf = self.model_config.hf_config
             parallel = vllm_config.parallel_config
@@ -201,19 +250,26 @@ class DeepseekV41ModelState(DefaultModelState):
         # Fresh decoder pages lack cached history; streaming updates retain
         # the live request's private pages and therefore its original boundary.
         pending = self._ced_streaming_prefix_start
-        prefix_start = (
-            pending[1]
-            if pending is not None and pending[0] == new_req_data.req_id
-            else new_req_data.num_computed_tokens
-        )
+        streaming = pending is not None and pending[0] == new_req_data.req_id
+        prefix_start = pending[1] if streaming else new_req_data.num_computed_tokens
         self._ced_streaming_prefix_start = None
         self._ced_prefix_start[new_req_data.req_id] = prefix_start
+        if not streaming:
+            self._ced_expected_chunk.pop(new_req_data.req_id, None)
+        if new_req_data.mm_features:
+            self._ced_mm_requests.add(new_req_data.req_id)
+        else:
+            self._ced_mm_requests.discard(new_req_data.req_id)
 
     def remove_request(self, req_id: str) -> None:
         super().remove_request(req_id)
         self._prefill_tokens.pop(req_id, None)
         self._ced_prompt_logprobs.discard(req_id)
         self._ced_prefix_start.pop(req_id, None)
+        self._ced_mm_requests.discard(req_id)
+        pending = self._ced_streaming_prefix_start
+        if pending is None or pending[0] != req_id:
+            self._ced_expected_chunk.pop(req_id, None)
 
     def can_use_single_request_prefill_graph(self, num_reqs, num_tokens, req_ids):
         return (
@@ -237,20 +293,57 @@ class DeepseekV41ModelState(DefaultModelState):
         if state is None:
             return
         nr = input_batch.num_reqs
+        req_ids = input_batch.req_ids
+        limits = None
+        if force_full:
+            keep_full, prefix_start = [True] * nr, [0] * nr
+        else:
+            keep_full = [req_id in self._ced_prompt_logprobs for req_id in req_ids]
+            prefix_start = [self._ced_prefix_start.get(req_id, 0) for req_id in req_ids]
+            if self._ced_skip_min_rows:
+                computed = input_batch.num_computed_prefill_tokens_np[:nr]
+                for i, req_id in enumerate(req_ids):
+                    expected = self._ced_expected_chunk.get(req_id)
+                    if expected is None:
+                        continue
+                    actual = (
+                        int(computed[i]),
+                        int(input_batch.num_scheduled_tokens[i]),
+                    )
+                    if actual != expected:
+                        raise RuntimeError(
+                            f"CED successor chunk for {req_id!r} is {actual}, "
+                            f"expected {expected}"
+                        )
+                    del self._ced_expected_chunk[req_id]
+                if input_batch.has_prefill:
+                    totals = input_batch.prefill_len_np[:nr]
+                    limits = nonfinal_limits(
+                        input_batch.num_scheduled_tokens[:nr],
+                        computed,
+                        totals,
+                        keep_full,
+                        [req_id not in self._ced_mm_requests for req_id in req_ids],
+                        min_remaining=self._ced_skip_min_rows,
+                        chunk_align=self._ced_chunk_align,
+                    )
+                    if limits is not None:
+                        for i, req_id in enumerate(req_ids):
+                            if limits[i] == 1:
+                                end = int(computed[i]) + int(
+                                    input_batch.num_scheduled_tokens[i]
+                                )
+                                self._ced_expected_chunk[req_id] = (
+                                    end,
+                                    min(int(totals[i]) - end, self._ced_chunk_align),
+                                )
         state.stage(
             input_batch.query_start_loc,
             input_batch.seq_lens,
             input_batch.num_scheduled_tokens[:nr],
-            [True] * nr
-            if force_full
-            else [
-                req_id in self._ced_prompt_logprobs for req_id in input_batch.req_ids
-            ],
-            [0] * nr
-            if force_full
-            else [
-                self._ced_prefix_start.get(req_id, 0) for req_id in input_batch.req_ids
-            ],
+            keep_full,
+            prefix_start,
+            limits,
         )
         self._ced_batch = input_batch
 

@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from .sparse_mla import DeepseekV41B12xMetadata
 
 CED_WINDOW = 128
+# The kept-row limit of a request that keeps every row (prompt logprobs, capture).
 KEEP_ALL = 2**31 - 1
 
 
@@ -74,20 +75,71 @@ class CEDPlan:
     keep_full: tuple[bool, ...]
 
 
-def plan_ced(query_lengths, keep_full, capacities: tuple[int, ...]) -> CEDPlan | None:
-    kept = tuple(
+def plan_ced(
+    query_lengths, keep_full, capacities: tuple[int, ...], limits=None
+) -> CEDPlan | None:
+    """The CPU bounds of a step's decoder rows: each request's last ``CED_WINDOW``
+    rows, or every row where ``keep_full``. ``limits`` (``nonfinal_limits``) lowers a
+    request's kept rows further; ``max_query_len`` keeps the window bound, so the
+    decoder runs in the mode it would without the limits."""
+    bounds = tuple(
         int(q) if full else min(int(q), CED_WINDOW)
         for q, full in zip(query_lengths, keep_full)
     )
-    if all(k == int(q) for k, q in zip(kept, query_lengths)):
+    if all(b == int(q) for b, q in zip(bounds, query_lengths)):
         return None
+    kept = (
+        bounds
+        if limits is None
+        else tuple(min(b, int(limit)) for b, limit in zip(bounds, limits))
+    )
     count = sum(kept)
     return CEDPlan(
         capacities[bisect_left(capacities, count)],
         count,
-        max(kept, default=0),
+        max(bounds, default=0),
         tuple(keep_full),
     )
+
+
+def nonfinal_limits(
+    query_lengths,
+    computed,
+    prefill_lens,
+    keep_full,
+    eligible,
+    *,
+    min_remaining: int,
+    chunk_align: int,
+) -> list[int] | None:
+    """Kept-row limits for prefill chunks whose decoder rows are never read.
+
+    A request's chunk keeps one decoder row instead of its last ``CED_WINDOW``
+    when the chunk is truncated anyway (more than ``CED_WINDOW`` rows, not
+    ``keep_full``), it is ``eligible``, it ends on a multiple of ``chunk_align``
+    (the scheduler's aligned chunk boundaries), and at least ``min_remaining``
+    prefill rows follow it. The next chunk then has more than ``CED_WINDOW`` rows,
+    so its decoder rows replay from inside it, and every later decoder and draft
+    window starts past this chunk. The one row is the chunk's last, whose logits
+    the runner discards (a chunked prefill samples no token). Returns None when no
+    request qualifies.
+    """
+    limits = [CED_WINDOW] * len(query_lengths)
+    skipped = False
+    for i, (q, start, total, full, ok) in enumerate(
+        zip(query_lengths, computed, prefill_lens, keep_full, eligible)
+    ):
+        end = int(start) + int(q)
+        if (
+            ok
+            and not full
+            and int(q) > CED_WINDOW
+            and end % chunk_align == 0
+            and int(total) - end >= min_remaining
+        ):
+            limits[i] = 1
+            skipped = True
+    return limits if skipped else None
 
 
 class CEDState:
@@ -179,14 +231,20 @@ class CEDState:
         query_lengths,
         keep_full,
         prefix_start,
+        limits=None,
     ) -> None:
+        """``limits``: optional per-request kept-row limits (``nonfinal_limits``)."""
         nr = len(query_lengths)
-        self.plan = plan_ced(query_lengths, keep_full, self.capacities)
+        self.plan = plan_ced(query_lengths, keep_full, self.capacities, limits)
         # Fresh pinned sources remain owned by the async-copy allocator until
         # transfer completion; reusing a CPU staging buffer could race overlap.
-        # A request keeps at most its limit of rows: all of them, or the window.
+        # A request keeps at most its limit of rows: all of them, the window, or
+        # its nonfinal limit.
         limits_host = torch.tensor(
-            [KEEP_ALL if full else CED_WINDOW for full in keep_full],
+            [
+                KEEP_ALL if full else CED_WINDOW if limits is None else limits[i]
+                for i, full in enumerate(keep_full)
+            ],
             dtype=torch.int32,
             device="cpu",
             pin_memory=True,
