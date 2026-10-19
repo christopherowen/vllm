@@ -27,8 +27,8 @@ def requests_kernel(max_requests: int):
         nr: T.int32,
     ):
         with T.Kernel(1, threads=128):
-            kept = T.alloc_fragment((block,), T.int32)
-            cumulative = T.alloc_fragment((block,), T.int32)
+            kept = T.alloc_shared((block,), T.int32)
+            cumulative = T.alloc_shared((block,), T.int32)
             for r in T.Parallel(block):
                 kept[r] = T.if_then_else(
                     r < nr, T.min(starts[r + 1] - starts[r], limits[r]), 0
@@ -144,7 +144,8 @@ def copy_rows_kernel(
                         source_row = row if scatter else index
                         source_offset = source_row * strides[0]
                         remainder = col
-                        for axis in T.unroll(len(tail) - 1, -1, -1):
+                        for reverse in T.unroll(len(tail)):
+                            axis = len(tail) - 1 - reverse
                             source_offset += (remainder % tail[axis]) * strides[
                                 axis + 1
                             ]
