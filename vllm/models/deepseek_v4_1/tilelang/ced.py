@@ -37,7 +37,7 @@ def requests_kernel(max_requests: int, compact: bool = True, single: bool = Fals
     if compact and single:
 
         @T.prim_func
-        def ced_single(
+        def ced_requests(
             starts: T.Tensor((starts_len,), T.int32),
             seq: T.Tensor((seq_len,), T.int32),
             limits: T.Tensor((max_requests,), T.int32),
@@ -68,12 +68,12 @@ def requests_kernel(max_requests: int, compact: bool = True, single: bool = Fals
                     counts[0] = kept
                     counts[1] = 1
 
-        return ced_single
+        return ced_requests
 
     if not compact:
 
         @T.prim_func
-        def ced_identity(
+        def ced_requests(
             starts: T.Tensor((starts_len,), T.int32),
             seq: T.Tensor((seq_len,), T.int32),
             limits: T.Tensor((max_requests,), T.int32),
@@ -101,7 +101,7 @@ def requests_kernel(max_requests: int, compact: bool = True, single: bool = Fals
                     counts[0] = total
                     counts[1] = nr
 
-        return ced_identity
+        return ced_requests
 
     @T.prim_func
     def ced_requests(
