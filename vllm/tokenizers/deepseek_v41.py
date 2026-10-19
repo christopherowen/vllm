@@ -12,9 +12,13 @@ from transformers import TokenizersBackend
 from vllm.entrypoints.chat_utils import ChatCompletionMessageParam
 
 from .deepseek_v41_encoding import (
+    ASSISTANT_SP_TOKEN,
     IMAGE_PLACEHOLDER,
     REASONING_EFFORT_MAPPINGS,
     encode_messages,
+    eos_token,
+    thinking_end_token,
+    thinking_start_token,
 )
 from .hf import HfTokenizer, get_cached_tokenizer
 from .protocol import TokenizerLike
@@ -206,6 +210,51 @@ def _normalize_messages(
     return result
 
 
+def _apply_generation_controls(
+    prompt: str,
+    final: dict[str, Any] | None,
+    *,
+    thinking: bool,
+    add_generation_prompt: bool | None,
+    continue_final_message: bool,
+) -> str:
+    """Honor `add_generation_prompt` and `continue_final_message` on the prompt
+    the reference encoder rendered.
+
+    The encoder opens the assistant turn (`<｜Assistant｜>` and the thinking
+    token) after a final user, tool or mid-conversation system message, and
+    closes a final assistant message with its end-of-sentence token. Left alone,
+    its prompt is unchanged: a caller that does not pass the controls, or passes
+    the API defaults on a conversation the encoder already opens, gets exactly
+    the reference prompt.
+    - `add_generation_prompt=True` after a closed assistant message opens a new
+      assistant turn instead of asking the model to write after its
+      end-of-sentence token. A message the encoder followed with a task token
+      (e.g. `<｜title｜>`) already asks for that task and is left alone.
+    - `add_generation_prompt=False` leaves the turn the encoder opened unopened.
+    - `continue_final_message=True` ends the prompt at the final message's text:
+      an assistant message without its end-of-sentence token (the encoder's
+      `wo_eos`), its reasoning still open in thinking mode when it has no
+      content or tool calls yet; any other message without the opened turn.
+    """
+    cue = ASSISTANT_SP_TOKEN + (
+        thinking_start_token if thinking else thinking_end_token
+    )
+    final_is_assistant = final is not None and final["role"] == "assistant"
+    if continue_final_message:
+        if not final_is_assistant:
+            return prompt.removesuffix(cue)
+        if thinking and not final.get("content") and not final.get("tool_calls"):
+            # The reasoning is still being written: leave it open.
+            return prompt.removesuffix(thinking_end_token)
+        return prompt
+    if add_generation_prompt is False and not final_is_assistant:
+        return prompt.removesuffix(cue)
+    if add_generation_prompt and final_is_assistant and prompt.endswith(eos_token):
+        return prompt + cue
+    return prompt
+
+
 def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
     """Wrap an HF tokenizer with the V4.1 prompt encoder."""
     wrapped = copy.copy(tokenizer)
@@ -293,11 +342,34 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
                     "or an integer within [1, 100] in chat_template_kwargs"
                 )
 
+            add_generation_prompt = kwargs.get("add_generation_prompt")
+            continue_final_message = bool(kwargs.get("continue_final_message"))
+            if continue_final_message and add_generation_prompt:
+                raise ValueError(
+                    "Cannot set both `add_generation_prompt` and "
+                    "`continue_final_message` to True."
+                )
+            if continue_final_message and not conversation:
+                raise ValueError("`continue_final_message` needs a final message.")
+            final = conversation[-1] if conversation else None
+            final_is_assistant = final is not None and final["role"] == "assistant"
+            # The reference encoder's own switch for an assistant message the
+            # model continues: rendered without its end-of-sentence token.
+            if continue_final_message and final_is_assistant:
+                final["wo_eos"] = True
+
             prompt = encode_messages(
                 conversation,
                 thinking_mode="thinking" if thinking else "chat",
                 drop_thinking=kwargs.get("drop_thinking", True),
                 reasoning_effort=effort,
+            )
+            prompt = _apply_generation_controls(
+                prompt,
+                final,
+                thinking=thinking,
+                add_generation_prompt=add_generation_prompt,
+                continue_final_message=continue_final_message,
             )
             if kwargs.get("tokenize", True):
                 tokenizer_kwargs = {

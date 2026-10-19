@@ -567,3 +567,151 @@ def test_renderer_tokenizes_so_control_spellings_stay_text():
     messages = [{"role": "user", "content": INJECTED}]
     ids = renderer._apply_chat_template(messages=messages, tokenize=False)
     assert ids == renderer.tokenizer.apply_chat_template(messages)
+# Generation controls. The chat API passes add_generation_prompt=True and
+# continue_final_message=False unless the request says otherwise.
+_API_DEFAULTS = {"add_generation_prompt": True, "continue_final_message": False}
+_EOS = "<｜end▁of▁sentence｜>"
+_ASSISTANT_TURNS = [
+    {"role": "user", "content": "What is 2+2?"},
+    {"role": "assistant", "content": "4.", "reasoning_content": "sum"},
+]
+
+
+@pytest.mark.parametrize("case", _FIXTURES["cases"], ids=lambda case: case["name"])
+def test_api_defaults_leave_reference_prompts_unchanged(case):
+    request = ChatCompletionRequest(
+        messages=case["messages"], tools=case.get("tools")
+    )
+    prompt = get_deepseek_v41_tokenizer(FakeHfTokenizer()).apply_chat_template(
+        request.messages,
+        tools=[tool.model_dump(exclude_none=True) for tool in request.tools]
+        if request.tools
+        else None,
+        tokenize=False,
+        **case["kwargs"],
+        **_API_DEFAULTS,
+    )
+    assert prompt == case["expected"]
+
+
+@pytest.mark.parametrize(
+    ("controls", "token"), [({}, "<think>"), ({"thinking": False}, "</think>")]
+)
+def test_user_terminated_prompt_is_the_reference_encoder_output(controls, token):
+    messages = [{"role": "user", "content": "Say hi."}]
+    thinking = controls.get("thinking", True)
+    reference = encode_messages(
+        messages,
+        thinking_mode="thinking" if thinking else "chat",
+        reasoning_effort="high",
+    )
+    assert reference.endswith("<｜Assistant｜>" + token)
+    assert render(messages, **controls, **_API_DEFAULTS) == reference
+    assert render(messages, **controls) == reference
+
+
+@pytest.mark.parametrize(
+    ("controls", "token"), [({}, "<think>"), ({"thinking": False}, "</think>")]
+)
+def test_assistant_terminated_conversation_opens_a_new_turn(controls, token):
+    closed = render(_ASSISTANT_TURNS, **controls)
+    assert closed.endswith("4." + _EOS)  # the reference encoder's own prompt
+    opened = render(_ASSISTANT_TURNS, **controls, **_API_DEFAULTS)
+    assert opened == closed + "<｜Assistant｜>" + token
+    assert render(_ASSISTANT_TURNS, **controls, add_generation_prompt=False) == closed
+
+
+def test_chat_request_on_assistant_terminated_conversation_opens_a_turn():
+    request = ChatCompletionRequest(
+        model="deepseek-ai/DeepSeek-V4.1-Flash", messages=_ASSISTANT_TURNS
+    )
+    kwargs = request.build_chat_params(None, "auto").get_apply_chat_template_kwargs()
+    assert render(request.messages, **kwargs).endswith(
+        "4." + _EOS + "<｜Assistant｜><think>"
+    )
+
+
+@pytest.mark.parametrize(
+    ("controls", "token"), [({}, "<think>"), ({"thinking": False}, "</think>")]
+)
+def test_add_generation_prompt_false_leaves_the_turn_unopened(controls, token):
+    messages = [{"role": "user", "content": "Say hi."}]
+    opened = render(messages, **controls, **_API_DEFAULTS)
+    unopened = render(messages, **controls, add_generation_prompt=False)
+    assert unopened.endswith("<｜User｜>Say hi.")
+    assert opened == unopened + "<｜Assistant｜>" + token
+
+
+@pytest.mark.parametrize(
+    ("controls", "tail"),
+    [
+        ({}, "<｜Assistant｜><think>sum</think>4."),
+        ({"thinking": False}, "<｜Assistant｜></think>4."),
+    ],
+)
+def test_continue_final_message_continues_the_assistant_text(controls, tail):
+    prompt = render(
+        _ASSISTANT_TURNS,
+        **controls,
+        add_generation_prompt=False,
+        continue_final_message=True,
+    )
+    assert prompt.endswith(tail)
+    assert prompt + _EOS == render(_ASSISTANT_TURNS, **controls)
+
+
+def test_continue_final_message_keeps_partial_reasoning_open():
+    messages = [
+        {"role": "user", "content": "What is 2+2?"},
+        {"role": "assistant", "content": "", "reasoning_content": "Adding two"},
+    ]
+    prompt = render(messages, continue_final_message=True)
+    assert prompt.endswith("<｜Assistant｜><think>Adding two")
+    # Chat mode has no reasoning to continue: the closed prefix stays.
+    chat = render(messages, thinking=False, continue_final_message=True)
+    assert chat.endswith("<｜Assistant｜></think>")
+
+
+def test_continue_final_message_on_an_empty_assistant_turn_is_a_new_turn():
+    messages = [
+        {"role": "user", "content": "What is 2+2?"},
+        {"role": "assistant", "content": ""},
+    ]
+    continued = render(messages, continue_final_message=True)
+    assert continued == render(messages[:1], **_API_DEFAULTS)
+
+
+def test_continue_final_message_after_instructions_is_a_prompt_prefix():
+    # The recurrent-instruction boundary renders the leading instructions with an
+    # empty user turn this way and needs a prefix of the full prompt.
+    instructions = [{"role": "system", "content": "Be brief."}]
+    prefix = render(
+        instructions + [{"role": "user", "content": ""}],
+        add_generation_prompt=False,
+        continue_final_message=True,
+    )
+    full = render(instructions + [{"role": "user", "content": "hi"}], **_API_DEFAULTS)
+    assert prefix.endswith("<｜User｜>")
+    assert full.startswith(prefix)
+
+
+def test_task_token_after_an_assistant_message_is_left_alone():
+    case = next(c for c in _FIXTURES["cases"] if c["name"] == "title_task")
+    prompt = render(case["messages"], **case["kwargs"], **_API_DEFAULTS)
+    assert prompt == case["expected"]
+    assert prompt.endswith(_EOS + "<｜title｜>")
+
+
+def test_both_generation_controls_is_a_request_error():
+    with pytest.raises(ValueError, match="continue_final_message"):
+        render(
+            _ASSISTANT_TURNS,
+            add_generation_prompt=True,
+            continue_final_message=True,
+        )
+
+
+def test_generation_controls_do_not_mutate_messages():
+    messages = copy.deepcopy(_ASSISTANT_TURNS)
+    render(messages, add_generation_prompt=False, continue_final_message=True)
+    assert messages == _ASSISTANT_TURNS
