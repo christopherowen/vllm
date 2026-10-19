@@ -67,6 +67,7 @@ from .. import kernels, l2_prefetch, sp_prefill
 from ..attention import DeepseekV4Attention
 from ..ced import ced_decoder_start, gather_rows, scatter_rows
 from ..common.engram import Engram, EngramLayout, NgramHashState
+from ..glp import glp_steering, steer_post_layer
 from .b12x_attention import DeepseekV41B12xAttention
 
 if typing.TYPE_CHECKING:
@@ -570,6 +571,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 self.hc_mult,
                 dtype=torch.float32,
             )
+        # GLP steering (glp.py) when WEIGHTLESS_STEER_PATH is set; None otherwise,
+        # which leaves the forward as it is.
+        self.glp = glp_steering(config.num_hidden_layers, config.hidden_size)
 
     def prepare_disk_engram(
         self, input_ids, query_start_loc, lookback_token_ids, early=None
@@ -813,9 +817,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 if input_ids is not None:
                     input_ids = gather_rows(input_ids, ced_indices)
                 decoder_compacted = True
+            hidden_states, residual, post_mix, res_mix = steer_post_layer(
+                self.glp, layer.mhc, idx, hidden_states, residual, post_mix, res_mix
+            )
             if idx + 1 in self.aux_hidden_state_layers:
-                # Reconstruct the aux hidden state for draft models
-                aux_recon = layer.mhc.post(hidden_states, residual, post_mix, res_mix)
+                # Reconstruct the aux hidden state for draft models; steering has
+                # already folded it.
+                aux_recon = (
+                    hidden_states
+                    if residual is None
+                    else layer.mhc.post(hidden_states, residual, post_mix, res_mix)
+                )
                 aux_hidden_state = layer.mhc.collapse(aux_recon)
                 if self.use_sequence_parallel:
                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
@@ -832,7 +844,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             # Reuse if the last layer was captured as an aux hidden state
             if self.end_layer in self.aux_hidden_state_layers:
                 hidden_states = final_aux_recon
-            else:
+            elif residual is not None:
                 hidden_states = layer.mhc.post(
                     hidden_states, residual, post_mix, res_mix
                 )
