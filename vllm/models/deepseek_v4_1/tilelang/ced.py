@@ -8,6 +8,17 @@ import tilelang.language as T
 _PASS = {tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
 
 
+# Predicated global loads (zero when off). They are volatile, so the compiler
+# keeps them where they are written, ahead of the stores and branches that use
+# them, instead of sinking each into its first use.
+def _load32(load, pred=None):
+    return T.reinterpret(T.ldg32(load, pred=pred), T.int32)
+
+
+def _load64(load, pred=None):
+    return T.reinterpret(T.ldg64(load, pred=pred), T.int64)
+
+
 @tilelang.jit(
     pass_configs={
         **_PASS,
@@ -37,17 +48,17 @@ def requests_kernel(max_requests: int, compact: bool = True, single: bool = Fals
         ):
             with T.Kernel(T.ceildiv(max_requests + 1, 128), threads=128) as bx:
                 r = bx * 128 + T.get_thread_binding()
-                q = starts[1] - starts[0]
-                kept = T.min(q, limits[0])
+                q = _load32(starts[1]) - _load32(starts[0])
+                kept = T.min(q, _load32(limits[0]))
+                last = T.cast(_load32(seq[0]), T.int64)
+                bound = _load64(prefix[0])
                 if r <= max_requests:
                     out_starts[r] = T.if_then_else(r == 0, 0, kept)
                 if r < max_requests:
                     if r == 0:
-                        position = T.cast(seq[0], T.int64) - kept
+                        position = last - kept
                         positions[0] = position
-                        replay[0] = T.max(
-                            prefix[0], T.if_then_else(q > kept, position, 0)
-                        )
+                        replay[0] = T.max(bound, T.if_then_else(q > kept, position, 0))
                     else:
                         positions[r] = -1
                         replay[r] = 0
@@ -73,19 +84,19 @@ def requests_kernel(max_requests: int, compact: bool = True, single: bool = Fals
         ):
             with T.Kernel(T.ceildiv(max_requests + 1, 128), threads=128) as bx:
                 r = bx * 128 + T.get_thread_binding()
+                live = r < nr
+                start = _load32(starts[T.min(r, nr)])
+                end = _load32(starts[r + 1], live)
+                last = T.cast(_load32(seq[r], live), T.int64)
+                bound = _load64(prefix[r], live)
+                total = _load32(starts[nr])
                 if r <= max_requests:
-                    out_starts[r] = starts[T.min(r, nr)]
+                    out_starts[r] = start
                 if r < max_requests:
-                    if r < nr:
-                        positions[r] = T.cast(seq[r], T.int64) - (
-                            starts[r + 1] - starts[r]
-                        )
-                        replay[r] = prefix[r]
-                    else:
-                        positions[r] = -1
-                        replay[r] = 0
+                    positions[r] = T.if_then_else(live, last - (end - start), -1)
+                    replay[r] = T.if_then_else(live, bound, 0)
                 if r == 0:
-                    counts[0] = starts[nr]
+                    counts[0] = total
                     counts[1] = nr
 
         return ced_identity
@@ -110,9 +121,14 @@ def requests_kernel(max_requests: int, compact: bool = True, single: bool = Fals
             carry = 0
             for chunk in T.serial(chunks):
                 r = chunk * 32 + lane
-                kept = T.if_then_else(
-                    r < nr, T.min(starts[r + 1] - starts[r], limits[r]), 0
-                )
+                # Every input loads before the scan, so one memory latency covers
+                # the request's lengths, sequence end and prefix bound.
+                live = r < nr
+                q = _load32(starts[r + 1], live) - _load32(starts[r], live)
+                limit = _load32(limits[r], live)
+                end = T.cast(_load32(seq[r], live), T.int64)
+                bound = _load64(prefix[r], live)
+                kept = T.min(q, limit)
                 if nr <= 1:
                     cumulative = T.shfl_sync(kept, 0) + carry
                 else:
@@ -125,16 +141,11 @@ def requests_kernel(max_requests: int, compact: bool = True, single: bool = Fals
                     cumulative = cumulative + carry
                 if r < max_requests:
                     out_starts[r] = cumulative - kept
-                    if r < nr:
-                        q = starts[r + 1] - starts[r]
-                        position = T.cast(seq[r], T.int64) - kept
-                        positions[r] = position
-                        replay[r] = T.max(
-                            prefix[r], T.if_then_else(q > kept, position, 0)
-                        )
-                    else:
-                        positions[r] = -1
-                        replay[r] = 0
+                    position = end - kept
+                    positions[r] = T.if_then_else(live, position, -1)
+                    replay[r] = T.if_then_else(
+                        live, T.max(bound, T.if_then_else(q > kept, position, 0)), 0
+                    )
                 carry = T.shfl_sync(cumulative, last_lane)
             if lane == 0:
                 out_starts[max_requests] = carry
@@ -157,7 +168,7 @@ def requests(
     *,
     compact=True,
 ):
-    requests_kernel(positions.shape[0], compact, nr == 1)(
+    requests_kernel(positions.shape[0], compact, compact and nr == 1)(
         starts, seq, limits, prefix, out_starts, positions, replay, counts, nr
     )
 
