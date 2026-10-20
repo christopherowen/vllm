@@ -101,6 +101,13 @@ def _warmup_block_counter(
     return block_count
 
 
+def _sink_draft_zero(model_runner: GPUModelRunner) -> bool:
+    """Sink rejection: a decoding request's spec tokens start with draft zero
+    (vllm.v1.sample.sink), so the warmup's decode steps carry one too."""
+    sink = getattr(model_runner, "sink", None)
+    return sink is not None and sink.rejection
+
+
 def run_mixed_prefill_decode_warmup(
     model_runner: GPUModelRunner,
     worker_execute_model: Callable[[SchedulerOutput], Any],
@@ -206,6 +213,9 @@ def run_mixed_prefill_decode_warmup(
         decode_req_id: decode_scheduled_tokens,
         prefill_req_id: prefill_len,
     }
+    if _sink_draft_zero(model_runner):
+        mixed_output.scheduled_spec_decode_tokens = {decode_req_id: [0]}
+        mixed_output.sink_draft_zero_req_ids = {decode_req_id}
     mixed_output.total_num_scheduled_tokens = num_tokens
     mixed_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
 
@@ -248,6 +258,10 @@ def warmup_kernels(
     if adaptive_sampling:
         assert rejection_sampler is not None
         rejection_sampler.enable_adaptive_verification = False
+    sink = getattr(model_runner, "sink", None)
+    if sink is not None:
+        # The warmup's synthetic rows are not traffic: neither logged nor kept.
+        sink.warming = True
     try:
         _warmup_kernels(model_runner, worker_execute_model, worker_sample_tokens)
     finally:
@@ -255,6 +269,8 @@ def warmup_kernels(
         if adaptive_sampling:
             assert rejection_sampler is not None
             rejection_sampler.enable_adaptive_verification = True
+        if sink is not None:
+            sink.end_warmup()
     _warmup_dead_row_kernels(model_runner)
 
 
@@ -445,6 +461,8 @@ def _warmup_kernels(
         req_computed = [prompt_len] * num_reqs
         req_blocks = [list(prefill_block_counts) for _ in range(num_reqs)]
 
+        draft_zero = _sink_draft_zero(model_runner)
+
         def _run_decode_step(indices: list[int], spec_flags: list[bool]) -> None:
             """Decode `indices`, spec-decoding the ones flagged in `spec_flags`."""
             cached_req_data = CachedRequestData.make_empty()
@@ -469,13 +487,17 @@ def _warmup_kernels(
                     held + delta for held, delta in zip(req_blocks[i], deltas)
                 ]
                 step_num_scheduled_tokens[req_ids[i]] = num_tokens
-                if use_spec:
+                if draft_zero:
+                    step_spec_tokens[req_ids[i]] = [0] * (num_tokens)
+                elif use_spec:
                     step_spec_tokens[req_ids[i]] = [0] * num_spec_steps
 
             decode_output = SchedulerOutput.make_empty()
             decode_output.scheduled_cached_reqs = cached_req_data
             decode_output.num_scheduled_tokens = step_num_scheduled_tokens
             decode_output.scheduled_spec_decode_tokens = step_spec_tokens
+            if draft_zero:
+                decode_output.sink_draft_zero_req_ids = {req_ids[i] for i in indices}
             decode_output.total_num_scheduled_tokens = sum(
                 step_num_scheduled_tokens.values()
             )

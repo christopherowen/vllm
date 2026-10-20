@@ -17,6 +17,7 @@ from vllm.v1.outputs import (
     PoolerOutput,
     RoutedExpertsTensors,
 )
+from vllm.v1.sample.sink import events_to_dict
 from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
 from vllm.v1.worker.utils import raise_if_nan_logits
 
@@ -145,10 +146,31 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.copy_event = torch.cuda.Event(blocking=True)
         self._has_fault: torch.Tensor | None = None
 
+        # Sink rejection replaces the sampled tokens by the committed ones
+        # with draft zero in front (vllm.v1.worker.gpu.sample.sink).
+        sink = sampler_output.sink
+        sampled_token_ids = sampler_output.sampled_token_ids
+        if sink is not None and sink.tokens is not None:
+            assert sink.num_tokens is not None
+            sampled_token_ids = sink.tokens
+            num_sampled_tokens = sink.num_tokens
+            self.num_sampled_tokens = num_sampled_tokens
+        self.sink_events: np.ndarray | None = None
+        self.sink_recovered_logprobs: np.ndarray | None = None
+        self.sink_recovered_ranks: np.ndarray | None = None
+
         with stream(copy_stream, main_stream):
             copy_stream.wait_stream(main_stream)
 
-            self.sampled_token_ids = async_copy_to_np(sampler_output.sampled_token_ids)
+            self.sampled_token_ids = async_copy_to_np(sampled_token_ids)
+            if sink is not None:
+                self.sink_events = async_copy_to_np(sink.events)
+                if sink.recovered_logprobs is not None:
+                    assert sink.recovered_ranks is not None
+                    self.sink_recovered_logprobs = async_copy_to_np(
+                        sink.recovered_logprobs
+                    )
+                    self.sink_recovered_ranks = async_copy_to_np(sink.recovered_ranks)
             self.logprobs_tensors: LogprobsTensors | None = None
             if sampler_output.logprobs_tensors is not None:
                 self.logprobs_tensors = (
@@ -220,6 +242,17 @@ class AsyncOutput(AsyncModelRunnerOutput):
 
         if self.logprobs_tensors is not None:
             self.model_runner_output.logprobs = self.logprobs_tensors.tolists()
+        if self.sink_events is not None:
+            self.model_runner_output.sink_events = events_to_dict(
+                self.sink_events.tolist(),
+                self.model_runner_output.req_ids,
+                self.sink_recovered_logprobs.tolist()
+                if self.sink_recovered_logprobs is not None
+                else None,
+                self.sink_recovered_ranks.tolist()
+                if self.sink_recovered_ranks is not None
+                else None,
+            )
         self.model_runner_output.prompt_logprobs_dict = self.prompt_logprobs_dict
         if self.routed_experts_cpu is not None:
             self.model_runner_output.routed_experts = self.routed_experts_cpu.tolists()

@@ -20,7 +20,11 @@ from vllm.v1.engine import (
     EngineCoreRequest,
     FinishReason,
 )
-from vllm.v1.metrics.stats import PrefillStats, RequestSpecDecodeMetrics
+from vllm.v1.metrics.stats import (
+    PrefillStats,
+    RequestSinkMetrics,
+    RequestSpecDecodeMetrics,
+)
 from vllm.v1.structured_output.request import StructuredOutputRequest
 from vllm.v1.utils import ConstantList
 
@@ -28,6 +32,7 @@ if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.boundary_checkpoint import BoundaryCheckpoint
     from vllm.v1.core.kv_cache_utils import BlockHash
+    from vllm.v1.outputs import LogprobsLists
 
 
 @dataclass
@@ -230,6 +235,20 @@ class Request:
         # the scheduler when --per-request-spec-decode-metrics is set (eagerly on
         # add_request, then observed each verify step); stays None otherwise.
         self.spec_decode_metrics: RequestSpecDecodeMetrics | None = None
+        # Attention-sink events of this request (vllm.v1.sample.sink), created
+        # at the first event when the engine's detector is on.
+        self.sink_metrics: RequestSinkMetrics | None = None
+        # Sink rejection: the last token the request sampled, held back until
+        # its next step verifies it as draft zero (never in the output token
+        # ids or seen by the frontend before then), and its logprobs entry.
+        # None while the token is unknown to the scheduler (in flight) or the
+        # request holds none.
+        self.sink_provisional: int | None = None
+        self.sink_provisional_logprobs: LogprobsLists | None = None
+        # Whether the request's next step starts with draft zero: set once a
+        # step that samples a provisional token is scheduled, cleared when the
+        # request loses it (preemption, a new streaming input).
+        self.sink_draft_zero = False
 
         self.block_hashes: list[BlockHash] = []
         # Store the block hasher without binding self to avoid creating a

@@ -18,6 +18,7 @@ from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.metrics.stats import (
     PrefillStats,
+    RequestSinkMetrics,
     RequestSpecDecodeMetrics,
     SchedulerStats,
 )
@@ -238,6 +239,10 @@ class EngineCoreOutput(
     # Per-request spec-decode acceptance; attached only on the final output.
     # Appended last so `array_like` positional serialization stays compatible.
     spec_decode_metrics: RequestSpecDecodeMetrics | None = None
+
+    # The request's attention-sink events, attached on its final output when
+    # the engine's sink detector is on.
+    sink_metrics: RequestSinkMetrics | None = None
 
     @property
     def finished(self) -> bool:

@@ -136,6 +136,35 @@ def gumbel_noised_argmax(
     appears; `pos` and `seed` place the draw in the request's stream, which is
     what lets a draft and its verification agree.
     """
+    logits = gumbel_noised_scores(
+        logits,
+        keys,
+        mask,
+        seed,
+        pos,
+        temp,
+        IS_DRAFTING=IS_DRAFTING,
+        USE_FP64=USE_FP64,
+        APPLY_TEMPERATURE=APPLY_TEMPERATURE,
+    )
+    return tl.max(logits, axis=0, return_indices=True)
+
+
+@triton.jit
+def gumbel_noised_scores(
+    logits,
+    keys,
+    mask,
+    seed,
+    pos,
+    temp,
+    IS_DRAFTING: tl.constexpr,
+    USE_FP64: tl.constexpr,
+    APPLY_TEMPERATURE: tl.constexpr = True,
+):
+    """The scores `gumbel_noised_argmax` takes the argmax of: the logits plus
+    the draw's Gumbel noise, or the logits themselves at temp 0. In descending
+    order they are sampling without replacement from the same draw."""
     if temp != 0.0 and APPLY_TEMPERATURE:
         # Match the behavior of _temperature_kernel: if that kernel uses
         # tl.div_rn, this must too.
@@ -157,8 +186,7 @@ def gumbel_noised_argmax(
             # log1p keeps the winning tail at u -> 0, where fp32 resolves it.
             gumbel_noise = -tl.log(-tldevice.log1p(-u))
         logits = tl.where(mask, logits + gumbel_noise, float("-inf"))
-
-    return tl.max(logits, axis=0, return_indices=True)
+    return logits
 
 
 @triton.jit

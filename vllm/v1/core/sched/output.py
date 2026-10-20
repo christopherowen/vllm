@@ -317,6 +317,11 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int | None = None
 
+    # Sink rejection (vllm.v1.sample.sink): the requests whose scheduled spec
+    # tokens start with draft zero, the provisional token their previous step
+    # sampled, ahead of the drafter's tokens. None with rejection off.
+    sink_draft_zero_req_ids: set[str] | None = None
+
     # Explicit model-execution class used by adaptive compute fairness.
     # None identifies a transfer-only or otherwise empty model step.
     compute_service_class: ComputeServiceClass | None = None

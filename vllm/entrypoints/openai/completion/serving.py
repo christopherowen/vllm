@@ -17,6 +17,7 @@ from vllm.entrypoints.generate.base.protocol import (
 from vllm.entrypoints.generate.base.serving import (
     GenerateBaseServing,
     build_per_request_timing_metrics,
+    build_sink_usage,
     build_spec_decoding_metrics,
     clamp_prompt_logprobs,
     format_token_id_placeholder,
@@ -452,6 +453,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                 final_usage_info.prompt_tokens_details = PromptTokenUsageInfo(
                     cached_tokens=num_cached_tokens
                 )
+            final_usage_info.sink_rejection = build_sink_usage(last_res)
 
             if include_usage:
                 # In streaming, metrics ride on this final usage chunk, which is
@@ -611,6 +613,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
             usage.prompt_tokens_details = PromptTokenUsageInfo(
                 cached_tokens=last_final_res.num_cached_tokens
             )
+        usage.sink_rejection = build_sink_usage(last_final_res)
 
         request_metadata.final_usage_info = usage
 

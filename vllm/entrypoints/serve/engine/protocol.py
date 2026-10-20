@@ -132,9 +132,25 @@ class CompletionTokenUsageInfo(OpenAIBaseModel):
     reasoning_tokens: int = 0
 
 
+class SinkUsageInfo(OpenAIBaseModel):
+    """Attention-sink events of the request's generation (the engine's sink
+    detector; see vllm.v1.sample.sink). Present when the detector is on."""
+
+    flagged_rows: int = 0
+    # Flagged rows by where they sit: draft zero (the token the previous step
+    # sampled), a drafter token, a prompt token.
+    flagged_draft_zero: int = 0
+    flagged_drafter: int = 0
+    flagged_prompt: int = 0
+    draft_zero_rejections: int = 0
+    draft_cuts: int = 0
+    fallthroughs: int = 0
+
+
 class UsageInfo(OpenAIBaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: int | None = 0
     prompt_tokens_details: PromptTokenUsageInfo | None = None
     completion_tokens_details: CompletionTokenUsageInfo | None = None
+    sink_rejection: SinkUsageInfo | None = None

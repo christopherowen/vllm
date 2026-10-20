@@ -22,7 +22,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionReque
 from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
-from vllm.entrypoints.serve.engine.protocol import ErrorResponse
+from vllm.entrypoints.serve.engine.protocol import ErrorResponse, SinkUsageInfo
 from vllm.entrypoints.serve.engine.serving import BaseServing
 from vllm.entrypoints.serve.engine.typing import AnyRequest
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
@@ -100,6 +100,27 @@ def build_per_request_timing_metrics(
         mean_itl_ms=mean_itl_ms,
         tokens_per_second=tokens_per_second,
     )
+
+
+def build_sink_usage(final_res: "RequestOutput | None") -> SinkUsageInfo | None:
+    """The request's attention-sink events for ``usage.sink_rejection``, summed
+    over its sequences, or ``None`` when the engine's detector is off."""
+    if final_res is None or not final_res.outputs:
+        return None
+    totals: dict[str, int] | None = None
+    for output in final_res.outputs:
+        metrics = output.sink_metrics
+        if metrics is None:
+            continue
+        counts = metrics.to_dict()
+        if totals is None:
+            totals = dict(counts)
+        else:
+            for key, value in counts.items():
+                totals[key] += value
+    if totals is None:
+        return None
+    return SinkUsageInfo(**totals)
 
 
 def build_spec_decoding_metrics(

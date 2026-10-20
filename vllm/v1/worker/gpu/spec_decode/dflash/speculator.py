@@ -888,7 +888,14 @@ def _prepare_dflash_inputs_kernel(
         # Chunked prefilling: splice in the next prefill token.
         bonus_token = tl.load(next_prefill_tokens_ptr + req_state_idx).to(tl.int32)
 
-    last_valid_pos = tl.load(target_positions_ptr + valid_ctx_end - 1)
+    # No valid row: every row was rejected, the first one included (sink
+    # rejection replaced draft zero). The anchor, its replacement, takes draft
+    # zero's position; the context before it is in the cache already.
+    last_valid_pos = tl.where(
+        num_valid_ctx > 0,
+        tl.load(target_positions_ptr + tl.maximum(valid_ctx_end - 1, ctx_start)),
+        tl.load(target_positions_ptr + ctx_start) - 1,
+    )
     query_base = req_idx * num_query_per_req
 
     j = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)

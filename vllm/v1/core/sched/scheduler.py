@@ -8,6 +8,8 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import numpy as np
+
 import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
@@ -65,7 +67,7 @@ from vllm.v1.core.sched.request_queue import (
     SchedulingPolicy,
     create_request_queue,
 )
-from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.core.sched.utils import check_stop, remove_all, stops_on_next_token
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -76,11 +78,19 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import (
     PrefixCacheStats,
+    RequestSinkMetrics,
     RequestSpecDecodeMetrics,
     SchedulerStats,
+    SinkStats,
 )
-from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.outputs import (
+    DraftTokenIds,
+    KVConnectorOutput,
+    LogprobsLists,
+    ModelRunnerOutput,
+)
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.sample.sink import SinkConfig, SinkEvent, SinkOutcome, SinkRow
 from vllm.v1.spec_decode.dynamic.acceptance_length import (
     BatchSizeAcceptanceLengthController,
 )
@@ -127,7 +137,34 @@ def _build_kv_connector_block_state(
     )
 
 
+def _concat_logprobs(first: LogprobsLists, second: LogprobsLists) -> LogprobsLists:
+    """Rows of two steps, whose widths follow each step's largest logprobs
+    request; the narrower rows are padded past every request's own columns."""
+    width = max(first.logprobs.shape[1], second.logprobs.shape[1])
+
+    def pad(array: np.ndarray, value: float) -> np.ndarray:
+        return np.pad(
+            array, ((0, 0), (0, width - array.shape[1])), constant_values=value
+        )
+
+    return LogprobsLists(
+        np.concatenate(
+            [pad(first.logprob_token_ids, 0), pad(second.logprob_token_ids, 0)]
+        ),
+        np.concatenate(
+            [pad(first.logprobs, float("-inf")), pad(second.logprobs, float("-inf"))]
+        ),
+        np.concatenate([first.sampled_token_ranks, second.sampled_token_ranks]),
+        None,
+    )
+
+
 class Scheduler(SchedulerInterface):
+    # Attention-sink detector and rejection (set in __init__ from the
+    # environment; off for a scheduler built without it).
+    sink_config: SinkConfig | None = None
+    sink_rejection: bool = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -187,6 +224,19 @@ class Scheduler(SchedulerInterface):
         self.num_sampled_tokens_per_step = (
             1 if not vllm_config.model_config.is_diffusion else 0
         )
+        # Attention-sink detector and rejection (vllm.v1.sample.sink). With
+        # rejection on, each step's last sampled token is held back as the
+        # request's provisional token and scheduled as draft zero of its next
+        # step; the worker verifies it there.
+        self.sink_config = SinkConfig.from_env()
+        self.sink_rejection = (
+            self.sink_config is not None and self.sink_config.rejection
+        )
+        if self.sink_rejection and self.num_sampled_tokens_per_step != 1:
+            raise ValueError(
+                "Sink rejection holds back the token each step samples; "
+                "diffusion models sample none."
+            )
 
         # Create KVConnector for the Scheduler. Note that each Worker
         # will have a corresponding KVConnector with Role=WORKER.
@@ -1096,6 +1146,19 @@ class Scheduler(SchedulerInterface):
                     # Async scheduling: avoid an extra step when the previous
                     # one reached max_tokens. Do not schedule partial drafts;
                     # that prevents uniform decode optimizations.
+                    req_index += 1
+                    continue
+                if (
+                    self.sink_rejection
+                    and request.sink_draft_zero
+                    and request.num_output_placeholders == 0
+                    and request.num_in_flight_tokens > 0
+                    and request.num_computed_tokens + 1
+                    >= request.num_prompt_tokens + request.max_tokens
+                ):
+                    # Sink rejection, async scheduling: the prefill in flight
+                    # samples the max_tokens token, which is committed as it
+                    # is; no step follows it.
                     req_index += 1
                     continue
 
@@ -2211,6 +2274,17 @@ class Scheduler(SchedulerInterface):
             else:
                 compute_service_class = "decode"
 
+        sink_draft_zero_req_ids: set[str] | None = None
+        if self.sink_rejection:
+            sink_draft_zero_req_ids = set()
+            for request in scheduled_running_reqs:
+                if request.sink_draft_zero:
+                    # Draft zero leads every step of a decoding request.
+                    assert scheduled_spec_decode_tokens.get(request.request_id), (
+                        request.request_id
+                    )
+                    sink_draft_zero_req_ids.add(request.request_id)
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             boundary_logits_only=bool(
@@ -2239,6 +2313,7 @@ class Scheduler(SchedulerInterface):
             kv_cache_block_copies=pending_kv_cache_block_copies,
             kv_connector_block_state=kv_connector_block_state,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
+            sink_draft_zero_req_ids=sink_draft_zero_req_ids,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
             compute_service_class=compute_service_class,
             # Execution feedback is only useful while both classes can run.
@@ -2483,6 +2558,10 @@ class Scheduler(SchedulerInterface):
         request.num_computed_tokens = 0
         if request.spec_token_ids:
             request.spec_token_ids = []
+        # The resumed request samples its next position again: its next step
+        # has no draft zero. The held token stays until an in-flight output
+        # of the request (stale) commits draft zero with its kept logprobs.
+        request.sink_draft_zero = False
         # Async scheduling: mark all in-flight output as stale. Its tokens are
         # still delivered on return (dropping them would perturb spec-decode
         # acceptance) but must not mutate the reset counters; each step drains
@@ -2525,6 +2604,10 @@ class Scheduler(SchedulerInterface):
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
             )
+            if self.sink_rejection and not request.is_prefill_chunk:
+                # This step samples a provisional token: the request's next
+                # step starts with it as draft zero.
+                request.sink_draft_zero = True
             scheduler_output.has_structured_output_requests |= (
                 request.use_structured_output and not request.is_prefill_chunk
             )
@@ -2565,6 +2648,7 @@ class Scheduler(SchedulerInterface):
 
         # Current streaming input behaviour: Keep only computed output tokens
         # (discard final sampled output token).
+        self._drop_sink_provisional(session)
         num_computed_tokens = session.num_computed_tokens
         kept_output_tokens = session._all_token_ids[
             session.num_prompt_tokens : num_computed_tokens
@@ -2858,6 +2942,7 @@ class Scheduler(SchedulerInterface):
             self.requests,
             structured_output_request_ids,
             scheduler_output.scheduled_spec_decode_tokens,
+            scheduler_output.sink_draft_zero_req_ids if self.sink_rejection else None,
         )
         return GrammarOutput(
             structured_output_request_ids,
@@ -2927,6 +3012,8 @@ class Scheduler(SchedulerInterface):
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
+        sink_events = model_runner_output.sink_events
+        sink_stats: SinkStats | None = None
 
         failed_kv_load_req_ids: set[str] = set()
         if kv_connector_output and kv_connector_output.failed_recving:
@@ -3005,6 +3092,11 @@ class Scheduler(SchedulerInterface):
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
+            # Sink rejection: whether this step's spec tokens started with
+            # draft zero, the provisional token of the request's previous step.
+            draft_zero = self.sink_rejection and req_id in (
+                scheduler_output.sink_draft_zero_req_ids or ()
+            )
 
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
@@ -3013,14 +3105,18 @@ class Scheduler(SchedulerInterface):
                 generated_token_ids or self.num_sampled_tokens_per_step == 0
             ):
                 num_scheduled_draft_tokens = len(scheduled_spec_token_ids)
-                num_draft_tokens = num_scheduled_draft_tokens
+                # Draft zero is the request's own sampled token, not a drafter
+                # token: it rolls back like a draft but stays out of the
+                # acceptance statistics.
+                num_drafter_tokens = num_scheduled_draft_tokens - draft_zero
+                num_draft_tokens = num_drafter_tokens
                 if model_runner_output.num_verified_draft_tokens is not None:
                     num_draft_tokens = model_runner_output.num_verified_draft_tokens[
                         req_index
                     ]
-                    assert 0 <= num_draft_tokens <= num_scheduled_draft_tokens
+                    assert 0 <= num_draft_tokens <= num_drafter_tokens
                 if scheduler_output.num_invalid_spec_tokens:
-                    num_valid_draft_tokens = num_scheduled_draft_tokens - (
+                    num_valid_draft_tokens = num_drafter_tokens - (
                         scheduler_output.num_invalid_spec_tokens.get(req_id, 0)
                     )
                     num_draft_tokens = min(
@@ -3028,7 +3124,8 @@ class Scheduler(SchedulerInterface):
                         num_valid_draft_tokens,
                     )
                 num_sampled = self.num_sampled_tokens_per_step
-                num_accepted = max(len(generated_token_ids) - num_sampled, 0)
+                num_committed_spec = max(len(generated_token_ids) - num_sampled, 0)
+                num_accepted = max(num_committed_spec - draft_zero, 0)
                 assert num_accepted <= num_draft_tokens, (
                     f"{req_id}: accepted={num_accepted}, "
                     f"valid_drafts={num_draft_tokens}, "
@@ -3037,12 +3134,9 @@ class Scheduler(SchedulerInterface):
                     f"{(scheduler_output.num_invalid_spec_tokens or {}).get(req_id, 0)}"
                 )
                 # Every unaccepted scheduler placeholder must be rolled back,
-                # including drafts omitted by adaptive verification.
-                num_rejected = num_scheduled_draft_tokens - num_accepted
-                if self.acceptance_length_controller is not None:
-                    adaptive_num_drafts += 1
-                    adaptive_num_draft_tokens += num_draft_tokens
-                    adaptive_num_accepted_tokens += num_accepted
+                # including drafts omitted by adaptive verification and a
+                # rejected draft zero.
+                num_rejected = num_scheduled_draft_tokens - num_committed_spec
                 # Rejections roll back num_computed_tokens (and, under async
                 # scheduling, num_output_placeholders, which covers the spec
                 # tokens). A stale rejection count predates the preemption
@@ -3052,17 +3146,28 @@ class Scheduler(SchedulerInterface):
                         request.num_computed_tokens -= num_rejected
                     if request.num_output_placeholders > 0:
                         request.num_output_placeholders -= num_rejected
-                spec_decoding_stats = self.make_spec_decoding_stats(
-                    spec_decoding_stats,
-                    num_draft_tokens=num_draft_tokens,
-                    num_accepted_tokens=num_accepted,
-                )
-                if request.spec_decode_metrics is not None and num_draft_tokens:
-                    request.spec_decode_metrics.observe(
+                if num_drafter_tokens:
+                    if self.acceptance_length_controller is not None:
+                        adaptive_num_drafts += 1
+                        adaptive_num_draft_tokens += num_draft_tokens
+                        adaptive_num_accepted_tokens += num_accepted
+                    spec_decoding_stats = self.make_spec_decoding_stats(
+                        spec_decoding_stats,
                         num_draft_tokens=num_draft_tokens,
-                        num_accepted=num_accepted,
-                        detailed=self.spec_decode_metrics_level == "detailed",
+                        num_accepted_tokens=num_accepted,
                     )
+                    if request.spec_decode_metrics is not None and num_draft_tokens:
+                        request.spec_decode_metrics.observe(
+                            num_draft_tokens=num_draft_tokens,
+                            num_accepted=num_accepted,
+                            detailed=self.spec_decode_metrics_level == "detailed",
+                        )
+
+            sink_event = sink_events.get(req_id) if sink_events else None
+            if sink_event is not None and not output_is_stale:
+                if sink_stats is None:
+                    sink_stats = SinkStats()
+                self._observe_sink_event(request, sink_event, sink_stats)
 
             # Free encoder inputs only after the step has actually executed.
             if request.has_encoder_inputs:
@@ -3079,11 +3184,61 @@ class Scheduler(SchedulerInterface):
             status_before_stop = request.status
             num_output_tokens_before = len(request._output_token_ids)
 
+            # Sink rejection: the step's last sampled token is not committed
+            # yet; it is held back as the provisional token (draft zero of the
+            # request's next step) unless it ends the request.
+            held_token: int | None = None
+            sink_logprobs: LogprobsLists | None = None
+            if self.sink_rejection and generated_token_ids:
+                if (
+                    request.sampling_params is not None
+                    and request.sampling_params.num_logprobs is not None
+                    and logprobs
+                ):
+                    sink_logprobs = self._sink_logprobs(
+                        request,
+                        logprobs,
+                        req_index,
+                        generated_token_ids,
+                        draft_zero,
+                        sink_event,
+                    )
+                if draft_zero and len(generated_token_ids) > 1 and not output_is_stale:
+                    # The worker verified the token this scheduler held back.
+                    assert generated_token_ids[0] == request.sink_provisional, (
+                        req_id,
+                        generated_token_ids,
+                        request.sink_provisional,
+                    )
+                request.sink_provisional = None
+                request.sink_provisional_logprobs = None
+                new_token_ids = generated_token_ids[:-1]
+                held_token = generated_token_ids[-1]
+
             # Check for stop and update request status.
-            if new_token_ids:
-                new_token_ids, stopped = self._update_request_with_output(
-                    request, new_token_ids, is_stale=output_is_stale
-                )
+            if new_token_ids or held_token is not None:
+                if new_token_ids:
+                    new_token_ids, stopped = self._update_request_with_output(
+                        request, new_token_ids, is_stale=output_is_stale
+                    )
+                # A stale output's held token is dropped: the resumed request
+                # samples its position again.
+                if held_token is not None and not stopped and not output_is_stale:
+                    if stops_on_next_token(request, held_token, self.max_model_len):
+                        # EOS, a stop token or the length cap: no step follows
+                        # to verify it, so it is committed as it is.
+                        unverified, stopped = self._update_request_with_output(
+                            request, [held_token], count_placeholders=False
+                        )
+                        new_token_ids = new_token_ids + unverified
+                    else:
+                        self._hold_sink_provisional(
+                            request,
+                            held_token,
+                            sink_logprobs.slice_request(len(generated_token_ids) - 1, 1)
+                            if sink_logprobs is not None
+                            else None,
+                        )
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
@@ -3215,7 +3370,10 @@ class Scheduler(SchedulerInterface):
                 and request.sampling_params.num_logprobs is not None
                 and logprobs
             ):
-                new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
+                if sink_logprobs is None:
+                    new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
+                elif new_token_ids:
+                    new_logprobs = sink_logprobs.slice_request(0, len(new_token_ids))
 
             if self.return_sampling_mask:
                 sampling_masks = model_runner_output.sampling_masks
@@ -3253,6 +3411,12 @@ class Scheduler(SchedulerInterface):
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        sink_metrics=(
+                            request.sink_metrics or RequestSinkMetrics()
+                            if finish_reason is not None
+                            and self.sink_config is not None
+                            else None
+                        ),
                     )
                 )
             else:
@@ -3384,6 +3548,7 @@ class Scheduler(SchedulerInterface):
                 kv_connector_stats,
                 cudagraph_stats,
                 perf_stats,
+                sink_stats=sink_stats,
             )
         ) is not None:
             # Return stats to only one of the front-ends.
@@ -3450,9 +3615,14 @@ class Scheduler(SchedulerInterface):
         return False
 
     def _update_request_with_output(
-        self, request: Request, new_token_ids: list[int], is_stale: bool = False
+        self,
+        request: Request,
+        new_token_ids: list[int],
+        is_stale: bool = False,
+        count_placeholders: bool = True,
     ) -> tuple[list[int], bool]:
-        # is_stale is only used by the AsyncScheduler override.
+        # is_stale and count_placeholders are only used by the AsyncScheduler
+        # override.
         # Append generated tokens and check for stop. Note that if
         # a request is still being prefilled, we expect the model runner
         # to return empty token ids for the request.
@@ -3522,10 +3692,18 @@ class Scheduler(SchedulerInterface):
                     request.spec_token_ids = []
                 continue
 
+            if request.sink_draft_zero:
+                # The drafter's tokens follow draft zero, the token the
+                # request's last step sampled.
+                assert request.sink_provisional is not None, req_id
+                spec_token_ids = [request.sink_provisional, *spec_token_ids]
             # Add newly generated spec token ids to the request.
             request.spec_token_ids = self.structured_output_manager.validate_tokens(
                 request, spec_token_ids
             )
+            if request.sink_draft_zero:
+                # Draft zero was sampled under the grammar's mask.
+                assert request.spec_token_ids, req_id
 
     def update_draft_token_ids_in_output(
         self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput
@@ -3547,6 +3725,14 @@ class Scheduler(SchedulerInterface):
                 continue
 
             orig_num_spec_tokens = len(placeholder_spec_tokens)
+            if self.sink_rejection and req_id in (
+                scheduler_output.sink_draft_zero_req_ids or ()
+            ):
+                # Draft zero leads the placeholders: the provisional token of
+                # the request's previous step, whose output this deferred
+                # step waited for.
+                assert request.sink_provisional is not None, req_id
+                spec_token_ids = [request.sink_provisional, *spec_token_ids]
             # Trim drafts to scheduled number of spec tokens
             # (needed for chunked prefill case for example).
             del spec_token_ids[orig_num_spec_tokens:]
@@ -3883,6 +4069,7 @@ class Scheduler(SchedulerInterface):
         kv_connector_stats: KVConnectorStats | None = None,
         cudagraph_stats: CUDAGraphStat | None = None,
         perf_stats: PerfStats | None = None,
+        sink_stats: SinkStats | None = None,
     ) -> SchedulerStats | None:
         if not self.log_stats:
             return None
@@ -3929,6 +4116,7 @@ class Scheduler(SchedulerInterface):
             connector_prefix_cache_stats=connector_prefix_cache_stats,
             kv_cache_eviction_events=eviction_events,
             spec_decoding_stats=spec_stats,
+            sink_stats=sink_stats,
             kv_connector_stats=connector_stats_payload,
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
@@ -3939,6 +4127,81 @@ class Scheduler(SchedulerInterface):
             prefill_compute_pressure=prefill_compute_pressure,
             local_prefill_backlog_tokens=local_prefill_backlog_tokens,
         )
+
+    def _observe_sink_event(
+        self, request: Request, event: SinkEvent, sink_stats: SinkStats
+    ) -> None:
+        """Counts one request's sink event of this step and logs it."""
+        sink_stats.observe(event)
+        if request.sink_metrics is None:
+            request.sink_metrics = RequestSinkMetrics()
+        request.sink_metrics.observe(event)
+        # Output position of row r's input: row 0 reads draft zero (the next
+        # output token) with rejection on, else the last committed token.
+        first = request.num_output_tokens
+        if not (self.sink_rejection and event.row0 == SinkRow.DRAFT_ZERO):
+            first -= 1
+        logger.info(
+            "Sink: request %s, next output position %d: %s row %s, %d drafter "
+            "row(s) flagged%s, value %d at output position %d (row %d)",
+            request.request_id,
+            request.num_output_tokens,
+            event.row0.label,
+            event.outcome.name.lower(),
+            event.num_drafter_flags,
+            f", cut at row {event.cut_row}" if event.cut_row >= 0 else "",
+            event.value,
+            first + event.value_row,
+            event.value_row,
+        )
+
+    def _sink_logprobs(
+        self,
+        request: Request,
+        logprobs: LogprobsLists,
+        req_index: int,
+        generated_token_ids: list[int],
+        draft_zero: bool,
+        sink_event: SinkEvent | None,
+    ) -> LogprobsLists:
+        """One logprobs row per generated token. Draft zero's is the row kept
+        from the step that sampled it; a rejected draft zero's replacement
+        takes that row with its own token, logprob and rank in the same
+        distribution."""
+        kept = request.sink_provisional_logprobs
+        if sink_event is not None and sink_event.outcome == SinkOutcome.REJECTED:
+            assert kept is not None and sink_event.recovered_logprob is not None, (
+                request.request_id
+            )
+            token_ids = kept.logprob_token_ids.copy()
+            values = kept.logprobs.copy()
+            token_ids[0, 0] = generated_token_ids[0]
+            values[0, 0] = sink_event.recovered_logprob
+            ranks = np.array([sink_event.recovered_rank])
+            return LogprobsLists(token_ids, values, ranks, None)
+        draft_zero = draft_zero and len(generated_token_ids) > 1
+        step = logprobs.slice_request(req_index, len(generated_token_ids) - draft_zero)
+        if not draft_zero:
+            return step
+        assert kept is not None, request.request_id
+        return _concat_logprobs(kept, step)
+
+    def _hold_sink_provisional(
+        self, request: Request, token_id: int, logprobs: LogprobsLists | None
+    ) -> None:
+        """Holds the step's last sampled token back as the request's
+        provisional token: its next step verifies it as draft zero."""
+        request.sink_provisional = token_id
+        request.sink_provisional_logprobs = logprobs
+        # Synchronous scheduling: the drafter's tokens follow it
+        # (update_draft_token_ids).
+        request.spec_token_ids = [token_id]
+
+    @staticmethod
+    def _drop_sink_provisional(request: Request) -> None:
+        request.sink_provisional = None
+        request.sink_provisional_logprobs = None
+        request.sink_draft_zero = False
 
     def make_spec_decoding_stats(
         self,

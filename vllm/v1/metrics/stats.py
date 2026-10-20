@@ -13,6 +13,7 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 if TYPE_CHECKING:
     from vllm.v1.engine import EngineCoreEvent, EngineCoreOutput, FinishReason
+    from vllm.v1.sample.sink import SinkEvent
 
 
 @dataclass
@@ -183,6 +184,71 @@ class SchedulerIterationDetails:
 
 
 @dataclass
+class SinkStats:
+    """Attention-sink detector and rejection events (vllm.v1.sample.sink)."""
+
+    # Flagged rows, by where they sit (vllm.v1.sample.sink.SinkRow).
+    num_flagged_draft_zero: int = 0
+    num_flagged_drafter: int = 0
+    num_flagged_prompt: int = 0
+    # Sunk draft zeros replaced by their next alternate.
+    num_draft_zero_rejections: int = 0
+    # Verifications cut at a sunk drafter token.
+    num_draft_cuts: int = 0
+    # Sunk draft zeros past their alternates, committed as they are.
+    num_fallthroughs: int = 0
+
+    def observe(self, event: "SinkEvent") -> None:
+        from vllm.v1.sample.sink import SinkOutcome, SinkRow
+
+        if event.flagged_row0:
+            if event.row0 == SinkRow.DRAFT_ZERO:
+                self.num_flagged_draft_zero += 1
+            else:
+                self.num_flagged_prompt += 1
+        self.num_flagged_drafter += event.num_drafter_flags
+        if event.outcome == SinkOutcome.REJECTED:
+            self.num_draft_zero_rejections += 1
+        elif event.outcome == SinkOutcome.FALLTHROUGH:
+            self.num_fallthroughs += 1
+        if event.cut_row >= 0:
+            self.num_draft_cuts += 1
+
+    def add(self, other: "SinkStats") -> None:
+        for name in self.__dataclass_fields__:
+            setattr(self, name, getattr(self, name) + getattr(other, name))
+
+    @property
+    def num_flagged_rows(self) -> int:
+        return (
+            self.num_flagged_draft_zero
+            + self.num_flagged_drafter
+            + self.num_flagged_prompt
+        )
+
+    @property
+    def empty(self) -> bool:
+        return self.num_flagged_rows == 0
+
+
+@dataclass
+class RequestSinkMetrics(SinkStats):
+    """One request's sink events over its generation, surfaced on its final
+    ``EngineCoreOutput`` and the response usage (``usage.sink_rejection``)."""
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "flagged_rows": self.num_flagged_rows,
+            "flagged_draft_zero": self.num_flagged_draft_zero,
+            "flagged_drafter": self.num_flagged_drafter,
+            "flagged_prompt": self.num_flagged_prompt,
+            "draft_zero_rejections": self.num_draft_zero_rejections,
+            "draft_cuts": self.num_draft_cuts,
+            "fallthroughs": self.num_fallthroughs,
+        }
+
+
+@dataclass
 class SchedulerStats:
     """Stats associated with the scheduler."""
 
@@ -204,6 +270,7 @@ class SchedulerStats:
     kv_cache_eviction_events: list[KVCacheEvictionEvent] = field(default_factory=list)
 
     spec_decoding_stats: SpecDecodingStats | None = None
+    sink_stats: SinkStats | None = None
     kv_connector_stats: dict[str, Any] | None = None
 
     waiting_lora_adapters: dict[str, int] = field(default_factory=dict)

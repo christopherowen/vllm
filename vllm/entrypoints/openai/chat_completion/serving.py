@@ -26,6 +26,7 @@ from vllm.entrypoints.generate.base.protocol import (
 from vllm.entrypoints.generate.base.serving import (
     GenerateBaseServing,
     build_per_request_timing_metrics,
+    build_sink_usage,
     build_spec_decoding_metrics,
     clamp_prompt_logprobs,
     format_token_id_placeholder,
@@ -833,6 +834,7 @@ class OpenAIServingChat(GenerateBaseServing):
                     num_cache_creation_tokens,
                     mm_token_counts,
                 )
+                final_usage.sink_rejection = build_sink_usage(last_res)
 
                 # In streaming, metrics ride on this final usage chunk, which is
                 # only emitted when usage reporting is enabled (i.e.
@@ -1139,6 +1141,7 @@ class OpenAIServingChat(GenerateBaseServing):
             final_res.num_cache_creation_tokens,
             mm_token_counts,
         )
+        usage.sink_rejection = build_sink_usage(final_res)
 
         request_metadata.final_usage_info = usage
 

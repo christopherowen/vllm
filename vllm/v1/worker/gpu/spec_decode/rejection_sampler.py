@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Iterator, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -28,6 +29,7 @@ from vllm.v1.worker.gpu.sample.logprob import (
 )
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler
+from vllm.v1.worker.gpu.sample.sink import SinkAlternates, SinkSampler
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     register_rejection_sample_warmups,
@@ -103,6 +105,15 @@ _flatten_sampled_launcher = triton_kernel_dispatcher_with_warmup(
 )(_flatten_sampled_kernel)
 
 
+@dataclass
+class _SinkChunk:
+    """A verification chunk's sink flags, and the alternates of its last
+    draws once verified (sink rejection)."""
+
+    flags: torch.Tensor
+    alternates: torch.Tensor | None = None
+
+
 class RejectionSampler:
     def __init__(
         self,
@@ -114,6 +125,9 @@ class RejectionSampler:
     ):
         self.sampler = sampler
         self.watermark_key = watermark_key
+        # Sink rejection (set by the model runner): the drafter-row cut and
+        # the alternates of each request's last draw.
+        self.sink: SinkSampler | None = None
         if watermark_key is not None:
             assert isinstance(sampler, GPUWatermarkSampler)
         self.num_speculative_steps = spec_config.num_speculative_tokens
@@ -239,6 +253,7 @@ class RejectionSampler:
         expanded_idx_mapping: torch.Tensor,
         expanded_local_pos: torch.Tensor,
         max_sampled: torch.Tensor | None = None,
+        sink: _SinkChunk | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         processed_logits = self.sampler.apply_sampling_params(
             logits,
@@ -249,6 +264,16 @@ class RejectionSampler:
             draft_sampled,
             expanded_local_pos,
         )
+        cut = None
+        if sink is not None:
+            assert self.sink is not None
+            cut = self.sink.cut(
+                processed_logits,
+                sink.flags,
+                draft_sampled,
+                cu_num_logits,
+                idx_mapping.shape[0],
+            )
         sampled, num_sampled = rejection_sample(
             processed_logits,
             draft_logits,
@@ -270,6 +295,23 @@ class RejectionSampler:
         )
         if max_sampled is not None:
             num_sampled = torch.minimum(num_sampled, max_sampled)
+        if cut is not None:
+            assert self.sink is not None and sink is not None
+            # From the scores the last tokens were drawn from: the cut stays
+            # applied until they are taken.
+            sink.alternates = self.sink.alternates_of(
+                processed_logits,
+                cu_num_logits,
+                num_sampled,
+                sampled,
+                draft_sampled,
+                idx_mapping,
+                self.sampler.sampling_states.temperature.gpu,
+                self.sampler.sampling_states.seeds.gpu,
+                pos,
+                mask_rejected_draft=True,
+            )
+            cut.restore()
         return processed_logits, sampled, num_sampled
 
     def _verify_in_chunks(
@@ -282,7 +324,12 @@ class RejectionSampler:
         max_chunk_logits: int,
         max_num_logprobs: int,
         max_sampled: torch.Tensor | None = None,
+        sink_flags: torch.Tensor | None = None,
+        sink_alternates: list[SinkAlternates] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, LogprobsTensors | None]:
+        """With ``sink_flags`` (sink rejection), cuts the verification at
+        flagged drafter rows and appends the alternates of each request's last
+        draw to ``sink_alternates``."""
         cu_num_logits_np = input_batch.cu_num_logits_np
         use_processed_logits = self.sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
         num_reqs = input_batch.num_reqs
@@ -300,6 +347,9 @@ class RejectionSampler:
         sampled_chunks: list[torch.Tensor] = []
         num_sampled_chunks: list[torch.Tensor] = []
         logprobs_chunks: list[LogprobsTensors] = []
+        alternates_chunks: list[SinkAlternates] = (
+            sink_alternates if sink_alternates is not None else []
+        )
 
         for start, end in request_chunks:
             lo = int(cu_num_logits_np[start])
@@ -307,6 +357,7 @@ class RejectionSampler:
             chunk_cu_num_logits_np = cu_num_logits_np[start : end + 1] - lo
             chunk_cu_num_logits = input_batch.cu_num_logits[start : end + 1] - lo
             # draft_logits uses persistent request-state indices and stays global.
+            sink = None if sink_flags is None else _SinkChunk(sink_flags[lo:hi])
             processed_logits, sampled, num_sampled = self._verify(
                 logits[lo:hi],
                 draft_logits,
@@ -318,7 +369,24 @@ class RejectionSampler:
                 input_batch.expanded_idx_mapping[lo:hi],
                 input_batch.expanded_local_pos[lo:hi],
                 None if max_sampled is None else max_sampled[start:end],
+                sink,
             )
+            if sink is not None:
+                alternates = sink.alternates
+                assert self.sink is not None and alternates is not None
+                if max_num_logprobs != NO_LOGPROBS:
+                    alternates_chunks.append(
+                        self.sink.alternate_logprobs_of(
+                            processed_logits if use_processed_logits else logits[lo:hi],
+                            chunk_cu_num_logits,
+                            num_sampled,
+                            alternates,
+                            logits_mode=self.sampler.logprobs_mode
+                            in ("raw_logits", "processed_logits"),
+                        )
+                    )
+                else:
+                    alternates_chunks.append(SinkAlternates(alternates))
             chunk_logprobs = self._get_logprobs_tensors(
                 sampled,
                 num_sampled,
@@ -357,7 +425,11 @@ class RejectionSampler:
         input_batch: InputBatch,
         draft_logits: torch.Tensor | None = None,
         dead_row_cut: torch.Tensor | None = None,
+        sink_flags: torch.Tensor | None = None,
     ) -> SamplerOutput:
+        """``sink_flags``: the sink detector's flag per logits row, with sink
+        rejection on (vllm.v1.worker.gpu.sample.sink): flagged drafter rows cut
+        the verification, and the output carries each request's alternates."""
         # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
         # that num_nans is computed before applying penalties and temperature.
         num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
@@ -369,6 +441,8 @@ class RejectionSampler:
             input_batch.idx_mapping_np
         )
         chunk_logit_limit = get_max_chunk_logits(logits.shape[1])
+        sink_rejection = sink_flags is not None and self.sink is not None
+        alternates_chunks: list[SinkAlternates] = []
         sampled, num_sampled, logprobs_tensors = self._verify_in_chunks(
             logits,
             input_batch,
@@ -377,12 +451,28 @@ class RejectionSampler:
             pos,
             chunk_logit_limit,
             max_num_logprobs,
-            # Logprobs take their token counts inside the chunks; clamp there
-            # too so they match the committed tokens.
+            # Logprobs (and the sink alternates) take their token counts
+            # inside the chunks; clamp there too so they match the committed
+            # tokens.
             dead_row_cut + 1
-            if dead_row_cut is not None and max_num_logprobs != NO_LOGPROBS
+            if dead_row_cut is not None
+            and (max_num_logprobs != NO_LOGPROBS or sink_rejection)
             else None,
+            sink_flags if sink_rejection else None,
+            alternates_chunks,
         )
+        alternates = None
+        if alternates_chunks:
+            first = alternates_chunks[0]
+            alternates = SinkAlternates(
+                torch.cat([a.tokens for a in alternates_chunks]),
+                torch.cat([a.logprobs for a in alternates_chunks])  # type: ignore[misc]
+                if first.logprobs is not None
+                else None,
+                torch.cat([a.ranks for a in alternates_chunks])  # type: ignore[misc]
+                if first.ranks is not None
+                else None,
+            )
 
         num_sampled, num_rejected = get_num_sampled_and_rejected(
             num_sampled,
@@ -399,4 +489,5 @@ class RejectionSampler:
             num_nans=num_nans,
             num_sampled=num_sampled,
             num_rejected=num_rejected,
+            sink_alternates=alternates,
         )

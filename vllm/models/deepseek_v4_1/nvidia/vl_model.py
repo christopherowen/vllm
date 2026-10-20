@@ -143,6 +143,10 @@ class DeepseekV41ForCausalLM(UpstreamDeepseekV41ForCausalLM):
             span_offset += span_len
         return tuple(embeds)
 
+    def get_sink_residual_columns(self) -> torch.Tensor | None:
+        """The attention-sink detector's residual column per stream."""
+        return self.language_model.get_sink_residual_columns()
+
     @staticmethod
     def get_model_state_cls():
         from .model_state import DeepseekV41ModelState

@@ -13,7 +13,11 @@ from typing_extensions import TypeVar
 from vllm.logger import init_logger
 from vllm.logprobs import PromptLogprobs, SampleLogprobs
 from vllm.lora.request import LoRARequest
-from vllm.v1.metrics.stats import RequestSpecDecodeMetrics, RequestStateStats
+from vllm.v1.metrics.stats import (
+    RequestSinkMetrics,
+    RequestSpecDecodeMetrics,
+    RequestStateStats,
+)
 
 logger = init_logger(__name__)
 
@@ -66,6 +70,9 @@ class CompletionOutput:
     lora_request: LoRARequest | None = None
     sampling_mask: SamplingMask | None = None
     spec_decode_metrics: RequestSpecDecodeMetrics | None = None
+    # Attention-sink events of this sequence, attached on finish when the
+    # engine's sink detector is on.
+    sink_metrics: RequestSinkMetrics | None = None
 
     def finished(self) -> bool:
         return self.finish_reason is not None

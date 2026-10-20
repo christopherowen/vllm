@@ -27,6 +27,7 @@ from vllm.v1.metrics.stats import (
     MultiModalCacheStats,
     PromptTokenStats,
     SchedulerStats,
+    SinkStats,
 )
 from vllm.v1.metrics.utils import create_metric_per_engine
 from vllm.v1.spec_decode.metrics import SpecDecodingLogging, SpecDecodingProm
@@ -140,6 +141,8 @@ class LoggingStatLogger(StatLoggerBase):
         self.num_generation_tokens: int = 0
         self.num_corrupted_reqs: int = 0
         self.num_preemptions: int = 0
+        # Attention-sink events since startup (vllm.v1.sample.sink).
+        self.sink_stats = SinkStats()
 
     def _enable_perf_stats(self) -> bool:
         return self.vllm_config.observability_config.enable_mfu_metrics
@@ -222,6 +225,8 @@ class LoggingStatLogger(StatLoggerBase):
 
             if scheduler_stats.spec_decoding_stats is not None:
                 self.spec_decoding_logging.observe(scheduler_stats.spec_decoding_stats)
+            if scheduler_stats.sink_stats is not None:
+                self.sink_stats.add(scheduler_stats.sink_stats)
             if kv_connector_stats := scheduler_stats.kv_connector_stats:
                 self.kv_connector_logging.observe(kv_connector_stats)
             if (
@@ -305,6 +310,22 @@ class LoggingStatLogger(StatLoggerBase):
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             log_parts.append("Corrupted: %d reqs")
             log_args.append(self.num_corrupted_reqs)
+        if not self.sink_stats.empty:
+            log_parts.append(
+                "Sink rows: %d (draft zero %d, drafter %d, prompt %d; "
+                "draft zero rejections %d, draft cuts %d, fallthroughs %d)"
+            )
+            log_args.extend(
+                [
+                    self.sink_stats.num_flagged_rows,
+                    self.sink_stats.num_flagged_draft_zero,
+                    self.sink_stats.num_flagged_drafter,
+                    self.sink_stats.num_flagged_prompt,
+                    self.sink_stats.num_draft_zero_rejections,
+                    self.sink_stats.num_draft_cuts,
+                    self.sink_stats.num_fallthroughs,
+                ]
+            )
         if not self.connector_prefix_caching_metrics.empty:
             log_parts.append("External prefix cache hit rate: %.1f%%")
             log_args.append(self.connector_prefix_caching_metrics.hit_rate * 100)
@@ -642,6 +663,51 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             )
             self.counter_corrupted_requests = create_metric_per_engine(
                 counter_corrupted_requests, per_engine_labelvalues
+            )
+
+        # Attention-sink detector and rejection (vllm.v1.sample.sink). Created
+        # unconditionally: the detector is the engine's setting, not the API
+        # server's, and the counters stay at zero without it.
+        self.counter_sink_flagged_rows: dict[str, dict[int, Counter]] = {}
+        counter_sink_flagged_rows_base = self._counter_cls(
+            name="vllm:sink_flagged_rows",
+            documentation=(
+                "Sampled rows the attention-sink detector flagged, by row: "
+                "draft_zero (the input is the token the request's previous step "
+                "sampled), drafter (a drafter token) or prompt (a prompt token)."
+            ),
+            labelnames=labelnames + ["row"],
+        )
+        for row in ("draft_zero", "drafter", "prompt"):
+            self.counter_sink_flagged_rows[row] = {
+                idx: counter_sink_flagged_rows_base.labels(*labelvalues, row)
+                for idx, labelvalues in per_engine_labelvalues.items()
+            }
+        self.sink_counters: dict[str, dict[int, Counter]] = {}
+        for field, name, documentation in (
+            (
+                "num_draft_zero_rejections",
+                "vllm:sink_draft_zero_rejections",
+                "Sunk draft zeros replaced by the next alternate of the draw "
+                "that produced them (sink rejection).",
+            ),
+            (
+                "num_draft_cuts",
+                "vllm:sink_draft_cuts",
+                "Verifications cut at a sunk drafter token (sink rejection).",
+            ),
+            (
+                "num_fallthroughs",
+                "vllm:sink_fallthroughs",
+                "Sunk draft zeros past their alternates, committed as they were "
+                "(sink rejection).",
+            ),
+        ):
+            self.sink_counters[field] = create_metric_per_engine(
+                self._counter_cls(
+                    name=name, documentation=documentation, labelnames=labelnames
+                ),
+                per_engine_labelvalues,
             )
 
         counter_prefix_cache_queries = self._counter_cls(
@@ -1133,6 +1199,16 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 self.spec_decoding_prom.observe(
                     scheduler_stats.spec_decoding_stats, engine_idx
                 )
+
+            if (sink_stats := scheduler_stats.sink_stats) is not None:
+                for row, count in (
+                    ("draft_zero", sink_stats.num_flagged_draft_zero),
+                    ("drafter", sink_stats.num_flagged_drafter),
+                    ("prompt", sink_stats.num_flagged_prompt),
+                ):
+                    self.counter_sink_flagged_rows[row][engine_idx].inc(count)
+                for field, counters in self.sink_counters.items():
+                    counters[engine_idx].inc(getattr(sink_stats, field))
 
             if scheduler_stats.kv_connector_stats is not None:
                 self.kv_connector_prom.observe(

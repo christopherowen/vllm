@@ -91,6 +91,20 @@ def remove_all(lst: list, items_to_remove: set) -> list:
     return [item for item in lst if item not in items_to_remove]
 
 
+def stops_on_next_token(request: Request, token_id: int, max_model_len: int) -> bool:
+    """Whether committing ``token_id`` next stops the request by EOS, a stop
+    token or a length cap: check_stop's checks that no later token changes.
+    Sink rejection commits such a token as soon as it is sampled."""
+    sampling_params = request.sampling_params
+    assert sampling_params is not None
+    return (
+        token_id == sampling_params.eos_token_id
+        or token_id in (sampling_params.stop_token_ids or ())
+        or request.num_tokens + 1 >= max_model_len
+        or request.num_output_tokens + 1 >= request.max_tokens
+    )
+
+
 def check_stop(request: Request, max_model_len: int) -> bool:
     assert not request.pooling_params
 

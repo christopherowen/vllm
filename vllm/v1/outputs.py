@@ -21,6 +21,7 @@ if TYPE_CHECKING:
         KVConnectorWorkerMetadata,
     )
     from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+    from vllm.v1.sample.sink import SinkEvent
 else:
     KVConnectorStats = object
     KVConnectorWorkerMetadata = object
@@ -379,6 +380,10 @@ class ModelRunnerOutput:
     # Per request: completed prompt, response, leading-instruction, and
     # prefill-tail checkpoint token counts, or 0 for an uncaptured endpoint.
     boundary_checkpoint_tokens: list[list[int]] | None = None
+
+    # req_id -> the request's attention-sink event of this step, for the
+    # requests with one (vllm.v1.sample.sink). ``None`` without one.
+    sink_events: dict[str, "SinkEvent"] | None = None
 
     @staticmethod
     def with_kv_conn_output_only(

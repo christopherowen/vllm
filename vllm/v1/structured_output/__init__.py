@@ -316,7 +316,12 @@ class StructuredOutputManager:
         requests: dict[str, "Request"],
         structured_output_request_ids: list[str],
         scheduled_spec_decode_tokens: dict[str, list[int]],
+        draft_zero_req_ids: set[str] | None = None,
     ) -> "npt.NDArray[np.int32] | None":
+        """``draft_zero_req_ids``: the requests whose spec tokens start with
+        draft zero (sink rejection), the token their previous step sampled.
+        Its own mask was that step's; the masks of this step's rows start
+        after it."""
         # Prepare the structured output bitmask for this batch.
         if not structured_output_request_ids:
             return None
@@ -346,6 +351,7 @@ class StructuredOutputManager:
         if (
             len(structured_output_request_ids) > self.fill_bitmask_parallel_threshold
             and max_num_spec_tokens == 0
+            and not draft_zero_req_ids
         ):
             promises = []
             batch = []
@@ -390,11 +396,18 @@ class StructuredOutputManager:
                 state_advancements = 0
                 seen_padding = False
                 failed = False
+                draft_zero = draft_zero_req_ids is not None and (
+                    req_id in draft_zero_req_ids
+                )
                 for i, token in enumerate(req_tokens):
                     apply_bitmask = (
                         not failed and not seen_padding and i >= constraint_start
                     )
-                    self._fill_bitmasks(((grammar, cumulative_index, apply_bitmask),))
+                    if i > 0 or not draft_zero:
+                        self._fill_bitmasks(
+                            ((grammar, cumulative_index, apply_bitmask),)
+                        )
+                        cumulative_index += 1
                     if token == -1:
                         seen_padding = True
                     elif apply_bitmask:
@@ -410,7 +423,6 @@ class StructuredOutputManager:
                                 token,
                                 req_id,
                             )
-                    cumulative_index += 1
 
                 # Diffusion LLMs don't sample a bonus token after the
                 # scheduled positions, so skip its bitmask in that case.

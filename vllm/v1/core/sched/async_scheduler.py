@@ -4,6 +4,7 @@
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.outputs import LogprobsLists
 from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
@@ -13,15 +14,19 @@ class AsyncScheduler(Scheduler):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         # reusable read-only placeholder list for speculative decoding.
-        self._spec_token_placeholders: list[int] = [-1] * self.num_spec_tokens
+        self._spec_token_placeholders: list[int] = [-1] * (
+            self.num_spec_tokens + self.sink_rejection
+        )
         self.pp_size = self.parallel_config.pipeline_parallel_size
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         super()._update_after_schedule(scheduler_output)
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
         # Use the latest num of scheduled draft tokens in next step as placeholder.
+        # Sink rejection: draft zero leads them (the token this step samples).
         self._spec_token_placeholders = [-1] * (
             scheduler_output.resolve_num_spec_tokens_to_schedule(self.num_spec_tokens)
+            + self.sink_rejection
         )
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests[req_id]
@@ -40,9 +45,15 @@ class AsyncScheduler(Scheduler):
                     or self._needs_draft_backfill(cur_num_spec_tokens)
                 )
             )
-            request.num_output_placeholders += (
-                self.num_sampled_tokens_per_step + cur_num_spec_tokens
-            )
+            if self.sink_rejection:
+                # Only the spec tokens can be committed by this step (draft
+                # zero and the drafter's); the token it samples is held back
+                # and becomes the next step's draft zero.
+                request.num_output_placeholders += cur_num_spec_tokens
+            else:
+                request.num_output_placeholders += (
+                    self.num_sampled_tokens_per_step + cur_num_spec_tokens
+                )
             # Add placeholders for the new draft/spec tokens.
             # We will update the actual spec token ids in the worker process.
             request.spec_token_ids = self._spec_token_placeholders
@@ -70,7 +81,11 @@ class AsyncScheduler(Scheduler):
         )
 
     def _update_request_with_output(
-        self, request: Request, new_token_ids: list[int], is_stale: bool = False
+        self,
+        request: Request,
+        new_token_ids: list[int],
+        is_stale: bool = False,
+        count_placeholders: bool = True,
     ) -> tuple[list[int], bool]:
         status_before_update = request.status
         new_token_ids, stopped = super()._update_request_with_output(
@@ -78,8 +93,9 @@ class AsyncScheduler(Scheduler):
         )
 
         # Placeholders were zeroed at preemption; a stale delivery must not
-        # decrement them (it would underflow).
-        if not is_stale:
+        # decrement them (it would underflow). A held-back sampled token that
+        # ends the request had no placeholder (sink rejection).
+        if not is_stale and count_placeholders:
             request.num_output_placeholders -= len(new_token_ids)
             assert request.num_output_placeholders >= 0
 
@@ -89,3 +105,11 @@ class AsyncScheduler(Scheduler):
                 request, request.num_computed_tokens - request.num_output_placeholders
             )
         return new_token_ids, stopped
+
+    def _hold_sink_provisional(
+        self, request: Request, token_id: int, logprobs: LogprobsLists | None
+    ) -> None:
+        # The next step is already scheduled with draft zero as a placeholder;
+        # only the value is recorded (for its logprobs and the grammar).
+        request.sink_provisional = token_id
+        request.sink_provisional_logprobs = logprobs

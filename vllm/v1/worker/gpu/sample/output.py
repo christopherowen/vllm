@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors, SamplingMaskLists
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.sample.sink import SinkAlternates, SinkStepOutput
 
 
 @dataclass
@@ -20,6 +23,10 @@ class SamplerOutput:
     num_sampled: torch.Tensor | None
     num_rejected: torch.Tensor | None = None
     sampling_mask_tensors: SamplingMaskTensors | None = None
+    # Sink rejection (vllm.v1.worker.gpu.sample.sink): the alternates of each
+    # request's last draw, and the policy's results for the host.
+    sink_alternates: SinkAlternates | None = None
+    sink: SinkStepOutput | None = None
 
 
 @triton.jit

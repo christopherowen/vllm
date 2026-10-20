@@ -35,9 +35,11 @@ from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from vllm.forward_context import (
@@ -93,6 +95,7 @@ from vllm.v1.outputs import (
     RoutedExpertsTensors,
 )
 from vllm.v1.sample.ops.topk_topp_sampler import register_top_k_top_p_warmups
+from vllm.v1.sample.sink import SinkConfig, SinkOutcome
 from vllm.v1.watermarking import create_watermarker
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
 from vllm.v1.watermarking.spec_decode import (
@@ -182,6 +185,7 @@ from vllm.v1.worker.gpu.sample.batch_shard import (
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
+from vllm.v1.worker.gpu.sample.sink import SinkAlternates, SinkSampler
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
@@ -344,6 +348,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ):
                 # Drafting may require auxiliary hidden states from target model outputs
                 self.use_aux_hidden_state_outputs = True
+
+        # Attention-sink detector and draft-zero rejection
+        # (vllm.v1.sample.sink); its sampling state is built in load_model.
+        self.sink_config = SinkConfig.from_env()
+        self.sink: SinkSampler | None = None
+        # Per batch index: the request was decoding (with rejection on, its
+        # row 0's input is draft zero).
+        self._sink_decoding = torch.zeros(
+            self.max_num_reqs, dtype=torch.int8, device=self.device
+        )
 
         # Draft tokens propagation - for spec-dec + struct outputs.
         self.draft_tokens_handler = DraftTokensHandler(
@@ -582,6 +596,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 mask_stride=self.decode_query_len,
                 num_bonus_tokens=self.model_state.num_new_sampled_tokens_per_step,
             )
+            if self.sink_config is not None:
+                self._init_sink(self.sink_config, custom_sampler=bool(custom))
 
         if self.is_pooling_model and self.is_last_pp_rank:
             self.pooling_runner = PoolingRunner(self.model, self.vllm_config)
@@ -1592,7 +1608,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_reqs, num_toks, max_query_len, has_prefill=False
             )
 
-        draft_tokens = scheduler_output.scheduled_spec_decode_tokens
+        draft_tokens = self._drafter_spec_tokens(scheduler_output)
         # batch_idx -> req_id
         req_ids = sort_batch_req_ids(
             num_tokens_per_req, draft_tokens, self.decode_query_len
@@ -1664,8 +1680,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         idx_mapping = async_tensor_h2d(idx_mapping_np, device=self.device)
         num_reqs = len(req_ids)
 
+        if self.sink is not None:
+            self._set_sink_decoding(scheduler_output, batch_req_state)
+
         # Get the number of draft tokens for each request.
-        draft_tokens = scheduler_output.scheduled_spec_decode_tokens
+        draft_tokens = self._drafter_spec_tokens(scheduler_output)
         num_draft_tokens_per_req = None
         if not draft_tokens:
             # No draft token scheduled (common case).
@@ -1904,6 +1923,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
+        sink_flags = None
+        if self.sink is not None and input_batch.num_reqs > 0:
+            sink_flags = self._sink_flags(input_batch)
+
         shard_metadata = None
         global_input_batch = input_batch
         if self.batch_sharder is not None:
@@ -1922,7 +1945,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         else:
             sample_hidden_states = hidden_states[input_batch.logits_indices]
             if self._verifies_greedily(input_batch, grammar_output):
-                return self._verify_greedily(sample_hidden_states, input_batch)
+                output = self._verify_greedily(
+                    sample_hidden_states, input_batch, sink_flags
+                )
+                if sink_flags is not None:
+                    self._apply_sink(output, input_batch, sink_flags)
+                assert output.num_sampled is not None
+                assert output.num_rejected is not None
+                return output, output.num_sampled, output.num_rejected
             logits = self.model.compute_logits(sample_hidden_states)
 
         if grammar_output is not None:
@@ -1958,7 +1988,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     if shard_metadata is None
                     else None
                 ),
+                sink_flags=sink_flags,
             )
+        if sink_flags is not None and sampler_output is not None:
+            self._apply_sink(sampler_output, input_batch, sink_flags)
 
         if shard_metadata is not None:
             # Gather the sharded sampler outputs from the TP ranks into a single
@@ -2113,6 +2146,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     vocab_size=vocab_size,
                     invalid_spec_tokens=self.speculative_config is not None,
                 )
+            if self.sink is not None:
+                self.sink.register_warmups(
+                    logits=logits,
+                    processed_logits_strides=processed_strides,
+                    sampled_widths=(1,)
+                    + (
+                        (self.num_speculative_steps + 1,)
+                        if self.num_speculative_steps > 0
+                        else ()
+                    ),
+                    bin_counts_stride=self.sampler.penalties_state.output_bin_counts.stride(
+                        0
+                    ),
+                )
         if self.rejection_sampler is not None and self._greedy_verification_available():
             assert head is not None and processor is not None
             shard = head.shard_indices
@@ -2230,21 +2277,40 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
     def _verify_greedily(
-        self, sample_hidden_states: torch.Tensor, input_batch: InputBatch
-    ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
+        self,
+        sample_hidden_states: torch.Tensor,
+        input_batch: InputBatch,
+        sink_flags: torch.Tensor | None = None,
+    ) -> SamplerOutput:
         """The rejection sampler's output for an all-greedy step, without the
         logits all-gather: the same committed tokens, bit for bit."""
         assert self.rejection_sampler is not None and self.sampler is not None
         shard = self._language_model().lm_head.shard_indices
+        tp_size = get_tensor_model_parallel_world_size()
+        local_logits = self.model.compute_logits_local(sample_hidden_states)
+        drafts = input_batch.input_ids[input_batch.logits_indices]
+        rejection = self.sink is not None and self.sink.rejection
+        if rejection:
+            assert self.sink is not None and sink_flags is not None
+            # The rank that holds a sunk draft's column masks it.
+            self.sink.cut(
+                local_logits,
+                sink_flags,
+                drafts,
+                input_batch.cu_num_logits,
+                input_batch.num_reqs,
+                shard.org_vocab_start_index,
+                shard.num_org_elements,
+            )
         target_ids = vocab_parallel_argmax(
-            self.model.compute_logits_local(sample_hidden_states),
+            local_logits,
             shard.num_org_elements,
             shard.org_vocab_start_index,
-            get_tensor_model_parallel_world_size(),
+            tp_size,
         )
         sampled, num_sampled = greedy_rejection_sample(
             target_ids,
-            input_batch.input_ids[input_batch.logits_indices],
+            drafts,
             input_batch.cu_num_logits,
             self.rejection_sampler.num_speculative_steps,
         )
@@ -2263,7 +2329,179 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_sampled=num_sampled,
             num_rejected=num_rejected,
         )
-        return output, num_sampled, num_rejected
+        if rejection:
+            assert self.sink is not None
+            output.sink_alternates = SinkAlternates(
+                self.sink.alternates_of_greedy_shards(
+                    local_logits,
+                    input_batch.cu_num_logits,
+                    num_sampled,
+                    sampled,
+                    shard.org_vocab_start_index,
+                    shard.num_org_elements,
+                    tp_size,
+                )
+            )
+        return output
+
+    def _init_sink(self, config: SinkConfig, custom_sampler: bool) -> None:
+        """Builds the sink detector's sampling state, after the samplers, and
+        refuses the configurations it does not handle."""
+        parallel = self.parallel_config
+        unsupported = [
+            ("pipeline parallelism", self.use_pp),
+            ("batch-sharded sampling", self.batch_sharder is not None),
+            ("prefill context parallelism", parallel.prefill_context_parallel_size > 1),
+            (
+                "dual-batch overlap",
+                parallel.use_ubatching and parallel.data_parallel_size > 1,
+            ),
+        ]
+        if config.rejection:
+            spec = self.speculative_config
+            unsupported += [
+                ("a model-specific sampler", custom_sampler),
+                (
+                    "drafters other than DSpark and DFlash",
+                    spec is not None and spec.method not in ("dspark", "dflash"),
+                ),
+                (
+                    "probabilistic drafts",
+                    getattr(self.speculator, "draft_logits", None) is not None,
+                ),
+                ("watermarking", self.vllm_config.watermark_config is not None),
+                ("sampling masks", self.model_config.return_sampling_mask),
+                ("trace replay", self.model_config.enable_trace_replay),
+                ("routed experts", self.model_config.enable_return_routed_experts),
+                ("KV transfer", self.vllm_config.kv_transfer_config is not None),
+                (
+                    "request boundary checkpoints",
+                    self.vllm_config.use_request_boundary_checkpoints,
+                ),
+            ]
+        names = [name for name, present in unsupported if present]
+        if names:
+            raise ValueError(
+                f"The sink detector{' and rejection' if config.rejection else ''} "
+                f"(vllm.v1.sample.sink) do not support {', '.join(names)}."
+            )
+        get_columns = getattr(self.model, "get_sink_residual_columns", None)
+        if get_columns is None or get_columns() is None:
+            raise ValueError(
+                "The sink detector needs the model to keep its residual column "
+                "(get_sink_residual_columns); DeepSeek V4.1 on SM120 does."
+            )
+        assert self.sampler is not None
+        self.sink = SinkSampler(
+            config,
+            self.max_num_reqs,
+            self.model_config.get_hidden_size(),
+            self.vocab_size,
+            self.num_speculative_steps,
+            self.device,
+            self.model_config.use_fp64_gumbel,
+        )
+        if config.rejection:
+            # A draw's alternates are the next of its Gumbel scores, which
+            # FlashInfer's sampler does not expose.
+            self.sampler.use_flashinfer = False
+            self.sampler.sink = self.sink
+            if self.rejection_sampler is not None:
+                self.rejection_sampler.sink = self.sink
+        logger.info(
+            "Sink detector: residual column %d, threshold %g, rejection %s "
+            "(%d alternates per provisional token)",
+            config.column,
+            config.threshold,
+            "on" if config.rejection else "off",
+            config.num_alternates,
+        )
+
+    def _drafter_spec_tokens(
+        self, scheduler_output: SchedulerOutput
+    ) -> dict[str, list[int]]:
+        """The scheduled drafter tokens per request. Draft zero (sink
+        rejection) is not one: it is the request's last sampled token, the
+        input of its first row, which the request state already holds."""
+        spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        draft_zero = scheduler_output.sink_draft_zero_req_ids
+        if not draft_zero:
+            return spec_tokens
+        return {
+            req_id: tokens[1:] if req_id in draft_zero else tokens
+            for req_id, tokens in spec_tokens.items()
+            if req_id not in draft_zero or len(tokens) > 1
+        }
+
+    def _set_sink_decoding(
+        self, scheduler_output: SchedulerOutput, batch_req_state: "BatchReqState"
+    ) -> None:
+        """Marks the requests that are decoding (not finishing a prefill): the
+        rows the detector counts as draft zero. With rejection on these are
+        exactly the requests the scheduler gave a draft zero."""
+        decoding = ~batch_req_state.is_prefilling_np
+        assert self.sink is not None
+        if self.sink.rejection:
+            draft_zero = scheduler_output.sink_draft_zero_req_ids or set()
+            for req_id, is_decoding in zip(batch_req_state.req_ids, decoding):
+                assert (req_id in draft_zero) == bool(is_decoding), (
+                    f"{req_id}: scheduler draft zero {req_id in draft_zero}, "
+                    f"decoding {bool(is_decoding)}"
+                )
+        async_tensor_h2d(
+            decoding.astype(np.int8), out=self._sink_decoding[: decoding.shape[0]]
+        )
+
+    def _sink_flags(self, input_batch: InputBatch) -> torch.Tensor:
+        assert self.sink is not None
+        columns = self.model.get_sink_residual_columns()
+        flags = self.sink.flags(
+            columns,
+            input_batch.logits_indices,
+            input_batch.cu_num_logits,
+            input_batch.num_reqs,
+            getattr(self, "_dead_row_cut", None),
+        )
+        if envs.VLLM_SINK_DETECTOR_CHECK_RANKS:
+            self._check_sink_flags_across_ranks(flags)
+        return flags
+
+    @staticmethod
+    def _check_sink_flags_across_ranks(flags: torch.Tensor) -> None:
+        """Lab check: every tensor-parallel rank flagged the same rows."""
+        if get_tensor_model_parallel_world_size() == 1:
+            return
+        gathered = tensor_model_parallel_all_gather(flags[None], dim=0)
+        if not bool((gathered == flags[None]).all()):
+            raise RuntimeError(
+                "Sink detector flags differ across tensor-parallel ranks: "
+                f"{gathered.tolist()}"
+            )
+
+    def _apply_sink(
+        self,
+        sampler_output: SamplerOutput,
+        input_batch: InputBatch,
+        sink_flags: torch.Tensor,
+    ) -> None:
+        """The draft-zero policy and the step's sink events, on the device."""
+        assert self.sink is not None and self.sampler is not None
+        assert sampler_output.num_sampled is not None
+        assert sampler_output.num_rejected is not None
+        num_reqs = input_batch.num_reqs
+        sampler_output.sink = self.sink.apply(
+            sampler_output.sampled_token_ids,
+            sampler_output.num_sampled,
+            sampler_output.num_rejected,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self._sink_decoding[:num_reqs],
+            sink_flags,
+            input_batch.input_ids[input_batch.logits_indices],
+            sampler_output.sink_alternates,
+            self.req_states.total_len.gpu,
+            self.sampler.penalties_state.output_bin_counts,
+        )
 
     def postprocess_sampled(
         self,
@@ -2983,8 +3221,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         elif self.speculator is not None and num_spec_tokens_to_schedule > 0:
             assert self.sampler is not None
             if isinstance(self.speculator, DraftModelSpeculator):
+                observed_rejected = num_rejected
+                if (
+                    sampler_output.sink is not None
+                    and self.speculator.acceptance_estimator is not None
+                ):
+                    # A rejected draft zero left the drafts unjudged.
+                    observed_rejected = num_rejected.masked_fill(
+                        sampler_output.sink.events[:, 0] == SinkOutcome.REJECTED, 0
+                    )
                 self.speculator.observe_verification(
-                    input_batch.idx_mapping, num_sampled, num_rejected
+                    input_batch.idx_mapping, num_sampled, observed_rejected
                 )
             # Let the target override the hidden state fed to the drafter
             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
@@ -3070,6 +3317,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             boundary_state.capture_attention(
                 input_batch.idx_mapping, boundary_capture, self.block_tables
             )
+
+        if self.sink is not None:
+            self.sink.log_counts(get_tensor_model_parallel_rank())
 
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)

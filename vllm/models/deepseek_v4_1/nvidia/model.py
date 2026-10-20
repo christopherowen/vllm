@@ -60,6 +60,7 @@ from vllm.utils.b12x import (
     set_b12x_preparation_provider,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.sample.sink import SinkConfig
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 from .. import kernels, l2_prefetch, sp_prefill
@@ -557,6 +558,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.prefill_sp_skips_mtp_buffer = (
             spec_config is not None and spec_config.use_dspark()
         )
+        # The attention-sink detector (vllm.v1.sample.sink) watches one column
+        # of the pre-norm residual: each forward keeps that column of every
+        # residual stream, [tokens, hc_mult] (float32), for every token.
+        sink_config = SinkConfig.from_env()
+        self._sink_column = sink_config.column if sink_config is not None else -1
+        self._sink_columns: torch.Tensor | None = None
+        if get_pp_group().is_last_rank and sink_config is not None:
+            self._sink_columns = torch.empty(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                self.hc_mult,
+                dtype=torch.float32,
+            )
 
     def prepare_disk_engram(
         self, input_ids, query_start_loc, lookback_token_ids, early=None
@@ -834,6 +847,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 {"hidden_states": hidden_states, "pre_mix": pre_mix}
             )
 
+        if self._sink_columns is not None:
+            # A gather of hc_mult values per token under sequence parallelism.
+            columns = hidden_states[:, :, self._sink_column].float().contiguous()
+            if self.use_sequence_parallel:
+                columns = sp_all_gather(columns)[:full_num_tokens]
+            elif sp is not None:
+                columns = sp.gather(columns)
+            if decoder_compacted:
+                columns = scatter_rows(columns, ced_indices, full_num_tokens)
+            self._sink_columns[:full_num_tokens].copy_(columns)
+
         # MTP needs full HC states; otherwise collapse and normalize locally
         # before gathering to reduce communication.
         if self._mtp_hidden_buffer is not None and not (
@@ -1078,6 +1102,12 @@ class DeepseekV41LLMForCausalLM(UpstreamDeepseekV41LLMForCausalLM):
         return DeepseekV41ModelState
 
     requires_accepted_token_lookback = True
+
+    def get_sink_residual_columns(self) -> torch.Tensor | None:
+        """The attention-sink detector's column of each pre-norm residual
+        stream, (max_num_batched_tokens, hc_mult) float32, for every token of
+        the last forward; None without the detector (vllm.v1.sample.sink)."""
+        return self.model._sink_columns
 
     def forward(
         self,

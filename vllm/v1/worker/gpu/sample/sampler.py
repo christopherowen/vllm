@@ -26,6 +26,7 @@ from vllm.v1.worker.gpu.sample.logprob import (
 from vllm.v1.worker.gpu.sample.min_p import register_min_p_warmup
 from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
 from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
+from vllm.v1.worker.gpu.sample.sink import SinkAlternates, SinkSampler
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
 from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
 from vllm.v1.worker.gpu.sample.trace_replay import TraceReplayState
@@ -66,6 +67,9 @@ class Sampler:
         self.use_flashinfer = (
             not return_sampling_mask and flashinfer_sampler_supported()
         )
+        # Sink rejection (set by the model runner): the alternates of each
+        # request's draw. The runner turns FlashInfer off with it.
+        self.sink: SinkSampler | None = None
 
     def add_request(
         self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
@@ -222,6 +226,32 @@ class Sampler:
             self.req_states.prefill_len.gpu,
         )
 
+        sink_alternates = None
+        if self.sink is not None:
+            alternates = self.sink.alternates_of(
+                processed_logits,
+                input_batch.cu_num_logits,
+                num_sampled,
+                sampled.view(-1, 1),
+                input_ids,
+                idx_mapping,
+                self.sampling_states.temperature.gpu,
+                self.sampling_states.seeds.gpu,
+                pos,
+                mask_rejected_draft=False,
+            )
+            if logprobs_dims is not None:
+                sink_alternates = self.sink.alternate_logprobs_of(
+                    logits,
+                    input_batch.cu_num_logits,
+                    num_sampled,
+                    alternates,
+                    logits_mode=self.logprobs_mode
+                    in ("raw_logits", "processed_logits"),
+                )
+            else:
+                sink_alternates = SinkAlternates(alternates)
+
         sampling_mask_tensors = None
         if self.return_sampling_mask:
             # Size by the validated top_k batch max; wider supports use the bitmask.
@@ -241,6 +271,7 @@ class Sampler:
             num_sampled=num_sampled,
             num_rejected=num_rejected,
             sampling_mask_tensors=sampling_mask_tensors,
+            sink_alternates=sink_alternates,
         )
         return sampler_output
 
