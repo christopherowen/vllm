@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import copy
+import json
+import re
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from transformers import TokenizersBackend
@@ -15,6 +18,137 @@ from .deepseek_v41_encoding import (
 )
 from .hf import HfTokenizer, get_cached_tokenizer
 from .protocol import TokenizerLike
+
+# Keys whose values are protocol identifiers, never rendered request text.
+_PROTOCOL_KEYS = frozenset({"role", "type"})
+
+
+class _ControlSpellings:
+    """Keeps control-token spellings written in request text out of the vocabulary.
+
+    The encoder renders one prompt string, so a control token the template writes
+    and the same spelling inside a message, a tool result, a tool call or a tool
+    definition are indistinguishable once rendered. Before rendering, every such
+    spelling in request text is replaced by a sentinel that no request string
+    contains; after rendering, the prompt is split at the control tokens that
+    remain, which can only come from the template, and the text between them is
+    encoded without the added vocabulary, with the sentinels restored. This
+    matches DeepSeek's encoder, which encodes a typed spelling as plain text.
+
+    The image placeholder is left alone: `_normalize_messages` already rejects it
+    in text, and image parts render it.
+    """
+
+    @staticmethod
+    def compile(spellings: list[str]) -> re.Pattern[str] | None:
+        """One alternation, longest spelling first; built once per tokenizer."""
+        ordered = sorted(spellings, key=len, reverse=True)
+        return re.compile("|".join(re.escape(s) for s in ordered)) if ordered else None
+
+    def __init__(self, pattern: re.Pattern[str] | None) -> None:
+        self.pattern = pattern
+        self.originals: list[str] = []
+        self.open = self.close = ""
+
+    def protect(self, *values: Any) -> list[Any]:
+        """Return the values with control spellings in text replaced by sentinels.
+
+        Values without any such spelling are returned unchanged, and the prompt is
+        then encoded exactly as before.
+        """
+        assert not self.originals, "one _ControlSpellings per prompt"
+        if self.pattern is None or not any(
+            self.pattern.search(text) for text in _strings(values)
+        ):
+            return list(values)
+        self.open, self.close = _unused_private_pair(values)
+        return [self._protect(value) for value in values]
+
+    @property
+    def active(self) -> bool:
+        return bool(self.originals)
+
+    def _protect(self, value: Any, key: str | None = None) -> Any:
+        if isinstance(value, str):
+            assert self.pattern is not None
+            if key == "arguments":
+                decoded = _decode_arguments(value)
+                if isinstance(decoded, dict):
+                    # The encoder decodes JSON arguments before rendering them, so
+                    # spellings escaped in the JSON are protected in decoded form.
+                    return self._protect(decoded)
+            return self.pattern.sub(self._sentinel, value)
+        if isinstance(value, Mapping):
+            return {
+                k: item if k in _PROTOCOL_KEYS else self._protect(item, k)
+                for k, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return type(value)(self._protect(item) for item in value)
+        return value
+
+    def _sentinel(self, match: re.Match[str]) -> str:
+        self.originals.append(match.group(0))
+        return f"{self.open}{len(self.originals) - 1}{self.close}"
+
+    def restore(self, text: str) -> str:
+        if not self.originals:
+            return text
+        sentinel = re.compile(f"{re.escape(self.open)}(\\d+){re.escape(self.close)}")
+        return sentinel.sub(lambda m: self.originals[int(m.group(1))], text)
+
+
+def _decode_arguments(arguments: str) -> Any:
+    """Tool-call arguments as `encode_arguments_to_dsml` decodes them."""
+    for _ in range(2):
+        if not isinstance(arguments, str):
+            break
+        try:
+            arguments = json.loads(arguments)
+        except Exception:
+            break
+    return arguments
+
+
+def _strings(value: Any, key: str | None = None):
+    if isinstance(value, str):
+        yield value
+        if key == "arguments":
+            decoded = _decode_arguments(value)
+            if not isinstance(decoded, str):
+                yield from _strings(decoded)
+    elif isinstance(value, Mapping):
+        for k, item in value.items():
+            yield from _strings(item, k)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _strings(item)
+
+
+def _unused_private_pair(values: tuple[Any, ...]) -> tuple[str, str]:
+    """Two supplementary private-use characters that no request string contains."""
+    used: set[str] = set()
+    for text in _strings(values):
+        used.update(text)
+    free = (chr(code) for code in range(0xF0000, 0xFFFFE) if chr(code) not in used)
+    return next(free), next(free)
+
+
+def _plain_text_encoder(tokenizer: Any) -> Callable[[list[str]], list[list[int]]]:
+    """Encode text with the model vocabulary but none of the added tokens."""
+    from tokenizers import Tokenizer as RustTokenizer
+
+    spec = json.loads(tokenizer.backend_tokenizer.to_str())
+    spec["added_tokens"] = []
+    plain = RustTokenizer.from_str(json.dumps(spec))
+
+    def encode(texts: list[str]) -> list[list[int]]:
+        return [
+            encoding.ids
+            for encoding in plain.encode_batch(texts, add_special_tokens=False)
+        ]
+
+    return encode
 
 
 def _normalize_messages(
@@ -76,6 +210,45 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
     """Wrap an HF tokenizer with the V4.1 prompt encoder."""
     wrapped = copy.copy(tokenizer)
     added_vocab = tokenizer.get_added_vocab()
+    # Every added-token spelling splits the rendered prompt; all but the image
+    # placeholder are kept out of the vocabulary when they occur in request text.
+    template_controls = (
+        re.compile(
+            "|".join(re.escape(s) for s in sorted(added_vocab, key=len, reverse=True))
+        )
+        if added_vocab
+        else None
+    )
+    text_spellings = _ControlSpellings.compile(
+        [s for s in added_vocab if s != IMAGE_PLACEHOLDER]
+    )
+    plain_encoder: list[Callable[[list[str]], list[list[int]]]] = []
+
+    def encode_with_text_spellings(
+        prompt: str, controls: _ControlSpellings
+    ) -> list[int]:
+        """Template controls become their IDs; everything else is plain text."""
+        assert template_controls is not None
+        if not plain_encoder:
+            plain_encoder.append(_plain_text_encoder(tokenizer))
+        pieces: list[int | str] = []
+        position = 0
+        for match in template_controls.finditer(prompt):
+            if match.start() > position:
+                pieces.append(controls.restore(prompt[position : match.start()]))
+            pieces.append(added_vocab[match.group(0)])
+            position = match.end()
+        if position < len(prompt):
+            pieces.append(controls.restore(prompt[position:]))
+        texts = [piece for piece in pieces if isinstance(piece, str)]
+        encoded = iter(plain_encoder[0](texts))
+        ids: list[int] = []
+        for piece in pieces:
+            if isinstance(piece, str):
+                ids.extend(next(encoded))
+            else:
+                ids.append(piece)
+        return ids
 
     class _DeepseekV41Tokenizer(tokenizer.__class__):  # type: ignore
         def apply_chat_template(
@@ -84,6 +257,10 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
             tools: list[dict[str, Any]] | None = None,
             **kwargs,
         ) -> str | list[int]:
+            # Control-token spellings in request text must not become control
+            # tokens (see _ControlSpellings); requests without any are unchanged.
+            controls = _ControlSpellings(text_spellings)
+            messages, tools = controls.protect(messages, tools)
             # The generic renderer's conversation has already flattened text
             # parts with '\n'. V4.1 encodes the original messages with '\n\n'.
             conversation = _normalize_messages(messages)
@@ -128,8 +305,21 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
                     for key in ("truncation", "max_length")
                     if key in kwargs
                 }
-                return self.encode(prompt, add_special_tokens=False, **tokenizer_kwargs)
-            return prompt
+                if not controls.active:
+                    return self.encode(
+                        prompt, add_special_tokens=False, **tokenizer_kwargs
+                    )
+                ids = encode_with_text_spellings(prompt, controls)
+                max_length = tokenizer_kwargs.get("max_length")
+                if tokenizer_kwargs.get("truncation") and max_length is not None:
+                    if getattr(self, "truncation_side", "right") == "left":
+                        ids = ids[-max_length:]
+                    else:
+                        ids = ids[:max_length]
+                return ids
+            # The text form cannot mark which spellings are controls; it is for
+            # display, and serving encodes through the branch above.
+            return controls.restore(prompt)
 
         def num_special_tokens_to_add(self) -> int:
             return len(self.encode(""))

@@ -18,7 +18,16 @@ class DeepseekV41Renderer(DeepseekV4Renderer):
     The encoder sorts a turn's tool results by the order the assistant called
     them; media is collected from the messages before encoding, so the messages
     are put in that order first and images follow their placeholders.
+
+    The prompt is tokenized here, not re-tokenized from the rendered string
+    downstream: the tokenizer encodes the template's control tokens as such and
+    control-token spellings in request text as plain text, which the string
+    form cannot carry (the online chat path asks for ``tokenize=False``).
     """
+
+    def _apply_chat_template(self, *args, **kwargs):
+        kwargs["tokenize"] = True
+        return super()._apply_chat_template(*args, **kwargs)
 
     def render_messages(
         self,
