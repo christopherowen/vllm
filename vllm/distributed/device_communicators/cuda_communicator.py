@@ -923,11 +923,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
             raise RuntimeError("RoCEnante policy has no gather; all-gather instead")
         return super().gather(input_, dst, dim)
 
+    @property
+    def owns_broadcast(self) -> bool:
+        """Whether the group's broadcasts go through this communicator: the RoCE
+        policy never creates the PyTorch NCCL process group's communicator."""
+        return self._roce_policy
+
     def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
         """Broadcast a tensor from source rank to all ranks."""
         self._require_roce_policy()
         if self.world_size == 1:
             return tensor
+
+        if self._roce_policy and envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
+            return self._broadcast_one_shot(tensor, src)
 
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
@@ -935,6 +944,22 @@ class CudaCommunicator(DeviceCommunicatorBase):
             return tensor
         else:
             raise ValueError("No PyNCCL communicator found")
+
+    def _broadcast_one_shot(self, tensor: torch.Tensor, src: int) -> torch.Tensor:
+        """Every rank's copy through the one-shot all-gather; the source's is kept,
+        byte for byte. DS4.1 broadcasts only DSpark's per-step confidences (a few
+        hundred bytes), so a tensor the all-gather cannot take raises rather than
+        reach NCCL."""
+        flat = tensor.view(-1)
+        if not self.b12x_ar_comm.should_all_gather(flat, 0):
+            raise RuntimeError(
+                "RoCEnante policy: one-shot broadcast cannot take "
+                f"{tuple(tensor.shape)} {tensor.dtype}"
+            )
+        gathered = self.b12x_ar_comm.all_gather(flat, 0)
+        if self.rank_in_group != src:
+            flat.copy_(gathered.view(self.world_size, -1)[src])
+        return tensor
 
     def destroy(self):
         for transport in getattr(self, "b12x_dcp_transports", {}).values():

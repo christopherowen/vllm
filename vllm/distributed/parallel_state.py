@@ -954,6 +954,9 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
+        if getattr(self.device_communicator, "owns_broadcast", False):
+            # A collective policy keeps serving off the PyTorch process group.
+            return self.device_communicator.broadcast(input_, src)
         # Broadcast.
         torch.distributed.broadcast(
             input_, src=self.ranks[src], group=self.device_group

@@ -17,6 +17,7 @@ from vllm.distributed.device_communicators import cuda_communicator
 from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
+from vllm.distributed.parallel_state import GroupCoordinator
 
 PROCESS_GROUP_COLLECTIVES = (
     "all_reduce",
@@ -135,3 +136,86 @@ def test_failure_report_comes_from_the_one_shot_runtime(monkeypatch):
     assert comm.roce_failure() == "saw nothing from rank 2"
     comm.b12x_ar_comm.report = None
     assert comm.roce_failure() is None
+
+
+class _GatheringAdapter(_OneShot):
+    """Sparknet's adapter as a broadcast sees it: rank r's copy is
+    ``arange(n) + 100 * r``, so the kept slice names its rank."""
+
+    def __init__(self, world: int, eligible: bool = True):
+        self.world = world
+        self.eligible = eligible
+        self.gathers = []
+
+    def should_all_gather(self, inp, dim):
+        return self.eligible and inp.is_contiguous() and dim == 0
+
+    def all_gather(self, inp, dim):
+        self.gathers.append((tuple(inp.shape), dim))
+        base = torch.arange(inp.numel(), dtype=inp.dtype)
+        return torch.cat([base + 100 * r for r in range(self.world)])
+
+
+def _tilelang_communicator(monkeypatch, rank, eligible=True):
+    monkeypatch.setattr(envs, "VLLM_DS41_KERNEL_BACKEND", "tilelang", raising=False)
+    comm = _policy_communicator()
+    comm.rank_in_group = rank
+    comm.b12x_ar_comm = _GatheringAdapter(comm.world_size, eligible)
+    return comm
+
+
+def test_tilelang_broadcast_keeps_the_source_copy_of_the_one_shot_all_gather(
+    monkeypatch,
+):
+    comm = _tilelang_communicator(monkeypatch, rank=1)
+    tensor = torch.full((2, 3), -1.0)
+    assert comm.broadcast(tensor, src=2) is tensor
+    assert torch.equal(tensor, (torch.arange(6.0) + 200).view(2, 3))
+    assert comm.b12x_ar_comm.gathers == [((6,), 0)]
+    assert comm.pynccl_comm.calls == []
+
+
+def test_tilelang_broadcast_source_keeps_its_own_bytes(monkeypatch):
+    comm = _tilelang_communicator(monkeypatch, rank=2)
+    tensor = torch.full((2, 3), 7.0)
+    comm.broadcast(tensor, src=2)
+    assert torch.equal(tensor, torch.full((2, 3), 7.0))
+    # The source takes part in the collective like every other rank.
+    assert comm.b12x_ar_comm.gathers == [((6,), 0)]
+
+
+def test_tilelang_broadcast_refuses_what_the_all_gather_cannot_take(monkeypatch):
+    comm = _tilelang_communicator(monkeypatch, rank=1, eligible=False)
+    with pytest.raises(RuntimeError, match="one-shot broadcast cannot take"):
+        comm.broadcast(torch.zeros(4), src=0)
+    assert comm.pynccl_comm.calls == []
+
+
+def _group(device_communicator):
+    group = object.__new__(GroupCoordinator)
+    group.world_size = 4
+    group.ranks = [0, 1, 2, 3]
+    group.device_communicator = device_communicator
+    group.device_group = object()
+    return group
+
+
+def test_group_broadcast_goes_through_the_policy():
+    """The TP group's broadcast (DSpark's per-step confidences) never reaches
+    the PyTorch process group under the policy."""
+    pynccl = _PyNccl()
+    tensor = torch.zeros(4)
+    assert _group(_policy_communicator(pynccl)).broadcast(tensor, src=0) is tensor
+    assert pynccl.calls == [("broadcast", 0)]
+
+
+def test_group_broadcast_without_a_policy_keeps_the_process_group(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        torch.distributed,
+        "broadcast",
+        lambda tensor, src, group: calls.append((src, group)),
+    )
+    group = _group(device_communicator=None)
+    group.broadcast(torch.zeros(4), src=1)
+    assert calls == [(1, group.device_group)]
