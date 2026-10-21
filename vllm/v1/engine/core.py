@@ -103,8 +103,30 @@ HANDSHAKE_TIMEOUT_MINS = 5
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 
+def late_admission_enabled(vllm_config: VllmConfig, *, batch_queue: bool) -> bool:
+    """Whether each step is decided when the step in flight reaches
+    ``VLLM_LATE_ADMISSION_LAYER`` (the workers' execute_model reply arrives then).
+
+    Raises:
+        ValueError: when it is set without async scheduling's batch queue, or with
+            pipeline parallelism, whose batch queue holds one batch per stage.
+    """
+    if envs.VLLM_LATE_ADMISSION_LAYER < 0:
+        return False
+    if not batch_queue or vllm_config.parallel_config.pipeline_parallel_size > 1:
+        raise ValueError(
+            "VLLM_LATE_ADMISSION_LAYER needs async scheduling without pipeline "
+            "parallelism: it moves the decision of the step that async scheduling "
+            "queues behind the one in flight"
+        )
+    return True
+
+
 class EngineCore:
     """Inner loop of vLLM's Engine."""
+
+    # Set from VLLM_LATE_ADMISSION_LAYER in __init__ (late_admission_enabled).
+    late_admission: bool = False
 
     def __init__(
         self,
@@ -225,6 +247,9 @@ class EngineCore:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
             self.batch_queue = deque(maxlen=self.batch_queue_size)
         self._last_model_completion_time: float | None = None
+        self.late_admission = late_admission_enabled(
+            vllm_config, batch_queue=self.batch_queue is not None
+        )
 
         self.is_ec_consumer = (
             vllm_config.ec_transfer_config is None
@@ -592,6 +617,11 @@ class EngineCore:
         else:
             eco.scheduler_stats.iteration_details = iteration_details
 
+    def _admit_arrivals(self) -> None:
+        """Late admission: take the requests that arrived while the step in flight
+        ran. An in-process engine core receives requests directly, so it has none
+        waiting."""
+
     def _should_throttle_prefills(self) -> bool:
         """Defer prefills on non-cadence steps in a non-DP engine.
 
@@ -742,6 +772,13 @@ class EngineCore:
         deferred_scheduler_output = None
         deferred_execution_timing = None
         if self.scheduler.has_requests():
+            if self.late_admission and batch_queue:
+                # Late admission: the step in flight replies to execute_model when
+                # its GPU work reaches the admission layer; the rest of it hides
+                # this decision and the next step's preparation. Requests that
+                # arrived meanwhile join this decision.
+                batch_queue[0][2].result()
+                self._admit_arrivals()
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
             with self.log_error_detail(scheduler_output):
                 exec_future, execution_timing = self._execute_model(scheduler_output)
@@ -1604,6 +1641,10 @@ class EngineCoreProc(EngineCore):
             logger.debug("EngineCore loop active.")
 
         # Handle any more client requests.
+        self._admit_arrivals()
+
+    def _admit_arrivals(self) -> None:
+        """Handle every client request that has arrived, without blocking."""
         while not self.input_queue.empty():
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)

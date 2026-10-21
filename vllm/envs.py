@@ -179,6 +179,7 @@ if TYPE_CHECKING:
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S: float = 60.0
     VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS: bool = False
+    VLLM_LATE_ADMISSION_LAYER: int = -1
     VLLM_MLA_DISABLE: bool = False
     VLLM_K3_DENSE_MLA_PARTIAL_DTYPE: Literal["bf16", "fp32"] = "bf16"
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
@@ -1569,6 +1570,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS": lambda: (
         os.getenv("VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS", "0") == "1"
     ),
+    # Late admission (async scheduling): decide each step when the step in flight
+    # reaches the start of this decoder layer, so requests that arrived meanwhile
+    # join the next step instead of the one after it. -1 decides each step as soon
+    # as the previous one is under way.
+    "VLLM_LATE_ADMISSION_LAYER": lambda: int(
+        os.getenv("VLLM_LATE_ADMISSION_LAYER", "-1")
+    ),
     # If set, vLLM will disable the MLA attention optimizations.
     "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),
     # Keep dense MLA split partials in FP32 until the merge when requested.
@@ -2761,6 +2769,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",
+        "VLLM_LATE_ADMISSION_LAYER",
         "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS",
         "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH",
         "VLLM_IMAGE_FETCH_TIMEOUT",

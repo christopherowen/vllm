@@ -166,6 +166,7 @@ from vllm.v1.worker.gpu.kv_connector import (
     KVConnector,
     get_kv_connector,
 )
+from vllm.v1.worker.gpu.late_admission import LayerProgress
 from vllm.v1.worker.gpu.lora_utils import (
     LoraState,
     create_lora_capture_hook,
@@ -423,6 +424,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
+        # Late admission: the event each step records at VLLM_LATE_ADMISSION_LAYER.
+        self.layer_progress: LayerProgress | None = None
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
@@ -510,6 +513,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             format_gib(m.consumed_memory),
             time_after_load - time_before_load,
         )
+
+        if envs.VLLM_LATE_ADMISSION_LAYER >= 0:
+            # Before graph capture, so every captured graph records the event.
+            self.layer_progress = LayerProgress(
+                self.model, envs.VLLM_LATE_ADMISSION_LAYER
+            )
 
         # Initialize the components that require the model. Model states select
         # input-preparation kernels that need JIT warmup.
@@ -3023,6 +3032,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return self.pp_handler.relay_aux_hidden_states(
                 model_inputs["intermediate_tensors"], output_intermediate_tensors
             )
+        if self.layer_progress is not None and not dummy_run:
+            # The engine core decides the next step once this one reaches the layer.
+            return self.layer_progress.reply()
         return None
 
     @torch.inference_mode()
