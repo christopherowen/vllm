@@ -544,6 +544,8 @@ def test_model_forward_matches_full_rows(
             _mtp_hidden_buffer=buffer,
             # L2 prefetch is on by default on SM121; its plans are built.
             _l2pf_ready=True,
+            # The sink detector's column buffer: none, the detector is off here.
+            _sink_columns=None,
             norm=lambda hidden: hidden * 2,
         )
         output, aux = native.DeepseekV4Model.forward(

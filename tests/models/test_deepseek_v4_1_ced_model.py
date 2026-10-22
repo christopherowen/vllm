@@ -264,6 +264,8 @@ def test_ced_global_context_and_full_row_output_abi(monkeypatch, compact):
         layers=nn.ModuleList(_Layer(i, shared, row_work) for i in range(4)),
         aux_hidden_state_layers={3, 4},
         _mtp_hidden_buffer=buffer,
+        # The sink detector's column buffer: none, the detector is off here.
+        _sink_columns=None,
         norm=lambda hidden: hidden,
     )
     output, aux = native.DeepseekV4Model.forward(

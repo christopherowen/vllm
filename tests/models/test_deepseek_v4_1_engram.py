@@ -977,7 +977,12 @@ def test_disk_engram_model_allocates_hash_buffer_from_declared_caps(monkeypatch)
         num_hidden_layers=0,
     )
     vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(hf_config=config, dtype=torch.bfloat16),
+        model_config=SimpleNamespace(
+            hf_config=config,
+            dtype=torch.bfloat16,
+            # The sink detector's settings follow the served architecture.
+            architecture="DeepseekV41ForCausalLM",
+        ),
         quant_config=SimpleNamespace(get_name=lambda: "deepseek_v41_fp8"),
         parallel_config=SimpleNamespace(use_ubatching=False, tensor_parallel_size=1),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=13),
