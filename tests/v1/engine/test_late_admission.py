@@ -102,7 +102,25 @@ def engine_core(scheduler, executor, late_admission: bool, admit) -> EngineCore:
     return engine
 
 
-def _engine(model: str, late_admission: bool):
+class ChunkedExecutor(FakeExecutor):
+    """As FakeExecutor, but a prompt chunk that is not the prompt's last samples
+    nothing, as the model runner discards it."""
+
+    def __init__(self, log: list, scheduler):
+        super().__init__(log)
+        self.scheduler = scheduler
+
+    def sample_tokens(self, grammar_output, non_block=False):
+        future = super().sample_tokens(grammar_output, non_block)
+        output = future.result()
+        output.sampled_token_ids = [
+            [] if self.scheduler.requests[req_id].is_prefill_chunk else sampled
+            for req_id, sampled in zip(output.req_ids, output.sampled_token_ids)
+        ]
+        return future
+
+
+def _engine(model: str, late_admission: bool, max_num_batched_tokens: int = 8192):
     log: list = []
     arrivals: list = []
     scheduler = create_scheduler(
@@ -111,6 +129,7 @@ def _engine(model: str, late_admission: bool):
         device="cpu",
         async_scheduling=True,
         max_model_len=256,
+        max_num_batched_tokens=max_num_batched_tokens,
     )
 
     def admit():
@@ -119,7 +138,9 @@ def _engine(model: str, late_admission: bool):
             scheduler.add_request(request)
         arrivals.clear()
 
-    engine = engine_core(scheduler, FakeExecutor(log), late_admission, admit)
+    engine = engine_core(
+        scheduler, ChunkedExecutor(log, scheduler), late_admission, admit
+    )
     return engine, log, arrivals
 
 
@@ -145,6 +166,43 @@ def test_an_arrival_joins_the_next_step(opt_model_path, late_admission):
         # Step 2 was decided without waiting; "b" waits for step 3.
         assert log[1] == ("execute", 2)
         assert batches[1] == ["a"]
+
+
+def test_a_continuing_prompt_decides_the_next_step_at_once(opt_model_path):
+    """While a prompt chunk that is not the prompt's last runs, the prompt's next
+    chunk is the next step's work: that step is decided at once, as async
+    scheduling does, so its preparation keeps the whole step's lead. The step
+    after the prompt's last chunk is decided late again."""
+    engine, log, arrivals = _engine(
+        opt_model_path, late_admission=True, max_num_batched_tokens=16
+    )
+    first, second = create_requests(
+        2, num_tokens=40, max_tokens=8, req_ids=["a", "b"]
+    )
+    engine.scheduler.add_request(first)
+    batches = engine.model_executor.batches
+
+    # Chunks 0-16 and 16-32 are in flight in turn: steps 2 and 3 are decided
+    # without waiting, and nothing is admitted.
+    engine.step_with_batch_queue()
+    engine.step_with_batch_queue()
+    engine.step_with_batch_queue()
+    assert log == [("execute", 1), ("execute", 2), ("execute", 3)]
+    assert batches == [["a"], ["a"], ["a"]]
+
+    # "b" arrives while the last chunk (32-40) runs: step 4 waits for the layer.
+    assert not engine.scheduler.continues_prefill(engine.batch_queue[0][1])
+    arrivals.append(second)
+    engine.step_with_batch_queue()
+    assert log[3:6] == [("reached layer", 3), ("admit", ["b"]), ("execute", 4)]
+    assert batches[3] == ["a", "b"]
+
+    # Step 4 is "a"'s decode beside "b"'s first chunk (15 of 40 tokens), which
+    # continues "b"'s prompt: step 5 is decided at once.
+    assert engine.scheduler.continues_prefill(engine.batch_queue[0][1])
+    engine.step_with_batch_queue()
+    assert log[6:] == [("execute", 5)]
+    assert batches[4] == ["a", "b"]
 
 
 def test_no_wait_when_nothing_is_in_flight(opt_model_path):

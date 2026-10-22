@@ -215,6 +215,12 @@ class SchedulerInterface(ABC):
         not yet returned in SchedulerOutputs."""
         return self.has_unfinished_requests() or self.has_finished_requests()
 
+    def continues_prefill(self, scheduler_output: "SchedulerOutput") -> bool:
+        """Whether a scheduled step carries a prompt chunk that is not its
+        request's last, so that request's next chunk is already the next step's
+        work. Late admission decides the step after such a step at once."""
+        return False
+
     @property
     @abstractmethod
     def pause_state(self) -> PauseState:

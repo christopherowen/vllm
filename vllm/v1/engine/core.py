@@ -772,11 +772,19 @@ class EngineCore:
         deferred_scheduler_output = None
         deferred_execution_timing = None
         if self.scheduler.has_requests():
-            if self.late_admission and batch_queue:
+            if (
+                self.late_admission
+                and batch_queue
+                and not self.scheduler.continues_prefill(batch_queue[0][1])
+            ):
                 # Late admission: the step in flight replies to execute_model when
                 # its GPU work reaches the admission layer; the rest of it hides
                 # this decision and the next step's preparation. Requests that
-                # arrived meanwhile join this decision.
+                # arrived meanwhile join this decision. A step in flight that
+                # continues a prompt already fixes the next step's work (that
+                # prompt's next chunk fills its budget), so that step is decided
+                # at once, as async scheduling does: its preparation and Engram
+                # read-ahead keep the whole step's lead.
                 batch_queue[0][2].result()
                 self._admit_arrivals()
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())

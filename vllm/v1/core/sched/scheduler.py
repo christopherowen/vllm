@@ -3956,6 +3956,15 @@ class Scheduler(SchedulerInterface):
         )
         return num_waiting + len(self.running)
 
+    def continues_prefill(self, scheduler_output: SchedulerOutput) -> bool:
+        # is_prefill_chunk still describes each request's most recent step, the
+        # one asked about: a finished or aborted request has left self.requests.
+        return any(
+            (request := self.requests.get(req_id)) is not None
+            and request.is_prefill_chunk
+            for req_id in scheduler_output.num_scheduled_tokens
+        )
+
     def has_finished_requests(self) -> bool:
         if self.finished_req_ids:
             return True
