@@ -16,8 +16,11 @@ the next token after it would be document-start noise. Here `` can`` is
 ``CAN`` and its draw's next candidate ``I_``.
 """
 
+import functools
+import tempfile
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -53,7 +56,10 @@ SUNK = frozenset({CAN, 9})
 
 @pytest.fixture(autouse=True)
 def sink_rejection_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The test model has no entry in SINK_CHANNELS: name its column and
+    # threshold, and switch rejection on.
     monkeypatch.setenv("VLLM_SINK_DETECTOR_COLUMN", "2455")
+    monkeypatch.setenv("VLLM_SINK_DETECTOR_THRESHOLD", "85000")
     monkeypatch.setenv("VLLM_SINK_REJECTION", "1")
     monkeypatch.setenv("VLLM_SINK_REJECTION_MAX_RETRIES", "3")
 
@@ -414,8 +420,21 @@ def drive(
     return run
 
 
+@functools.cache
+def _model_dir() -> str:
+    """A local OPT config: the scheduler needs no download or tokenizer."""
+    path = Path(tempfile.mkdtemp(prefix="sink-draft-zero-"))
+    (path / "config.json").write_text(
+        '{"architectures":["OPTForCausalLM"],"model_type":"opt",'
+        '"max_position_embeddings":2048}'
+    )
+    return str(path)
+
+
 def _scheduler(async_scheduling: bool, num_drafts: int | None, **kwargs):
     scheduler = create_scheduler(
+        model=_model_dir(),
+        skip_tokenizer_init=True,
         device="cpu",
         async_scheduling=async_scheduling,
         num_speculative_tokens=num_drafts,
@@ -905,11 +924,55 @@ def test_usage_reports_zero_flags_with_the_detector_on():
     assert run.finished["a"].sink_metrics == RequestSinkMetrics()
 
 
-def test_sink_config_threshold_default():
-    config = SinkConfig.from_env()
-    assert config is not None
-    assert config.threshold == 85000.0
-    assert config.rejection and config.num_alternates == 3
+def _served(architecture: str):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(model_config=SimpleNamespace(architecture=architecture))
+
+
+@pytest.fixture
+def unset_sink_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
+    for name in (
+        "VLLM_SINK_DETECTOR_COLUMN",
+        "VLLM_SINK_DETECTOR_THRESHOLD",
+        "VLLM_SINK_REJECTION",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    return monkeypatch
+
+
+def test_sink_config_on_by_default_for_deepseek_v41(unset_sink_env):
+    config = SinkConfig.for_model(_served("DeepseekV41ForCausalLM"))
+    assert config == SinkConfig(
+        column=2455, threshold=85000.0, rejection=True, max_retries=3
+    )
+    assert config.num_alternates == 3
+
+
+def test_sink_config_switched_off(unset_sink_env):
+    unset_sink_env.setenv("VLLM_SINK_REJECTION", "0")
+    assert SinkConfig.for_model(_served("DeepseekV41ForCausalLM")) is None
+
+
+def test_sink_config_off_for_other_models(unset_sink_env):
+    assert SinkConfig.for_model(_served("OPTForCausalLM")) is None
+    unset_sink_env.setenv("VLLM_SINK_REJECTION", "1")
+    with pytest.raises(ValueError, match="no sink channel"):
+        SinkConfig.for_model(_served("OPTForCausalLM"))
+
+
+def test_sink_config_explicit_column_runs_the_detector_alone(unset_sink_env):
+    unset_sink_env.setenv("VLLM_SINK_REJECTION", "0")
+    unset_sink_env.setenv("VLLM_SINK_DETECTOR_COLUMN", "17")
+    with pytest.raises(ValueError, match="THRESHOLD"):
+        SinkConfig.for_model(_served("OPTForCausalLM"))
+    unset_sink_env.setenv("VLLM_SINK_DETECTOR_THRESHOLD", "100")
+    assert SinkConfig.for_model(_served("OPTForCausalLM")) == SinkConfig(
+        column=17, threshold=100.0, rejection=False, max_retries=3
+    )
+    # On the model with an entry, the explicit column replaces its own.
+    config = SinkConfig.for_model(_served("DeepseekV41ForCausalLM"))
+    assert config is not None and (config.column, config.rejection) == (17, False)
 
 
 @pytest.mark.parametrize("rejection", [False, True])

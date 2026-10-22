@@ -325,9 +325,9 @@ if TYPE_CHECKING:
     VLLM_SSM_CONV_STATE_LAYOUT: Literal["SD", "DS"] | None = None
     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
     VLLM_RAISE_ON_LOGIT_NANS: bool = False
-    VLLM_SINK_DETECTOR_COLUMN: int = -1
-    VLLM_SINK_DETECTOR_THRESHOLD: float = 85000.0
-    VLLM_SINK_REJECTION: bool = False
+    VLLM_SINK_DETECTOR_COLUMN: int | None = None
+    VLLM_SINK_DETECTOR_THRESHOLD: float | None = None
+    VLLM_SINK_REJECTION: bool | None = None
     VLLM_SINK_REJECTION_MAX_RETRIES: int = 3
     VLLM_SINK_DETECTOR_CHECK_RANKS: bool = False
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: Literal[
@@ -2193,24 +2193,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_RAISE_ON_LOGIT_NANS": lambda: bool(
         int(os.getenv("VLLM_RAISE_ON_LOGIT_NANS", "0"))
     ),
-    # Attention-sink detector: the column of the pre-norm residual watched at
-    # every sampled row (DeepSeek V4.1 Flash: 2455, its BOS sink channel), and
-    # the magnitude above which the row counts as sunk. -1 keeps the detector
-    # off. Sunk rows carry 108,032 to 125,440 there on DeepSeek's reference
-    # and 116,736 to 118,784 served; ordinary text peaked at 62,720 (number
-    # tokens) over a 358,785-token survey. 85,000 is the geometric midpoint
-    # (experiments/2026-10-19-sink-rejection-v2 in spark-ds41f).
-    "VLLM_SINK_DETECTOR_COLUMN": lambda: int(
-        os.getenv("VLLM_SINK_DETECTOR_COLUMN", "-1")
+    # Attention-sink detector and rejection (vllm.v1.sample.sink). On by
+    # default for the models in its SINK_CHANNELS table, which holds each
+    # one's watched residual column and threshold; off for every other model.
+    # VLLM_SINK_REJECTION=0 turns both off. The column and threshold settings
+    # replace the model's numbers (lab); with VLLM_SINK_REJECTION=0 an
+    # explicit column runs the detector alone, counting without correcting.
+    "VLLM_SINK_DETECTOR_COLUMN": lambda: maybe_convert_int(
+        os.getenv("VLLM_SINK_DETECTOR_COLUMN", None)
     ),
-    "VLLM_SINK_DETECTOR_THRESHOLD": lambda: float(
-        os.getenv("VLLM_SINK_DETECTOR_THRESHOLD", "85000")
+    "VLLM_SINK_DETECTOR_THRESHOLD": lambda: (
+        float(os.environ["VLLM_SINK_DETECTOR_THRESHOLD"])
+        if "VLLM_SINK_DETECTOR_THRESHOLD" in os.environ
+        else None
     ),
     # Never commit a token sampled from a sunk row: each step's last sampled
     # token is verified by the request's next step as draft zero and replaced
     # by the next alternate of its draw when its own row is sunk; a sunk
-    # drafter token cuts the verification. Needs the detector column.
-    "VLLM_SINK_REJECTION": lambda: bool(int(os.getenv("VLLM_SINK_REJECTION", "0"))),
+    # drafter token cuts the verification. Unset: the model's default.
+    "VLLM_SINK_REJECTION": lambda: maybe_convert_bool(
+        os.getenv("VLLM_SINK_REJECTION", None)
+    ),
     # Alternates kept per provisional token, so rejections per position; past
     # them the sunk token is committed as it is (counted as a fallthrough).
     "VLLM_SINK_REJECTION_MAX_RETRIES": lambda: int(
@@ -2807,9 +2810,9 @@ def compile_factors() -> dict[str, object]:
         "NO_COLOR",
         "VLLM_SKIP_VERSION_SUFFIX",
         # Sampling-only settings of the sink detector: the compiled forward
-        # depends on its column alone.
+        # depends on whether it keeps the column, which the column and the
+        # switch decide (vllm.v1.sample.sink.SinkConfig.for_model).
         "VLLM_SINK_DETECTOR_THRESHOLD",
-        "VLLM_SINK_REJECTION",
         "VLLM_SINK_REJECTION_MAX_RETRIES",
         "VLLM_SINK_DETECTOR_CHECK_RANKS",
     }

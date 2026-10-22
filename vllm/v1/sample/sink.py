@@ -3,11 +3,13 @@
 """Attention-sink detection and rejection: configuration and host-side events.
 
 A generated token can become an attention sink: from a middle layer on, one
-channel of its residual (DeepSeek V4.1 Flash: column 2455, the BOS sink channel)
-runs away by orders of magnitude and the row's next-token distribution turns
-into document-start noise. The forward pass is the model's own, so the remedy is
-a decoding policy. The detector reads that column of the pre-norm residual at
-every sampled row (vllm.v1.worker.gpu.sample.sink).
+channel of its residual (DeepSeek V4.1 Flash: its BOS sink channel) runs away by
+orders of magnitude and the row's next-token distribution turns into
+document-start noise. The forward pass is the model's own, so the remedy is a
+decoding policy. The detector reads that column of the pre-norm residual at
+every sampled row (vllm.v1.worker.gpu.sample.sink). It is on by default for the
+models in SINK_CHANNELS and off for every other; ``VLLM_SINK_REJECTION=0`` turns
+it off.
 
 With rejection on, the last token a step samples is not committed when it is
 sampled: it is the request's provisional token, and the scheduler schedules it
@@ -24,8 +26,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
+from typing import TYPE_CHECKING
 
 import vllm.envs as envs
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 # Fields of a request's per-step sink event, as the worker encodes them.
 NUM_SINK_EVENT_FIELDS = 6
@@ -63,6 +69,30 @@ class SinkRow(IntEnum):
 
 
 @dataclass(frozen=True)
+class SinkChannel:
+    """A model's sink channel: the residual column that runs away when a
+    sampled token turns into an attention sink, and the ``|value|`` above
+    which a sampled row counts as sunk."""
+
+    column: int
+    threshold: float
+
+
+# The models the detector and rejection are on for by default, by
+# architecture. Every other model has no entry and runs without them. This
+# table is the only place the numbers live: the code here exists for these
+# checkpoints, and a model without the behaviour drops its entry.
+SINK_CHANNELS: dict[str, SinkChannel] = {
+    # DeepSeek V4.1 Flash (measured on the 1017 checkpoint): column 2455 is its
+    # BOS sink channel. Sunk rows carry 108,032 to 125,440 there on DeepSeek's
+    # reference and 116,736 to 118,784 served; ordinary text peaked at 62,720
+    # (number tokens) over a 358,785-token survey. 85,000 is the geometric
+    # midpoint (experiments/2026-10-19-sink-rejection-v2 in spark-ds41f).
+    "DeepseekV41ForCausalLM": SinkChannel(column=2455, threshold=85_000.0),
+}
+
+
+@dataclass(frozen=True)
 class SinkConfig:
     """The detector's column and threshold, and the rejection policy's switch."""
 
@@ -77,25 +107,53 @@ class SinkConfig:
     max_retries: int
 
     @classmethod
-    def from_env(cls) -> SinkConfig | None:
+    def for_model(cls, vllm_config: VllmConfig) -> SinkConfig | None:
+        """The settings for the served model, or None when the detector is off.
+
+        On (detector and rejection) for the architectures in SINK_CHANNELS, off
+        for every other model; ``VLLM_SINK_REJECTION`` overrides the default.
+        ``VLLM_SINK_DETECTOR_COLUMN`` and ``_THRESHOLD`` replace the model's
+        numbers; with rejection off, an explicit column runs the detector alone.
+
+        Raises:
+            ValueError: rejection on without a column (a model with no entry),
+                or no threshold for the column.
+        """
+        architecture = vllm_config.model_config.architecture
+        channel = SINK_CHANNELS.get(architecture)
+        rejection = envs.VLLM_SINK_REJECTION
+        if rejection is None:
+            rejection = channel is not None
         column = envs.VLLM_SINK_DETECTOR_COLUMN
-        if column < 0:
-            if envs.VLLM_SINK_REJECTION:
+        if column is None:
+            if not rejection:
+                return None
+            if channel is None:
                 raise ValueError(
-                    "VLLM_SINK_REJECTION needs the detector column "
-                    "(VLLM_SINK_DETECTOR_COLUMN)."
+                    f"VLLM_SINK_REJECTION: {architecture} has no sink channel "
+                    "(vllm.v1.sample.sink.SINK_CHANNELS); set "
+                    "VLLM_SINK_DETECTOR_COLUMN and VLLM_SINK_DETECTOR_THRESHOLD."
                 )
-            return None
+            column = channel.column
+        if column < 0:
+            raise ValueError("VLLM_SINK_DETECTOR_COLUMN must not be negative.")
         threshold = envs.VLLM_SINK_DETECTOR_THRESHOLD
+        if threshold is None:
+            if channel is None:
+                raise ValueError(
+                    f"VLLM_SINK_DETECTOR_COLUMN: {architecture} has no sink "
+                    "channel, so set VLLM_SINK_DETECTOR_THRESHOLD too."
+                )
+            threshold = channel.threshold
         if threshold <= 0:
             raise ValueError("VLLM_SINK_DETECTOR_THRESHOLD must be positive.")
         max_retries = envs.VLLM_SINK_REJECTION_MAX_RETRIES
-        if envs.VLLM_SINK_REJECTION and max_retries < 1:
+        if rejection and max_retries < 1:
             raise ValueError("VLLM_SINK_REJECTION_MAX_RETRIES must be at least 1.")
         return cls(
             column=column,
             threshold=threshold,
-            rejection=bool(envs.VLLM_SINK_REJECTION),
+            rejection=rejection,
             max_retries=max_retries,
         )
 

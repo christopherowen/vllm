@@ -90,6 +90,7 @@ from vllm.v1.outputs import (
     DraftTokenIds,
     ModelRunnerOutput,
 )
+from vllm.v1.sample.sink import SinkConfig
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
 from vllm.v1.worker.sentinel.gpu_worker_sentinel import WorkerSentinel
 from vllm.v1.worker.startup_plan import (
@@ -556,6 +557,14 @@ class Worker(WorkerBase):
                 GPUModelRunner as GPUModelRunnerV1,
             )
 
+            if SinkConfig.for_model(self.vllm_config) is not None:
+                # The scheduler would hold each step's last token for a
+                # verification this runner does not do.
+                raise ValueError(
+                    "The sink detector (vllm.v1.sample.sink) runs in the V2 model "
+                    "runner: set VLLM_USE_V2_MODEL_RUNNER=1, or "
+                    "VLLM_SINK_REJECTION=0 to serve without it."
+                )
             self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
 
         if self.rank == 0:

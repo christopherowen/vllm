@@ -561,7 +561,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # The attention-sink detector (vllm.v1.sample.sink) watches one column
         # of the pre-norm residual: each forward keeps that column of every
         # residual stream, [tokens, hc_mult] (float32), for every token.
-        sink_config = SinkConfig.from_env()
+        sink_config = SinkConfig.for_model(vllm_config)
         self._sink_column = sink_config.column if sink_config is not None else -1
         self._sink_columns: torch.Tensor | None = None
         if get_pp_group().is_last_rank and sink_config is not None:

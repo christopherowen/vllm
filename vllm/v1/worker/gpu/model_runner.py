@@ -352,7 +352,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Attention-sink detector and draft-zero rejection
         # (vllm.v1.sample.sink); its sampling state is built in load_model.
-        self.sink_config = SinkConfig.from_env()
+        self.sink_config = SinkConfig.for_model(vllm_config)
         self.sink: SinkSampler | None = None
         # Per batch index: the request was decoding (with rejection on, its
         # row 0's input is draft zero).

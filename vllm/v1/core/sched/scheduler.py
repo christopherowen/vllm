@@ -228,7 +228,7 @@ class Scheduler(SchedulerInterface):
         # rejection on, each step's last sampled token is held back as the
         # request's provisional token and scheduled as draft zero of its next
         # step; the worker verifies it there.
-        self.sink_config = SinkConfig.from_env()
+        self.sink_config = SinkConfig.for_model(vllm_config)
         self.sink_rejection = (
             self.sink_config is not None and self.sink_config.rejection
         )
