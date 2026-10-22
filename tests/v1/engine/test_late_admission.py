@@ -79,19 +79,12 @@ def opt_model_path(tmp_path):
     return str(tmp_path)
 
 
-def _engine(model: str, late_admission: bool):
-    log: list = []
-    arrivals: list = []
-    scheduler = create_scheduler(
-        model=model,
-        skip_tokenizer_init=True,
-        device="cpu",
-        async_scheduling=True,
-        max_model_len=256,
-    )
+def engine_core(scheduler, executor, late_admission: bool, admit) -> EngineCore:
+    """An engine core with async scheduling's batch queue around a test scheduler
+    and executor; ``admit`` plays the arrival of client requests."""
     engine = object.__new__(EngineCore)
     engine.scheduler = scheduler
-    engine.model_executor = FakeExecutor(log)
+    engine.model_executor = executor
     engine.batch_queue_size = 2
     engine.batch_queue = deque(maxlen=2)
     engine.late_admission = late_admission
@@ -105,6 +98,20 @@ def _engine(model: str, late_admission: bool):
     engine._wait_for_boundary_checkpoint_copies = Mock()
     engine._process_aborts_queue = Mock()
     engine._attach_iteration_details = Mock()
+    engine._admit_arrivals = admit
+    return engine
+
+
+def _engine(model: str, late_admission: bool):
+    log: list = []
+    arrivals: list = []
+    scheduler = create_scheduler(
+        model=model,
+        skip_tokenizer_init=True,
+        device="cpu",
+        async_scheduling=True,
+        max_model_len=256,
+    )
 
     def admit():
         log.append(("admit", [r.request_id for r in arrivals]))
@@ -112,7 +119,7 @@ def _engine(model: str, late_admission: bool):
             scheduler.add_request(request)
         arrivals.clear()
 
-    engine._admit_arrivals = admit
+    engine = engine_core(scheduler, FakeExecutor(log), late_admission, admit)
     return engine, log, arrivals
 
 
