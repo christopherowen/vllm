@@ -664,6 +664,71 @@ def test_large_full_capture_decodes_small_live_prefix(monkeypatch):
 
 
 @cuda
+@pytest.mark.parametrize(
+    "sink_columns, pipeline", [(True, False), (False, True), (False, False)]
+)
+def test_warmup_declares_the_column_scatter(sink_columns, pipeline):
+    """The [hc_mult] float32 scatter is declared when the model keeps the sink
+    detector's columns or a pipeline stage scatters its pre-mix, and only then."""
+    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+    from vllm.models.deepseek_v4_1 import ced
+    from vllm.models.deepseek_v4_1.tilelang import prepare
+
+    state = CEDState(4, 8192, (128, 256, 384, 512, 8192), "cuda")
+    registry = JitWarmupRegistry(None)
+    with registry.activate():
+        state.warmup(
+            hidden_size=8, hc_mult=4, pipeline=pipeline, sink_columns=sink_columns
+        )
+    key = tuple(ced.ced_kernels.packed_copy_rows_key("float32", (4,), True))
+    declared = [
+        tuple(args)
+        for function, args, _ in prepare.declared_calls(registry)
+        if function is ced.ced_kernels.copy_rows_kernel
+    ]
+    assert (key in declared) == (sink_columns or pipeline)
+
+
+@cuda
+def test_startup_warmup_serves_the_sink_columns_scatter(monkeypatch):
+    """A compacted decoder scatters the sink detector's [tokens, hc_mult] float32
+    columns back to every row; with the model keeping them, the frozen cache
+    serves that scatter without a compile."""
+    import importlib
+
+    import tilelang.cache
+
+    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+    from vllm.models.deepseek_v4_1 import ced
+    from vllm.models.deepseek_v4_1.tilelang import prepare
+
+    cache_module = importlib.import_module(tilelang.cache.freeze.__module__)
+    monkeypatch.setattr(cache_module, "_frozen_reason", None)
+    kernel = ced.ced_kernels.copy_rows_kernel
+    monkeypatch.setattr(kernel, "_kernel_cache", {})
+    monkeypatch.setattr(kernel, "_call_form_cache", type(kernel._call_form_cache)())
+    state = CEDState(4, 8192, (128, 256, 384, 512, 8192), "cuda")
+    registry = JitWarmupRegistry(None)
+    with registry.activate():
+        state.warmup(hidden_size=8, hc_mult=4, pipeline=False, sink_columns=True)
+    registry.warmup()
+    prepare.warm_declared(registry)
+    prepare.freeze("CED sink-columns warmup test")
+
+    lengths = [4096, 1]
+    starts = torch.tensor(
+        np.r_[0, np.cumsum(lengths)], dtype=torch.int32, device="cuda"
+    )
+    seq = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    state.stage(starts, seq, lengths, [False, False], [0, 0])
+    indices = state.get_indices()
+    columns = torch.ones((indices.numel(), 4), dtype=torch.float32, device="cuda")
+    full = scatter_rows(columns, indices, sum(lengths))
+    assert full[indices].eq(1).all()
+    assert full.sum().item() == 4 * indices.numel()
+
+
+@cuda
 def test_startup_warmup_covers_live_compaction_without_jit(monkeypatch):
     import importlib
 
@@ -688,7 +753,7 @@ def test_startup_warmup_covers_live_compaction_without_jit(monkeypatch):
     # The packings compile with the runner's JIT warmup, as under the worker.
     registry = JitWarmupRegistry(None)
     with registry.activate():
-        state.warmup(hidden_size=8, hc_mult=4, pipeline=False)
+        state.warmup(hidden_size=8, hc_mult=4, pipeline=False, sink_columns=False)
     registry.warmup()
     from vllm.models.deepseek_v4_1.tilelang import prepare
 
