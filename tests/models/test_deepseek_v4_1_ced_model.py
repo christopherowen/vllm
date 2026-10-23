@@ -266,6 +266,8 @@ def test_ced_global_context_and_full_row_output_abi(monkeypatch, compact):
         _mtp_hidden_buffer=buffer,
         # The sink detector's column buffer: none, the detector is off here.
         _sink_columns=None,
+        # GLP steering: none, unset here.
+        glp=None,
         norm=lambda hidden: hidden,
     )
     output, aux = native.DeepseekV4Model.forward(
