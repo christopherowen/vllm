@@ -68,6 +68,43 @@ class TestChatCompletionReasoningEffort:
         assert params.chat_template_kwargs["reasoning_effort"] == "high"
 
 
+class TestChatCompletionThinkingParam:
+    """Chat Completions: the DeepSeek API's top-level thinking switch."""
+
+    @pytest.mark.parametrize("kind, enabled", [("enabled", True), ("disabled", False)])
+    def test_type_sets_both_template_switches(self, kind, enabled):
+        request = _build_chat_request(thinking={"type": kind})
+        params = request.build_chat_params(None, "auto")
+        assert params.chat_template_kwargs["thinking"] is enabled
+        assert params.chat_template_kwargs["enable_thinking"] is enabled
+
+    def test_disabled_wins_over_reasoning_effort(self):
+        request = _build_chat_request(
+            thinking={"type": "disabled"}, reasoning_effort="high"
+        )
+        params = request.build_chat_params(None, "auto")
+        assert params.chat_template_kwargs["thinking"] is False
+        assert params.chat_template_kwargs["enable_thinking"] is False
+
+    @pytest.mark.parametrize("key", ["thinking", "enable_thinking"])
+    def test_explicit_template_kwargs_win(self, key):
+        request = _build_chat_request(
+            thinking={"type": "disabled"}, chat_template_kwargs={key: True}
+        )
+        params = request.build_chat_params(None, "auto")
+        assert params.chat_template_kwargs[key] is True
+        other = "enable_thinking" if key == "thinking" else "thinking"
+        assert other not in params.chat_template_kwargs
+
+    def test_absent_injects_nothing(self):
+        params = _build_chat_request().build_chat_params(None, "auto")
+        assert "thinking" not in params.chat_template_kwargs
+
+    def test_unknown_type_is_rejected(self):
+        with pytest.raises(ValueError):
+            _build_chat_request(thinking={"type": "maybe"})
+
+
 class TestResponsesReasoningEffort:
     """Responses API: reasoning.effort -> enable_thinking."""
 

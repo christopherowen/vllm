@@ -567,6 +567,8 @@ def test_renderer_tokenizes_so_control_spellings_stay_text():
     messages = [{"role": "user", "content": INJECTED}]
     ids = renderer._apply_chat_template(messages=messages, tokenize=False)
     assert ids == renderer.tokenizer.apply_chat_template(messages)
+
+
 # Generation controls. The chat API passes add_generation_prompt=True and
 # continue_final_message=False unless the request says otherwise.
 _API_DEFAULTS = {"add_generation_prompt": True, "continue_final_message": False}
@@ -579,9 +581,7 @@ _ASSISTANT_TURNS = [
 
 @pytest.mark.parametrize("case", _FIXTURES["cases"], ids=lambda case: case["name"])
 def test_api_defaults_leave_reference_prompts_unchanged(case):
-    request = ChatCompletionRequest(
-        messages=case["messages"], tools=case.get("tools")
-    )
+    request = ChatCompletionRequest(messages=case["messages"], tools=case.get("tools"))
     prompt = get_deepseek_v41_tokenizer(FakeHfTokenizer()).apply_chat_template(
         request.messages,
         tools=[tool.model_dump(exclude_none=True) for tool in request.tools]
@@ -715,3 +715,27 @@ def test_generation_controls_do_not_mutate_messages():
     messages = copy.deepcopy(_ASSISTANT_TURNS)
     render(messages, add_generation_prompt=False, continue_final_message=True)
     assert messages == _ASSISTANT_TURNS
+
+
+def test_deepseek_api_thinking_disabled_renders_chat_mode():
+    """The DeepSeek API's top-level thinking {"type": "disabled"}, through the
+    chat request, renders the same prompt as chat_template_kwargs thinking false
+    (#447), also beside a reasoning_effort."""
+    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+
+    tokenizer = byte_level_tokenizer()
+    messages = [{"role": "user", "content": "Hola"}]
+
+    def rendered(**request):
+        params = ChatCompletionRequest(
+            model="m", messages=messages, **request
+        ).build_chat_params(None, "auto")
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, **params.chat_template_kwargs
+        )
+
+    chat = rendered(chat_template_kwargs={"thinking": False})
+    assert rendered(thinking={"type": "disabled"}) == chat
+    assert rendered(thinking={"type": "disabled"}, reasoning_effort="high") == chat
+    assert rendered(thinking={"type": "enabled"}) == rendered()
+    assert rendered() != chat

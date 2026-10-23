@@ -222,6 +222,12 @@ class ChatCompletionNamedToolChoiceParam(OpenAIBaseModel):
         return normalize_tool_namespace(data)
 
 
+class ChatCompletionThinkingParam(OpenAIBaseModel):
+    """The DeepSeek API's top-level thinking switch."""
+
+    type: Literal["enabled", "disabled"]
+
+
 class ChatCompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
@@ -265,6 +271,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "faster responses and fewer tokens used on reasoning in a response. "
             "Note that 'max' is specific to the DeepSeek V4 series and is not "
             "part of the standard OpenAI API specification."
+        ),
+    )
+    thinking: ChatCompletionThinkingParam | None = Field(
+        default=None,
+        description=(
+            "DeepSeek API format: {'type': 'enabled'} or {'type': 'disabled'} "
+            "turns the model's thinking on or off. Explicit chat_template_kwargs "
+            "'thinking' or 'enable_thinking' take precedence."
         ),
     )
     thinking_token_budget: ThinkingTokenBudget = None
@@ -623,7 +637,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
         # enable_thinking to false). For templates that don't declare the
         # variable, resolve_chat_template_kwargs filters it out harmlessly.
         user_kwargs = self.chat_template_kwargs or {}
-        if self.reasoning_effort is not None and "enable_thinking" not in user_kwargs:
+        if self.thinking is not None:
+            # The DeepSeek API's top-level switch sets both template spellings,
+            # so a reasoning_effort beside it cannot turn thinking back on.
+            if not {"thinking", "enable_thinking"} & user_kwargs.keys():
+                enabled = self.thinking.type == "enabled"
+                extra_kwargs["thinking"] = enabled
+                extra_kwargs["enable_thinking"] = enabled
+        elif self.reasoning_effort is not None and "enable_thinking" not in user_kwargs:
             extra_kwargs["enable_thinking"] = self.reasoning_effort != "none"
 
         return ChatParams(
