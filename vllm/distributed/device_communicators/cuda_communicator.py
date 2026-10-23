@@ -216,7 +216,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # Multi-node DGX Spark one-shot RDMA collectives: sparknet's for
             # DS4.1's TileLang kernel family (configured by its SPARKNET_ROCE_*
             # settings), b12x.comm.roce's for B12X. Both carry the same
-            # protocol (B12X's with spark3's RoCE patches).
+            # protocol (B12X's with spark-ds41f's RoCE patches).
             roce_options = {}
             if envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
                 from sparknet.integration.vllm import (

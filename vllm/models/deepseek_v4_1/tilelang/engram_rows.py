@@ -37,10 +37,10 @@ SCALES = ROW // 32
 CONTROL_WORDS = 64
 
 # Debug only: the wait records each wait's length for the reader's timeline
-# (SPARK3_ENGRAM_TIMELINE, common/engram.py); compiled in only when set.
+# (SPARK_DS41F_ENGRAM_TIMELINE, common/engram.py); compiled in only when set.
 _TIMING = (
     "#define ENGRAM_TIMING\n"
-    if os.environ.get("SPARK3_ENGRAM_TIMELINE", "0") == "1"
+    if os.environ.get("SPARK_DS41F_ENGRAM_TIMELINE", "0") == "1"
     else ""
 )
 

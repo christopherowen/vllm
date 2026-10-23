@@ -1787,7 +1787,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
 
-        # Dead verification rows (SPARK3_DSPARK_DEAD_ROWS_TAU) are marked inside
+        # Dead verification rows (SPARK_DS41F_DSPARK_DEAD_ROWS_TAU) are marked inside
         # the draft combine; sample() clamps committed tokens to live rows.
         dead_rows = None
         if adaptive_verification is not None and self.batch_sharder is None:

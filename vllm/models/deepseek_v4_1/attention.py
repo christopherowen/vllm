@@ -63,7 +63,7 @@ logger = init_logger(__name__)
 
 # Validation only: under a sequence-parallel indexer split, every rank also runs
 # the full-row indexer twice and compares its own rows with the split result.
-_INDEX_SPLIT_CHECK = os.environ.get("SPARK3_DS41_INDEXER_SPLIT_CHECK") == "1"
+_INDEX_SPLIT_CHECK = os.environ.get("SPARK_DS41F_DS41_INDEXER_SPLIT_CHECK") == "1"
 
 
 def _source(prefix, layer):

@@ -80,20 +80,24 @@ DEAD_ID = -1
 # GPU with a record of the step (a liveness bound; the rows normally arrive
 # within a millisecond).
 ENGRAM_ROWS_TIMEOUT_S = (
-    float(os.environ.get("SPARK3_ENGRAM_ROWS_TIMEOUT_MS", "10000")) / 1000
+    float(os.environ.get("SPARK_DS41F_ENGRAM_ROWS_TIMEOUT_MS", "10000")) / 1000
 )
 # Tests only: delay every disk read, to show the forward waits for its rows.
-ENGRAM_READ_DELAY_S = float(os.environ.get("SPARK3_ENGRAM_READ_DELAY_MS", "0")) / 1000
+ENGRAM_READ_DELAY_S = (
+    float(os.environ.get("SPARK_DS41F_ENGRAM_READ_DELAY_MS", "0")) / 1000
+)
 # Debug only (off and free in serving): every row ID the host hashed early must equal
 # the GPU's, or the step fails with both.
-ENGRAM_CHECK_EARLY_IDS = os.environ.get("SPARK3_ENGRAM_CHECK_EARLY_IDS", "0") == "1"
+ENGRAM_CHECK_EARLY_IDS = (
+    os.environ.get("SPARK_DS41F_ENGRAM_CHECK_EARLY_IDS", "0") == "1"
+)
 # Debug only (off and free in serving: the wait kernel's timing is compiled in only
 # when set): every disk table's reader records each step's timeline, and the GPU each
 # wait's length; a thread appends them every few seconds to JSON lines in
-# SPARK3_ENGRAM_TIMELINE_DIR (<host>-tp<rank>-layer<id>.jsonl).
-ENGRAM_TIMELINE = os.environ.get("SPARK3_ENGRAM_TIMELINE", "0") == "1"
+# SPARK_DS41F_ENGRAM_TIMELINE_DIR (<host>-tp<rank>-layer<id>.jsonl).
+ENGRAM_TIMELINE = os.environ.get("SPARK_DS41F_ENGRAM_TIMELINE", "0") == "1"
 ENGRAM_TIMELINE_DIR = os.environ.get(
-    "SPARK3_ENGRAM_TIMELINE_DIR", "/cache/kkref/engram-timeline"
+    "SPARK_DS41F_ENGRAM_TIMELINE_DIR", "/cache/spark-ds41f/engram-timeline"
 )
 _timeline_tables: list = []
 

@@ -78,10 +78,10 @@ logger = init_logger(__name__)
 
 
 def _vocab_parallel_greedy() -> bool:
-    """SPARK3_DSPARK_VOCAB_PARALLEL=1: shard the Markov projection by
+    """SPARK_DS41F_DSPARK_VOCAB_PARALLEL=1: shard the Markov projection by
     vocabulary and reduce greedy drafts across ranks (see
     DSparkDeepseekV4ForCausalLM.vocab_parallel_greedy)."""
-    if os.environ.get("SPARK3_DSPARK_VOCAB_PARALLEL", "0") != "1":
+    if os.environ.get("SPARK_DS41F_DSPARK_VOCAB_PARALLEL", "0") != "1":
         return False
     return get_tensor_model_parallel_world_size() > 1
 
@@ -360,11 +360,11 @@ class DSparkDeepseekV4Model(nn.Module):
         # unused vocabulary allocation while loading the draft checkpoint.
         self.embed_tokens: nn.Module | None = None
 
-        # SPARK3_DSPARK_MAIN_PROJ_TP=1 column-shards the projection of the
+        # SPARK_DS41F_DSPARK_MAIN_PROJ_TP=1 column-shards the projection of the
         # target's auxiliary hidden states (replicated otherwise, so every rank
         # streams the whole weight) and gathers the output: same arithmetic.
         main_proj_tp = (
-            os.environ.get("SPARK3_DSPARK_MAIN_PROJ_TP", "0") == "1"
+            os.environ.get("SPARK_DS41F_DSPARK_MAIN_PROJ_TP", "0") == "1"
             and get_tensor_model_parallel_world_size() > 1
         )
         main_proj_cls = (
@@ -656,7 +656,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
 
-    # --- Vocabulary-parallel greedy drafting (SPARK3_DSPARK_VOCAB_PARALLEL) ---
+    # --- Vocabulary-parallel greedy drafting (SPARK_DS41F_DSPARK_VOCAB_PARALLEL) ---
     # Each rank keeps its vocabulary shard of the draft logits and Markov bias
     # and reduces only (max, index) pairs across ranks: exact greedy drafts
     # without the draft-logits all-gather or a replicated Markov projection.
@@ -678,7 +678,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         shard = head.org_vocab_start_index, head.num_org_elements
         if shard != (markov.org_vocab_start_index, markov.num_org_elements):
             raise RuntimeError(
-                "SPARK3_DSPARK_VOCAB_PARALLEL needs the draft head and Markov "
+                "SPARK_DS41F_DSPARK_VOCAB_PARALLEL needs the draft head and Markov "
                 f"projection sharded alike: {head} != {markov}"
             )
         return shard

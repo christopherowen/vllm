@@ -18,7 +18,7 @@ slower. So only data read once per step belongs there. The embedding table
 prefill's sampled positions) qualify, while the KV cache, which attention
 gathers and re-reads, does not: holding it there cost 8% at eight streams.
 
-With ``SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1`` those weights are created in the
+With ``SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1`` those weights are created in the
 carve-out when the model is built (``allocate``), so the checkpoint streams
 straight into it and they never occupy ordinary memory: on GB10, memory freed
 after loading stays charged to the process, so copying them in after loading
@@ -35,7 +35,7 @@ surfaces, and the scanout heap never hands out a range in use. A driver fault
 or GPU reset could still leave the mapping on memory that something else
 reuses, and the result would be wrong embeddings or logits with no error.
 
-For debugging such a fault, ``SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS`` above 0
+For debugging such a fault, ``SPARK_DS41F_DISPLAY_CARVEOUT_CHECK_SECONDS`` above 0
 turns on an integrity check; production leaves it unset, which adds no work
 at all. The worker then checksums every carve-out weight once loading is
 done and, from the end of graph capture, re-checks it from a background
@@ -63,8 +63,10 @@ from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmb
 
 logger = init_logger(__name__)
 
-_REQUIRED = os.environ.get("SPARK3_DISPLAY_CARVEOUT_WEIGHTS", "0") == "1"
-_CHECK_SECONDS = float(os.environ.get("SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS", "0"))
+_REQUIRED = os.environ.get("SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS", "0") == "1"
+_CHECK_SECONDS = float(
+    os.environ.get("SPARK_DS41F_DISPLAY_CARVEOUT_CHECK_SECONDS", "0")
+)
 # 16 MiB of 32-bit words per partial checksum (a 32 MiB int64 transient).
 _CHECK_CHUNK_WORDS = 1 << 22
 _DRM_NODE = "/dev/dri/card0"
@@ -211,7 +213,7 @@ def allocate(
         carveout = _Carveout(rounded)
     except OSError as error:
         raise RuntimeError(
-            f"SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1 but the display carve-out cannot "
+            f"SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 but the display carve-out cannot "
             f"hold a {nbytes >> 20} MiB weight ({_DRM_NODE}: {error})"
         ) from error
     _carveouts.append(carveout)
@@ -365,7 +367,7 @@ def confirm_streamed_weights(model: torch.nn.Module, device: torch.device) -> No
     weights = streamed_weights(model)
     if not weights:
         raise RuntimeError(
-            "SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1 but the model has no "
+            "SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 but the model has no "
             "vocabulary-sized embedding or output-head weights"
         )
     outside = [
@@ -375,7 +377,7 @@ def confirm_streamed_weights(model: torch.nn.Module, device: torch.device) -> No
     ]
     if outside:
         raise RuntimeError(
-            "SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1 but these vocabulary-sized weights "
+            "SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 but these vocabulary-sized weights "
             f"were not created in the display carve-out: {', '.join(outside)}"
         )
     orphaned = [

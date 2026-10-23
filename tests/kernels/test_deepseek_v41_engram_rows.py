@@ -488,7 +488,7 @@ def test_timeline_records_each_step_and_the_gpu_wait():
     import subprocess
     import sys
 
-    env = dict(os.environ, SPARK3_ENGRAM_TIMELINE="1")
+    env = dict(os.environ, SPARK_DS41F_ENGRAM_TIMELINE="1")
     result = subprocess.run(
         [sys.executable, "-c", _TIMELINE_CHILD, __file__],
         env=env, capture_output=True, text=True, timeout=600,

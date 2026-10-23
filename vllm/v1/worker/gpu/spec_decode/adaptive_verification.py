@@ -29,7 +29,7 @@ logger = init_logger(__name__)
 # as padding, so routed MoE skips them, and the request commits at most one
 # token past its last live row. Decided on device, inside the draft combine,
 # from the current drafts' confidences; the batch shape is unchanged. 0 = off.
-_DEAD_ROWS_TAU = float(os.environ.get("SPARK3_DSPARK_DEAD_ROWS_TAU", "0"))
+_DEAD_ROWS_TAU = float(os.environ.get("SPARK_DS41F_DSPARK_DEAD_ROWS_TAU", "0"))
 
 
 def dead_rows_enabled() -> bool:
