@@ -17,7 +17,9 @@ site, and a file for it is refused.
 Off unless WEIGHTLESS_STEER_PATH names a file; the model then has no steering
 module and its forward is unchanged. The reader is fail-closed: a file this
 runtime cannot apply exactly stops the boot rather than serving unsteered or
-steering at another site.
+steering at another site. On, the projection is one TileLang launch per layer
+(``tilelang/glp.py``), declared for kernel preparation with the model's other
+kernels.
 """
 
 import argparse
@@ -32,6 +34,7 @@ from torch import nn
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.models.deepseek_v4_1.tilelang import glp as tilelang_glp
 
 logger = init_logger(__name__)
 
@@ -247,8 +250,9 @@ def read_glp(
 class GLPSteering(nn.Module):
     """Projects a layer's direction off its folded hyper-connection streams."""
 
-    def __init__(self, directions: torch.Tensor, alpha: float):
+    def __init__(self, directions: torch.Tensor, alpha: float, hc_mult: int):
         super().__init__()
+        self.hc_mult = hc_mult
         # One float32 row per model layer; unsteered layers are zero rows, so
         # the traced graph does not depend on which layers a file covers.
         self.register_buffer("directions", directions, persistent=False)
@@ -257,11 +261,28 @@ class GLPSteering(nn.Module):
             "alpha", torch.tensor(alpha, dtype=torch.float32), persistent=False
         )
 
+    def declare_kernels(self) -> None:
+        """The projection of the model's streams, the only shape the forward runs."""
+        tilelang_glp.declare(self.hc_mult, self.directions.shape[1])
+
     def forward(self, streams: torch.Tensor, layer: int) -> torch.Tensor:
-        h = streams.float()
-        d = self.directions[layer]
-        coefficient = h @ d
-        return (h - (self.alpha * coefficient).unsqueeze(-1) * d).to(streams.dtype)
+        """``streams`` ([T, hc_mult, hidden], BF16) with layer ``layer``'s direction
+        projected off every stream."""
+        if streams.dtype != torch.bfloat16 or streams.shape[1:] != (
+            self.hc_mult,
+            self.directions.shape[1],
+        ):
+            raise ValueError(
+                f"GLP steering projects [T, {self.hc_mult}, "
+                f"{self.directions.shape[1]}] BF16 streams, not "
+                f"{list(streams.shape)} {streams.dtype}"
+            )
+        streams = streams.contiguous()
+        out = torch.empty_like(streams)
+        tilelang_glp.glp_project(
+            streams, self.directions[layer], self.alpha.view(1), out
+        )
+        return out
 
 
 def steer_post_layer(
@@ -291,7 +312,9 @@ def steer_post_layer(
     )
 
 
-def glp_steering(num_layers: int, hidden_size: int) -> GLPSteering | None:
+def glp_steering(
+    num_layers: int, hidden_size: int, hc_mult: int
+) -> GLPSteering | None:
     """The steering WEIGHTLESS_STEER_PATH asks for, or None when it is unset.
 
     WEIGHTLESS_STEER_ALPHA overrides the file's alpha_default and
@@ -326,7 +349,7 @@ def glp_steering(num_layers: int, hidden_size: int) -> GLPSteering | None:
     for layer in layers:
         stack[layer] = torch.from_numpy(directions[layer])
     logger.info("GLP steering on: alpha %s, layers %s", alpha, layers)
-    return GLPSteering(stack, alpha)
+    return GLPSteering(stack, alpha, hc_mult)
 
 
 def main() -> None:

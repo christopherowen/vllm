@@ -573,7 +573,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
         # GLP steering (glp.py) when WEIGHTLESS_STEER_PATH is set; None otherwise,
         # which leaves the forward as it is.
-        self.glp = glp_steering(config.num_hidden_layers, config.hidden_size)
+        self.glp = glp_steering(
+            config.num_hidden_layers, config.hidden_size, config.hc_mult
+        )
 
     def prepare_disk_engram(
         self, input_ids, query_start_loc, lookback_token_ids, early=None

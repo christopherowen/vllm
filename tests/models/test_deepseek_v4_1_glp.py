@@ -190,12 +190,12 @@ def test_a_transferred_vector_is_read(tmp_path):
 def test_no_path_means_no_steering_module(monkeypatch):
     monkeypatch.setenv("WEIGHTLESS_STEER_ALPHA", "not a number")
     monkeypatch.setenv("WEIGHTLESS_STEER_LAYERS", "99")
-    assert glp.glp_steering(NUM_LAYERS, HIDDEN) is None
+    assert glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS) is None
 
 
 def test_steering_stacks_the_file_directions(tmp_path, monkeypatch):
     monkeypatch.setenv("WEIGHTLESS_STEER_PATH", glp_file(tmp_path))
-    steering = glp.glp_steering(NUM_LAYERS, HIDDEN)
+    steering = glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS)
     assert steering.directions.shape == (NUM_LAYERS, HIDDEN)
     assert steering.directions.dtype == torch.float32
     for layer in range(NUM_LAYERS):
@@ -211,7 +211,7 @@ def test_alpha_and_layers_can_be_overridden(tmp_path, monkeypatch):
     monkeypatch.setenv("WEIGHTLESS_STEER_PATH", glp_file(tmp_path))
     monkeypatch.setenv("WEIGHTLESS_STEER_ALPHA", "0.5")
     monkeypatch.setenv("WEIGHTLESS_STEER_LAYERS", "2, 5")
-    steering = glp.glp_steering(NUM_LAYERS, HIDDEN)
+    steering = glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS)
     assert steering.alpha.item() == pytest.approx(0.5)
     assert torch.count_nonzero(steering.directions.abs().sum(-1)) == 2
     assert steering.directions[1].abs().sum() == 0
@@ -232,20 +232,20 @@ def test_malformed_overrides_are_refused(tmp_path, monkeypatch, env, message):
     for name, value in env.items():
         monkeypatch.setenv(name, value)
     with pytest.raises(ValueError, match=message):
-        glp.glp_steering(NUM_LAYERS, HIDDEN)
+        glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS)
 
 
 def test_a_missing_file_is_refused(tmp_path, monkeypatch):
     monkeypatch.setenv("WEIGHTLESS_STEER_PATH", str(tmp_path / "missing.gguf"))
     with pytest.raises(FileNotFoundError):
-        glp.glp_steering(NUM_LAYERS, HIDDEN)
+        glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS)
 
 
 def test_no_alpha_anywhere_is_refused(tmp_path, monkeypatch):
     path = glp_file(tmp_path, metadata={"glp.alpha_default": None})
     monkeypatch.setenv("WEIGHTLESS_STEER_PATH", path)
     with pytest.raises(ValueError, match="no glp.alpha_default"):
-        glp.glp_steering(NUM_LAYERS, HIDDEN)
+        glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS)
 
 
 def test_the_steering_variables_are_part_of_the_compile_key(monkeypatch):
@@ -256,57 +256,80 @@ def test_the_steering_variables_are_part_of_the_compile_key(monkeypatch):
     assert envs.compile_factors() != unsteered
 
 
-# The projection.
+# The projection: one TileLang launch (tilelang/glp.py) on the model's BF16
+# streams, at the serving width. Its precision against FP64 is
+# tests/kernels/test_deepseek_v41_tilelang_glp.py's.
+
+WIDE = 5120
+on_gpu = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] != 12,
+    reason="the TileLang projection targets SM120/SM121",
+)
 
 
 def steering(alpha: float, layers=LAYERS) -> glp.GLPSteering:
-    directions = torch.zeros(NUM_LAYERS, HIDDEN)
+    directions = torch.zeros(NUM_LAYERS, WIDE)
     for layer in layers:
-        directions[layer] = torch.from_numpy(unit(layer))
-    return glp.GLPSteering(directions, alpha)
+        directions[layer] = torch.from_numpy(unit(layer, WIDE))
+    return glp.GLPSteering(directions, alpha, STREAMS).cuda()
 
 
-def streams(dtype=torch.float32, tokens: int = 7) -> torch.Tensor:
+def streams(tokens: int = 7) -> torch.Tensor:
     generator = torch.Generator().manual_seed(0)
-    return torch.randn(tokens, STREAMS, HIDDEN, generator=generator).to(dtype)
+    return torch.randn(tokens, STREAMS, WIDE, generator=generator).bfloat16().cuda()
 
 
+def direction(layer: int) -> torch.Tensor:
+    return torch.from_numpy(unit(layer, WIDE)).double().cuda()
+
+
+@on_gpu
 @pytest.mark.parametrize("alpha", [0.0, 0.25, 0.75, 1.0, 2.0])
 def test_projection_scales_only_the_direction(alpha):
-    d = torch.from_numpy(unit(2))
+    d = direction(2)
     h = streams()
-    out = steering(alpha)(h, 2)
-    torch.testing.assert_close(out @ d, (1 - alpha) * (h @ d), atol=1e-5, rtol=0)
-    rest = lambda x: x - (x @ d).unsqueeze(-1) * d  # noqa: E731
-    torch.testing.assert_close(rest(out), rest(h), atol=1e-5, rtol=0)
-
-
-def test_every_stream_is_projected_so_their_mean_is_too():
-    d = torch.from_numpy(unit(5))
-    h = streams()
-    out = steering(1.0)(h, 5)
-    torch.testing.assert_close(out @ d, torch.zeros(7, STREAMS), atol=1e-5, rtol=0)
-    mean = h.mean(dim=1)
+    out = steering(alpha)(h, 2).double()
+    # One BF16 rounding of each output element bounds the error.
     torch.testing.assert_close(
-        out.mean(dim=1), mean - (mean @ d).unsqueeze(-1) * d, atol=1e-5, rtol=0
+        out @ d, (1 - alpha) * (h.double() @ d), atol=0.05, rtol=0
+    )
+    rest = lambda x: x - (x @ d).unsqueeze(-1) * d  # noqa: E731
+    torch.testing.assert_close(rest(out), rest(h.double()), atol=0.05, rtol=0.01)
+
+
+@on_gpu
+def test_every_stream_is_projected_so_their_mean_is_too():
+    d = direction(5)
+    h = streams()
+    out = steering(1.0)(h, 5).double()
+    torch.testing.assert_close(
+        out @ d, torch.zeros(7, STREAMS, dtype=torch.float64, device="cuda"),
+        atol=0.05, rtol=0,
+    )
+    mean = h.double().mean(dim=1)
+    torch.testing.assert_close(
+        out.mean(dim=1), mean - (mean @ d).unsqueeze(-1) * d, atol=0.02, rtol=0.01
     )
 
 
+@on_gpu
 @pytest.mark.parametrize("alpha", [0.0, 0.75, 1.0, 2.0])
 def test_projection_never_adds_to_a_stream(alpha):
     h = streams()
     out = steering(alpha)(h, 1)
-    assert (out.norm(dim=-1) <= h.norm(dim=-1) + 1e-5).all()
+    assert (out.double().norm(dim=-1) <= h.double().norm(dim=-1) * (1 + 2**-8)).all()
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_an_unsteered_layer_is_unchanged(dtype):
-    h = streams(dtype)
+@on_gpu
+def test_an_unsteered_layer_is_unchanged():
+    h = streams()
     out = steering(0.75)(h, 3)
-    assert out.dtype == dtype
+    assert out.dtype == torch.bfloat16
     assert torch.equal(out, h)
 
 
+@on_gpu
 def test_alpha_is_read_when_the_projection_runs():
     module = steering(1.0)
     h = streams()
@@ -314,6 +337,25 @@ def test_alpha_is_read_when_the_projection_runs():
     module.alpha.fill_(0.0)
     assert torch.equal(module(h, 1), h)
     assert not torch.equal(full, h)
+
+
+@on_gpu
+def test_only_the_models_streams_are_projected():
+    module = steering(1.0)
+    with pytest.raises(ValueError, match="BF16 streams"):
+        module(streams().float(), 1)
+    with pytest.raises(ValueError, match="BF16 streams"):
+        module(streams()[:, :2], 1)
+
+
+def test_the_projection_is_declared_for_the_models_streams(monkeypatch):
+    declared = []
+    monkeypatch.setattr(
+        glp.tilelang_glp, "declare", lambda *shape: declared.append(shape)
+    )
+    directions = torch.zeros(NUM_LAYERS, WIDE)
+    glp.GLPSteering(directions, 0.75, STREAMS).declare_kernels()
+    assert declared == [(STREAMS, WIDE)]
 
 
 # The model loop's step.
@@ -326,16 +368,19 @@ class _FoldingMHC(torch.nn.Module):
 
     def post(self, x, residual, post_mix, res_mix):
         self.calls += 1
-        return post_mix.unsqueeze(-1) * x.unsqueeze(1) + res_mix @ residual
+        return (
+            post_mix.unsqueeze(-1) * x.float().unsqueeze(1)
+            + res_mix @ residual.float()
+        ).to(residual.dtype)
 
 
-def _layer_outputs():
+def _layer_outputs(device="cpu"):
     generator = torch.Generator().manual_seed(1)
-    x = torch.randn(3, HIDDEN, generator=generator)
-    residual = torch.randn(3, STREAMS, HIDDEN, generator=generator)
+    x = torch.randn(3, WIDE, generator=generator).bfloat16()
+    residual = torch.randn(3, STREAMS, WIDE, generator=generator).bfloat16()
     post_mix = torch.rand(3, STREAMS, generator=generator)
     res_mix = torch.rand(3, STREAMS, STREAMS, generator=generator)
-    return x, residual, post_mix, res_mix
+    return tuple(t.to(device) for t in (x, residual, post_mix, res_mix))
 
 
 def test_unsteered_layer_outputs_pass_through_untouched():
@@ -346,9 +391,10 @@ def test_unsteered_layer_outputs_pass_through_untouched():
     assert mhc.calls == 0
 
 
+@on_gpu
 def test_steered_layer_outputs_are_the_projected_fold():
     mhc = _FoldingMHC()
-    outputs = _layer_outputs()
+    outputs = _layer_outputs("cuda")
     module = steering(1.0)
     hidden_states, residual, post_mix, res_mix = glp.steer_post_layer(
         module, mhc, 5, *outputs
@@ -356,10 +402,12 @@ def test_steered_layer_outputs_are_the_projected_fold():
     assert (residual, post_mix, res_mix) == (None, None, None)
     assert mhc.calls == 1
     fold = _FoldingMHC().post(*outputs)
-    torch.testing.assert_close(hidden_states, module(fold, 5))
-    d = torch.from_numpy(unit(5))
+    assert torch.equal(hidden_states, module(fold, 5))
     torch.testing.assert_close(
-        hidden_states @ d, torch.zeros(3, STREAMS), atol=1e-5, rtol=0
+        hidden_states.double() @ direction(5),
+        torch.zeros(3, STREAMS, dtype=torch.float64, device="cuda"),
+        atol=0.05,
+        rtol=0,
     )
 
 
