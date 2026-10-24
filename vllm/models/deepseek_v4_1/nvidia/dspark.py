@@ -431,8 +431,9 @@ class DSparkDeepseekV4Model(nn.Module):
         )
         self.confidence_head: DSparkConfidenceHead | None = None
         if getattr(config, "enable_confidence_head", True):
-            self.confidence_head = DSparkConfidenceHead(
-                config.hidden_size + config.dspark_markov_rank,
+            self.confidence_head = kernels.dspark_confidence_head(
+                config.hidden_size,
+                config.dspark_markov_rank,
                 prefix=maybe_prefix(prefix, "confidence_head"),
             )
 
