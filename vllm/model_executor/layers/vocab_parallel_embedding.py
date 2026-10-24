@@ -4,7 +4,7 @@
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, cast
 
 import torch
 import torch.nn.functional as F
@@ -165,6 +165,27 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
         return F.embedding(input_, layer.weight)
+
+    def parallel_embedding(
+        self,
+        layer: torch.nn.Module,
+        input_ids: torch.Tensor,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """This rank's partial embeddings of the 1-D ``input_ids`` (the layer's
+        fused tensor-parallel lookup): its shard's row for each id it owns, zeros
+        for every other id. A model's kernel family may supply its own kernel."""
+        shard = layer.shard_indices
+        return ops.vocab_parallel_embedding(
+            input_ids,
+            layer.weight,
+            shard.org_vocab_start_index,
+            shard.org_vocab_end_index,
+            shard.num_org_vocab_padding,
+            shard.added_vocab_start_index,
+            shard.added_vocab_end_index,
+            out=out,
+        )
 
     def tie_weights(
         self, layer: torch.nn.Module, embed_tokens: "VocabParallelEmbedding"
@@ -691,19 +712,21 @@ class VocabParallelEmbedding(PluggableLayer):
         copy_weight(param[: loaded_weight.shape[0]].data, loaded_weight)
         param[loaded_weight.shape[0] :].data.fill_(0)
 
+    def _fused_embedding(
+        self, input_ids: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """The fused lookup of this rank's shard (``use_fused_embedding``), by the
+        unquantized embedding method's kernel."""
+        method = cast(UnquantizedEmbeddingMethod, self.quant_method)
+        return method.parallel_embedding(self, input_ids, out=out)
+
     def forward(self, input_):
         if self.tp_size == 1:
             return self.quant_method.embedding(self, input_.long())
 
         if self.use_fused_embedding:
-            output_parallel = ops.vocab_parallel_embedding(
-                input_ if input_.ndim == 1 else input_.reshape(-1),
-                self.weight,
-                self.shard_indices.org_vocab_start_index,
-                self.shard_indices.org_vocab_end_index,
-                self.shard_indices.num_org_vocab_padding,
-                self.shard_indices.added_vocab_start_index,
-                self.shard_indices.added_vocab_end_index,
+            output_parallel = self._fused_embedding(
+                input_ if input_.ndim == 1 else input_.reshape(-1)
             )
             if input_.ndim != 1:
                 output_parallel = output_parallel.view(
@@ -768,16 +791,7 @@ class VocabParallelEmbedding(PluggableLayer):
                 dtype=self.weight.dtype,
                 device=self.weight.device,
             )
-            ops.vocab_parallel_embedding(
-                input_,
-                self.weight,
-                self.shard_indices.org_vocab_start_index,
-                self.shard_indices.org_vocab_end_index,
-                self.shard_indices.num_org_vocab_padding,
-                self.shard_indices.added_vocab_start_index,
-                self.shard_indices.added_vocab_end_index,
-                out=output_parallel[:rows],
-            )
+            self._fused_embedding(input_, out=output_parallel[:rows])
         else:
             masked_input, input_mask = get_masked_input_and_mask(
                 input_,
