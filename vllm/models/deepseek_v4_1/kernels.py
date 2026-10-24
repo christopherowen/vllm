@@ -124,3 +124,15 @@ def is_native_linear_method(method) -> bool:
 
         native = (TileLangFP8LinearMethod, TileLangLinearMethod)
     return isinstance(method, native)
+
+
+def dspark_confidence_head(hidden_size: int, markov_rank: int, prefix: str):
+    """DSpark's acceptance-confidence head over the drafter's head hidden and the
+    Markov embedding of the token before each draft."""
+    if uses_tilelang():
+        from .tilelang.confidence import TileLangConfidenceHead
+
+        return TileLangConfidenceHead(hidden_size, markov_rank, prefix=prefix)
+    from vllm.model_executor.models.qwen3_dspark import DSparkConfidenceHead
+
+    return DSparkConfidenceHead(hidden_size + markov_rank, prefix=prefix)
