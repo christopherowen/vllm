@@ -212,7 +212,6 @@ class AdaptiveVerificationManager:
     ) -> None:
         """Publish this step's raw confidences for the ranking kernel and start
         copying them to the CPU, where a later step's budget reads them."""
-        num_reqs = input_batch.num_reqs
         ready_idx = self._stale_idx ^ 1
         with gpu_sync_allowed():
             self._copy_events[ready_idx].synchronize()
@@ -223,7 +222,9 @@ class AdaptiveVerificationManager:
         # slot they were reading before.
         self._stale_idx, write_idx = ready_idx, self._stale_idx
 
-        self._confidence_probs[input_batch.idx_mapping] = confidence_probs[:num_reqs]
+        tilelang_inputs.scatter_rows(
+            input_batch.idx_mapping, confidence_probs, self._confidence_probs
+        )
         # Replicated projections may differ through unordered floating-point
         # reductions. Both CPU graph selection and GPU request compaction must
         # consume one TP-wide confidence snapshot to issue matching collectives.

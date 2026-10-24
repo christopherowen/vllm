@@ -653,6 +653,36 @@ def test_expand_idx_mapping(num_reqs, idx_dtype):
     assert torch.equal(ref_pos, ours_pos)
 
 
+@pytest.mark.parametrize("num_reqs", REQUEST_COUNTS)
+@pytest.mark.parametrize("width", [1, 3, DRAFTS])
+@pytest.mark.parametrize("dtype,gather", [(torch.int64, True), (torch.float32, False)])
+def test_scatter_rows(num_reqs, width, dtype, gather):
+    """The runner's commit of a step's drafts (int64, read back) and adaptive
+    verification's confidences (float32): ``state[idx] = source`` against torch's
+    indexing, a filtered row's -1 wrapping to the last row as torch's does, with
+    sources that are column views of wider rows."""
+    gen = _gen(num_reqs * 7 + width)
+    idx = _idx(num_reqs, gen)
+    if 2 < num_reqs < MAX_REQS:
+        # -1 wraps to the last row, which no other request then takes.
+        idx = torch.randperm(MAX_REQS - 1, generator=gen, device=DEVICE)[:num_reqs]
+        idx[1] = -1
+    wide = _garbage((MAX_REQS, DRAFTS + 2), dtype, gen)
+    source = wide[:num_reqs, :width]
+    state = _garbage((MAX_REQS, DRAFTS), dtype, gen)
+    expected = state.clone()
+    expected[idx, :width] = source
+    gathered = expected[idx, :width]
+    out = tli.scatter_rows(idx, source, state, gather=gather)
+    torch.accelerator.synchronize()
+    bits = torch.int32 if dtype == torch.float32 else dtype
+    assert torch.equal(state.view(bits), expected.view(bits))
+    if gather:
+        assert torch.equal(out, gathered)
+    else:
+        assert out is None
+
+
 def _adaptive_offsets_ref(capacities, non_draft, cu, starts, bonus, tokens, drafted):
     """reallocate_drafts' torch chain before the port."""
     num_reqs = capacities.shape[0]

@@ -106,6 +106,7 @@ from vllm.v1.worker import display_carveout
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
+from vllm.v1.worker.gpu import tilelang_inputs
 from vllm.v1.worker.gpu.async_utils import (
     AsyncOutput,
     AsyncPoolingOutput,
@@ -2116,10 +2117,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             + ((self.num_speculative_steps + 1,) if self.num_speculative_steps else ()),
             commits=commits,
         )
+        if self.speculator is not None and self.num_speculative_steps:
+            # The commit of a step's drafts (sample_tokens), and of a boundary
+            # checkpoint's replayed drafts.
+            draft_dtype = self.req_states.draft_tokens.dtype
+            tilelang_inputs.declare(
+                lambda: tilelang_inputs.scatter_rows_calls(
+                    torch.int64, draft_dtype, gather=True
+                )
+                + (
+                    tilelang_inputs.scatter_rows_calls(
+                        torch.int64, draft_dtype, gather=False
+                    )
+                    if self.vllm_config.use_request_boundary_checkpoints
+                    else []
+                )
+            )
         if self.adaptive_verification is not None:
-            from vllm.v1.worker.gpu import tilelang_inputs
-
-            tilelang_inputs.declare(tilelang_inputs.adaptive_offsets_calls)
+            tilelang_inputs.declare(
+                lambda: tilelang_inputs.adaptive_offsets_calls()
+                + tilelang_inputs.scatter_rows_calls(
+                    torch.int64, torch.float32, gather=False
+                )
+            )
         self.req_states.register_warmups()
         if not samples:
             return
@@ -3245,9 +3265,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 boundary_aux_block_id,
                 num_speculative_tokens=num_spec_tokens_to_schedule,
             )
-            self.req_states.draft_tokens[
-                input_batch.idx_mapping, :num_spec_tokens_to_schedule
-            ] = draft_tokens_for_next_step
+            tilelang_inputs.scatter_rows(
+                input_batch.idx_mapping,
+                draft_tokens_for_next_step,
+                self.req_states.draft_tokens,
+            )
         elif self.speculator is not None and num_spec_tokens_to_schedule > 0:
             assert self.sampler is not None
             if isinstance(self.speculator, DraftModelSpeculator):
@@ -3308,12 +3330,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
             num_draft_tokens = draft_tokens.shape[1]
             if num_draft_tokens > 0:
-                self.req_states.draft_tokens[
-                    input_batch.idx_mapping, :num_draft_tokens
-                ] = draft_tokens
-                draft_tokens_for_next_step = self.req_states.draft_tokens[
-                    input_batch.idx_mapping, :num_draft_tokens
-                ]
+                # Into the request states, and read back for the next step.
+                draft_tokens_for_next_step = tilelang_inputs.scatter_rows(
+                    input_batch.idx_mapping,
+                    draft_tokens,
+                    self.req_states.draft_tokens,
+                    gather=True,
+                )
             else:
                 draft_tokens_for_next_step = draft_tokens
             if self.adaptive_verification is not None:

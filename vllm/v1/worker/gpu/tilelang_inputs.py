@@ -565,6 +565,99 @@ def zero_kv_blocks(
     )
 
 
+# --- Per-request row scatters ---------------------------------------------------
+
+_SCATTER_THREADS = 128
+
+
+@tilelang.jit(pass_configs=_PASS)
+def scatter_rows_kernel(idx_dtype: str, dtype: str, gather: bool):
+    """``state[idx_mapping] = source`` for the batch's ``[num_reqs, width]`` rows, a
+    negative index wrapping as torch's indexing does, and with ``gather`` the rows
+    read back (``out = state[idx_mapping, :width]``, which is ``source``): the
+    runner's commit of a step's drafts, and adaptive verification's confidences. A
+    thread an element, its loads clamped into the batch and issued before its
+    guarded stores."""
+    num_reqs, width, source_rows, source_stride = T.dynamic(
+        "num_reqs, width, source_rows, source_stride"
+    )
+    state_rows, state_cols, state_stride = T.dynamic(
+        "state_rows, state_cols, state_stride"
+    )
+    grid = T.ceildiv(num_reqs * width, _SCATTER_THREADS)
+
+    if gather:
+
+        @T.prim_func
+        def scatter_rows_gather(
+            idx_mapping: T.Tensor((num_reqs,), idx_dtype),
+            source: T.StridedTensor((source_rows, width), (source_stride, 1), dtype),
+            state: T.StridedTensor((state_rows, state_cols), (state_stride, 1), dtype),
+            out: T.Tensor((num_reqs, width), dtype),
+        ):
+            with T.Kernel(grid, threads=_SCATTER_THREADS) as b:
+                e = b * _SCATTER_THREADS + T.get_thread_binding()
+                r = T.min(e // width, num_reqs - 1)
+                j = e % width
+                index = T.alloc_var(T.int64, init=T.cast(idx_mapping[r], T.int64))
+                value = T.alloc_var(dtype, init=source[r, j])
+                if e < num_reqs * width:
+                    state[T.if_then_else(index < 0, index + state_rows, index), j] = (
+                        value
+                    )
+                    out[r, j] = value
+
+        return scatter_rows_gather
+
+    @T.prim_func
+    def scatter_rows(
+        idx_mapping: T.Tensor((num_reqs,), idx_dtype),
+        source: T.StridedTensor((source_rows, width), (source_stride, 1), dtype),
+        state: T.StridedTensor((state_rows, state_cols), (state_stride, 1), dtype),
+    ):
+        with T.Kernel(grid, threads=_SCATTER_THREADS) as b:
+            e = b * _SCATTER_THREADS + T.get_thread_binding()
+            r = T.min(e // width, num_reqs - 1)
+            j = e % width
+            index = T.alloc_var(T.int64, init=T.cast(idx_mapping[r], T.int64))
+            value = T.alloc_var(dtype, init=source[r, j])
+            if e < num_reqs * width:
+                state[T.if_then_else(index < 0, index + state_rows, index), j] = value
+
+    return scatter_rows
+
+
+def scatter_rows_key(idx_dtype: torch.dtype, dtype: torch.dtype, gather: bool) -> tuple:
+    return (_DTYPES[idx_dtype], _DTYPES[dtype], gather)
+
+
+def scatter_rows(
+    idx_mapping: torch.Tensor,
+    source: torch.Tensor,
+    state: torch.Tensor,
+    gather: bool = False,
+) -> torch.Tensor | None:
+    """``state[idx_mapping, :width] = source[:num_reqs]``; with ``gather``, returns
+    the rows read back as a new ``[num_reqs, width]`` tensor."""
+    num_reqs = idx_mapping.shape[0]
+    source = source[:num_reqs]
+    key = scatter_rows_key(idx_mapping.dtype, source.dtype, gather)
+    if num_reqs == 0 or source.shape[1] == 0:
+        return source.clone() if gather else None
+    if not gather:
+        _kernel(scatter_rows_kernel, *key)(idx_mapping, source, state)
+        return None
+    out = torch.empty(source.shape, dtype=source.dtype, device=source.device)
+    _kernel(scatter_rows_kernel, *key)(idx_mapping, source, state, out)
+    return out
+
+
+def scatter_rows_calls(
+    idx_dtype: torch.dtype, dtype: torch.dtype, gather: bool
+) -> list:
+    return [_call(scatter_rows_kernel, *scatter_rows_key(idx_dtype, dtype, gather))]
+
+
 # --- Adaptive verification's offsets ------------------------------------------
 
 _SCAN = 256  # requests a pass of the offsets' scan
