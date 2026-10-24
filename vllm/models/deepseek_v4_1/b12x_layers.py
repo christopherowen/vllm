@@ -953,8 +953,14 @@ class B12xMHC(nn.Module):
         return out
 
     def collapse(
-        self, state: torch.Tensor, pre: torch.Tensor | None = None
+        self,
+        state: torch.Tensor,
+        pre: torch.Tensor | None = None,
+        columns: torch.Tensor | None = None,
+        column: int = -1,
     ) -> torch.Tensor:
+        if columns is not None:
+            columns.copy_(state[:, :, column])
         out = torch.empty(
             (state.shape[0], state.shape[-1]),
             dtype=state.dtype,

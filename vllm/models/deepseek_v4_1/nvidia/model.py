@@ -640,11 +640,25 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
     def declare_kernels(self) -> None:
         """Declare the TileLang kernels the forward reaches outside its modules: the
-        rank-order sum of the TP group's collectives and the L2 prefetch."""
+        rank-order sum of the TP group's collectives, the L2 prefetch and the last
+        collapse's sink-column variant."""
         from ..tilelang import collectives, prepare
+        from ..tilelang.mhc import TileKernelsMHC
 
+        # The last collapse with the sink detector's column (forward).
+        collapse = (
+            TileKernelsMHC.collapse_column_calls(
+                self.config.hidden_size, self._sink_column
+            )
+            if self._sink_columns is not None
+            else []
+        )
         prepare.declare(
-            lambda: [*collectives.rank_order_sum_calls(), *l2_prefetch.kernel_calls()]
+            lambda: [
+                *collectives.rank_order_sum_calls(),
+                *l2_prefetch.kernel_calls(),
+                *collapse,
+            ]
         )
 
     def _build_l2_prefetch(self) -> None:
@@ -845,9 +859,33 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 {"hidden_states": hidden_states, "pre_mix": pre_mix}
             )
 
+        # The sink detector's column of every residual stream comes from the last
+        # collapse, which reads the streams anyway: straight into its buffer when
+        # every row is here, else gathered after.
+        columns: torch.Tensor | None = None
+        rows_here = sp is None and not decoder_compacted
         if self._sink_columns is not None:
+            columns = (
+                self._sink_columns[:full_num_tokens]
+                if rows_here and not self.use_sequence_parallel
+                else torch.empty(
+                    (hidden_states.shape[0], self.hc_mult),
+                    dtype=torch.float32,
+                    device=hidden_states.device,
+                )
+            )
+        # Collapse the hc copies with the pre-mix from the last layer's FFN
+        # mixes — the mix the reference applies via
+        # ``last_layer.hc_pre(h, pre_mix)`` (v4.1 has no learned hc_head).
+        hidden_states = (
+            layer.mhc.collapse(hidden_states, pre_mix)
+            if columns is None
+            else layer.mhc.collapse(
+                hidden_states, pre_mix, columns=columns, column=self._sink_column
+            )
+        )
+        if columns is not None and not (rows_here and not self.use_sequence_parallel):
             # A gather of hc_mult values per token under sequence parallelism.
-            columns = hidden_states[:, :, self._sink_column].float().contiguous()
             if self.use_sequence_parallel:
                 columns = sp_all_gather(columns)[:full_num_tokens]
             elif sp is not None:
@@ -855,11 +893,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if decoder_compacted:
                 columns = scatter_rows(columns, ced_indices, full_num_tokens)
             self._sink_columns[:full_num_tokens].copy_(columns)
-
-        # Collapse the hc copies with the pre-mix from the last layer's FFN
-        # mixes — the mix the reference applies via
-        # ``last_layer.hc_pre(h, pre_mix)`` (v4.1 has no learned hc_head).
-        hidden_states = layer.mhc.collapse(hidden_states, pre_mix)
         hidden_states = self.norm(hidden_states)
         if self.use_sequence_parallel:
             # Gather only the collapsed and normalized hidden states.

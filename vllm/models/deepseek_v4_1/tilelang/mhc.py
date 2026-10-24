@@ -481,7 +481,30 @@ _COLLAPSE_RESERVE = 24 * 1024
 
 
 @tilelang.jit(pass_configs=_PASS_CONFIGS)
-def collapse_streams(hidden_size: int, threads: int = 128):
+@T.macro
+def _collapse_rows(state, mix, out, sv, token, col, tx, reserve):
+    """One thread's ``VEC`` columns of a token: the streams' weighted sum, as
+    ``collapse_streams`` describes it. Leaves the streams' values in ``sv``."""
+    ov = T.alloc_local((VEC,), T.bfloat16)
+    mv = T.alloc_local((MULT,), T.float32)
+    acc = T.alloc_var(T.float32)
+    if tx == 0:
+        reserve[0] = T.float32(0)
+    for m in T.vectorized(MULT):
+        mv[m] = mix[token, m]
+    for m in T.unroll(MULT):
+        for v in T.vectorized(VEC):
+            sv[m * VEC + v] = state[token, m, col + v]
+    for v in T.unroll(VEC):
+        acc = T.float32(0)
+        for m in T.unroll(MULT):
+            acc = T.fma(mv[m], T.Cast(T.float32, sv[m * VEC + v]), acc)
+        ov[v] = T.Cast(T.bfloat16, acc)
+    for v in T.vectorized(VEC):
+        out[token, col + v] = ov[v]
+
+
+def collapse_streams(hidden_size: int, threads: int = 128, column: int = -1):
     """The streams' weighted sum, TileKernels' ``mhc_pre_apply_mix_fwd`` to the bit:
     ``out = bf16(sum_m mix[m] * state[m])``.
 
@@ -491,43 +514,76 @@ def collapse_streams(hidden_size: int, threads: int = 128):
     matters only in sign: four negative-zero products sum to positive zero, as
     TileKernels' do. The thread mapping is ``post_streams``'; each block holds
     ``_COLLAPSE_RESERVE`` bytes of shared memory.
+
+    With ``column`` (the sink detector's), the thread that reads it also writes
+    each stream's value there, as FP32, to ``columns`` ([tokens, MULT]): the
+    forward's last collapse hands the detector its column in the same launch.
     """
     assert hidden_size % (threads * VEC) == 0
+    assert column < hidden_size
     blocks = hidden_size // (threads * VEC)
     M = T.dynamic("M")
 
+    if column < 0:
+
+        @T.prim_func
+        def mhc_collapse(
+            state: T.Tensor((M, MULT, hidden_size), T.bfloat16),
+            mix: T.Tensor((M, MULT), T.float32),
+            out: T.Tensor((M, hidden_size), T.bfloat16),
+        ):
+            with T.Kernel(M * blocks, threads=threads) as pid:
+                tx = T.get_thread_binding()
+                sv = T.alloc_local((MULT * VEC,), T.bfloat16)
+                # Held, not used: the one write keeps the allocation, and with it
+                # the cap.
+                reserve = T.alloc_shared((_COLLAPSE_RESERVE // 4,), T.float32)
+                _collapse_rows(
+                    state,
+                    mix,
+                    out,
+                    sv,
+                    pid // blocks,
+                    (pid % blocks * threads + tx) * VEC,
+                    tx,
+                    reserve,
+                )
+
+        return mhc_collapse
+
+    # The block, thread and vector element that read ``column``.
+    column_block = column // (threads * VEC)
+    column_thread = column % (threads * VEC) // VEC
+    column_element = column % VEC
+
     @T.prim_func
-    def mhc_collapse(
+    def mhc_collapse_column(
         state: T.Tensor((M, MULT, hidden_size), T.bfloat16),
         mix: T.Tensor((M, MULT), T.float32),
         out: T.Tensor((M, hidden_size), T.bfloat16),
+        columns: T.Tensor((M, MULT), T.float32),
     ):
         with T.Kernel(M * blocks, threads=threads) as pid:
             tx = T.get_thread_binding()
-            token = pid // blocks
-            col = (pid % blocks * threads + tx) * VEC
             sv = T.alloc_local((MULT * VEC,), T.bfloat16)
-            ov = T.alloc_local((VEC,), T.bfloat16)
-            mv = T.alloc_local((MULT,), T.float32)
-            acc = T.alloc_var(T.float32)
-            # Held, not used: the one write keeps the allocation, and with it the cap.
             reserve = T.alloc_shared((_COLLAPSE_RESERVE // 4,), T.float32)
-            if tx == 0:
-                reserve[0] = T.float32(0)
-            for m in T.vectorized(MULT):
-                mv[m] = mix[token, m]
-            for m in T.unroll(MULT):
-                for v in T.vectorized(VEC):
-                    sv[m * VEC + v] = state[token, m, col + v]
-            for v in T.unroll(VEC):
-                acc = T.float32(0)
+            _collapse_rows(
+                state,
+                mix,
+                out,
+                sv,
+                pid // blocks,
+                (pid % blocks * threads + tx) * VEC,
+                tx,
+                reserve,
+            )
+            if (pid % blocks == column_block) & (tx == column_thread):
                 for m in T.unroll(MULT):
-                    acc = T.fma(mv[m], T.Cast(T.float32, sv[m * VEC + v]), acc)
-                ov[v] = T.Cast(T.bfloat16, acc)
-            for v in T.vectorized(VEC):
-                out[token, col + v] = ov[v]
+                    columns[pid // blocks, m] = T.Cast(
+                        T.float32, sv[m * VEC + column_element]
+                    )
 
-    return mhc_collapse
+    return mhc_collapse_column
 
 
 def _project_call(hidden: int, mode: str, world: int) -> prepare.TileLangCall:
@@ -547,9 +603,12 @@ def _post_call(hidden: int) -> prepare.TileLangCall:
     return prepare.call(post_streams, hidden)
 
 
-def _collapse_call(hidden: int) -> prepare.TileLangCall:
-    """The stream collapse's call."""
-    return prepare.call(collapse_streams, hidden)
+def _collapse_call(hidden: int, column: int = -1) -> prepare.TileLangCall:
+    """The stream collapse's call, and with ``column`` its variant that also writes
+    that column of every stream."""
+    if column < 0:
+        return prepare.call(collapse_streams, hidden)
+    return prepare.call(collapse_streams, hidden, column=column)
 
 
 def _make(call: prepare.TileLangCall):
@@ -573,8 +632,8 @@ def _post(hidden: int):
 
 
 @cache
-def _collapse(hidden: int):
-    return _make(_collapse_call(hidden))
+def _collapse(hidden: int, column: int = -1):
+    return _make(_collapse_call(hidden, column))
 
 
 @torch.library.custom_op(
@@ -710,6 +769,32 @@ def _mhc_collapse(state: torch.Tensor, mix: torch.Tensor, out: torch.Tensor) -> 
 
 @_mhc_collapse.register_fake
 def _mhc_collapse_fake(state, mix, out):
+    return None
+
+
+@torch.library.custom_op(
+    "vllm::dsv41_tilelang_mhc_collapse_column", mutates_args=("out", "columns")
+)
+def _mhc_collapse_column(
+    state: torch.Tensor,
+    mix: torch.Tensor,
+    out: torch.Tensor,
+    columns: torch.Tensor,
+    column: int,
+) -> None:
+    tokens, hidden = int(state.shape[0]), int(state.shape[-1])
+    if tokens == 0:
+        return
+    _collapse(hidden, column)(
+        state.view(tokens, MULT, hidden),
+        mix.view(tokens, MULT),
+        out.view(tokens, hidden),
+        columns.view(tokens, MULT),
+    )
+
+
+@_mhc_collapse_column.register_fake
+def _mhc_collapse_column_fake(state, mix, out, columns, column):
     return None
 
 
@@ -867,16 +952,29 @@ class TileKernelsMHC(nn.Module):
         return out
 
     def collapse(
-        self, state: torch.Tensor, pre: torch.Tensor | None = None
+        self,
+        state: torch.Tensor,
+        pre: torch.Tensor | None = None,
+        columns: torch.Tensor | None = None,
+        column: int = -1,
     ) -> torch.Tensor:
-        """The streams' weighted sum with ``pre``, or their mean."""
+        """The streams' weighted sum with ``pre``, or their mean; with ``columns``
+        ([tokens, MULT] FP32), also each stream's ``column``, in the same launch."""
         if pre is None:
             pre = _constant_mixes(int(state.shape[0]), state.device)[1]
         out = torch.empty(
             (state.shape[0], state.shape[-1]), dtype=state.dtype, device=state.device
         )
-        _mhc_collapse(state, pre, out)
+        if columns is None:
+            _mhc_collapse(state, pre, out)
+        else:
+            _mhc_collapse_column(state, pre, out, columns, column)
         return out
+
+    @staticmethod
+    def collapse_column_calls(hidden: int, column: int) -> list:
+        """The declared call of ``collapse`` with ``columns`` for ``column``."""
+        return [_collapse_call(hidden, column)]
 
 
 __all__ = [
