@@ -494,7 +494,8 @@ def test_warmup_rows_are_neither_logged_nor_kept(monkeypatch: pytest.MonkeyPatch
     assert sink.counts.tolist() == [0, 0, 0] and not sink.warming
     step()
     assert lines == [
-        "Sink detector, rank 0: 1 flagged rows (draft zero 1, drafter 0, prompt 0)"
+        "Sink detector, rank 0: 1 flagged rows in executed steps (draft zero 1, "
+        "drafter 0, prompt 0; vllm:sink_* counts committed outputs only)"
     ]
 
 

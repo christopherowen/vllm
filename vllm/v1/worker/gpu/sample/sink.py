@@ -10,7 +10,11 @@ same Gumbel noise for random rows) in descending order after the sampled token,
 i.e. sampling without replacement. A flagged drafter row cuts the verification:
 its draft is masked in the row before, and restored after the verification.
 Everything stays on the device; each rank counts the rows it flagged and logs
-the counts without a synchronization.
+the counts without a synchronization. That count covers every step the rank
+executes, including steps whose output the scheduler then discards (the step in
+flight when a request finishes or is aborted, stale output after a preemption);
+``vllm:sink_*`` counts the flags in committed outputs, so the log reads at least
+the metric.
 """
 
 from dataclasses import dataclass
@@ -755,8 +759,9 @@ class SinkSampler:
             if counts != self._logged_counts:
                 self._logged_counts = counts
                 logger.info(
-                    "Sink detector, rank %d: %d flagged rows (draft zero %d, "
-                    "drafter %d, prompt %d)",
+                    "Sink detector, rank %d: %d flagged rows in executed steps "
+                    "(draft zero %d, drafter %d, prompt %d; vllm:sink_* counts "
+                    "committed outputs only)",
                     rank,
                     sum(counts),
                     *counts,
