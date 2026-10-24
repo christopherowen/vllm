@@ -24,10 +24,12 @@ def make_case(kind, rows, width, seed, count):
     torch.manual_seed(seed)
     states = rows + 9
     mapping = torch.randperm(states, device="cuda")[:rows]
-    if kind == "bincount":
+    if kind.startswith("bincount"):
         tokens = torch.randint(
             129280, (states, width), device="cuda", dtype=torch.int32
         )
+        if kind == "bincount_repeated":
+            tokens[:, ::3] = 31
         prompt = torch.full((states,), width // 2, device="cuda", dtype=torch.int32)
         prefill = torch.full_like(prompt, width)
         buffers = [
@@ -236,20 +238,22 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--gate", action="store_true")
     parser.add_argument("--seed", type=int, default=48291)
-    parser.add_argument("--kernels", default="min_p,penalties,bincount")
+    parser.add_argument(
+        "--kernels", default="min_p,penalties,bincount,bincount_repeated"
+    )
     args = parser.parse_args()
     cases = [
         (kind, rows, width)
         for kind in args.kernels.split(",")
+        if kind in ("min_p", "penalties")
         for rows in (1, 16, 96)
-        if kind != "bincount"
         for width in (129280,)
     ]
-    if "bincount" in args.kernels.split(","):
+    for kind in args.kernels.split(","):
+        if not kind.startswith("bincount"):
+            continue
         cases += [
-            ("bincount", rows, width)
-            for rows in (1, 16)
-            for width in (128, 8192, 131072)
+            (kind, rows, width) for rows in (1, 16) for width in (128, 8192, 131072)
         ]
     results = [measure(*case, args.seed) for case in cases]
     failed = [(r["kernel"], r["rows"], r["width"]) for r in results if r["slower"]]
