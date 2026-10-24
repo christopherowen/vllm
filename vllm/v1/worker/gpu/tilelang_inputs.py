@@ -565,6 +565,42 @@ def zero_kv_blocks(
     )
 
 
+# --- Padding rows -----------------------------------------------------------------
+
+_PADDING_THREADS = 256
+
+
+@tilelang.jit(pass_configs=_PASS)
+def padding_rows_kernel():
+    """``is_padding[i] = i >= live`` for ``i < rows``: the rows the MoE routers skip
+    (``VLLM_MOE_SKIP_PADDING``), the target's before a step and the drafter's before
+    its graph replays, where torch wrote two fills, or a comparison and a copy."""
+    length = T.dynamic("length")
+
+    @T.prim_func
+    def padding_rows(
+        is_padding: T.Tensor((length,), T.bool),
+        live: T.int32,
+        rows: T.int32,
+    ):
+        with T.Kernel(T.ceildiv(rows, _PADDING_THREADS), threads=_PADDING_THREADS) as b:
+            i = b * _PADDING_THREADS + T.get_thread_binding()
+            if i < rows:
+                is_padding[i] = i >= live
+
+    return padding_rows
+
+
+def padding_rows(is_padding: torch.Tensor, live: int, rows: int) -> None:
+    """Rows ``live`` to ``rows`` of ``is_padding`` padding, the rows before them not."""
+    if rows:
+        _kernel(padding_rows_kernel)(is_padding, live, rows)
+
+
+def padding_rows_calls() -> list:
+    return [_call(padding_rows_kernel)]
+
+
 # --- Per-request row scatters ---------------------------------------------------
 
 _SCATTER_THREADS = 128

@@ -1681,9 +1681,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if envs.VLLM_MOE_SKIP_PADDING:
             # Mark trailing cudagraph-padding rows so kernels can skip work for
             # them when supported.
-            is_padding = self.input_buffers.is_padding
-            is_padding[:num_tokens].fill_(False)
-            is_padding[num_tokens:num_tokens_after_padding].fill_(True)
+            tilelang_inputs.padding_rows(
+                self.input_buffers.is_padding, num_tokens, num_tokens_after_padding
+            )
 
         req_ids = batch_req_state.req_ids
         num_scheduled_tokens_np = batch_req_state.num_scheduled_tokens
@@ -2133,6 +2133,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     else []
                 )
             )
+        if envs.VLLM_MOE_SKIP_PADDING:
+            # The target's padding rows (prepare_inputs).
+            tilelang_inputs.declare(tilelang_inputs.padding_rows_calls)
         if self.adaptive_verification is not None:
             tilelang_inputs.declare(
                 lambda: tilelang_inputs.adaptive_offsets_calls()

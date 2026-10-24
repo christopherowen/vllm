@@ -653,6 +653,22 @@ def test_expand_idx_mapping(num_reqs, idx_dtype):
     assert torch.equal(ref_pos, ours_pos)
 
 
+@pytest.mark.parametrize(
+    "live,rows", [(0, 0), (0, 8), (6, 8), (96, 96), (90, 128), (16000, MAX_TOKENS)]
+)
+def test_padding_rows(live, rows):
+    """The routers' padding rows, torch's two fills (the target) and comparison
+    (the drafter): rows past ``rows`` keep their contents."""
+    gen = _gen(live + rows)
+    start = torch.randint(0, 2, (MAX_TOKENS + 5,), generator=gen, device=DEVICE)
+    expected, actual = start.bool(), start.bool()
+    expected[:live].fill_(False)
+    expected[live:rows].fill_(True)
+    tli.padding_rows(actual, live, rows)
+    torch.accelerator.synchronize()
+    assert torch.equal(expected, actual)
+
+
 @pytest.mark.parametrize("num_reqs", REQUEST_COUNTS)
 @pytest.mark.parametrize("width", [1, 3, DRAFTS])
 @pytest.mark.parametrize("dtype,gather", [(torch.int64, True), (torch.float32, False)])
