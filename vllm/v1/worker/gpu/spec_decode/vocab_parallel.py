@@ -25,7 +25,7 @@ from __future__ import annotations
 import torch
 
 from vllm.triton_utils import tl, tldevice, triton
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax, spec_step_seed
 
 BLOCK = 1024
 
@@ -104,6 +104,9 @@ def _vp_draft_block_kernel(
         mask=mask & valid,
     )
     seed = tl.load(seeds_ptr + req, mask=valid, other=0)
+    # As the full-vocab draft (gumbel._gumbel_sample_kernel with a logits cache):
+    # the step column in the seed's high word, so each step draws fresh noise.
+    seed = spec_step_seed(seed, col)
     pos = tl.load(pos_ptr + row)
     keys = vocab_start + offs
     value, idx = gumbel_noised_argmax(
