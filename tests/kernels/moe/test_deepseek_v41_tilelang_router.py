@@ -344,3 +344,35 @@ def test_ced_decoder_skips_nan_padding_rows(ced_step):
     torch.cuda.synchronize()
     assert (ids[~expected] == -1).all() and (weights[~expected] == 0).all()
     assert (ids[expected] >= 0).all() and torch.isfinite(weights).all()
+
+
+def test_gate_router_reads_the_padding_and_ced_masks_itself(plain_scratch, ced_step):
+    """The fused decode router takes the step's padding mask as it is (a set row
+    is skipped) and a CED decoder's routing mask (a clear row is skipped), the
+    rows the unfused router routes, bit for bit."""
+    context, _, compact = ced_step
+    generator = torch.Generator(device="cuda").manual_seed(29)
+    bias = torch.randn(384, device="cuda", generator=generator) * 0.1
+    kwargs = dict(
+        top_k=6,
+        global_num_experts=384,
+        e_score_correction_bias=bias,
+        renormalize=True,
+        routed_scaling_factor=SCALE,
+        scoring_func="sqrtsoftplus",
+    )
+    for rows, ced, skipped in ((361, False, context.is_padding), (158, True, ~compact)):
+        gate = _Gate(384, seed=rows)
+        x = torch.randn(rows, 5120, device="cuda", generator=generator)
+        x = x.to(torch.bfloat16)
+        router = tilelang_router.TileLangGateRouter(gate=gate, **kwargs)
+        router._ds41_is_ced_decoder = ced
+        router.declare_kernels()
+        weights, ids = router._compute_routing(None, x, None)
+        logits, _ = gate(x)
+        unfused = tilelang_router.TileKernelsRouter(**kwargs)
+        unfused._ds41_is_ced_decoder = ced
+        expected = unfused._compute_routing(None, logits, None)
+        assert (ids[skipped] == -1).all()
+        assert torch.equal(ids, expected[1])
+        assert torch.equal(weights.view(torch.int32), expected[0].view(torch.int32))
