@@ -515,8 +515,14 @@ def test_declared_calls_are_the_forwards(mhc, monkeypatch):
         mhc.declare_kernels()
     declared = prepare.declared_calls(registry)
     assert prepare.warm_declared(registry) == 0
-    ours = [call for call in declared if call[0] in (post_streams, collapse_streams)]
+    factories = (post_streams, collapse_streams)
+    ours = [call for call in declared if call[0] in factories]
     assert ours == [(post_streams, (HIDDEN,), {}), (collapse_streams, (HIDDEN,), {})]
+
+    def by_factory(call):
+        # TileLang's JIT objects have no __name__; order by the factory itself.
+        found = (i for i, factory in enumerate(factories) if factory is call[0])
+        return next(found, len(factories))
 
     # The forward's calls, recorded as its cached lookups make them.
     launched = []
@@ -536,6 +542,4 @@ def test_declared_calls_are_the_forwards(mhc, monkeypatch):
     mhc.post(RankOrderParts(torch.stack((x, x))), residual, post, comb)
     mhc.collapse(residual, _pre_mix(6, seed=72))
     mhc.collapse(residual)
-    assert sorted(launched, key=lambda call: call[0].__name__) == sorted(
-        ours, key=lambda call: call[0].__name__
-    )
+    assert sorted(launched, key=by_factory) == ours
