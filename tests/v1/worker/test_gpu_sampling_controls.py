@@ -152,7 +152,10 @@ def test_penalties_count_only_preceding_drafts(index_dtype, vocab, nonfinite):
 
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("length", [1, 1023, 1025, 8192])
-def test_bincount_distinguishes_prompt_bits_and_output_counts(index_dtype, length):
+@pytest.mark.parametrize("initial", [0, 7])
+def test_bincount_distinguishes_prompt_bits_and_output_counts(
+    index_dtype, length, initial
+):
     torch.manual_seed(29401)
     states, rows, vocab = 9, 4, 129280
     tokens = torch.randint(
@@ -164,6 +167,8 @@ def test_bincount_distinguishes_prompt_bits_and_output_counts(index_dtype, lengt
     prefill = torch.full((states,), length, dtype=torch.int32, device="cuda")
     mask = torch.zeros((states, (vocab + 31) // 32), dtype=torch.int32, device="cuda")
     counts = torch.zeros((states, vocab), dtype=torch.int32, device="cuda")
+    mask.fill_(initial)
+    counts.fill_(initial)
     expected_mask, expected_counts = mask.clone(), counts.clone()
     _bincount_kernel[(rows, (length + 1023) // 1024)](
         mapping,
@@ -177,7 +182,9 @@ def test_bincount_distinguishes_prompt_bits_and_output_counts(index_dtype, lengt
         counts.stride(0),
         BLOCK_SIZE=1024,
     )
-    candidate.bincount(mapping, tokens, prompt, prefill, mask, counts, length)
+    candidate.accumulate_bincount(
+        mapping, tokens, prompt, prefill, mask, counts, length
+    )
     assert_bits(mask, expected_mask)
     assert_bits(counts, expected_counts)
 

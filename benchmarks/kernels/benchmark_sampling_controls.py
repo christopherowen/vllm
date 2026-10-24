@@ -48,7 +48,7 @@ def make_case(kind, rows, width, seed, count):
         def invoke(index, ours):
             mask, counts = buffers[index]
             if ours:
-                candidate.bincount(
+                candidate.accumulate_bincount(
                     mapping, tokens, prompt, prefill, mask, counts, width
                 )
             else:

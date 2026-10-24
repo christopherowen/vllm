@@ -332,7 +332,10 @@ def register_bincount(
     )
 
 
-def bincount(mapping, tokens, prompt, prefill, mask, counts, max_prefill_len):
+def accumulate_bincount(
+    mapping, tokens, prompt, prefill, mask, counts, max_prefill_len
+):
+    """Kernel portion only; the owner still clears selected rows before accumulation."""
     if mapping.numel() and max_prefill_len:
         _launch(
             bincount_kernel,
