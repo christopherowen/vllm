@@ -79,11 +79,15 @@ def test_within_one_rounding_of_fp64(tokens, alpha):
 
 
 def test_the_direction_is_removed():
+    """At alpha 1 what remains along d is only the outputs' BF16 rounding: no more than
+    the correctly rounded projection leaves, and a small part of what was there."""
     streams, directions = _inputs(256)
     d = directions[2].double()
-    out = _project(streams, directions[2], 1.0).double()
-    # What remains along d is the outputs' own BF16 rounding.
-    assert (out @ d).abs().max().item() < 0.02
+    before = (streams.double() @ d).abs()
+    after = (_project(streams, directions[2], 1.0).double() @ d).abs()
+    rounded = (_fp64(streams, directions[2], 1.0).bfloat16().double() @ d).abs()
+    assert after.max().item() <= 1.25 * rounded.max().item() + 1e-4
+    assert after.mean().item() <= 0.05 * before.mean().item()
 
 
 def test_alpha_zero_and_a_zero_direction_change_nothing():
