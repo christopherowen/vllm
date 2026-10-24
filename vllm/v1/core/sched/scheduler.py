@@ -3387,6 +3387,13 @@ class Scheduler(SchedulerInterface):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
+            if should_emit_output and request.sink_prompt_logprobs is not None:
+                # The prompt logprobs held with the request's first token. A
+                # prompt computed again after a preemption returns new ones,
+                # which replace them.
+                if prompt_logprobs_tensors is None:
+                    prompt_logprobs_tensors = request.sink_prompt_logprobs
+                request.sink_prompt_logprobs = None
             if should_emit_output:
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
@@ -3419,6 +3426,14 @@ class Scheduler(SchedulerInterface):
                         ),
                     )
                 )
+            elif (
+                prompt_logprobs_tensors and self.sink_rejection and generated_token_ids
+            ):
+                # The step finished the prompt and sampled the request's first
+                # token, which sink rejection holds back (or a stale output
+                # drops): the prompt logprobs wait for the request's first
+                # output.
+                request.sink_prompt_logprobs = prompt_logprobs_tensors
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors

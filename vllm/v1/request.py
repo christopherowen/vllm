@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.boundary_checkpoint import BoundaryCheckpoint
     from vllm.v1.core.kv_cache_utils import BlockHash
-    from vllm.v1.outputs import LogprobsLists
+    from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 
 
 @dataclass
@@ -245,6 +245,10 @@ class Request:
         # request holds none.
         self.sink_provisional: int | None = None
         self.sink_provisional_logprobs: LogprobsLists | None = None
+        # Sink rejection: the prompt logprobs of a prompt whose last step had
+        # its sampled token held back. They go out with the request's first
+        # output, as they do with its first token when no token is held.
+        self.sink_prompt_logprobs: LogprobsTensors | None = None
         # Whether the request's next step starts with draft zero: set once a
         # step that samples a provisional token is scheduled, cleared when the
         # request loses it (preemption, a new streaming input).
