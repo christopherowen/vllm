@@ -1697,13 +1697,13 @@ def greedy_rejection_sample(
 def temperature_kernel(idx_dtype: str, run: int, threads: int = _TEMPERATURE_THREADS):
     """``gumbel._temperature_kernel``: FP32 logits divided in place by their
     request's temperature (``div.full.f32``), rows at temperature 0 or 1 left
-    alone; a block of ``threads`` per ``(token, 8192 columns)``, each thread's
-    elements in runs of ``run`` (``_triton_run``), one vector load and store each
-    when aligned. As in Triton, the thread's runs are all loaded, then divided,
-    then stored: the logits are read and written through one pointer, so a run
-    stored before the next run's load would make every load wait for a store. As
-    in Triton, the temperature is read at the mapped index without a validity
-    check."""
+    alone; a block of ``threads`` per token and ``_TEMPERATURE_BLOCK`` columns,
+    each thread's elements in runs of ``run`` (``_triton_run``), one vector load
+    and store each when aligned. As in Triton, the thread's runs are all loaded,
+    then divided, then stored: the logits are read and written through one pointer,
+    so a run stored before the next run's load would make every load wait for a
+    store. As in Triton, the temperature is read at the mapped index without a
+    validity check."""
     tokens, vocab, idx_len, temp_len = T.dynamic("tokens, vocab, idx_len, temp_len")
     logits_stride = T.dynamic("logits_stride", "int64")
     runs = _TEMPERATURE_BLOCK // (threads * run)
