@@ -172,7 +172,7 @@ def register_select_first_argmax_warmup(
     from vllm.v1.worker.gpu.sample import tilelang_sampling
 
     tilelang_sampling.declare(
-        lambda: tilelang_sampling.greedy_calls(select=[output_dtype])
+        lambda: tilelang_sampling.greedy_calls(select=[(output_dtype, ranks)])
     )
 
 
