@@ -202,9 +202,10 @@ def nan_count_kernel(vocab: int, stride: int, dtype: str):
             for block in T.serial(T.ceildiv(vocab, 8192)):
                 for col in T.Parallel(8192):
                     index = block * 8192 + col
-                    if index < vocab:
-                        value = logits[T.cast(row, "int64"), index]
-                        counts[col] += T.cast(value != value, "int32")
+                    value = T.if_then_else(
+                        index < vocab, logits[T.cast(row, "int64"), index], 0
+                    )
+                    counts[col] += T.cast(value != value, "int32")
             T.reduce_sum(counts, total, dim=0)
             output[row] = total[0]
 

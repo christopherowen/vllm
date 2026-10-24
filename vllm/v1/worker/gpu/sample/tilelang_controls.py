@@ -115,7 +115,9 @@ def apply_min_p(logits, mapping, thresholds):
         )
 
 
-@tilelang.jit(pass_configs=_PASS)
+@tilelang.jit(
+    pass_configs={**_PASS, tilelang.PassConfigKey.TIR_DISABLE_VECTORIZE: True}
+)
 def penalties_kernel(
     vocab: int,
     logits_stride: int,

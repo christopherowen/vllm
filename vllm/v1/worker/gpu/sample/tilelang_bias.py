@@ -86,12 +86,14 @@ def bias_kernel(
                     for block in T.serial(T.ceildiv(vocab, 8192)):
                         for col in T.Parallel(8192):
                             index = block * 8192 + col
-                            if index < vocab:
-                                alive[col] |= T.cast(
-                                    logits[T.cast(row, "int64"), index]
-                                    != -T.infinity("float32"),
-                                    "int32",
-                                )
+                            value = T.if_then_else(
+                                index < vocab,
+                                logits[T.cast(row, "int64"), index],
+                                -T.infinity("float32"),
+                            )
+                            alive[col] |= T.cast(
+                                value != -T.infinity("float32"), "int32"
+                            )
                     T.reduce_max(alive, any_alive, dim=0)
                     if any_alive[0] == 0:
                         for col in T.Parallel(width):
