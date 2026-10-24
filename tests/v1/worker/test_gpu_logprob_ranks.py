@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Reported ranks must preserve the previous kernel's ties, padding and NaNs."""
+"""Reported ranks count real vocabulary entries, including ties and nonfinite values."""
 
 import pytest
 import torch
@@ -43,7 +43,7 @@ def test_ranks_match_triton(dtype, rows, vocab, padding):
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_ranks_keep_ties_nonfinite_and_padding(dtype):
+def test_ranks_keep_ties_nonfinite_and_exclude_padding(dtype):
     logits = torch.zeros(6, 8193, device="cuda", dtype=dtype)
     logits[0, 0] = -torch.inf
     logits[1, 0] = torch.inf
@@ -54,8 +54,29 @@ def test_ranks_keep_ties_nonfinite_and_padding(dtype):
     ids = torch.zeros(6, device="cuda", dtype=torch.int32)
     output = torch.empty(6, device="cuda", dtype=torch.int64)
     tilelang_logprob.token_ranks(logits, ids, output)
-    assert torch.equal(output, reference(logits, ids))
-    assert output.tolist() == [16384, 1, 0, 8192, 16384, 8193]
+    expected = (logits >= logits.gather(1, ids.long()[:, None])).sum(-1)
+    assert torch.equal(output, expected)
+    assert output.tolist() == [8193, 1, 0, 8192, 8193, 8193]
+    # The old kernel's only difference is its 8,191 phantom vocabulary
+    # entries when the scored token has logit -inf.
+    assert (reference(logits, ids) - output).tolist() == [8191, 0, 0, 0, 8191, 0]
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_ds41f_zero_probability_token_reports_rank_within_vocabulary(dtype):
+    """Forced-token scoring must not count DS41F's 1,792 padded columns."""
+    vocab = 129280
+    logits = torch.zeros(2, vocab, device="cuda", dtype=dtype)
+    ids = torch.tensor([0, vocab - 1], device="cuda", dtype=torch.int64)
+    logits[0, 0] = -torch.inf
+    logits[1, -1] = -torch.inf
+    original_ids = ids.clone()
+    result = logprob.compute_topk_scores(logits, 0, ids, logits_mode=True)
+    assert result.selected_token_ranks.tolist() == [vocab, vocab]
+    assert reference(logits, ids).tolist() == [131072, 131072]
+    assert torch.isneginf(result.logprobs[:, 0]).all()
+    assert torch.equal(result.logprob_token_ids[:, 0], original_ids)
+    assert torch.equal(ids, original_ids)
 
 
 def test_rank_is_independent_of_batch_and_graph_replay():

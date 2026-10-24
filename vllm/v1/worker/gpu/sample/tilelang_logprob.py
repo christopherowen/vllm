@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Selected-token ranks, with the V2 runner's Triton rank semantics."""
+"""Selected-token ranks over the real vocabulary, including ties."""
 
 from collections.abc import Sequence
 
@@ -47,9 +47,9 @@ def ranks_kernel(vocab: int, stride: int, dtype: str, id_dtype: str, threads: in
                         T.cast(logits[T.cast(row, "int64"), index], "float32"),
                         -T.infinity("float32"),
                     )
-                    # Triton counts its -inf padding when the selected logit
-                    # is -inf; keep that behaviour as well as ties and NaNs.
-                    counts[col] += T.cast(value >= selected[0], "int32")
+                    counts[col] += T.cast(
+                        (index < vocab) & (value >= selected[0]), "int32"
+                    )
             T.reduce_sum(counts, total, dim=0)
             output[row] = T.cast(total[0], "int64")
 
