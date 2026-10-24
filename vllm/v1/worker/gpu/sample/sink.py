@@ -391,16 +391,17 @@ class SinkSampler:
         watched column of every token's pre-norm residual streams,
         ``[tokens, streams]`` float32. Rows past a request's live drafts
         (``dead_cut``) are never flagged: they skipped routed MoE."""
-        rows = columns[logits_indices].abs()
-        self.row_values = rows.amax(dim=1).nan_to_num(0.0)
-        flags = (rows > self.config.threshold).any(dim=1)
-        if dead_cut is not None:
-            rows = torch.arange(
-                flags.shape[0], dtype=cu_num_logits.dtype, device=self.device
-            )
-            req = torch.searchsorted(cu_num_logits[1 : num_reqs + 1], rows, right=True)
-            flags &= rows - cu_num_logits[req] <= dead_cut[req]
-        return flags.to(torch.int8)
+        from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+        flags, self.row_values = tilelang_sampling.sink_flags(
+            columns,
+            logits_indices,
+            cu_num_logits,
+            num_reqs,
+            dead_cut,
+            self.config.threshold,
+        )
+        return flags
 
     def cut(
         self,

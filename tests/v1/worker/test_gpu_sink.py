@@ -95,6 +95,46 @@ def test_flags_on_reference_numbers():
     assert flags.tolist() == [1, 0, 1, 1]
 
 
+def _torch_flags(columns, logits_indices, cu_num_logits, num_reqs, dead_cut, threshold):
+    """The detector's flags as they were computed in torch (the TileLang kernel's
+    reference): each row's largest |column| (NaN reads 0) and its flag."""
+    rows = columns[logits_indices].abs()
+    values = rows.amax(dim=1).nan_to_num(0.0)
+    flags = (rows > threshold).any(dim=1)
+    if dead_cut is not None:
+        index = torch.arange(flags.shape[0], dtype=cu_num_logits.dtype, device=DEVICE)
+        req = torch.searchsorted(cu_num_logits[1 : num_reqs + 1], index, right=True)
+        flags &= index - cu_num_logits[req] <= dead_cut[req]
+    return flags.to(torch.int8), values
+
+
+@pytest.mark.parametrize("dead", [False, True])
+def test_flags_match_the_torch_reference(dead: bool):
+    """Random columns with NaN, +-inf, -0 and values at the threshold, at scattered
+    tokens, five requests of up to six rows: flags and values bit for bit."""
+    gen = torch.Generator(device=DEVICE).manual_seed(29)
+    columns = torch.randn(300, 4, generator=gen, device=DEVICE) * 60000.0
+    columns[::7, 1] = float("nan")
+    columns[3::11, 2] = float("inf")
+    columns[5::13, 0] = -float("inf")
+    columns[::17] = -0.0
+    columns[2::19, 3] = REJECTION.threshold
+    columns[4::23, 3] = -REJECTION.threshold
+    counts = [6, 1, 4, 6, 3]
+    num_logits, num_reqs = sum(counts), len(counts)
+    logits_indices = torch.randperm(300, generator=gen, device=DEVICE)[:num_logits]
+    cu = _cu(counts)
+    cut = torch.tensor([2, 0, 5, 1, 0], dtype=torch.int32, device=DEVICE)
+    cut = cut if dead else None
+    sink = _sink()
+    flags = sink.flags(columns, logits_indices, cu, num_reqs, cut)
+    ref_flags, ref_values = _torch_flags(
+        columns, logits_indices, cu, num_reqs, cut, REJECTION.threshold
+    )
+    assert torch.equal(flags, ref_flags)
+    assert torch.equal(sink.row_values.view(torch.int32), ref_values.view(torch.int32))
+
+
 def _random_logits(rows: int, vocab: int, seed: int = 0) -> torch.Tensor:
     gen = torch.Generator(device=DEVICE).manual_seed(seed)
     return torch.randn(rows, vocab, generator=gen, device=DEVICE) * 2.0

@@ -631,7 +631,93 @@ def gumbel_sample(
 
 # --- Sink detector ------------------------------------------------------------
 
+
 # sink._CANDIDATE_BLOCK_SIZE
+@tilelang.jit(pass_configs=_PASS)
+def sink_flags_kernel(dead_rows: bool):
+    """``SinkSampler.flags`` as one kernel, a thread a logits row: the watched
+    column of every residual stream at the row's token
+    (``columns[logits_indices[r]]``), its largest magnitude as torch's
+    ``abs().amax(dim=1).nan_to_num(0.0)`` gives it (any NaN reads 0, +inf the
+    largest float), and the flag, some stream above the threshold (NaN never is).
+    With ``dead_rows``, a row past its request's live drafts (``dead_cut``) is not
+    flagged; the request is ``searchsorted``'s, the number of request ends at or
+    before the row."""
+    tokens, streams, num_logits, cu_len, cut_len = T.dynamic(
+        "tokens, streams, num_logits, cu_len, cut_len"
+    )
+
+    @T.prim_func
+    def sink_flags(
+        columns: T.Tensor((tokens, streams), T.float32),
+        logits_indices: T.Tensor((num_logits,), T.int64),
+        cu_num_logits: T.Tensor((cu_len,), T.int32),
+        dead_cut: T.Tensor((cut_len,), T.int32),
+        flags: T.Tensor((num_logits,), T.int8),
+        values: T.Tensor((num_logits,), T.float32),
+        threshold: T.float32,
+        num_reqs: T.int32,
+    ):
+        with T.Kernel(T.ceildiv(num_logits, _THREADS), threads=_THREADS) as bx:
+            row = bx * _THREADS + T.get_thread_binding()
+            if row < num_logits:
+                token = T.alloc_var(T.int64, init=logits_indices[row])
+                largest = T.alloc_var(T.float32, init=0)
+                nan = T.alloc_var(T.int32, init=0)
+                above = T.alloc_var(T.int32, init=0)
+                for s in T.serial(streams):
+                    magnitude = T.abs(columns[token, s])
+                    nan = nan | T.cast(T.isnan(magnitude), T.int32)
+                    above = above | T.cast(magnitude > threshold, T.int32)
+                    largest = T.max(largest, magnitude)
+                if dead_rows:
+                    req = T.alloc_var(T.int32, init=0)
+                    for k in T.serial(num_reqs):
+                        req = req + T.cast(cu_num_logits[k + 1] <= row, T.int32)
+                    above = above & T.cast(
+                        row - cu_num_logits[req] <= dead_cut[req], T.int32
+                    )
+                flags[row] = T.cast(above, T.int8)
+                values[row] = T.if_then_else(
+                    nan != 0,
+                    T.float32(0),
+                    T.if_then_else(
+                        largest == T.infinity(T.float32),
+                        T.max_value(T.float32),
+                        largest,
+                    ),
+                )
+
+    return sink_flags
+
+
+def sink_flags(
+    columns: torch.Tensor,
+    logits_indices: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    num_reqs: int,
+    dead_cut: torch.Tensor | None,
+    threshold: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``SinkSampler.flags``' launch: each logits row's int8 flag and its largest
+    |column| (FP32), for the logits rows of ``logits_indices``."""
+    num_logits = logits_indices.shape[0]
+    flags = torch.empty(num_logits, dtype=torch.int8, device=columns.device)
+    values = torch.empty(num_logits, dtype=torch.float32, device=columns.device)
+    if num_logits:
+        _kernel(sink_flags_kernel, dead_cut is not None)(
+            columns,
+            logits_indices,
+            cu_num_logits,
+            cu_num_logits if dead_cut is None else dead_cut,
+            flags,
+            values,
+            threshold,
+            num_reqs,
+        )
+    return flags, values
+
+
 SINK_CANDIDATE_BLOCK = 1024
 
 
@@ -1883,11 +1969,13 @@ def sink_calls(
     rejection: bool,
     num_event_fields: int,
 ) -> list:
-    """``SinkSampler``'s calls: the policy for each sampled width, with and
-    without logprobs; with rejection on, the candidates of logits of each of
+    """``SinkSampler``'s calls: the flags, with and without dead rows; the policy
+    for each sampled width, with and without logprobs; with rejection on, the
+    candidates of logits of each of
     ``logits_dtypes`` (a rejected draft masked when more than one row is
     sampled)."""
-    calls = [
+    calls = [_call(sink_flags_kernel, dead_rows) for dead_rows in (False, True)]
+    calls += [
         _call(
             sink_policy_kernel,
             *sink_policy_key(
