@@ -24,6 +24,18 @@ END_B = 93
 VOCAB_SIZE = 128
 
 
+@pytest.fixture(params=["triton", "tilelang"], autouse=True)
+def thinking_implementation(request, monkeypatch):
+    if request.param == "tilelang":
+        from vllm.v1.worker.gpu.sample import thinking_budget, tilelang_thinking
+
+        monkeypatch.setattr(
+            thinking_budget,
+            "apply_thinking_budget",
+            tilelang_thinking.apply_thinking_budget,
+        )
+
+
 class MockReasoningConfig:
     reasoning_start_token_ids = [START]
     reasoning_end_token_ids = [END]
