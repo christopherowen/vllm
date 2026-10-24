@@ -105,27 +105,9 @@ def _topk_log_softmax_warmup_inputs(
     )
 
 
-def _ranks_warmup_inputs(
-    *, logits_dtype: torch.dtype, logits_stride: int, vocab_size: int
-) -> dict[str, Any]:
-    return triton_warmup_inputs(
-        _ranks_kernel,
-        TritonWarmupTensor(torch.int64),
-        TritonWarmupTensor(logits_dtype),
-        logits_stride,
-        TritonWarmupTensor(torch.int64),
-        vocab_size,
-        grid=(1,),
-        BLOCK_SIZE=8192,
-    )
-
-
 _topk_log_softmax_launcher = triton_kernel_dispatcher_with_warmup(
     warmup_inputs=_topk_log_softmax_warmup_inputs
 )(_topk_log_softmax_kernel)
-_ranks_launcher = triton_kernel_dispatcher_with_warmup(
-    warmup_inputs=_ranks_warmup_inputs
-)(_ranks_kernel)
 
 
 def register_topk_scores_warmup(
@@ -134,6 +116,9 @@ def register_topk_scores_warmup(
     """Register ``compute_topk_scores`` (without per-request token ids) for
     ``vocab_size``-wide logits given as ``(dtype, row stride)`` pairs: the
     selected tokens' ranks, and their log-softmax unless ``logits_mode``."""
+    from vllm.v1.worker.gpu.sample.tilelang_logprob import register_ranks
+
+    register_ranks(logits, vocab_size)
     for logits_dtype, logits_stride in logits:
         if not logits_mode:
             _topk_log_softmax_launcher.register_warmup(
@@ -141,11 +126,6 @@ def register_topk_scores_warmup(
                 logits_stride=logits_stride,
                 vocab_size=vocab_size,
             )
-        _ranks_launcher.register_warmup(
-            logits_dtype=logits_dtype,
-            logits_stride=logits_stride,
-            vocab_size=vocab_size,
-        )
 
 
 def compute_token_logprobs(
@@ -237,14 +217,9 @@ def compute_topk_scores(
         scores = scores.masked_fill(~valid_mask, float("-inf"))
 
     token_ranks = torch.empty(batch_size, dtype=torch.int64, device=logits.device)
-    _ranks_launcher[(batch_size,)](
-        token_ranks,
-        logits,
-        logits.stride(0),
-        sampled_token_ids,
-        vocab_size,
-        BLOCK_SIZE=8192,  # type: ignore
-    )
+    from vllm.v1.worker.gpu.sample.tilelang_logprob import token_ranks as fill_ranks
+
+    fill_ranks(logits, sampled_token_ids, token_ranks)
     is_tensor = isinstance(cu_num_logits, torch.Tensor)
     return LogprobsTensors(
         logprob_token_ids=logprob_token_ids,
