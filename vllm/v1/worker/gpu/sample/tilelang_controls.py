@@ -12,10 +12,44 @@ _PASS = {
 }
 _DTYPES = {torch.int32: "int32", torch.int64: "int64"}
 _HEADER = r"""
+// Triton's bundled libdevice __nv_logf, as used by the sampling family.
+// CUDA's logf and lg2.approx * ln(2) can move a min-p threshold by one ULP.
 __device__ __forceinline__ float vllm_control_log(float x) {
-  float y;
-  asm("lg2.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
-  return __fmul_rn(y, 0.693147182464599609375f);
+  float result;
+  asm("{\n"
+      ".reg .pred tiny, fin, zero;\n"
+      ".reg .b32 z, o, e, m, f, r, p, q, l, w;\n"
+      "setp.lt.f32 tiny, %1, 0f00800000;\n"
+      "mul.rn.f32 z, %1, 0f4B000000;\n"
+      "selp.f32 z, z, %1, tiny;\n"
+      "selp.f32 o, 0fC1B80000, 0f00000000, tiny;\n"
+      "add.s32 e, z, -1059760811;\n"
+      "and.b32 e, e, -8388608;\n"
+      "sub.s32 m, z, e;\n"
+      "cvt.rn.f32.s32 f, e;\n"
+      "fma.rn.ftz.f32 f, f, 0f34000000, o;\n"
+      "add.rn.f32 r, m, 0fBF800000;\n"
+      "fma.rn.ftz.f32 p, 0fBE055027, r, 0f3E1039F6;\n"
+      "fma.rn.ftz.f32 p, p, r, 0fBDF8CDCC;\n"
+      "fma.rn.ftz.f32 p, p, r, 0f3E0F2955;\n"
+      "fma.rn.ftz.f32 p, p, r, 0fBE2AD8B9;\n"
+      "fma.rn.ftz.f32 p, p, r, 0f3E4CED0B;\n"
+      "fma.rn.ftz.f32 p, p, r, 0fBE7FFF22;\n"
+      "fma.rn.ftz.f32 p, p, r, 0f3EAAAA78;\n"
+      "fma.rn.ftz.f32 p, p, r, 0fBF000000;\n"
+      "mul.rn.f32 q, r, p;\n"
+      "fma.rn.ftz.f32 q, q, r, r;\n"
+      "fma.rn.ftz.f32 l, f, 0f3F317218, q;\n"
+      // Not finite non-negative: fma(z, inf, inf). The noise is 0 - logf(y), or
+      // +inf where z is zero.
+      "setp.lt.u32 fin, z, 2139095040;\n"
+      "fma.rn.ftz.f32 w, z, 0f7F800000, 0f7F800000;\n"
+      "selp.f32 l, l, w, fin;\n"
+      "setp.eq.f32 zero, z, 0f00000000;\n"
+      "selp.f32 %0, 0fFF800000, l, zero;\n"
+      "}"
+      : "=f"(result) : "f"(x));
+  return result;
 }
 __device__ __forceinline__ float vllm_control_reciprocal(float x) {
   float y;

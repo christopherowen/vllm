@@ -190,8 +190,8 @@ def fill_ids_kernel(index_dtype: str, sampled_dtype: str, topk_dtype: str):
     output_stride, mask_stride, topk_stride, custom_stride = T.dynamic(
         "output_stride, mask_stride, topk_stride, custom_stride", "int64"
     )
-    rows, out_cols, mask_cols, topk_cols, states, custom_cols = T.dynamic(
-        "rows, out_cols, mask_cols, topk_cols, states, custom_cols"
+    rows, out_cols, mask_cols, topk_rows, topk_cols, states, custom_cols = T.dynamic(
+        "rows, out_cols, mask_cols, topk_rows, topk_cols, states, custom_cols"
     )
 
     @T.prim_func
@@ -199,7 +199,7 @@ def fill_ids_kernel(index_dtype: str, sampled_dtype: str, topk_dtype: str):
         output: T.StridedTensor((rows, out_cols), (output_stride, 1), "int64"),
         valid: T.StridedTensor((rows, mask_cols), (mask_stride, 1), "bool"),
         sampled: T.Tensor((rows,), sampled_dtype),
-        topk_ids: T.StridedTensor((rows, topk_cols), (topk_stride, 1), topk_dtype),
+        topk_ids: T.StridedTensor((topk_rows, topk_cols), (topk_stride, 1), topk_dtype),
         mapping: T.Tensor((rows,), index_dtype),
         num_custom: T.Tensor((states,), "int32"),
         custom_ids: T.StridedTensor((states, custom_cols), (custom_stride, 1), "int32"),

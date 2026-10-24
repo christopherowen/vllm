@@ -275,6 +275,9 @@ def test_custom_logprob_ids_override_topk_without_touching_padding(index_dtype, 
     count = torch.zeros(states, device="cuda", dtype=torch.int32)
     count[mapping[::2]] = 17
     custom = torch.randint(129280, (states, 17), device="cuda", dtype=torch.int32)
+    if topk == 0:
+        # The owner reuses the state-capacity tensor as an unused pointer.
+        top_ids = custom
     expected, expected_valid = output.clone(), valid.clone()
     _fill_logprob_token_ids_kernel[(rows,)](
         expected,
