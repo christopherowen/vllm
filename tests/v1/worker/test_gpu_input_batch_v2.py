@@ -29,6 +29,145 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers, post_update
 DEVICE = current_platform.device_type
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("requests", [1, 8, 16, 127, 128, 129, 257])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("dead_rows", [False, True])
+def test_token_counts_preserve_commits_and_rejections(requests, index_dtype, dead_rows):
+    """DS41F's five drafts, prefill chunks and dead rows commit the same tokens."""
+    from vllm.v1.worker.gpu.input_batch import (
+        _get_num_sampled_and_rejected_kernel,
+        get_num_sampled_and_rejected,
+    )
+
+    torch.manual_seed(41 + requests)
+    capacity = requests + 19
+    idx = torch.randperm(capacity, device="cuda")[:requests].to(index_dtype)
+    prefill = torch.randint(1, 1048577, (capacity,), device="cuda", dtype=torch.int32)
+    seq = (
+        prefill[idx.long()]
+        + torch.arange(requests, device="cuda", dtype=torch.int32) % 3
+        - 1
+    )
+    widths = torch.arange(requests, device="cuda", dtype=torch.int32) % 6 + 1
+    cu = torch.cat((widths.new_zeros(1), widths.cumsum(0).int())) + 13
+    sampled = torch.arange(requests, device="cuda", dtype=torch.int32) % (widths + 1)
+    cut = widths - 2 if dead_rows else None
+    read_only = [seq, cu, idx, prefill] + ([] if cut is None else [cut])
+    before = [x.clone() for x in read_only]
+    original = sampled.clone()
+    reference = sampled.clone()
+    rejected = torch.empty_like(reference)
+    _get_num_sampled_and_rejected_kernel[(requests,)](
+        reference,
+        rejected,
+        seq,
+        cu,
+        idx,
+        prefill,
+        cut if cut is not None else reference,
+        DEAD_ROWS=dead_rows,
+    )
+
+    actual, actual_rejected = get_num_sampled_and_rejected(
+        sampled, seq, cu, idx, prefill, cut
+    )
+    live = seq >= prefill[idx.long()]
+    expected = original if cut is None else torch.minimum(original, cut + 1)
+    expected = torch.where(live, expected, 0)
+    expected_rejected = torch.where(live, widths - expected, 0)
+    assert actual.data_ptr() == sampled.data_ptr()
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual_rejected, expected_rejected)
+    assert torch.equal(actual, reference)
+    assert torch.equal(actual_rejected, rejected)
+    for x, saved in zip(read_only, before):
+        assert torch.equal(x, saved)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_token_counts_graph_replay_uses_current_prefill_and_dead_cuts():
+    from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
+
+    def t(x):
+        return torch.tensor(x, dtype=torch.int32, device="cuda")
+
+    sampled, seq, cu, idx, prefill, cut = (
+        t([6, 6, 1]),
+        t([100, 19, 20]),
+        t([0, 6, 12, 13]),
+        t([2, 0, 3]),
+        t([20, 80, 100, 20]),
+        t([2, 4, 0]),
+    )
+    get_num_sampled_and_rejected(sampled, seq, cu, idx, prefill, cut)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(side), torch.cuda.graph(graph):
+        output, rejected = get_num_sampled_and_rejected(
+            sampled, seq, cu, idx, prefill, cut
+        )
+    torch.cuda.current_stream().wait_stream(side)
+    sampled.copy_(t([6, 6, 1]))
+    cut.copy_(t([4, -1, 0]))
+    seq.copy_(t([99, 20, 20]))
+    graph.replay()
+    assert output.tolist() == [0, 0, 1]
+    assert rejected.tolist() == [0, 6, 0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_token_counts_empty_batch():
+    from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
+
+    empty = torch.empty(0, device="cuda", dtype=torch.int32)
+    actual, rejected = get_num_sampled_and_rejected(empty, empty, empty, empty, empty)
+    assert actual is empty
+    assert rejected.numel() == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_token_counts_preserve_capacity_tail_and_accept_full_dead_cut_buffer():
+    from vllm.v1.worker.gpu.tilelang_token_counts import count_tokens
+
+    def t(x):
+        return torch.tensor(x, dtype=torch.int32, device="cuda")
+
+    sampled, rejected = t([6, 3, 99, 99]), t([-1, -1, 77, 77])
+    seq, cu, idx = t([80, 20, 90, 90]), t([0, 6, 12, 999]), t([2, 0])
+    prefill, cut = t([20, 40, 80, 80]), t([3, 0, 999, 999])
+    count_tokens(sampled, rejected, seq, cu, idx, prefill, cut)
+    assert sampled.tolist() == [4, 1, 99, 99]
+    assert rejected.tolist() == [2, 5, 77, 77]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_token_counts_owner_declares_both_index_and_dead_row_variants():
+    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+    from vllm.models.deepseek_v4_1.tilelang import prepare
+    from vllm.v1.worker.gpu.input_batch import register_input_batch_warmups
+    from vllm.v1.worker.gpu.tilelang_token_counts import count_tokens, counts_kernel
+
+    registry = JitWarmupRegistry(None)
+    with registry.activate():
+        register_input_batch_warmups(dead_rows=True)
+    calls = [c for c in prepare.declared_calls(registry) if c[0] is counts_kernel]
+    assert len(calls) == 4
+    prepare.prepare_declared(registry)
+    for dead_rows in (False, True):
+        for dtype in (torch.int32, torch.int64):
+            ones = torch.ones(1, device="cuda", dtype=torch.int32)
+            rejected = torch.empty_like(ones)
+            idx = torch.zeros(1, device="cuda", dtype=dtype)
+            cu = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+            count_tokens(
+                ones, rejected, ones, cu, idx, ones, ones if dead_rows else None
+            )
+            assert ones.item() == 1
+            assert rejected.item() == 0
+
+
 @pytest.mark.parametrize(
     ("method", "draft_width"), [(None, None), ("mtp", 16), ("mtp", 8), ("dflash", None)]
 )
