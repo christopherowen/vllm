@@ -1,17 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import Any
-
 import torch
 
-from vllm.model_executor.warmup.jit_warmup_triton_helper import (
-    TritonWarmupTensor,
-    triton_kernel_dispatcher_with_warmup,
-    triton_warmup_inputs,
-)
 from vllm.triton_utils import tl, triton
+from vllm.v1.worker.gpu.sample import tilelang_controls
 
 
+# The reference the TileLang min-p (``tilelang_controls.min_p_kernel``) is tested
+# against; the sampler no longer launches it.
 @triton.jit
 def _min_p_kernel(
     logits_ptr,
@@ -52,40 +48,13 @@ def _min_p_kernel(
         tl.store(logits_ptr + token_idx * logits_stride + block, logits, mask=mask)
 
 
-def _min_p_warmup_inputs(*, logits_stride: int, vocab_size: int) -> dict[str, Any]:
-    return triton_warmup_inputs(
-        _min_p_kernel,
-        TritonWarmupTensor(torch.float32),
-        logits_stride,
-        TritonWarmupTensor(torch.int64),
-        TritonWarmupTensor(torch.float32),
-        vocab_size,
-        grid=(1,),
-        BLOCK_SIZE=1024,
-    )
-
-
-_min_p_launcher = triton_kernel_dispatcher_with_warmup(
-    warmup_inputs=_min_p_warmup_inputs
-)(_min_p_kernel)
-
-
 def register_min_p_warmup(*, logits_stride: int, vocab_size: int) -> None:
-    """Register ``apply_min_p`` for processed FP32 logits, rows ``logits_stride``
-    apart, int64 request indices and FP32 thresholds."""
-    _min_p_launcher.register_warmup(logits_stride=logits_stride, vocab_size=vocab_size)
+    """Declare ``apply_min_p`` for processed FP32 logits, rows ``logits_stride``
+    apart, and FP32 thresholds."""
+    tilelang_controls.register_min_p(logits_stride=logits_stride, vocab_size=vocab_size)
 
 
 def apply_min_p(
     logits: torch.Tensor, expanded_idx_mapping: torch.Tensor, min_p: torch.Tensor
 ) -> None:
-    num_tokens, vocab_size = logits.shape
-    BLOCK_SIZE = 1024
-    _min_p_launcher[(num_tokens,)](
-        logits,
-        logits.stride(0),
-        expanded_idx_mapping,
-        min_p,
-        vocab_size,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
+    tilelang_controls.apply_min_p(logits, expanded_idx_mapping, min_p)

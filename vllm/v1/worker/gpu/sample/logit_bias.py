@@ -1,18 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import Any
-
 import numpy as np
 import torch
 
-from vllm.model_executor.warmup.jit_warmup_triton_helper import (
-    TritonWarmupTensor,
-    triton_kernel_dispatcher_with_warmup,
-    triton_warmup_inputs,
-)
 from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
+from vllm.v1.worker.gpu.sample import tilelang_bias
 
 MAX_NUM_ALLOWED_TOKEN_IDS = 1024
 MAX_NUM_LOGIT_BIAS_TOKENS = 1024
@@ -136,8 +130,8 @@ class LogitBiasState:
     def register_warmups(
         self, logits_strides: tuple[int, ...], vocab_size: int
     ) -> None:
-        """Register the staged writes of the per-request lists and the bias
-        kernel for processed FP32 logits with each row stride in
+        """Register the staged writes of the per-request lists and declare the
+        bias kernel for processed FP32 logits with each row stride in
         ``logits_strides``, with and without the all-masked stop-token restore."""
         for tensor in (
             self.allowed_token_ids,
@@ -146,24 +140,21 @@ class LogitBiasState:
             self.stop_token_ids,
         ):
             tensor.register_warmup()
-        for logits_stride in logits_strides:
-            for check_all_masked_rows in (False, True):
-                _bias_launcher.register_warmup(
-                    logits_stride=logits_stride,
-                    vocab_size=vocab_size,
-                    allowed_token_ids_stride=self.allowed_token_ids.gpu.stride(0),
-                    bias_token_ids_stride=self.logit_bias_token_ids.gpu.stride(0),
-                    bias_stride=self.logit_bias.gpu.stride(0),
-                    stop_token_ids_stride=self.stop_token_ids.gpu.stride(0),
-                    block_size=triton.next_power_of_2(
-                        max(
-                            self.allowed_token_ids.gpu.shape[-1],
-                            self.logit_bias_token_ids.gpu.shape[-1],
-                            self.stop_token_ids.gpu.shape[-1],
-                        )
-                    ),
-                    check_all_masked_rows=check_all_masked_rows,
+        tilelang_bias.register_bias(
+            vocab_size=vocab_size,
+            logits_strides=logits_strides,
+            allowed_stride=self.allowed_token_ids.gpu.stride(0),
+            bias_ids_stride=self.logit_bias_token_ids.gpu.stride(0),
+            bias_stride=self.logit_bias.gpu.stride(0),
+            stop_stride=self.stop_token_ids.gpu.stride(0),
+            width=triton.next_power_of_2(
+                max(
+                    self.allowed_token_ids.gpu.shape[-1],
+                    self.logit_bias_token_ids.gpu.shape[-1],
+                    self.stop_token_ids.gpu.shape[-1],
                 )
+            ),
+        )
 
     def apply_logit_bias(
         self,
@@ -197,6 +188,8 @@ class LogitBiasState:
         )
 
 
+# The reference the TileLang bias (``tilelang_bias.bias_kernel``) is tested against;
+# the sampler no longer launches it.
 @triton.jit
 def _bias_kernel(
     logits_ptr,
@@ -357,80 +350,18 @@ def apply_logit_bias(
     stop_token_ids: torch.Tensor,
     check_all_masked_rows: bool = False,
 ) -> None:
-    num_tokens, vocab_size = logits.shape
-    BLOCK_SIZE = triton.next_power_of_2(
-        max(
-            allowed_token_ids.shape[-1],
-            logit_bias_token_ids.shape[-1],
-            stop_token_ids.shape[-1],
-        )
-    )
-    LOGITS_BLOCK_SIZE = 8192
-    _bias_launcher[(num_tokens,)](
+    tilelang_bias.apply_logit_bias(
         logits,
-        logits.stride(0),
-        vocab_size,
         expanded_idx_mapping,
+        pos,
         num_allowed_token_ids,
         allowed_token_ids,
-        allowed_token_ids.stride(0),
         num_logit_bias,
         logit_bias_token_ids,
-        logit_bias_token_ids.stride(0),
         logit_bias,
-        logit_bias.stride(0),
-        pos,
         min_lens,
         num_stop_token_ids,
         restore_when_all_masked,
         stop_token_ids,
-        stop_token_ids.stride(0),
-        BLOCK_SIZE=BLOCK_SIZE,
-        LOGITS_BLOCK_SIZE=LOGITS_BLOCK_SIZE,
-        CHECK_ALL_MASKED_ROWS=check_all_masked_rows,
+        check_all_masked_rows,
     )
-
-
-def _bias_warmup_inputs(
-    *,
-    logits_stride: int,
-    vocab_size: int,
-    allowed_token_ids_stride: int,
-    bias_token_ids_stride: int,
-    bias_stride: int,
-    stop_token_ids_stride: int,
-    block_size: int,
-    check_all_masked_rows: bool,
-) -> dict[str, Any]:
-    int32 = TritonWarmupTensor(torch.int32)
-    float32 = TritonWarmupTensor(torch.float32)
-    return triton_warmup_inputs(
-        _bias_kernel,
-        float32,
-        logits_stride,
-        vocab_size,
-        TritonWarmupTensor(torch.int64),
-        int32,
-        int32,
-        allowed_token_ids_stride,
-        int32,
-        int32,
-        bias_token_ids_stride,
-        float32,
-        bias_stride,
-        TritonWarmupTensor(torch.int64),
-        int32,
-        int32,
-        int32,
-        int32,
-        stop_token_ids_stride,
-        grid=(1,),
-        BLOCK_SIZE=block_size,
-        LOGITS_BLOCK_SIZE=8192,
-        CHECK_ALL_MASKED_ROWS=check_all_masked_rows,
-    )
-
-
-_bias_launcher = triton_kernel_dispatcher_with_warmup(
-    warmup_inputs=_bias_warmup_inputs
-)(_bias_kernel)

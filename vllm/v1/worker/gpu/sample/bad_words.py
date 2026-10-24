@@ -1,19 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import Any
-
 import numpy as np
 import torch
 
 import vllm.envs as envs
-from vllm.model_executor.warmup.jit_warmup_triton_helper import (
-    TritonWarmupTensor,
-    triton_kernel_dispatcher_with_warmup,
-    triton_warmup_inputs,
-)
 from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
+from vllm.v1.worker.gpu.sample import tilelang_auxiliary
 from vllm.v1.worker.gpu.states import RequestState
 
 
@@ -79,12 +73,12 @@ class BadWordsState:
         self.bad_word_offsets.apply_write()
 
     def register_warmups(self, logits_strides: tuple[int, ...]) -> None:
-        """Register the staged writes of the bad words and the bad-words kernel
-        for processed FP32 logits with each row stride in ``logits_strides``."""
+        """Register the staged writes of the bad words and declare the bad-words
+        kernel for processed FP32 logits with each row stride in ``logits_strides``."""
         self.bad_word_token_ids.register_warmup()
         self.bad_word_offsets.register_warmup()
         for logits_stride in logits_strides:
-            _bad_words_launcher.register_warmup(
+            tilelang_auxiliary.register_bad_words(
                 logits_stride=logits_stride,
                 bad_word_token_ids_stride=self.bad_word_token_ids.gpu.stride(0),
                 bad_word_offsets_stride=self.bad_word_offsets.gpu.stride(0),
@@ -119,6 +113,9 @@ class BadWordsState:
         )
 
 
+# The reference the TileLang forbidden sequences
+# (``tilelang_auxiliary.bad_words_kernel``) are tested against; the sampler no longer
+# launches it.
 @triton.jit
 def _bad_words_kernel(
     logits_ptr,
@@ -199,53 +196,16 @@ def apply_bad_words(
     expanded_local_pos: torch.Tensor,
     max_num_bad_words: int,
 ) -> None:
-    num_tokens = logits.shape[0]
-    _bad_words_launcher[(num_tokens, max_num_bad_words)](
+    tilelang_auxiliary.apply_bad_words(
         logits,
-        logits.stride(0),
         expanded_idx_mapping,
         bad_word_token_ids,
-        bad_word_token_ids.stride(0),
         bad_word_offsets,
-        bad_word_offsets.stride(0),
         num_bad_words,
         all_token_ids,
-        all_token_ids.stride(0),
         prompt_len,
         total_len,
         input_ids,
         expanded_local_pos,
+        max_num_bad_words,
     )
-
-
-def _bad_words_warmup_inputs(
-    *,
-    logits_stride: int,
-    bad_word_token_ids_stride: int,
-    bad_word_offsets_stride: int,
-    all_token_ids_stride: int,
-) -> dict[str, Any]:
-    int32 = TritonWarmupTensor(torch.int32)
-    return triton_warmup_inputs(
-        _bad_words_kernel,
-        TritonWarmupTensor(torch.float32),
-        logits_stride,
-        TritonWarmupTensor(torch.int64),
-        int32,
-        bad_word_token_ids_stride,
-        int32,
-        bad_word_offsets_stride,
-        int32,
-        int32,
-        all_token_ids_stride,
-        int32,
-        int32,
-        int32,
-        int32,
-        grid=(1,),
-    )
-
-
-_bad_words_launcher = triton_kernel_dispatcher_with_warmup(
-    warmup_inputs=_bad_words_warmup_inputs
-)(_bad_words_kernel)

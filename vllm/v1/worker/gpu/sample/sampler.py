@@ -15,6 +15,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
 )
 from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
+from vllm.v1.worker.gpu.sample import tilelang_auxiliary
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample, register_sampling_warmups
 from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
@@ -124,6 +125,10 @@ class Sampler:
         self.penalties_state.register_warmups(processed_logits_strides)
         self.logit_bias_state.register_warmups(processed_logits_strides, vocab_size)
         self.bad_words_state.register_warmups(processed_logits_strides)
+        self.thinking_budget_state.register_warmups(processed_logits_strides)
+        if self.compute_nans:
+            # The raw logits' NaN count, here and in the rejection sampler.
+            tilelang_auxiliary.register_nan_counts(logits=logits, vocab_size=vocab_size)
         self.logprob_token_ids_state.register_warmups()
         if self.trace_replay_state is not None:
             self.trace_replay_state.trace_token_ids.register_warmup()

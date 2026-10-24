@@ -9,12 +9,15 @@ from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
+from vllm.v1.worker.gpu.sample import tilelang_thinking
 from vllm.v1.worker.gpu.states import RequestState
 
 if TYPE_CHECKING:
     from vllm.config.reasoning import ReasoningConfig
 
 _INT32_MAX = np.iinfo(np.int32).max
+# The Triton marker cache's cold-scan block (tests launch the Triton kernels as
+# references).
 _COLD_SCAN_BLOCK = 1024
 
 
@@ -107,6 +110,19 @@ class ThinkingBudgetState:
             self.thinking_token_budget.copy_to_uva()
             self._budget_dirty = False
 
+    def register_warmups(self, logits_strides: tuple[int, ...]) -> None:
+        """Declare the marker cache and budget kernels for processed FP32 logits
+        with each row stride in ``logits_strides``."""
+        if not self.enabled:
+            return
+        tilelang_thinking.register_thinking(
+            logits_strides=logits_strides,
+            tokens_stride=self.req_states.all_token_ids.gpu.stride(0),
+            start_len=self.reasoning_start_token_ids.numel(),
+            natural_len=self.natural_reasoning_end_token_ids.numel(),
+            end_len=self.reasoning_end_token_ids.numel(),
+        )
+
     def apply(
         self,
         logits: torch.Tensor,
@@ -156,6 +172,8 @@ def _load_effective_token(
     return tl.load(input_ids_ptr + input_pos)
 
 
+# The references the TileLang marker cache and budget (``tilelang_thinking``) are
+# tested against; the sampler no longer launches them.
 @triton.jit
 def _update_committed_marker_cache_kernel(
     req_ids_ptr,
@@ -385,44 +403,19 @@ def apply_thinking_budget(
     natural_reasoning_end_token_ids: torch.Tensor,
     reasoning_end_token_ids: torch.Tensor,
 ) -> None:
-    num_tokens = logits.shape[0]
-    start_len = reasoning_start_token_ids.shape[0]
-    natural_end_len = natural_reasoning_end_token_ids.shape[0]
-    end_len = reasoning_end_token_ids.shape[0]
-
-    _update_committed_marker_cache_kernel[(req_ids.shape[0],)](
-        req_ids,
-        thinking_token_budget,
-        all_token_ids,
-        all_token_ids.stride(0),
-        total_len,
-        cached_last_start,
-        cached_last_end,
-        cached_scan_pos,
-        reasoning_start_token_ids,
-        natural_reasoning_end_token_ids,
-        START_LEN=start_len,
-        NATURAL_END_LEN=natural_end_len,
-        MAX_LEN=max(start_len, natural_end_len),
-        BLOCK=_COLD_SCAN_BLOCK,
-    )
-
-    _thinking_budget_kernel[(num_tokens,)](
+    tilelang_thinking.apply_thinking_budget(
         logits,
-        logits.stride(0),
+        req_ids,
         expanded_idx_mapping,
         thinking_token_budget,
         all_token_ids,
-        all_token_ids.stride(0),
         total_len,
         input_ids,
         expanded_local_pos,
         cached_last_start,
         cached_last_end,
+        cached_scan_pos,
         reasoning_start_token_ids,
         natural_reasoning_end_token_ids,
         reasoning_end_token_ids,
-        START_LEN=start_len,
-        NATURAL_END_LEN=natural_end_len,
-        END_LEN=end_len,
     )

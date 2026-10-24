@@ -1,21 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable, Sequence
-from typing import Any
 
 import numpy as np
 import torch
 
 from vllm.config.model import LogprobsMode
-from vllm.model_executor.warmup.jit_warmup_triton_helper import (
-    TritonWarmupTensor,
-    triton_kernel_dispatcher_with_warmup,
-    triton_warmup_inputs,
-)
 from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.sample import tilelang_auxiliary
 from vllm.v1.worker.gpu.sample.logprob import (
     compute_topk_scores,
     register_topk_scores_warmup,
@@ -51,7 +46,7 @@ class PromptLogprobsWorker:
     ) -> None:
         """Register the prompt token gather and the scores of prompt logits from
         ``logits_fn`` (``(dtype, row stride)`` pairs)."""
-        _prompt_logprobs_token_ids_launcher.register_warmup(
+        tilelang_auxiliary.register_prompt_ids(
             all_token_ids_stride=all_token_ids_stride
         )
         register_topk_scores_warmup(
@@ -169,6 +164,8 @@ class PromptLogprobsWorker:
         return prompt_logprobs_dict
 
 
+# The reference the TileLang gather (``tilelang_auxiliary.prompt_ids_kernel``) is
+# tested against; the runner no longer launches it.
 @triton.jit
 def _prompt_logprobs_token_ids_kernel(
     prompt_logprobs_token_ids_ptr,
@@ -202,28 +199,6 @@ def _prompt_logprobs_token_ids_kernel(
         )
 
 
-def _prompt_logprobs_token_ids_warmup_inputs(
-    *, all_token_ids_stride: int
-) -> dict[str, Any]:
-    int32 = TritonWarmupTensor(torch.int32)
-    return triton_warmup_inputs(
-        _prompt_logprobs_token_ids_kernel,
-        TritonWarmupTensor(torch.int64),
-        int32,
-        TritonWarmupTensor(torch.int64),
-        int32,
-        int32,
-        all_token_ids_stride,
-        grid=(1,),
-        BLOCK_SIZE=1024,
-    )
-
-
-_prompt_logprobs_token_ids_launcher = triton_kernel_dispatcher_with_warmup(
-    warmup_inputs=_prompt_logprobs_token_ids_warmup_inputs
-)(_prompt_logprobs_token_ids_kernel)
-
-
 def get_prompt_logprobs_token_ids(
     num_tokens: int,
     query_start_loc: torch.Tensor,
@@ -232,15 +207,8 @@ def get_prompt_logprobs_token_ids(
     all_token_ids: torch.Tensor,
 ) -> torch.Tensor:
     token_ids = torch.empty(num_tokens, dtype=torch.int64, device=idx_mapping.device)
-    num_reqs = idx_mapping.shape[0]
-    _prompt_logprobs_token_ids_launcher[(num_reqs,)](
-        token_ids,
-        query_start_loc,
-        idx_mapping,
-        num_computed_tokens,
-        all_token_ids,
-        all_token_ids.stride(0),
-        BLOCK_SIZE=1024,
+    tilelang_auxiliary.prompt_token_ids(
+        token_ids, query_start_loc, idx_mapping, num_computed_tokens, all_token_ids
     )
     return token_ids
 

@@ -4,8 +4,11 @@ import torch
 from torch._inductor.runtime.triton_helpers import libdevice
 
 from vllm.triton_utils import tl, triton
+from vllm.v1.worker.gpu.sample import tilelang_auxiliary
 
 
+# The reference the TileLang count (``tilelang_auxiliary.nan_count_kernel``) is
+# tested against; the sampler no longer launches it.
 @triton.jit
 def _num_nans_kernel(
     logits_ptr,
@@ -29,14 +32,4 @@ def _num_nans_kernel(
 
 
 def get_num_nans(logits: torch.Tensor) -> torch.Tensor:
-    num_reqs, vocab_size = logits.shape
-    BLOCK_SIZE = 8192
-    num_nans = torch.empty(num_reqs, dtype=torch.int32, device=logits.device)
-    _num_nans_kernel[(num_reqs,)](
-        logits,
-        logits.stride(0),
-        num_nans,
-        vocab_size,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-    return num_nans
+    return tilelang_auxiliary.count_nans(logits)
