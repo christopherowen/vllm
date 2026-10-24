@@ -42,11 +42,9 @@ def block_fp8_linear_method(quant_config):
 
 def embedding_method():
     if uses_tilelang():
-        from vllm.model_executor.layers.vocab_parallel_embedding import (
-            UnquantizedEmbeddingMethod,
-        )
+        from .tilelang.embedding import TileLangEmbeddingMethod
 
-        return UnquantizedEmbeddingMethod()
+        return TileLangEmbeddingMethod()
     from .b12x_layers import B12xEmbeddingMethod
 
     return B12xEmbeddingMethod()
