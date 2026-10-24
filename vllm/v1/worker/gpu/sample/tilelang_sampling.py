@@ -1804,9 +1804,10 @@ _FINISH_LANES = (1, 2)
 @tilelang.jit(pass_configs=_PASS)
 def finish_argmax_kernel(output: str, per_lane: int = 1):
     """``dspark.greedy._finish_argmax_pair`` (``output`` "pair": the row's first
-    maximum and its global index ``+ vocab_start`` as FP32 into ``pairs[row]``) and
-    ``_finish_argmax`` ("int32" / "int64": the index into ``out[row *
-    out_stride]``), from the parts' scratch, a warp a row. As Triton's, every part
+    maximum and its global index ``+ vocab_start`` as FP32 into ``out[row *
+    out_stride]`` and the element after it) and ``_finish_argmax`` ("int32" /
+    "int64": the index into ``out[row * out_stride]``), from the parts' scratch, a
+    warp a row. As Triton's, every part
     is loaded before any is combined: lane ``k`` reads parts ``k``, ``k + 32``, ...
     (``per_lane`` of them, Triton's masked values past ``parts``), then the lanes
     reduce; the combine is a total order, so the pairing does not matter."""
@@ -1849,8 +1850,8 @@ def finish_argmax_kernel(output: str, per_lane: int = 1):
             _warp_first_argmax(best, best_index, other, other_index)
             if tx == 0:
                 if pair:
-                    out[T.cast(row, T.int64) * 2] = best[0]
-                    out[T.cast(row, T.int64) * 2 + 1] = T.cast(
+                    out[T.cast(row, T.int64) * out_stride] = best[0]
+                    out[T.cast(row, T.int64) * out_stride + 1] = T.cast(
                         best_index[0] + vocab_start, T.float32
                     )
                 else:
@@ -1864,8 +1865,9 @@ def finish_argmax_kernel(output: str, per_lane: int = 1):
 @tilelang.jit(pass_configs=_PASS)
 def select_first_argmax_kernel(output_dtype: str, ranks: int):
     """``dspark.greedy._select_first_argmax``: the first maximum's global index
-    over the all-gathered ``(value, index)`` pairs of each row ([rows, 2 * ranks]
-    FP32; indices exact in FP32), into ``out[row * out_stride]``, a warp a row.
+    over the all-gathered ``(value, index)`` pairs of each row ([rows, pair_width *
+    ranks] FP32, a rank's pair at the start of its ``pair_width`` columns; indices
+    exact in FP32), into ``out[row * out_stride]``, a warp a row.
     As in Triton, the number of ranks is fixed when the kernel is built and every
     load is issued before any combine: lane ``k < ranks`` reads rank ``k``'s pair,
     the other lanes hold Triton's masked values (-inf, 2**30), and the lanes reduce
@@ -1880,6 +1882,7 @@ def select_first_argmax_kernel(output_dtype: str, ranks: int):
         pairs: T.StridedTensor((rows, width), (pairs_stride, 1), T.float32),
         out: T.Tensor((out_len,), output_dtype),
         out_stride: T.int64,
+        pair_width: T.int32,
     ):
         with T.Kernel(rows, threads=32) as row:
             T.import_source(_HEADER)
@@ -1889,8 +1892,8 @@ def select_first_argmax_kernel(output_dtype: str, ranks: int):
             other = T.alloc_local((1,), T.float32)
             other_index = T.alloc_local((1,), T.int32)
             lane = T.min(tx, ranks - 1)
-            value = pairs[row, 2 * lane]
-            index = pairs[row, 2 * lane + 1]
+            value = pairs[row, pair_width * lane]
+            index = pairs[row, pair_width * lane + 1]
             best[0] = T.if_then_else(tx < ranks, value, -T.infinity(T.float32))
             best_index[0] = T.if_then_else(
                 tx < ranks, T.cast(index, T.int32), T.int32(1 << 30)
@@ -2022,7 +2025,7 @@ def greedy_markov_shard_pair(
         pairs.view(-1),
         rows,
         parts,
-        2,
+        pairs.stride(0),
         vocab_start,
         "pair",
     )
@@ -2052,21 +2055,23 @@ def greedy_shard_pair(
         pairs.view(-1),
         rows,
         parts,
-        2,
+        pairs.stride(0),
         vocab_start,
         "pair",
     )
 
 
-def select_first_argmax(pairs: torch.Tensor, output: torch.Tensor) -> None:
+def select_first_argmax(
+    pairs: torch.Tensor, output: torch.Tensor, pair_width: int = 2
+) -> None:
     """``dspark.greedy.select_first_argmax``."""
     rows = pairs.shape[0]
     if rows == 0:
         return
     kernel = _kernel(
-        select_first_argmax_kernel, _DTYPES[output.dtype], pairs.shape[1] // 2
+        select_first_argmax_kernel, _DTYPES[output.dtype], pairs.shape[1] // pair_width
     )
-    kernel(pairs, _flat(output), output.stride(0))
+    kernel(pairs, _flat(output), output.stride(0), pair_width)
 
 
 def sample_greedy_markov(

@@ -110,8 +110,10 @@ class DSparkSpeculator(DFlashSpeculator):
         )
         # Per-request (max, global index) of this rank's vocabulary shard,
         # for vocabulary-parallel greedy drafts.
+        # (value, index) and two unused columns: 16-byte rows, which the
+        # one-shot all-gather writes in place (no staging or reshape copies).
         self._greedy_shard_pairs = torch.empty(
-            (self.max_num_reqs, 2), dtype=torch.float32, device=device
+            (self.max_num_reqs, 4), dtype=torch.float32, device=device
         )
 
     @property
@@ -333,7 +335,9 @@ class DSparkSpeculator(DFlashSpeculator):
                 )
                 draft_sampled_i = self.draft_tokens[:num_reqs, i]
                 select_first_argmax(
-                    tensor_model_parallel_all_gather(pairs, dim=-1), draft_sampled_i
+                    tensor_model_parallel_all_gather(pairs, dim=-1),
+                    draft_sampled_i,
+                    pair_width=4,
                 )
                 prev = draft_sampled_i
                 continue

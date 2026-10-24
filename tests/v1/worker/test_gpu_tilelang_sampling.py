@@ -737,6 +737,41 @@ def test_select_first_argmax(ranks, out_dtype, strided):
     _assert_same(outs[0], outs[1], "selected index")
 
 
+@pytest.mark.parametrize("case", CASES)
+def test_greedy_pairs_in_sixteen_byte_rows(case):
+    """The drafter's and the greedy verification's 16-byte pair rows ([rows, 4],
+    which the one-shot all-gather writes in place): the shard pair lands in each
+    row's first two columns, the others untouched, and the selection over the
+    gathered rows equals Triton's over the packed [rows, 2 * ranks] pairs."""
+    rows, vocab, ranks = 13, 32320, 4
+    base = _logits(rows, vocab, torch.bfloat16, case, 6)
+    bias = _logits(rows, vocab, torch.bfloat16, case, 7)
+    packed, wide = [], []
+    for rank in range(ranks):
+        narrow = torch.full((rows, 2), -3.0, device=DEVICE)
+        values, indices = _scratch(rows, vocab)
+        _triton_markov_pair(
+            base.roll(rank, 1), bias, rank * vocab, narrow, values, indices
+        )
+        rows4 = torch.full((rows, 4), -3.0, device=DEVICE)
+        tls.greedy_markov_shard_pair(
+            base.roll(rank, 1), bias, rank * vocab, rows4, values, indices
+        )
+        _assert_same(rows4[:, :2], narrow, "pair")
+        assert (rows4[:, 2:] == -3.0).all()
+        packed.append(narrow)
+        wide.append(rows4)
+    outs = []
+    for fn, pairs, kwargs in (
+        (tls.select_first_argmax, torch.cat(wide, dim=-1), {"pair_width": 4}),
+        (_triton_select, torch.cat(packed, dim=-1), {}),
+    ):
+        out = torch.full((rows,), -2, dtype=torch.int64, device=DEVICE)
+        fn(pairs, out, **kwargs)
+        outs.append(out)
+    _assert_same(outs[0], outs[1], "selected index")
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("case", CASES)
 def test_sample_greedy_markov(dtype, case):
