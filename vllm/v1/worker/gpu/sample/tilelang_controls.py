@@ -40,8 +40,7 @@ __device__ __forceinline__ float vllm_control_log(float x) {
       "mul.rn.f32 q, r, p;\n"
       "fma.rn.ftz.f32 q, q, r, r;\n"
       "fma.rn.ftz.f32 l, f, 0f3F317218, q;\n"
-      // Not finite non-negative: fma(z, inf, inf). The noise is 0 - logf(y), or
-      // +inf where z is zero.
+      // Preserve the bundled libdevice exceptional-value handling.
       "setp.lt.u32 fin, z, 2139095040;\n"
       "fma.rn.ftz.f32 w, z, 0f7F800000, 0f7F800000;\n"
       "selp.f32 l, l, w, fin;\n"
@@ -157,7 +156,7 @@ def penalties_kernel(
     rows, states, mask_rows, count_rows = T.dynamic(
         "rows, states, mask_rows, count_rows"
     )
-    block = 8192
+    block = 2048
 
     @T.prim_func
     def penalties(
