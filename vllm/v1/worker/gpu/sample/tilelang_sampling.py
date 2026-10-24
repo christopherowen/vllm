@@ -753,7 +753,7 @@ def sink_candidates_kernel(
             else:
                 passes(logits, raw, scores, row, rejected, verified, word_seed, blk, tx,
                        False)  # fmt: skip
-            for i in T.serial(num_candidates):
+            for i in T.unroll(num_candidates):
                 best[0] = scores[0]
                 best_index[0] = _element(0, tx, run)
                 for j in T.unroll(1, _PASSES):
