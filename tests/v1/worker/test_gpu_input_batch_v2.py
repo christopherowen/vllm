@@ -136,6 +136,7 @@ def test_boundary_auxiliary_restore_survives_slot_reuse_and_virtual_attention_pa
     raw_state = torch.arange(6, dtype=torch.float32, device=device).reshape(2, 3)
     anchors = torch.tensor([100, 200], dtype=torch.int64, device=device)
     accepted = torch.tensor([3, 4], dtype=torch.int32, device=device)
+    fresh = torch.ones(2, dtype=torch.bool, device=device)
     expected_state = raw_state[1].clone()
     cache = (
         torch.arange(16, dtype=torch.uint8, device=device)[:, None]
@@ -152,6 +153,7 @@ def test_boundary_auxiliary_restore_survives_slot_reuse_and_virtual_attention_pa
         model=model,
         get_recurrent_checkpoint_tensors=lambda: (raw_state, anchors, accepted),
         get_recurrent_checkpoint_acceptance=lambda: accepted,
+        get_recurrent_checkpoint_fresh=lambda: fresh,
         model_config=SimpleNamespace(max_model_len=128),
     )
     draft_state = torch.arange(8, dtype=torch.float32, device=device).reshape(2, 4)
@@ -235,6 +237,8 @@ def test_boundary_auxiliary_restore_survives_slot_reuse_and_virtual_attention_pa
     torch.testing.assert_close(raw_state[restore_slot], expected_state)
     assert anchors[restore_slot].item() == 6
     assert accepted[restore_slot].item() == 1
+    # The restored pools are not re-zeroed: only the restored slot is not fresh.
+    assert fresh.tolist() == [slot != restore_slot for slot in range(2)]
     assert state.seen[restore_slot, 3].item() == 1
     torch.testing.assert_close(state.get_hidden_states(auxiliary_block), hidden[:1])
     torch.testing.assert_close(
