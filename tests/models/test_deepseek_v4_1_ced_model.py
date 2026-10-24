@@ -250,7 +250,6 @@ def test_ced_global_context_and_full_row_output_abi(monkeypatch, compact):
     indices = torch.tensor([2, 3, 6, 7, -1, -1]) if compact else None
     shared: dict[str, torch.Tensor | int] = {}
     row_work: list[tuple[str, int, int]] = []
-    buffer = torch.empty(8, 8)
     target = SimpleNamespace(
         embed_input_ids=lambda _: inputs,
         use_mega_moe=False,
@@ -263,7 +262,6 @@ def test_ced_global_context_and_full_row_output_abi(monkeypatch, compact):
         ced_decoder_start=2,
         layers=nn.ModuleList(_Layer(i, shared, row_work) for i in range(4)),
         aux_hidden_state_layers={3, 4},
-        _mtp_hidden_buffer=buffer,
         # The sink detector's column buffer: none, the detector is off here.
         _sink_columns=None,
         # GLP steering: none, unset here.
@@ -302,12 +300,6 @@ def test_ced_global_context_and_full_row_output_abi(monkeypatch, compact):
     torch.testing.assert_close(output, expected, rtol=1e-6, atol=1e-6)
     for actual, value in zip(aux, expected_aux, strict=True):
         torch.testing.assert_close(actual, value, rtol=1e-6, atol=1e-6)
-    torch.testing.assert_close(
-        buffer.view(8, 4, 2),
-        expected[:, None, :].expand(-1, 4, -1),
-        rtol=1e-6,
-        atol=1e-6,
-    )
     assert shared["global_rows"] == 8
     decoder_rows = len(indices) if indices is not None else 8
     assert row_work == [

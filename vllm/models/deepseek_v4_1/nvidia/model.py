@@ -543,22 +543,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             self.norm = PPMissingLayer()
 
-        spec_config = vllm_config.speculative_config
-        needs_mtp_hidden_states = spec_config is not None and (
-            spec_config.use_eagle() or spec_config.uses_draft_model()
-        )
-        if get_pp_group().is_last_rank and needs_mtp_hidden_states:
-            self._mtp_hidden_buffer = torch.empty(
-                vllm_config.scheduler_config.max_num_batched_tokens,
-                self.hc_dim,
-                dtype=vllm_config.model_config.dtype,
-            )
-        else:
-            self._mtp_hidden_buffer = None
-        # DSpark drafts from the aux hidden states only; SP leaves this buffer.
-        self.prefill_sp_skips_mtp_buffer = (
-            spec_config is not None and spec_config.use_dspark()
-        )
         # The attention-sink detector (vllm.v1.sample.sink) watches one column
         # of the pre-norm residual: each forward keeps that column of every
         # residual stream, [tokens, hc_mult] (float32), for every token.
@@ -872,31 +856,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 columns = scatter_rows(columns, ced_indices, full_num_tokens)
             self._sink_columns[:full_num_tokens].copy_(columns)
 
-        # MTP needs full HC states; otherwise collapse and normalize locally
-        # before gathering to reduce communication.
-        if self._mtp_hidden_buffer is not None and not (
-            sp is not None and self.prefill_sp_skips_mtp_buffer
-        ):
-            if self.use_sequence_parallel:
-                hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
-                pre_mix = sp_all_gather(pre_mix)[:full_num_tokens]
-            elif sp is not None:
-                hidden_states, pre_mix = sp.gather(hidden_states), sp.gather(pre_mix)
-                sp = None  # every row from here on
-            buffer_states = (
-                scatter_rows(hidden_states, ced_indices, full_num_tokens)
-                if decoder_compacted
-                else hidden_states
-            )
-            self._mtp_hidden_buffer[:full_num_tokens].copy_(buffer_states.flatten(1))
-
         # Collapse the hc copies with the pre-mix from the last layer's FFN
         # mixes — the mix the reference applies via
         # ``last_layer.hc_pre(h, pre_mix)`` (v4.1 has no learned hc_head).
         hidden_states = layer.mhc.collapse(hidden_states, pre_mix)
         hidden_states = self.norm(hidden_states)
-        if self.use_sequence_parallel and self._mtp_hidden_buffer is None:
-            # Without MTP, gather only the collapsed and normalized hidden states.
+        if self.use_sequence_parallel:
+            # Gather only the collapsed and normalized hidden states.
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
         if sp is not None:
             hidden_states = sp.gather(hidden_states)

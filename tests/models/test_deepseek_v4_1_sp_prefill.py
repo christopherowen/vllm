@@ -497,10 +497,7 @@ class _Embedding:
 
 @pytest.mark.parametrize("num_tokens", (9, 10, 11))
 @pytest.mark.parametrize("use_embeds", (False, True))
-@pytest.mark.parametrize("skip_mtp_buffer", (False, True))
-def test_model_forward_matches_full_rows(
-    monkeypatch, num_tokens, use_embeds, skip_mtp_buffer
-):
+def test_model_forward_matches_full_rows(monkeypatch, num_tokens, use_embeds):
     pytest.importorskip("b12x")
     from vllm.models.deepseek_v4_1.nvidia import model as native
 
@@ -525,7 +522,6 @@ def test_model_forward_matches_full_rows(
     positions = torch.arange(100, 100 + num_tokens)
 
     def run(min_rows, local_rows):
-        buffer = torch.full((16, 8), -7.0, dtype=torch.float64)
         target = SimpleNamespace(
             embed_input_ids=lambda input_ids: table[input_ids],
             embed_tokens=_Embedding(table, world),
@@ -533,7 +529,6 @@ def test_model_forward_matches_full_rows(
             use_sequence_parallel=False,
             prefill_sp_min_rows=min_rows,
             prefill_sp_unreduced=False,
-            prefill_sp_skips_mtp_buffer=skip_mtp_buffer,
             disk_engram=False,
             engram_hash=None,
             start_layer=0,
@@ -541,7 +536,6 @@ def test_model_forward_matches_full_rows(
             ced_decoder_start=None,
             layers=nn.ModuleList(_Layer(i, world, local_rows) for i in range(3)),
             aux_hidden_state_layers={2, 3},
-            _mtp_hidden_buffer=buffer,
             # L2 prefetch is on by default on SM121; its plans are built.
             _l2pf_ready=True,
             # The sink detector's column buffer: none, the detector is off here.
@@ -557,20 +551,16 @@ def test_model_forward_matches_full_rows(
             None,
             inputs_embeds=table[ids] if use_embeds else None,
         )
-        return output, aux, buffer
+        return output, aux
 
-    expected, expected_aux, expected_buffer = run(0, [])
+    expected, expected_aux = run(0, [])
     local_rows = [[] for _ in range(3)]
     results = world.run(lambda rank: run(4, local_rows[rank]))
     layout = sp_prefill.SPRows(num_tokens, 3, 0)
-    for rank, (output, aux, buffer) in enumerate(results):
+    for rank, (output, aux) in enumerate(results):
         # Attention received only this rank's rows in every layer.
         assert local_rows[rank] == [layout.local_rows] * 3
         torch.testing.assert_close(output, expected, rtol=1e-9, atol=1e-9)
         assert len(aux) == len(expected_aux) == 2
         for actual, value in zip(aux, expected_aux):
             torch.testing.assert_close(actual, value, rtol=1e-9, atol=1e-9)
-        if skip_mtp_buffer:
-            assert (buffer == -7).all()
-        else:
-            torch.testing.assert_close(buffer, expected_buffer, rtol=1e-9, atol=1e-9)
