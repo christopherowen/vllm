@@ -147,6 +147,11 @@ class DeepseekV41ForCausalLM(UpstreamDeepseekV41ForCausalLM):
         """The attention-sink detector's residual column per stream."""
         return self.language_model.get_sink_residual_columns()
 
+    def get_graph_output_buffers(
+        self,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]] | None:
+        return self.language_model.get_graph_output_buffers()
+
     @staticmethod
     def get_model_state_cls():
         from .model_state import DeepseekV41ModelState

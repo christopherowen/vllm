@@ -906,6 +906,12 @@ class ModelCudaGraphManager(CudaGraphManager):
                 "Set VLLM_USE_BREAKABLE_CUDAGRAPH=1 or cudagraph_mode=NONE/FULL."
             )
 
+        # A model may write a captured forward's outputs into persistent buffers of
+        # its own (rows: the largest graph): they become the persistent buffers
+        # here, and a replay's outputs need no copy.
+        get_buffers = getattr(model, "get_graph_output_buffers", None)
+        declared = get_buffers() if get_buffers is not None else None
+
         def store_capture_output(num_tokens: int, model_output: Any) -> None:
             """Copy outputs to persistent buffers, allocating on first use."""
             if self.is_last_pp_rank:
@@ -916,14 +922,18 @@ class ModelCudaGraphManager(CudaGraphManager):
                     hidden_states = model_output
                     aux_hidden_states = []
                 if self.hidden_states is None:
-                    self.hidden_states = torch.empty_like(hidden_states)
-                self.hidden_states[:num_tokens] = hidden_states
+                    self.hidden_states = _output_buffer(
+                        declared[0] if declared is not None else None, hidden_states
+                    )
+                _store_output(self.hidden_states, hidden_states, num_tokens)
                 if self.use_aux_hidden_state_outputs and not self.aux_hidden_states:
+                    own = declared[1] if declared is not None else []
                     self.aux_hidden_states = [
-                        torch.empty_like(x) for x in aux_hidden_states
+                        _output_buffer(own[i] if i < len(own) else None, x)
+                        for i, x in enumerate(aux_hidden_states)
                     ]
                 for i, aux in enumerate(aux_hidden_states):
-                    self.aux_hidden_states[i][:num_tokens] = aux
+                    _store_output(self.aux_hidden_states[i], aux, num_tokens)
             else:
                 # Non-last PP rank.
                 assert isinstance(model_output, IntermediateTensors)
@@ -1062,6 +1072,31 @@ class ModelCudaGraphManager(CudaGraphManager):
         if not self.use_aux_hidden_state_outputs:
             return hidden_states
         return hidden_states, [x[: desc.num_tokens] for x in self.aux_hidden_states]
+
+
+def _output_buffer(declared: torch.Tensor | None, output: torch.Tensor) -> torch.Tensor:
+    """The persistent buffer for a captured output: the model's own when it
+    declares one of the output's row shape and dtype, else a new one."""
+    if (
+        declared is not None
+        and declared.shape[1:] == output.shape[1:]
+        and declared.dtype == output.dtype
+        and declared.device == output.device
+        and declared.shape[0] >= output.shape[0]
+    ):
+        return declared
+    return torch.empty_like(output)
+
+
+def _store_output(buffer: torch.Tensor, output: torch.Tensor, num_tokens: int) -> None:
+    """``buffer[:num_tokens] = output``, unless the forward wrote it there."""
+    if (
+        output.data_ptr() == buffer.data_ptr()
+        and output.stride() == buffer.stride()
+        and output.shape[0] == num_tokens
+    ):
+        return
+    buffer[:num_tokens] = output
 
 
 def prepare_inputs_to_capture(
