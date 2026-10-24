@@ -235,14 +235,32 @@ def greedy_shard_pair(
 
 
 def select_first_argmax(
-    pairs: torch.Tensor, output: torch.Tensor, pair_width: int = 2
+    pairs: torch.Tensor,
+    output: torch.Tensor,
+    pair_width: int = 2,
+    embed: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
     """Reduce all-gathered shard pairs ([rows, pair_width * ranks], FP32, each
     rank's pair first in its ``pair_width`` columns) to the first maximum's global
-    index, written to ``output`` (one per row)."""
+    index, written to ``output`` (one per row). With ``embed`` (a BF16 Markov W1
+    table and two row outputs), also the selected tokens' rows of the table."""
     from vllm.v1.worker.gpu.sample import tilelang_sampling
 
-    tilelang_sampling.select_first_argmax(pairs, output, pair_width)
+    tilelang_sampling.select_first_argmax(pairs, output, pair_width, embed)
+
+
+def markov_anchor_embed(
+    ids: torch.Tensor,
+    index: torch.Tensor,
+    table: torch.Tensor,
+    step_out: torch.Tensor,
+    confidence_out: torch.Tensor,
+) -> None:
+    """The rows of the BF16 Markov W1 ``table`` for the tokens ``ids[index]``, into
+    ``step_out`` and ``confidence_out``."""
+    from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+    tilelang_sampling.markov_anchor_embed(ids, index, table, step_out, confidence_out)
 
 
 def scratch_shape(max_requests: int, vocabulary_size: int) -> tuple[int, int]:

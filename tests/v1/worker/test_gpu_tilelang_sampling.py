@@ -772,6 +772,41 @@ def test_greedy_pairs_in_sixteen_byte_rows(case):
     _assert_same(outs[0], outs[1], "selected index")
 
 
+@pytest.mark.parametrize("ranks", [1, 3, 4])
+def test_select_first_argmax_embeds_the_next_token(ranks):
+    """The drafter's selection with the next step's Markov embedding: the same
+    index as without it, and the selected tokens' W1 rows (``nn.Embedding``) in
+    the step buffer and in the (request, step) buffer's column; the anchor
+    lookup likewise from ``ids[index]``."""
+    rows, vocab, width, steps = 13, 1 << 17, 256, 5
+    g = torch.Generator(device=DEVICE).manual_seed(ranks + 40)
+    values = torch.round(torch.randn(rows, ranks, generator=g, device=DEVICE))
+    index = torch.randint(0, vocab, (rows, ranks), generator=g, device=DEVICE)
+    pairs = torch.zeros(rows, ranks, 4, device=DEVICE)
+    pairs[:, :, 0], pairs[:, :, 1] = values, index.float()
+    pairs = pairs.view(rows, 4 * ranks)
+    table = torch.randn(vocab, width, generator=g, device=DEVICE).bfloat16()
+    plain = torch.full((rows,), -2, dtype=torch.int64, device=DEVICE)
+    tls.select_first_argmax(pairs, plain, pair_width=4)
+    out = torch.full((rows, steps), -2, dtype=torch.int64, device=DEVICE)
+    step = torch.zeros(rows + 3, width, dtype=torch.bfloat16, device=DEVICE)
+    confidence = torch.zeros(rows, steps, width, dtype=torch.bfloat16, device=DEVICE)
+    tls.select_first_argmax(
+        pairs, out[:, 2], pair_width=4, embed=(table, step[:rows], confidence[:, 3])
+    )
+    _assert_same(out[:, 2], plain, "selected index")
+    expected = torch.nn.functional.embedding(plain, table)
+    _assert_same(step[:rows], expected, "step rows")
+    _assert_same(confidence[:, 3], expected, "confidence rows")
+    assert (step[rows:] == 0).all() and (confidence[:, :3] == 0).all()
+    ids = torch.randint(0, vocab, (64,), generator=g, device=DEVICE).int()
+    anchors = torch.arange(rows, device=DEVICE) * 4
+    tls.markov_anchor_embed(ids, anchors, table, step[:rows], confidence[:, 0])
+    expected = torch.nn.functional.embedding(ids[anchors].long(), table)
+    _assert_same(step[:rows], expected, "anchor step rows")
+    _assert_same(confidence[:, 0], expected, "anchor confidence rows")
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("case", CASES)
 def test_sample_greedy_markov(dtype, case):
