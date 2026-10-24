@@ -565,6 +565,69 @@ def zero_kv_blocks(
     )
 
 
+# --- The logits rows' inputs ------------------------------------------------------
+
+_LOGITS_ROWS_THREADS = 128
+
+
+@tilelang.jit(pass_configs=_PASS)
+def logits_rows_kernel(index_dtype: str):
+    """``input_ids[logits_indices]`` and ``positions[logits_indices]``, a thread a
+    logits row, a negative index wrapping as torch's indexing does: the step's
+    drafts and positions at its logits rows, which the samplers, the sink policy
+    and its cut each gathered with torch."""
+    num_tokens, num_logits = T.dynamic("num_tokens, num_logits")
+
+    @T.prim_func
+    def logits_rows(
+        input_ids: T.Tensor((num_tokens,), T.int32),
+        positions: T.Tensor((num_tokens,), T.int64),
+        logits_indices: T.Tensor((num_logits,), index_dtype),
+        ids_out: T.Tensor((num_logits,), T.int32),
+        positions_out: T.Tensor((num_logits,), T.int64),
+    ):
+        with T.Kernel(
+            T.ceildiv(num_logits, _LOGITS_ROWS_THREADS), threads=_LOGITS_ROWS_THREADS
+        ) as b:
+            i = b * _LOGITS_ROWS_THREADS + T.get_thread_binding()
+            index = T.alloc_var(
+                T.int64,
+                init=T.cast(logits_indices[T.min(i, num_logits - 1)], T.int64),
+            )
+            row = T.alloc_var(
+                T.int64, init=T.if_then_else(index < 0, index + num_tokens, index)
+            )
+            token = T.alloc_var(T.int32, init=input_ids[row])
+            position = T.alloc_var(T.int64, init=positions[row])
+            if i < num_logits:
+                ids_out[i] = token
+                positions_out[i] = position
+
+    return logits_rows
+
+
+def logits_rows_key(index_dtype: torch.dtype) -> tuple:
+    return (_DTYPES[index_dtype],)
+
+
+def logits_rows(
+    input_ids: torch.Tensor, positions: torch.Tensor, logits_indices: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The input ids and positions at the logits rows, as new tensors."""
+    num_logits = logits_indices.shape[0]
+    ids = torch.empty(num_logits, dtype=input_ids.dtype, device=input_ids.device)
+    pos = torch.empty(num_logits, dtype=positions.dtype, device=positions.device)
+    if num_logits:
+        _kernel(logits_rows_kernel, *logits_rows_key(logits_indices.dtype))(
+            input_ids, positions, logits_indices, ids, pos
+        )
+    return ids, pos
+
+
+def logits_rows_calls(index_dtype: torch.dtype) -> list:
+    return [_call(logits_rows_kernel, *logits_rows_key(index_dtype))]
+
+
 # --- Padding rows -----------------------------------------------------------------
 
 _PADDING_THREADS = 256

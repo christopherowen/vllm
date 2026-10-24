@@ -2148,6 +2148,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return
         assert self.sampler is not None
         register_input_batch_warmups(dead_rows=dead_rows)
+        # The logits rows' inputs (InputBatch.logits_rows): a step's logits
+        # indices are int64, a dummy batch's int32.
+        tilelang_inputs.declare(
+            lambda: tilelang_inputs.logits_rows_calls(torch.int64)
+            + tilelang_inputs.logits_rows_calls(torch.int32)
+        )
 
         language_model = self._language_model()
         head = getattr(language_model, "lm_head", None)
@@ -2338,7 +2344,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         shard = self._language_model().lm_head.shard_indices
         tp_size = get_tensor_model_parallel_world_size()
         local_logits = self.model.compute_logits_local(sample_hidden_states)
-        drafts = input_batch.input_ids[input_batch.logits_indices]
+        drafts = input_batch.logits_rows()[0]
         rejection = self.sink is not None and self.sink.rejection
         if rejection:
             assert self.sink is not None and sink_flags is not None
@@ -2547,7 +2553,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.idx_mapping,
             self._sink_decoding[:num_reqs],
             sink_flags,
-            input_batch.input_ids[input_batch.logits_indices],
+            input_batch.logits_rows()[0],
             sampler_output.sink_alternates,
             self.req_states.total_len.gpu,
             self.sampler.penalties_state.output_bin_counts,

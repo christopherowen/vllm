@@ -653,6 +653,24 @@ def test_expand_idx_mapping(num_reqs, idx_dtype):
     assert torch.equal(ref_pos, ours_pos)
 
 
+@pytest.mark.parametrize("num_logits", [0, 1, 6, 96, 1000])
+@pytest.mark.parametrize("index_dtype", [torch.int64, torch.int32])
+def test_logits_rows(num_logits, index_dtype):
+    """The logits rows' input ids and positions against torch's indexing,
+    repeated rows and a negative index (which wraps) included."""
+    gen = _gen(num_logits + 5)
+    input_ids = _randint(0, 1 << 17, (MAX_TOKENS,), gen)
+    positions = _randint(0, 1 << 20, (MAX_TOKENS,), gen, torch.int64)
+    indices = _randint(0, MAX_TOKENS, (num_logits,), gen, index_dtype)
+    if num_logits > 2:
+        indices[1] = indices[0]
+        indices[2] = -1
+    ids, pos = tli.logits_rows(input_ids, positions, indices)
+    torch.accelerator.synchronize()
+    assert torch.equal(ids, input_ids[indices])
+    assert torch.equal(pos, positions[indices])
+
+
 @pytest.mark.parametrize(
     "live,rows", [(0, 0), (0, 8), (6, 8), (96, 96), (90, 128), (16000, MAX_TOKENS)]
 )
