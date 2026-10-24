@@ -25,7 +25,7 @@ from collections.abc import Callable
 import torch
 
 from vllm.models.deepseek_v4_1.nvidia.model_state import _gather_lookback_kernel
-from vllm.models.deepseek_v4_1.tilelang import lookback
+from vllm.models.deepseek_v4_1.tilelang import dspark_context, lookback
 from vllm.triton_utils import triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu import input_batch as ib
@@ -379,6 +379,41 @@ def case_adaptive_offsets(gen, num_reqs, prefill, widths):
     return torch_call, tilelang_call
 
 
+def case_dspark_context(gen, num_reqs, prefill, widths):
+    """DSpark's context-graph inputs (DSparkContextCudaGraphs.run): the three
+    auxiliary hidden states into the graph's buffer and its tail scrubbed; before
+    the port, three strided copies and three fills. The prefill shape stands for
+    a batch shrinking into a larger graph (90 rows in a 96-row graph)."""
+    width = 5120
+    num_tokens = 90 if prefill else num_reqs * ROWS
+    # The context graphs' capacities: powers of two up to 96 rows.
+    capacity = 96 if prefill else min(1 << (num_tokens - 1).bit_length(), 96)
+    wide = [
+        torch.randn(MAX_TOKENS, width + 64, generator=gen, device=DEVICE).to(
+            torch.bfloat16
+        )
+        for _ in range(3)
+    ]
+    sources = [buffer[:, :width] for buffer in wide]
+    aux = torch.empty(capacity, 3 * width, dtype=torch.bfloat16, device=DEVICE)
+    positions = torch.empty(MAX_TOKENS, dtype=torch.int64, device=DEVICE)
+    slots = torch.empty(2, MAX_TOKENS, dtype=torch.int64, device=DEVICE)
+
+    def torch_call():
+        for i, source in enumerate(sources):
+            aux[:num_tokens, i * width : (i + 1) * width].copy_(source[:num_tokens])
+        aux[num_tokens:capacity].zero_()
+        positions[num_tokens:capacity].zero_()
+        slots[:, num_tokens:capacity].fill_(PAD_SLOT_ID)
+
+    def tilelang_call():
+        dspark_context.context_inputs(
+            aux, sources, positions, slots, num_tokens, capacity
+        )
+
+    return torch_call, tilelang_call, wide
+
+
 def case_post_update(gen, num_reqs, prefill, widths):
     """The commit of a verified step (up to 1 + 5 tokens a request), or of a
     prefill chunk's one sampled token. Repeated calls keep committing: both
@@ -498,6 +533,7 @@ CASES = {
     "combine_sampled_and_draft_tokens (dead rows)": case_combine_dead_rows,
     "expand_idx_mapping": case_expand_idx_mapping,
     "adaptive_offsets": case_adaptive_offsets,
+    "dspark_context": case_dspark_context,
     "post_update": case_post_update,
     "prepare_dflash_inputs": case_prepare_dflash_inputs,
     "gather_lookback": case_gather_lookback,
