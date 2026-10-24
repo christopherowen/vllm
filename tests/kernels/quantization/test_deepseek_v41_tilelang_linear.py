@@ -358,3 +358,18 @@ def test_rmsnorm(hidden, rows=33, eps=1e-6):
     xf = x.float()
     ref = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps) * norm.weight.float()
     torch.testing.assert_close(out.float(), ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("width", [1280, 512])
+def test_rmsnorm_of_a_fused_projections_half(width, rows=33, eps=1e-6):
+    """The q and kv halves of ``fused_wqa_wkv``'s output (1280 + 512 columns),
+    normalized where they lie, equal the norm of their contiguous copies bit for bit."""
+    gen = _gen(5)
+    fused = torch.randn((rows, 1280 + 512), generator=gen, device=DEVICE).bfloat16()
+    half = fused[:, :1280] if width == 1280 else fused[:, 1280:]
+    norm = TileLangRMSNorm(width, eps).to(DEVICE)
+    norm.weight.data.copy_(torch.rand((width,), generator=gen, device=DEVICE) + 0.5)
+    assert not half.is_contiguous()
+    out = norm(half)
+    assert out.is_contiguous()
+    assert torch.equal(out.view(torch.int16), norm(half.contiguous()).view(torch.int16))
