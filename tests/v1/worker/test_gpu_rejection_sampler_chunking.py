@@ -49,7 +49,9 @@ def test_chunked_scores_match_full_batch(logprobs_mode: str):
         ).to(device),
     )
     rejection_sampler = object.__new__(RejectionSampler)
-    rejection_sampler.sampler = SimpleNamespace(logprobs_mode=logprobs_mode)
+    rejection_sampler.sampler = SimpleNamespace(
+        logprobs_mode=logprobs_mode, logprob_token_ids_state=None
+    )
     rejection_sampler.num_speculative_steps = 3
     rejection_sampler.enable_adaptive_verification = False
 
@@ -79,7 +81,7 @@ def test_chunked_scores_match_full_batch(logprobs_mode: str):
         draft_sampled=torch.arange(10, device=device),
         pos=torch.arange(10, device=device),
         max_chunk_logits=5,
-        max_num_logprobs=2,
+        logprobs_dims=(2, 0),
     )
     score_logits = logits + 1 if logprobs_mode in PROCESSED_LOGPROBS_MODES else logits
     full_logprobs = rejection_sampler._get_logprobs_tensors(
@@ -88,7 +90,8 @@ def test_chunked_scores_match_full_batch(logprobs_mode: str):
         score_logits,
         input_batch.cu_num_logits,
         input_batch.cu_num_logits_np,
-        max_num_logprobs=2,
+        input_batch.expanded_idx_mapping,
+        logprobs_dims=(2, 0),
     )
 
     assert sampled[:, 0].tolist() == idx_mapping_np.tolist()

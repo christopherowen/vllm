@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.v1.core.boundary_checkpoint import (
     INSTRUCTION_CHECKPOINT_SLOT,
     MAX_BOUNDARY_STOP_TOKENS,
@@ -27,10 +27,22 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_states.interface import ModelState
     from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
-_PROMPT_CHECKPOINT_SLOT = tl.constexpr(PROMPT_CHECKPOINT_SLOT)
-_RESPONSE_CHECKPOINT_SLOT = tl.constexpr(RESPONSE_CHECKPOINT_SLOT)
-_INSTRUCTION_CHECKPOINT_SLOT = tl.constexpr(INSTRUCTION_CHECKPOINT_SLOT)
-_PREFILL_TAIL_CHECKPOINT_SLOT = tl.constexpr(PREFILL_TAIL_CHECKPOINT_SLOT)
+_PROMPT_CHECKPOINT_SLOT = (
+    tl.constexpr(PROMPT_CHECKPOINT_SLOT) if HAS_TRITON else PROMPT_CHECKPOINT_SLOT
+)
+_RESPONSE_CHECKPOINT_SLOT = (
+    tl.constexpr(RESPONSE_CHECKPOINT_SLOT) if HAS_TRITON else RESPONSE_CHECKPOINT_SLOT
+)
+_INSTRUCTION_CHECKPOINT_SLOT = (
+    tl.constexpr(INSTRUCTION_CHECKPOINT_SLOT)
+    if HAS_TRITON
+    else INSTRUCTION_CHECKPOINT_SLOT
+)
+_PREFILL_TAIL_CHECKPOINT_SLOT = (
+    tl.constexpr(PREFILL_TAIL_CHECKPOINT_SLOT)
+    if HAS_TRITON
+    else PREFILL_TAIL_CHECKPOINT_SLOT
+)
 
 
 @triton.jit

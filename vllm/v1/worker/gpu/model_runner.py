@@ -189,7 +189,6 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.sink import SinkAlternates, SinkSampler
-from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
@@ -2017,12 +2016,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 local_batch=input_batch,
                 gather_num_nans=self.sampler.compute_nans,
                 logprobs_dims=self.sampler.get_logprobs_dims(
-                    global_input_batch.idx_mapping_np,
-                    # Rejection sampler does not return logprob token ids.
-                    include_token_ids=(
-                        global_input_batch.num_draft_tokens == 0
-                        or self.rejection_sampler is None
-                    ),
+                    global_input_batch.idx_mapping_np
                 ),
             )
 
@@ -2330,10 +2324,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         assert self.sampler is not None
         idx = input_batch.idx_mapping_np
         states = self.sampler.sampling_states
+        # No logprobs: neither top logprobs nor logprob_token_ids.
         return bool(
             np.all(states.temperature.np[idx] == 0.0)
             and not np.any(self.sampler.needs_logits_processing[idx])
-            and states.max_num_logprobs(idx) == NO_LOGPROBS
+            and self.sampler.get_logprobs_dims(idx) is None
         )
 
     def _verify_greedily(
