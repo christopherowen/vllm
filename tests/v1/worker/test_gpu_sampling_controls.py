@@ -36,6 +36,7 @@ def min_p_case(rows, vocab, index_dtype, *, padded=False, nonfinite=False):
         [0.0, 0.01, 0.1, 0.7, 1.0] * ((rows + 11) // 5), device="cuda"
     )[: rows + 7]
     if nonfinite:
+        thresholds.fill_(0.1)
         logits[0].fill_(-float("inf"))
         if rows > 1:
             logits[1, 0] = float("nan")

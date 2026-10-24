@@ -205,7 +205,7 @@ def nan_count_kernel(vocab: int, stride: int, dtype: str):
                     value = T.if_then_else(
                         index < vocab, logits[T.cast(row, "int64"), index], 0
                     )
-                    counts[col] += T.cast(value != value, "int32")
+                    counts[col] += T.cast(T.isnan(value), "int32")
             T.reduce_sum(counts, total, dim=0)
             output[row] = total[0]
 

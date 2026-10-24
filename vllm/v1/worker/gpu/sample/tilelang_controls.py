@@ -75,7 +75,7 @@ def min_p_kernel(vocab: int, stride: int, index_dtype: str, threads: int = 128):
                         if index < vocab:
                             value[0] = logits[T.cast(row, "int64"), index]
                         maximum[col] = T.max(maximum[col], value[0])
-                        invalid[col] |= T.cast(value[0] != value[0], "int32")
+                        invalid[col] |= T.cast(T.isnan(value[0]), "int32")
                 T.reduce_max(maximum, reduced, dim=0)
                 T.reduce_max(invalid, any_nan, dim=0)
                 minimum[0] = reduced[0] + T.call_extern(
@@ -116,7 +116,7 @@ def apply_min_p(logits, mapping, thresholds):
 
 
 @tilelang.jit(
-    pass_configs={**_PASS, tilelang.PassConfigKey.TIR_DISABLE_VECTORIZE: True}
+    pass_configs={**_PASS, tilelang.PassConfigKey.TL_DISABLE_VECTORIZE_256: True}
 )
 def penalties_kernel(
     vocab: int,
