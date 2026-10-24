@@ -290,9 +290,21 @@ class SinkCut:
     logits: torch.Tensor
     saved: torch.Tensor
     cols: torch.Tensor
+    flags: torch.Tensor
+    drafts: torch.Tensor
+    cu_num_logits: torch.Tensor
 
     def restore(self) -> None:
-        self.logits.scatter_(1, self.cols, self.saved)
+        from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+        tilelang_sampling.sink_restore(
+            self.logits,
+            self.saved,
+            self.cols,
+            self.flags,
+            self.drafts,
+            self.cu_num_logits,
+        )
 
 
 @dataclass
@@ -417,18 +429,20 @@ class SinkSampler:
         before it, which verifies it. ``logits`` may be this rank's vocabulary
         shard (columns from ``vocab_start``); a draft outside it is left
         alone."""
-        num_logits, num_cols = logits.shape
+        from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+        num_cols = logits.shape[1]
         # Row r + 1 holds a draft of row r's request unless it starts one.
-        starts = torch.zeros(num_logits + 1, dtype=torch.bool, device=self.device)
-        starts[cu_num_logits[:num_reqs].long()] = True
-        cols = drafts[1:num_logits].long() - vocab_start
-        cut = flags[1:num_logits].bool() & ~starts[1:num_logits] & (cols >= 0)
-        cut &= cols < (num_cols if vocab_cols is None else vocab_cols)
-        cols = cols.where(cut, 0)[:, None]
-        rows = logits[: num_logits - 1]
-        saved = rows.gather(1, cols)
-        rows.scatter_(1, cols, saved.masked_fill(cut[:, None], float("-inf")))
-        return SinkCut(rows, saved, cols)
+        saved, cols = tilelang_sampling.sink_cut(
+            logits,
+            flags,
+            drafts,
+            cu_num_logits,
+            num_reqs,
+            vocab_start,
+            num_cols if vocab_cols is None else vocab_cols,
+        )
+        return SinkCut(logits, saved, cols, flags, drafts, cu_num_logits)
 
     def alternates_of(
         self,

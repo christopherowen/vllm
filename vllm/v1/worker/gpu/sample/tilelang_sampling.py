@@ -718,6 +718,93 @@ def sink_flags(
     return flags, values
 
 
+@tilelang.jit(pass_configs=_PASS)
+def sink_cut_kernel(logits_dtype: str, drafts_dtype: str, restore: bool):
+    """``SinkSampler.cut`` as one kernel, a thread a row ``r`` of the first
+    ``num_logits - 1``: row ``r + 1`` holds a draft that row ``r`` verifies unless it
+    starts a request, and a flagged draft inside this shard's columns is masked to
+    -inf in row ``r``; the logit and its column are kept for the restore (column 0
+    and its own logit where nothing is cut). With ``restore``, each kept logit goes
+    back to its column."""
+    rows, vocab, logits_stride = T.dynamic("rows, vocab, logits_stride")
+    num_logits, cu_len, num_cut = T.dynamic("num_logits, cu_len, num_cut")
+
+    @T.prim_func
+    def sink_cut(
+        logits: T.StridedTensor((rows, vocab), (logits_stride, 1), logits_dtype),
+        flags: T.Tensor((num_logits,), T.int8),
+        drafts: T.Tensor((num_logits,), drafts_dtype),
+        cu_num_logits: T.Tensor((cu_len,), T.int32),
+        saved: T.Tensor((num_cut,), logits_dtype),
+        cols: T.Tensor((num_cut,), T.int64),
+        num_reqs: T.int32,
+        vocab_start: T.int64,
+        limit: T.int64,
+    ):
+        with T.Kernel(T.ceildiv(num_cut, _THREADS), threads=_THREADS) as bx:
+            row = bx * _THREADS + T.get_thread_binding()
+            if row < num_cut:
+                if restore:
+                    logits[row, cols[row]] = saved[row]
+                else:
+                    starts = T.alloc_var(T.int32, init=0)
+                    for b in T.serial(num_reqs):
+                        starts = starts | T.cast(cu_num_logits[b] == row + 1, T.int32)
+                    col = T.alloc_var(
+                        T.int64, init=T.cast(drafts[row + 1], T.int64) - vocab_start
+                    )
+                    cut = (
+                        (flags[row + 1] != 0)
+                        & (starts == 0)
+                        & (col >= 0)
+                        & (col < limit)
+                    )
+                    kept = T.alloc_var(T.int64, init=T.if_then_else(cut, col, 0))
+                    saved[row] = logits[row, kept]
+                    cols[row] = kept
+                    if cut:
+                        logits[row, kept] = -T.infinity(logits_dtype)
+
+    return sink_cut
+
+
+def sink_cut(
+    logits: torch.Tensor,
+    flags: torch.Tensor,
+    drafts: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    num_reqs: int,
+    vocab_start: int,
+    limit: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``SinkSampler.cut``'s launch: masks in place, and returns the kept logits and
+    their columns (one a row of the first ``logits.shape[0] - 1``)."""
+    num_cut = max(logits.shape[0] - 1, 0)
+    saved = torch.empty(num_cut, dtype=logits.dtype, device=logits.device)
+    cols = torch.empty(num_cut, dtype=torch.int64, device=logits.device)
+    if num_cut:
+        _kernel(sink_cut_kernel, _DTYPES[logits.dtype], _DTYPES[drafts.dtype], False)(
+            logits, flags, drafts, cu_num_logits, saved, cols, num_reqs,
+            vocab_start, limit,
+        )  # fmt: skip
+    return saved, cols
+
+
+def sink_restore(
+    logits: torch.Tensor,
+    saved: torch.Tensor,
+    cols: torch.Tensor,
+    flags: torch.Tensor,
+    drafts: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+) -> None:
+    """``SinkCut.restore``'s launch: each kept logit back to its column."""
+    if saved.shape[0]:
+        _kernel(sink_cut_kernel, _DTYPES[logits.dtype], _DTYPES[drafts.dtype], True)(
+            logits, flags, drafts, cu_num_logits, saved, cols, 0, 0, 0,
+        )  # fmt: skip
+
+
 SINK_CANDIDATE_BLOCK = 1024
 
 
@@ -1975,6 +2062,14 @@ def sink_calls(
     ``logits_dtypes`` (a rejected draft masked when more than one row is
     sampled)."""
     calls = [_call(sink_flags_kernel, dead_rows) for dead_rows in (False, True)]
+    if rejection:
+        # The cut and its restore, on raw and processed logits and on a rank's
+        # vocabulary shard (FP32), with the runner's int32 input ids as drafts.
+        calls += [
+            _call(sink_cut_kernel, _DTYPES[dtype], "int32", restore)
+            for dtype in dict.fromkeys([*logits_dtypes, torch.float32])
+            for restore in (False, True)
+        ]
     calls += [
         _call(
             sink_policy_kernel,

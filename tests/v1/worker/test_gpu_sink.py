@@ -218,6 +218,48 @@ def test_greedy_alternates_follow_the_logits():
     assert (alternates[:, 1:] == -1).all()
 
 
+def _torch_cut(logits, flags, drafts, cu, num_reqs, vocab_start=0, vocab_cols=None):
+    """The drafter-row cut as it was computed in torch (the TileLang kernel's
+    reference), in place."""
+    num_logits, num_cols = logits.shape
+    starts = torch.zeros(num_logits + 1, dtype=torch.bool, device=DEVICE)
+    starts[cu[:num_reqs].long()] = True
+    cols = drafts[1:num_logits].long() - vocab_start
+    cut = flags[1:num_logits].bool() & ~starts[1:num_logits] & (cols >= 0)
+    cut &= cols < (num_cols if vocab_cols is None else vocab_cols)
+    cols = cols.where(cut, 0)[:, None]
+    rows = logits[: num_logits - 1]
+    saved = rows.gather(1, cols)
+    rows.scatter_(1, cols, saved.masked_fill(cut[:, None], float("-inf")))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("shard", [None, (700, 600)])
+def test_cut_matches_the_torch_reference(dtype, shard):
+    """Random flags and drafts over five requests, the full vocabulary or a shard
+    (columns 700 on, 600 of them): the cut equals torch's bit for bit, and the
+    restore gives the logits back."""
+    gen = torch.Generator(device=DEVICE).manual_seed(41)
+    counts = [3, 1, 6, 4, 2]
+    num_logits, num_reqs = sum(counts), len(counts)
+    vocab = 1500
+    drafts = torch.randint(0, vocab, (num_logits,), generator=gen, device=DEVICE).int()
+    flags = torch.randint(0, 2, (num_logits,), generator=gen, device=DEVICE).to(
+        torch.int8
+    )
+    cu = _cu(counts)
+    start, cols = shard or (0, None)
+    width = vocab if shard is None else cols
+    logits = _random_logits(num_logits, width, seed=6).to(dtype)
+    original = logits.clone()
+    expected = logits.clone()
+    _torch_cut(expected, flags, drafts, cu, num_reqs, start, cols)
+    cut = _sink(vocab=vocab).cut(logits, flags, drafts, cu, num_reqs, start, cols)
+    assert torch.equal(logits, expected)
+    cut.restore()
+    assert torch.equal(logits, original)
+
+
 def test_cut_masks_sunk_drafts_and_restores_the_logits():
     """Row r verifies the draft at row r + 1: a flagged draft row masks the
     draft in the row before it, within the request only, and the restore
