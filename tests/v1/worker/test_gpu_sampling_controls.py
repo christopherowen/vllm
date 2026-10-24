@@ -68,6 +68,20 @@ def test_min_p_matches_triton_at_vocabulary_boundaries(index_dtype, vocab, nonfi
     assert_bits(logits, expected)
 
 
+@pytest.mark.parametrize("seed", range(48291, 48299))
+def test_min_p_preserves_threshold_boundary_at_full_serving_batch(seed):
+    rows, vocab, states = 96, 129280, 105
+    torch.manual_seed(seed)
+    mapping = torch.randperm(states, device="cuda")[:rows]
+    logits = torch.randn((rows, vocab), device="cuda")
+    thresholds = torch.full((states,), 0.1, device="cuda")
+    thresholds[::5] = 0
+    expected = logits.clone()
+    _min_p_kernel[(rows,)](expected, vocab, mapping, thresholds, vocab, BLOCK_SIZE=1024)
+    candidate.apply_min_p(logits, mapping, thresholds)
+    assert_bits(logits, expected)
+
+
 def penalties_case(rows, vocab, index_dtype, *, padded=False):
     torch.manual_seed(31037)
     states = rows + 7

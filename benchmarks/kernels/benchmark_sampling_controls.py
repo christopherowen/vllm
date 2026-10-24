@@ -95,7 +95,7 @@ def make_case(kind, rows, width, seed, count):
             if ours:
                 candidate.apply_min_p(logits, mapping, thresholds)
             else:
-                _min_p_kernel[(rows,)](
+                return _min_p_kernel[(rows,)](
                     logits,
                     logits.stride(0),
                     mapping,
@@ -158,11 +158,52 @@ def measure(kind, rows, width, seed):
     for sample in range(8):
         reset, invoke, output = make_case(kind, rows, width, seed + sample, count)
         reset()
-        invoke(0, False)
+        compiled = invoke(0, False)
         expected = [value.clone() for value in output(0)]
         reset()
         invoke(0, True)
         if any(not torch.equal(a, b) for a, b in zip(output(0), expected)):
+            if compiled is not None:
+                ptx = compiled.asm["ptx"]
+                print(
+                    json.dumps(
+                        {
+                            "ptx_arithmetic": [
+                                line.strip()
+                                for line in ptx.splitlines()
+                                if any(
+                                    op in line
+                                    for op in (
+                                        "lg2.",
+                                        "fma.",
+                                        "max.",
+                                        "mul.f32",
+                                        "add.f32",
+                                    )
+                                )
+                            ]
+                        }
+                    ),
+                    flush=True,
+                )
+            for actual, target in zip(output(0), expected):
+                indices = (actual != target).nonzero()[:8]
+                print(
+                    json.dumps(
+                        {
+                            "sample": sample,
+                            "differences": [
+                                [
+                                    index.tolist(),
+                                    actual[tuple(index)].item(),
+                                    target[tuple(index)].item(),
+                                ]
+                                for index in indices
+                            ],
+                        }
+                    ),
+                    flush=True,
+                )
             raise RuntimeError(f"outputs differ: {kind} rows={rows} width={width}")
         reset()
         a = capture(invoke, True, count)
