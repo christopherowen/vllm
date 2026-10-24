@@ -9,6 +9,7 @@ pytest.importorskip("triton")
 if not torch.cuda.is_available():
     pytest.skip("CUDA required for sampling controls", allow_module_level=True)
 
+from vllm.v1.worker.gpu.sample import tilelang_auxiliary as auxiliary
 from vllm.v1.worker.gpu.sample import tilelang_controls as candidate
 from vllm.v1.worker.gpu.sample.min_p import _min_p_kernel
 from vllm.v1.worker.gpu.sample.penalties import _bincount_kernel, _penalties_kernel
@@ -157,3 +158,135 @@ def test_bincount_distinguishes_prompt_bits_and_output_counts(index_dtype, lengt
     candidate.bincount(mapping, tokens, prompt, prefill, mask, counts, length)
     assert_bits(mask, expected_mask)
     assert_bits(counts, expected_counts)
+
+
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("word_count", [1, 7, 33, 129])
+def test_bad_words_match_across_committed_and_draft_boundary(index_dtype, word_count):
+    from vllm.v1.worker.gpu.sample.bad_words import _bad_words_kernel
+
+    rows, states, vocab = 18, 11, 129280
+    logits = torch.randn((rows, vocab + 13), device="cuda")[:, :vocab]
+    mapping = (torch.arange(rows, device="cuda") // 6 + 2).to(index_dtype)
+    pos = (torch.arange(rows, device="cuda") % 6).int()
+    inputs = (torch.arange(rows, device="cuda") % 6 + 50).int()
+    tokens = torch.full((states, 50), 50, dtype=torch.int32, device="cuda")
+    prompt = torch.full((states,), 10, dtype=torch.int32, device="cuda")
+    total = torch.full_like(prompt, 16)
+    words = torch.full((states, word_count * 3), 50, dtype=torch.int32, device="cuda")
+    words[:, 2::3] = torch.arange(word_count, device="cuda") + 80
+    offsets = (torch.arange(word_count + 1, device="cuda") * 3).int().repeat(states, 1)
+    num_words = torch.full_like(prompt, word_count)
+    num_words[3] = 0
+    expected = logits.clone()
+    _bad_words_kernel[(rows, word_count)](
+        expected,
+        expected.stride(0),
+        mapping,
+        words,
+        words.stride(0),
+        offsets,
+        offsets.stride(0),
+        num_words,
+        tokens,
+        tokens.stride(0),
+        prompt,
+        total,
+        inputs,
+        pos,
+    )
+    auxiliary.apply_bad_words(
+        logits,
+        mapping,
+        words,
+        offsets,
+        num_words,
+        tokens,
+        prompt,
+        total,
+        inputs,
+        pos,
+        word_count,
+    )
+    assert_bits(logits, expected)
+
+
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("length", [0, 1, 1023, 1025, 8192])
+def test_prompt_ids_shift_each_chunk_to_its_next_token(index_dtype, length):
+    from vllm.v1.worker.gpu.sample.prompt_logprob import (
+        _prompt_logprobs_token_ids_kernel,
+    )
+
+    states = 9
+    mapping = torch.tensor([8, 2, 4], device="cuda", dtype=index_dtype)
+    starts = torch.tensor(
+        [0, length, length + 3, length + 10], device="cuda", dtype=torch.int32
+    )
+    computed = torch.arange(states, device="cuda", dtype=torch.int32) * 3
+    tokens = torch.randint(
+        129280, (states, length + 100), device="cuda", dtype=torch.int32
+    )
+    output = torch.full((length + 10,), -7, device="cuda", dtype=torch.int64)
+    expected = output.clone()
+    _prompt_logprobs_token_ids_kernel[(3,)](
+        expected, starts, mapping, computed, tokens, tokens.stride(0), BLOCK_SIZE=1024
+    )
+    auxiliary.prompt_token_ids(output, starts, mapping, computed, tokens)
+    assert_bits(output, expected)
+
+
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("topk", [0, 1, 7, 1024])
+def test_custom_logprob_ids_override_topk_without_touching_padding(index_dtype, topk):
+    from vllm.v1.worker.gpu.sample.logprob import _fill_logprob_token_ids_kernel
+
+    states, rows = 11, 6
+    cols = max(topk, 17)
+    output = torch.full((rows, cols + 1), -19, device="cuda", dtype=torch.int64)
+    valid = torch.zeros_like(output, dtype=torch.bool)
+    mapping = torch.tensor([10, 2, 4, 7, 5, 8], device="cuda", dtype=index_dtype)
+    sampled = torch.randint(129280, (rows,), device="cuda", dtype=torch.int64)
+    top_ids = torch.randint(
+        129280, (rows, max(topk, 1)), device="cuda", dtype=torch.int32
+    )
+    count = torch.zeros(states, device="cuda", dtype=torch.int32)
+    count[mapping[::2]] = 17
+    custom = torch.randint(129280, (states, 17), device="cuda", dtype=torch.int32)
+    expected, expected_valid = output.clone(), valid.clone()
+    _fill_logprob_token_ids_kernel[(rows,)](
+        expected,
+        expected.stride(0),
+        expected_valid,
+        valid.stride(0),
+        sampled,
+        top_ids,
+        top_ids.stride(0),
+        mapping,
+        count,
+        custom,
+        custom.stride(0),
+        NUM_TOPK=topk,
+        PADDED_COLS=1 << (cols - 1).bit_length(),
+    )
+    auxiliary.fill_token_ids(
+        output, valid, sampled, top_ids, mapping, count, custom, topk
+    )
+    assert_bits(output, expected)
+    assert_bits(valid, expected_valid)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("vocab", [33, 8193, 129280])
+def test_nan_count_ignores_padded_columns(dtype, vocab):
+    from vllm.v1.worker.gpu.metrics.logits import _num_nans_kernel
+
+    logits = torch.randn((6, vocab + 17), device="cuda", dtype=dtype)
+    logits[:, vocab:] = float("nan")
+    logits[1::2, ::19] = float("nan")
+    logits = logits[:, :vocab]
+    expected = torch.empty(6, device="cuda", dtype=torch.int32)
+    _num_nans_kernel[(6,)](logits, logits.stride(0), expected, vocab, BLOCK_SIZE=8192)
+    output = auxiliary.count_nans(logits)
+    assert_bits(output, expected)
+    assert torch.equal(output, torch.isnan(logits).sum(-1))
