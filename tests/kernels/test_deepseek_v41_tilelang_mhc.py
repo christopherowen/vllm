@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek-V4.1 lagged mHC on TileKernels against the FP32 reference, with
-results independent of the batch."""
+results independent of the batch; the standalone post and the stream collapse bit
+for bit against TileKernels' CUDA kernels they replace (``mhc_post_fwd``,
+``mhc_pre_apply_mix_fwd``)."""
 
+import functools
 from types import SimpleNamespace
 
 import pytest
@@ -17,13 +20,18 @@ if not (
     pytest.skip("TileLang V4.1 kernels target SM120/SM121", allow_module_level=True)
 
 pytest.importorskip("tilelang")
-pytest.importorskip("tile_kernels")
+tile_kernels = pytest.importorskip("tile_kernels")
 
 from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
+    INF,
     NAN,
     assert_other_rows_equal,
     assert_rows_nan,
+    assert_same_nonfinite,
 )
+from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry  # noqa: E402
+from vllm.models.deepseek_v4_1.tilelang import mhc as mhc_module  # noqa: E402
+from vllm.models.deepseek_v4_1.tilelang import prepare  # noqa: E402
 from vllm.models.deepseek_v4_1.tilelang.collectives import (  # noqa: E402
     RankOrderParts,
 )
@@ -31,6 +39,8 @@ from vllm.models.deepseek_v4_1.tilelang.mhc import (  # noqa: E402
     BLOCK_H,
     MIXES,
     TileKernelsMHC,
+    collapse_streams,
+    post_streams,
     project_streams,
 )
 
@@ -241,3 +251,285 @@ def test_post_and_collapse(mhc):
     _close_bf16(mhc.collapse(residual, mix), weighted)
     mean = residual.float().mean(1).bfloat16()
     _close_bf16(mhc.collapse(residual), mean)
+
+
+# The standalone post and the stream collapse: TileLang ports of TileKernels'
+# CUDA kernels, held to their bits (BF16 bit patterns, so signed zeros count).
+
+SERVING_TOKENS = [1, 6, 96, 384, 2048, 16384]
+
+
+def _bits(t: torch.Tensor) -> torch.Tensor:
+    return t.view(torch.int16)
+
+
+def _assert_bits_equal(actual, expected, what=""):
+    assert actual.shape == expected.shape and actual.dtype == expected.dtype
+    differ = _bits(actual) != _bits(expected)
+    if differ.any():
+        where = differ.nonzero()[:4].tolist()
+        raise AssertionError(
+            f"{what}{int(differ.sum())} of {differ.numel()} values differ in their "
+            f"bits; first at {where}"
+        )
+
+
+def _tk_post(x, residual, post, comb):
+    """TileKernels' ``mhc_post_fwd`` (``mhc_post_fwd_cuda_kernel``), as the forward
+    called it before the port."""
+    tokens, hidden = x.shape
+    out = torch.empty_like(residual)
+    tile_kernels.mhc.mhc_post_fwd(
+        x.view(1, tokens, hidden),
+        residual.view(1, tokens, 4, hidden),
+        post.view(1, tokens, 4, 1),
+        comb.view(1, tokens, 4, 4),
+        out=out.view(1, tokens, 4, hidden),
+    )
+    return out
+
+
+def _tk_collapse(state, mix):
+    """TileKernels' ``mhc_pre_apply_mix_fwd`` (``mhc_pre_apply_mix_fwd_cuda_kernel``),
+    as the forward called it before the port."""
+    out = torch.empty(
+        (state.shape[0], state.shape[-1]), dtype=state.dtype, device=state.device
+    )
+    tile_kernels.mhc.mhc_pre_apply_mix_fwd(state, mix, out)
+    return out
+
+
+def _post_inputs(tokens, seed):
+    """A post's operands at serving magnitudes: the sublayer's BF16 output and
+    streams, the post-mix in (0, 2), combination rows summing to one; the first
+    eight columns are negative zeros (TileKernels keeps the sign)."""
+    g = torch.Generator(device=DEVICE).manual_seed(seed)
+    x = torch.randn(tokens, HIDDEN, generator=g, device=DEVICE, dtype=torch.bfloat16)
+    residual = torch.randn(
+        tokens, 4, HIDDEN, generator=g, device=DEVICE, dtype=torch.bfloat16
+    )
+    post = 2 * torch.sigmoid(torch.randn(tokens, 4, generator=g, device=DEVICE))
+    comb = torch.softmax(torch.randn(tokens, 4, 4, generator=g, device=DEVICE), -1)
+    x[:, :8] = -0.0
+    residual[:, :, :8] = -0.0
+    return x, residual, post, comb
+
+
+def _pre_mix(tokens, seed):
+    """An incoming pre-mix: sigmoid values plus ``hc_eps``."""
+    g = torch.Generator(device=DEVICE).manual_seed(seed)
+    return torch.sigmoid(torch.randn(tokens, 4, generator=g, device=DEVICE)) + 1e-6
+
+
+@pytest.mark.parametrize("tokens", SERVING_TOKENS)
+def test_post_bits_match_tile_kernels(mhc, tokens):
+    x, residual, post, comb = _post_inputs(tokens, seed=500 + tokens)
+    _assert_bits_equal(
+        mhc.post(x, residual, post, comb), _tk_post(x, residual, post, comb)
+    )
+
+
+@pytest.mark.parametrize("tokens", SERVING_TOKENS)
+def test_collapse_bits_match_tile_kernels(mhc, tokens):
+    """The weighted collapse and the mean; columns whose streams are all negative
+    zeros collapse to positive zero, as TileKernels' do."""
+    _, state, _, _ = _post_inputs(tokens, seed=600 + tokens)
+    mix = _pre_mix(tokens, seed=700 + tokens)
+    _assert_bits_equal(mhc.collapse(state, mix), _tk_collapse(state, mix), "mix: ")
+    quarter = torch.full((tokens, 4), 0.25, device=DEVICE)
+    _assert_bits_equal(mhc.collapse(state), _tk_collapse(state, quarter), "mean: ")
+    assert (_bits(mhc.collapse(state, mix)[:, :8]) == 0).all()
+
+
+@pytest.mark.parametrize("world", [2, 3, 4])
+@pytest.mark.parametrize("tokens", [1, 6, 96, 2048])
+def test_post_of_rank_order_parts_matches_tile_kernels(mhc, world, tokens):
+    """The ranks' unreduced partials are summed in rank order first (RankOrderParts),
+    then folded: TileKernels' post of that sum, bit for bit."""
+    _, residual, post, comb = _post_inputs(tokens, seed=800 + tokens)
+    g = torch.Generator(device=DEVICE).manual_seed(world * 1000 + tokens)
+    parts = torch.randn(
+        world, tokens, HIDDEN, generator=g, device=DEVICE, dtype=torch.bfloat16
+    )
+    parts[0, 0, :8] = -0.0  # a signed zero, added to nothing, survives
+    summed = RankOrderParts(parts).sum()
+    _assert_bits_equal(
+        mhc.post(RankOrderParts(parts), residual, post, comb),
+        _tk_post(summed, residual, post, comb),
+    )
+
+
+def _bf16(values, shape):
+    return torch.tensor(values, device=DEVICE).bfloat16().expand(shape).clone()
+
+
+def test_post_order_of_operations(mhc):
+    """Inputs on which another order of the terms, another fused product or another
+    starting value gives other bits. TileKernels' arithmetic per element:
+    ``p = post[n] * x`` rounded to FP32, then ``p = fma(comb[m, n], residual[m], p)``
+    for m = 0..3, then one rounding to BF16. The port gives those bits."""
+    big, eps = 2.0**127, 2.0**-23
+    x = torch.zeros(3, HIDDEN, dtype=torch.bfloat16, device=DEVICE)
+    residual = torch.zeros(3, 4, HIDDEN, dtype=torch.bfloat16, device=DEVICE)
+    post = torch.zeros(3, 4, device=DEVICE)
+    comb = torch.zeros(3, 4, 4, device=DEVICE)
+    # Token 0, output 0: big + big overflows before -big is added; stream 1 first
+    # would leave big.
+    x[0], residual[0, 0], residual[0, 1] = big, big, -big
+    post[0, 0], comb[0, 0, 0], comb[0, 1, 0] = 1.0, 1.0, 1.0
+    # Token 1, output 0: (1 + eps)(1 + 2^-7) - (1 + 2^-7) is eps (1 + 2^-7) with the
+    # stream's product fused, eps had the product been rounded first.
+    x[1], residual[1, 0] = -(1 + 2.0**-7), 1 + 2.0**-7
+    post[1, 0], comb[1, 0, 0] = 1.0, 1 + eps
+    # Token 2: negative zeros from the first product on stay negative.
+    x[2], residual[2] = -0.0, -0.0
+    post[2], comb[2] = 1.0, 1.0
+    expected = torch.zeros(3, 4, HIDDEN, dtype=torch.bfloat16, device=DEVICE)
+    expected[0, 0] = INF
+    expected[1, 0] = eps * (1 + 2.0**-7)
+    expected[2] = -0.0
+    ours = mhc.post(x, residual, post, comb)
+    _assert_bits_equal(ours, _tk_post(x, residual, post, comb), "TileKernels: ")
+    _assert_bits_equal(ours, expected, "expected: ")
+
+
+def test_collapse_order_of_operations(mhc):
+    """TileKernels' collapse per element: ``s = +0``, then ``s = fma(mix[m],
+    state[m], s)`` for m = 0..3, then one rounding to BF16."""
+    big, eps = 2.0**127, 2.0**-23
+    state = torch.zeros(3, 4, HIDDEN, dtype=torch.bfloat16, device=DEVICE)
+    mix = torch.zeros(3, 4, device=DEVICE)
+    # Token 0: big + big overflows before -big is added.
+    state[0, 0], state[0, 1], state[0, 2] = big, big, -big
+    mix[0, :3] = 1.0
+    # Token 1: the second stream's product fused with the first.
+    state[1, 0], state[1, 1] = -(1 + 2.0**-7), 1 + 2.0**-7
+    mix[1, 0], mix[1, 1] = 1.0, 1 + eps
+    # Token 2: four negative-zero products added to the positive zero start.
+    state[2] = -0.0
+    mix[2] = 0.25
+    expected = torch.zeros(3, HIDDEN, dtype=torch.bfloat16, device=DEVICE)
+    expected[0] = INF
+    expected[1] = eps * (1 + 2.0**-7)
+    ours = mhc.collapse(state, mix)
+    _assert_bits_equal(ours, _tk_collapse(state, mix), "TileKernels: ")
+    _assert_bits_equal(ours, expected, "expected: ")
+
+
+def test_post_matches_the_fused_entry(mhc):
+    """The standalone post and a sublayer entry's fused post write the same
+    streams, bit for bit."""
+    for tokens in (1, 96, 300):
+        residual, fn, scale, base, weight, incoming = _inputs(tokens, seed=900 + tokens)
+        x, _, post, comb = _post_inputs(tokens, seed=950 + tokens)
+        fused = mhc.post_pre(x, residual, post, comb, fn, scale, base, weight, incoming)
+        _assert_bits_equal(mhc.post(x, residual, post, comb), fused[0], f"{tokens}: ")
+
+
+def test_post_and_collapse_rows_independent_of_batch(mhc):
+    x, residual, post, comb = _post_inputs(384, seed=31)
+    mix = _pre_mix(384, seed=32)
+    full_post = mhc.post(x, residual, post, comb)
+    full_collapse = mhc.collapse(residual, mix)
+    for rows in (slice(0, 1), slice(0, 6), slice(0, 96), slice(0, 97), slice(200, 201)):
+        _assert_bits_equal(
+            mhc.post(x[rows], residual[rows], post[rows], comb[rows]),
+            full_post[rows],
+            f"post {rows}: ",
+        )
+        _assert_bits_equal(
+            mhc.collapse(residual[rows], mix[rows]),
+            full_collapse[rows],
+            f"collapse {rows}: ",
+        )
+
+
+def test_post_and_collapse_repeatable(mhc):
+    x, residual, post, comb = _post_inputs(2048, seed=41)
+    mix = _pre_mix(2048, seed=42)
+    first_post = mhc.post(x, residual, post, comb)
+    first_collapse = mhc.collapse(residual, mix)
+    for _ in range(3):
+        _assert_bits_equal(mhc.post(x, residual, post, comb), first_post)
+        _assert_bits_equal(mhc.collapse(residual, mix), first_collapse)
+
+
+def test_post_nonfinite_like_tile_kernels(mhc):
+    """NaNs and infinities in any operand reach exactly TileKernels' outputs, with
+    its bits; no other token moves."""
+    tokens = 33
+    x, residual, post, comb = _post_inputs(tokens, seed=51)
+    clean = mhc.post(x, residual, post, comb)
+    x[2, 100] = NAN
+    residual[5, 1, 7] = INF
+    residual[9, 0, 300], residual[9, 3, 300] = INF, -INF  # inf - inf
+    post[12, 2] = NAN
+    comb[17, 3, 1] = -INF
+    residual[20, 2, 4000], comb[20, 2] = INF, 0.0  # inf * 0
+    x[25, 4500] = -INF
+    poisoned = [2, 5, 9, 12, 17, 20, 25]
+    ours = mhc.post(x, residual, post, comb)
+    theirs = _tk_post(x, residual, post, comb)
+    assert_same_nonfinite(ours, theirs)
+    _assert_bits_equal(ours, theirs)
+    assert_other_rows_equal(ours, clean, poisoned)
+
+
+def test_collapse_nonfinite_like_tile_kernels(mhc):
+    tokens = 33
+    _, state, _, _ = _post_inputs(tokens, seed=61)
+    mix = _pre_mix(tokens, seed=62)
+    clean = mhc.collapse(state, mix)
+    state[3, 0, 11] = NAN
+    state[8, 2, 2048] = INF
+    state[14, 1, 77], state[14, 3, 77] = INF, -INF  # inf - inf
+    mix[19, 1] = NAN
+    state[23, 2, 5000], mix[23, 2] = -INF, 0.0  # inf * 0
+    mix[29, 0] = INF
+    poisoned = [3, 8, 14, 19, 23, 29]
+    ours = mhc.collapse(state, mix)
+    theirs = _tk_collapse(state, mix)
+    assert_same_nonfinite(ours, theirs)
+    _assert_bits_equal(ours, theirs)
+    assert_other_rows_equal(ours, clean, poisoned)
+    assert_rows_nan(ours, [19])
+
+
+def test_no_tokens_launch_nothing(mhc):
+    x, residual, post, comb = _post_inputs(0, seed=0)
+    assert mhc.post(x, residual, post, comb).shape == (0, 4, HIDDEN)
+    assert mhc.collapse(residual).shape == (0, HIDDEN)
+
+
+def test_declared_calls_are_the_forwards(mhc, monkeypatch):
+    """The post and the collapse are declared exactly as the forward launches them,
+    and nothing is left to warm: TileKernels' kernels no longer run."""
+    registry = JitWarmupRegistry(vllm_config=None)
+    with registry.activate():
+        mhc.declare_kernels()
+    declared = prepare.declared_calls(registry)
+    assert prepare.warm_declared(registry) == 0
+    ours = [call for call in declared if call[0] in (post_streams, collapse_streams)]
+    assert ours == [(post_streams, (HIDDEN,), {}), (collapse_streams, (HIDDEN,), {})]
+
+    # The forward's calls, recorded as its cached lookups make them.
+    launched = []
+    for name in ("post_streams", "collapse_streams"):
+        factory = getattr(mhc_module, name)
+
+        def record(*args, _factory=factory, **kwargs):
+            launched.append((_factory, args, kwargs))
+            return _factory(*args, **kwargs)
+
+        monkeypatch.setattr(mhc_module, name, record)
+    for name in ("_post", "_collapse"):
+        lookup = getattr(mhc_module, name)
+        monkeypatch.setattr(mhc_module, name, functools.cache(lookup.__wrapped__))
+    x, residual, post, comb = _post_inputs(6, seed=71)
+    mhc.post(x, residual, post, comb)
+    mhc.post(RankOrderParts(torch.stack((x, x))), residual, post, comb)
+    mhc.collapse(residual, _pre_mix(6, seed=72))
+    mhc.collapse(residual)
+    assert sorted(launched, key=lambda call: call[0].__name__) == sorted(
+        ours, key=lambda call: call[0].__name__
+    )
