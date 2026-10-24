@@ -5,17 +5,19 @@
 ``streams`` ([T, hc_mult, hidden], BF16) are a layer's folded hyper-connection
 streams, ``direction`` ([hidden], FP32) the layer's unit row (zero for a layer the
 file does not steer) and ``alpha`` ([1], FP32) a buffer, so a file's contents never
-change the traced graph. One block projects one stream of one token: each of its
-threads loads eight values of the stream once (640 threads cover the model's 5,120),
-widens them to FP32, and the block reduces ``h . d`` in a fixed order (each thread's
-values in sequence, then the warp's lanes, then the warps) before every thread writes
-``bf16(h - (alpha (h . d)) d)``. With the row spread that wide a thread holds sixteen
-values, so more rows are in flight at once: at 8K and 16K-token prefill chunks it is
-2.0-2.5% faster than the compiled torch projection, where 128 threads a row (five loads
-a thread) were 1.2-1.4% slower (experiments/2026-10-23-next-release, glp-variants). No row depends on another, so a token's result
-does not depend on what else the step carries. Alpha zero and a zero direction
-return the stream unchanged; a non-finite value in a stream reaches its whole row,
-as it does through ``h @ d``.
+change the traced graph. One block projects one stream of one token: its 320
+threads each load sixteen values of the stream in two loads of eight, widen them to
+FP32, and the block reduces ``h . d`` in a fixed order (each thread's values in
+sequence, then the warp's lanes, then the warps) before every thread writes
+``bf16(h - (alpha (h . d)) d)``. One shape for every batch, so a row's reduction order
+never depends on what else the step carries. Of ten variants measured against the
+compiled torch projection (experiments/2026-10-23-next-release, glp-variants), 320
+threads is faster at every serving shape: one stream 2.2 against 2.6 us, sixteen
+streams 6.9 against 7.9 us, a 16K-token prefill chunk -1.3%. 640 threads was faster on
+prefill but only level at sixteen streams, and slower there in the next run; 128 threads
+(0261) was slower on prefill. Alpha zero and a zero direction return the stream
+unchanged; a non-finite value in a stream reaches its whole row, as it does through
+``h @ d``.
 """
 
 # No `from __future__ import annotations`: TileLang reads the prim_func
@@ -30,7 +32,7 @@ from vllm.models.deepseek_v4_1.tilelang import prepare
 
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
-def glp_project_kernel(hc_mult: int, hidden: int, threads: int = 640, vec: int = 8):
+def glp_project_kernel(hc_mult: int, hidden: int, threads: int = 320, vec: int = 8):
     assert hidden % (threads * vec) == 0 and threads % 32 == 0
     chunks = hidden // (threads * vec)
     warps = threads // 32
