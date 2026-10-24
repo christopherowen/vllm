@@ -653,13 +653,14 @@ def prepare_pos_seq_lens_kernel(idx_dtype: str):
     return prepare_pos_seq_lens
 
 
-# The dead-row survival takes logf of the drafts' confidences. Triton links
-# libdevice with flush-to-zero selected (nvvm-reflect-ftz), so its __nv_logf takes
-# the FTZ path; nvcc selects the same path with -ftz=true.
-_FTZ_PASS = {**_PASS, tilelang.PassConfigKey.TL_DEVICE_COMPILE_FLAGS: ["-ftz=true"]}
-
-
-@tilelang.jit(pass_configs=_FTZ_PASS)
+# The dead-row survival takes logf of the drafts' confidences under nvcc's default
+# (non-flush-to-zero) flags: the same libdevice logf, instruction for instruction,
+# as Triton's PTX for this kernel (sm_121a, Triton 3.5), subnormal inputs scaled
+# by 2^23 before the reduction alike. Triton's polynomial FMAs carry .ftz, nvcc's
+# do not; no operand or result of those FMAs is subnormal for any float32 input,
+# so the bits agree. -ftz=true would flush subnormal confidences to zero (-inf
+# where Triton gives a finite log).
+@tilelang.jit(pass_configs=_PASS)
 def combine_sampled_and_draft_tokens_kernel(
     block: int, num_new: int, dead_rows: bool, idx_dtype: str
 ):
