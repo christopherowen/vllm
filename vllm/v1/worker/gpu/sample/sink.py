@@ -476,7 +476,9 @@ class SinkSampler:
             self.num_candidates,
             mask_rejected_draft,
         )
-        return self._merge(values, indices, num_sampled, sampled)
+        return tilelang_sampling.sink_merge(
+            values, indices, sampled, num_sampled, self.num_alternates
+        )
 
     def alternates_of_greedy_shards(
         self,
@@ -492,39 +494,25 @@ class SinkSampler:
         shards: each rank's top candidates of the last sampled rows, gathered
         (as ``(value, index)`` floats, exact for any vocabulary index) and
         merged identically on every rank."""
-        num_reqs = num_sampled.shape[0]
-        rows = cu_num_logits[:num_reqs].to(torch.int64) + (
-            num_sampled.to(torch.int64) - 1
-        ).clamp(min=0)
-        local = local_logits[rows, :vocab_cols].float()
-        values, indices = local.topk(self.num_candidates, dim=-1)
-        values = values.masked_fill(values.isnan(), float("-inf"))
-        packed = torch.cat([values, (indices + vocab_start).float()], dim=1)
+        from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+        packed = tilelang_sampling.sink_shard_top(
+            local_logits,
+            cu_num_logits,
+            num_sampled,
+            vocab_start,
+            vocab_cols,
+            self.num_candidates,
+        )
         if tp_size > 1:
             packed = tensor_model_parallel_all_gather(packed, dim=-1)
-        packed = packed.view(num_reqs, tp_size, 2, self.num_candidates)
-        values = packed[:, :, 0].reshape(num_reqs, -1).contiguous()
-        indices = packed[:, :, 1].reshape(num_reqs, -1).to(torch.int64)
-        return self._merge(values, indices, num_sampled, sampled)
-
-    def _merge(
-        self,
-        values: torch.Tensor,
-        indices: torch.Tensor,
-        num_sampled: torch.Tensor,
-        sampled: torch.Tensor,
-    ) -> torch.Tensor:
-        """The best candidates after each request's last sampled token, ties
-        to the lower token as in the samplers' argmax (candidates come in
-        vocabulary order). The sampled token and NaN scores are no alternates;
-        impossible tokens (-inf) become -1."""
-        last = (num_sampled.long() - 1).clamp(min=0)[:, None]
-        excluded = (indices == sampled.gather(1, last)) | values.isnan()
-        values = values.masked_fill(excluded, float("-inf"))
-        values, order = values.sort(dim=1, descending=True, stable=True)
-        alternates = indices.gather(1, order[:, : self.num_alternates])
-        return alternates.masked_fill(
-            values[:, : self.num_alternates] == float("-inf"), -1
+        return tilelang_sampling.sink_merge(
+            packed,
+            None,
+            sampled,
+            num_sampled,
+            self.num_alternates,
+            self.num_candidates,
         )
 
     def alternate_logprobs_of(

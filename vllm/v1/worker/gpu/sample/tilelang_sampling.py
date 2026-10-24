@@ -805,6 +805,288 @@ def sink_restore(
         )  # fmt: skip
 
 
+_SINK_TOP_THREADS = 256
+_SINK_MERGE_THREADS = 128
+_NO_INDEX = 2147483647  # an empty slot: past every column, so any column ranks above it
+
+
+@T.macro
+def _ranks_above(value, index, other, other_index, take):
+    """``take[0]``: ``(other, other_index)`` ranks above ``(value, index)``. NaN ranks
+    above everything (as in ``torch.topk``), then the larger value, then the lower
+    index."""
+    nan = T.isnan(value)
+    other_nan = T.isnan(other)
+    take[0] = T.if_then_else(
+        other_nan != nan,
+        other_nan,
+        T.if_then_else(
+            nan,
+            other_index < index,
+            (other > value) | ((other == value) & (other_index < index)),
+        ),
+    )
+
+
+@T.macro
+def _exchange_best(best, best_index, take, distance):
+    """Take the lane at XOR ``distance``'s ``(best, best_index)`` if it ranks above."""
+    other = T.shfl_xor(best[0], distance)
+    other_index = T.shfl_xor(best_index[0], distance)
+    _ranks_above(best[0], best_index[0], other, other_index, take)
+    best[0] = T.if_then_else(take[0], other, best[0])
+    best_index[0] = T.if_then_else(take[0], other_index, best_index[0])
+
+
+@T.macro
+def _block_best(best, best_index, take, partial, partial_index, tx, threads):
+    """Every thread's ``(best[0], best_index[0])`` becomes the block's best
+    (``_ranks_above``' order): warp shuffles, then the warps' bests."""
+    _exchange_best(best, best_index, take, 16)
+    _exchange_best(best, best_index, take, 8)
+    _exchange_best(best, best_index, take, 4)
+    _exchange_best(best, best_index, take, 2)
+    _exchange_best(best, best_index, take, 1)
+    if tx % 32 == 0:
+        partial[tx // 32] = best[0]
+        partial_index[tx // 32] = best_index[0]
+    T.sync_threads()
+    best[0] = partial[0]
+    best_index[0] = partial_index[0]
+    for w in T.unroll(1, threads // 32):
+        _ranks_above(best[0], best_index[0], partial[w], partial_index[w], take)
+        best[0] = T.if_then_else(take[0], partial[w], best[0])
+        best_index[0] = T.if_then_else(take[0], partial_index[w], best_index[0])
+    T.sync_threads()
+
+
+@tilelang.jit(pass_configs=_PASS)
+def sink_shard_top_kernel(logits_dtype: str, k: int):
+    """The candidates of ``SinkSampler.alternates_of_greedy_shards`` on this rank, a
+    block a request: the ``k`` best columns (``_ranks_above``: NaN first as in
+    ``torch.topk``, then by value, ties to the lower column, which is the full-logits
+    path's order) of the request's last sampled row of the vocabulary shard, written
+    as the packed row the ranks gather: ``k`` values (NaN as -inf), then the ``k``
+    vocabulary indices as floats (exact for any vocabulary)."""
+    rows, cols, logits_stride, cu_len, num_reqs = T.dynamic(
+        "rows, cols, logits_stride, cu_len, num_reqs"
+    )
+    threads = _SINK_TOP_THREADS
+
+    @T.prim_func
+    def sink_shard_top(
+        logits: T.StridedTensor((rows, cols), (logits_stride, 1), logits_dtype),
+        cu_num_logits: T.Tensor((cu_len,), T.int32),
+        num_sampled: T.Tensor((num_reqs,), T.int32),
+        packed: T.Tensor((num_reqs, 2 * k), T.float32),
+        vocab_cols: T.int32,
+        vocab_start: T.int64,
+    ):
+        with T.Kernel(num_reqs, threads=threads) as req:
+            tx = T.get_thread_binding()
+            values = T.alloc_local((k,), T.float32)
+            indices = T.alloc_local((k,), T.int32)
+            take = T.alloc_local((1,), T.bool)
+            best = T.alloc_local((1,), T.float32)
+            best_index = T.alloc_local((1,), T.int32)
+            partial = T.alloc_shared((threads // 32,), T.float32)
+            partial_index = T.alloc_shared((threads // 32,), T.int32)
+            head = T.alloc_var(T.int32, init=0)
+            row = T.alloc_var(
+                T.int64,
+                init=T.cast(cu_num_logits[req], T.int64)
+                + T.cast(T.max(num_sampled[req] - 1, 0), T.int64),
+            )
+            for j in T.unroll(k):
+                values[j] = -T.infinity(T.float32)
+                indices[j] = _NO_INDEX
+            # Each thread's own k best, in rank order.
+            for step in T.serial(T.ceildiv(vocab_cols, threads)):
+                col = step * threads + tx
+                if col < vocab_cols:
+                    value = T.alloc_var(
+                        T.float32, init=T.cast(logits[row, col], T.float32)
+                    )
+                    _ranks_above(values[k - 1], indices[k - 1], value, col, take)
+                    if take[0]:
+                        placed = T.alloc_var(T.int32, init=0)
+                        for t in T.unroll(k - 1):
+                            if placed == 0:
+                                _ranks_above(
+                                    values[k - 2 - t],
+                                    indices[k - 2 - t],
+                                    value,
+                                    col,
+                                    take,
+                                )
+                                if take[0]:
+                                    values[k - 1 - t] = values[k - 2 - t]
+                                    indices[k - 1 - t] = indices[k - 2 - t]
+                                else:
+                                    values[k - 1 - t] = value
+                                    indices[k - 1 - t] = col
+                                    placed = 1
+                        if placed == 0:
+                            values[0] = value
+                            indices[0] = col
+            # The block's k best: each round the best of the threads' next ones.
+            for rank in T.unroll(k):
+                best[0] = T.if_then_else(
+                    head < k, values[T.min(head, k - 1)], -T.infinity(T.float32)
+                )
+                best_index[0] = T.if_then_else(
+                    head < k, indices[T.min(head, k - 1)], _NO_INDEX
+                )
+                _block_best(best, best_index, take, partial, partial_index, tx, threads)
+                if (head < k) & (indices[T.min(head, k - 1)] == best_index[0]):
+                    head = head + 1
+                if tx == 0:
+                    packed[req, rank] = T.if_then_else(
+                        T.isnan(best[0]), -T.infinity(T.float32), best[0]
+                    )
+                    packed[req, k + rank] = T.cast(
+                        T.cast(best_index[0], T.int64) + vocab_start, T.float32
+                    )
+
+    return sink_shard_top
+
+
+@tilelang.jit(pass_configs=_PASS)
+def sink_merge_kernel(packed: bool, k: int, num_alternates: int):
+    """``SinkSampler._merge``, a block a request: the candidates (``packed``: the
+    ranks' gathered rows of ``k`` values then ``k`` indices; else values and indices
+    tensors) with the request's last sampled token and NaN scores excluded, the
+    ``num_alternates`` best in a stable descending sort of the values (equal values in
+    candidate order), and -1 where the value is -inf."""
+    num_reqs, width, sampled_width, sampled_stride = T.dynamic(
+        "num_reqs, width, sampled_width, sampled_stride"
+    )
+    index_rows, index_width, index_stride = T.dynamic(
+        "index_rows, index_width, index_stride"
+    )
+    threads = _SINK_MERGE_THREADS
+
+    @T.prim_func
+    def sink_merge(
+        values: T.Tensor((num_reqs, width), T.float32),
+        indices: T.StridedTensor((index_rows, index_width), (index_stride, 1), T.int64),
+        sampled: T.StridedTensor(
+            (num_reqs, sampled_width), (sampled_stride, 1), T.int64
+        ),
+        num_sampled: T.Tensor((num_reqs,), T.int32),
+        alternates: T.Tensor((num_reqs, num_alternates), T.int64),
+    ):
+        with T.Kernel(num_reqs, threads=threads) as req:
+            tx = T.get_thread_binding()
+            take = T.alloc_local((1,), T.bool)
+            best = T.alloc_local((1,), T.float32)
+            best_index = T.alloc_local((1,), T.int32)
+            partial = T.alloc_shared((threads // 32,), T.float32)
+            partial_index = T.alloc_shared((threads // 32,), T.int32)
+            picked = T.alloc_shared((num_alternates,), T.int32)
+            last = T.alloc_var(
+                T.int64, init=sampled[req, T.max(num_sampled[req] - 1, 0)]
+            )
+            # A stable descending sort's first entries, one selection a round: the
+            # largest value, ties to the earlier candidate (NaN is excluded, so
+            # _ranks_above's order is the sort's).
+            for rank in T.unroll(num_alternates):
+                best[0] = -T.infinity(T.float32)
+                best_index[0] = _NO_INDEX
+                for step in T.serial(T.ceildiv(width, threads)):
+                    j = step * threads + tx
+                    if j < width:
+                        if packed:
+                            value = values[req, (j // k) * 2 * k + j % k]
+                            index = T.cast(
+                                values[req, (j // k) * 2 * k + k + j % k], T.int64
+                            )
+                        else:
+                            value = values[req, j]
+                            index = indices[req, j]
+                        free = T.alloc_var(T.int32, init=1)
+                        for r in T.serial(rank):
+                            free = free & T.cast(picked[r] != j, T.int32)
+                        score = T.if_then_else(
+                            (index == last) | T.isnan(value),
+                            -T.infinity(T.float32),
+                            value,
+                        )
+                        if free != 0:
+                            _ranks_above(best[0], best_index[0], score, j, take)
+                            if take[0]:
+                                best[0] = score
+                                best_index[0] = j
+                _block_best(best, best_index, take, partial, partial_index, tx, threads)
+                if tx == 0:
+                    picked[rank] = best_index[0]
+                    if packed:
+                        chosen = T.cast(
+                            values[
+                                req,
+                                (best_index[0] // k) * 2 * k + k + best_index[0] % k,
+                            ],
+                            T.int64,
+                        )
+                    else:
+                        chosen = indices[req, best_index[0]]
+                    alternates[req, rank] = T.if_then_else(
+                        best[0] == -T.infinity(T.float32), T.int64(-1), chosen
+                    )
+                T.sync_threads()
+
+    return sink_merge
+
+
+def sink_shard_top(
+    local_logits: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    num_sampled: torch.Tensor,
+    vocab_start: int,
+    vocab_cols: int,
+    k: int,
+) -> torch.Tensor:
+    """``alternates_of_greedy_shards``' packed candidates of this rank:
+    ``[num_reqs, 2 * k]`` FP32, the values then the vocabulary indices."""
+    num_reqs = num_sampled.shape[0]
+    packed = torch.empty(
+        (num_reqs, 2 * k), dtype=torch.float32, device=local_logits.device
+    )
+    if num_reqs:
+        _kernel(sink_shard_top_kernel, _DTYPES[local_logits.dtype], k)(
+            local_logits, cu_num_logits, num_sampled, packed, vocab_cols, vocab_start
+        )
+    return packed
+
+
+def sink_merge(
+    values: torch.Tensor,
+    indices: torch.Tensor | None,
+    sampled: torch.Tensor,
+    num_sampled: torch.Tensor,
+    num_alternates: int,
+    k: int = 0,
+) -> torch.Tensor:
+    """``SinkSampler._merge``' launch: ``[num_reqs, num_alternates]`` int64. With
+    ``indices`` None, ``values`` is the ranks' gathered packed rows of ``k``
+    candidates each."""
+    num_reqs = values.shape[0]
+    alternates = torch.empty(
+        (num_reqs, num_alternates), dtype=torch.int64, device=values.device
+    )
+    if num_reqs and num_alternates:
+        packed = indices is None
+        # Packed rows carry their indices: ``sampled`` stands in, never read.
+        _kernel(sink_merge_kernel, packed, k if packed else 0, num_alternates)(
+            values,
+            sampled if packed else indices,
+            sampled,
+            num_sampled,
+            alternates,
+        )
+    return alternates
+
+
 SINK_CANDIDATE_BLOCK = 1024
 
 
@@ -2064,11 +2346,22 @@ def sink_calls(
     calls = [_call(sink_flags_kernel, dead_rows) for dead_rows in (False, True)]
     if rejection:
         # The cut and its restore, on raw and processed logits and on a rank's
-        # vocabulary shard (FP32), with the runner's int32 input ids as drafts.
+        # vocabulary shard (FP32), with the runner's int32 input ids as drafts; a
+        # greedy step's shard candidates; the merge of gathered shard candidates and
+        # of the sampled path's.
+        shard_dtypes = dict.fromkeys([*logits_dtypes, torch.float32])
         calls += [
             _call(sink_cut_kernel, _DTYPES[dtype], "int32", restore)
-            for dtype in dict.fromkeys([*logits_dtypes, torch.float32])
+            for dtype in shard_dtypes
             for restore in (False, True)
+        ]
+        calls += [
+            _call(sink_shard_top_kernel, _DTYPES[dtype], num_alternates + 1)
+            for dtype in shard_dtypes
+        ]
+        calls += [
+            _call(sink_merge_kernel, True, num_alternates + 1, num_alternates),
+            _call(sink_merge_kernel, False, 0, num_alternates),
         ]
     calls += [
         _call(

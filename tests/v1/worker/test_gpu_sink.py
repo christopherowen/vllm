@@ -288,6 +288,83 @@ def test_cut_masks_sunk_drafts_and_restores_the_logits():
     assert (shard == float("-inf")).nonzero().tolist() == [[1, 12], [3, 21]]
 
 
+def _torch_merge(values, indices, num_sampled, sampled, num_alternates):
+    """SinkSampler's merge as it was computed in torch (the TileLang kernel's
+    reference)."""
+    last = (num_sampled.long() - 1).clamp(min=0)[:, None]
+    excluded = (indices == sampled.gather(1, last)) | values.isnan()
+    values = values.masked_fill(excluded, float("-inf"))
+    values, order = values.sort(dim=1, descending=True, stable=True)
+    alternates = indices.gather(1, order[:, :num_alternates])
+    return alternates.masked_fill(values[:, :num_alternates] == float("-inf"), -1)
+
+
+def test_merge_matches_the_torch_reference():
+    """Random candidates with repeated values (the stable sort keeps their order),
+    -inf, NaN and the sampled token among them."""
+    from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+    gen = torch.Generator(device=DEVICE).manual_seed(53)
+    num_reqs, width = 7, 508
+    values = torch.randint(
+        -4, 4, (num_reqs, width), generator=gen, device=DEVICE
+    ).float()
+    values[:, ::9] = float("-inf")
+    values[:, 3::31] = float("nan")
+    indices = torch.randperm(4 * width, generator=gen, device=DEVICE)[:width]
+    indices = indices.repeat(num_reqs, 1)
+    sampled = indices[:, :3].flip(1).contiguous()
+    num_sampled = torch.tensor([1, 2, 3, 1, 2, 3, 0], dtype=torch.int32, device=DEVICE)
+    values[6] = float("-inf")
+    values[6, 5] = 1.0
+    got = tilelang_sampling.sink_merge(values, indices, sampled, num_sampled, 3)
+    assert torch.equal(got, _torch_merge(values, indices, num_sampled, sampled, 3))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_shard_candidates_are_the_rows_best_columns(dtype):
+    """Each request's last sampled row's k best columns of a shard, packed with the
+    vocabulary indices: a stable descending sort's first k (NaN first, as torch's sort
+    and topk put it; equal values by column). On FP32 rows without ties that is
+    torch.topk's answer too."""
+    from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+    gen = torch.Generator(device=DEVICE).manual_seed(61)
+    cols, k, start = 32320, 4, 32320
+    counts = [3, 1, 6, 2]
+    num_logits = sum(counts)
+    logits = (torch.randn(num_logits, cols, generator=gen, device=DEVICE) * 4).to(dtype)
+    logits[1, 7] = float("nan")
+    num_sampled = torch.tensor([3, 1, 4, 2], dtype=torch.int32, device=DEVICE)
+    cu = _cu(counts)
+    packed = tilelang_sampling.sink_shard_top(logits, cu, num_sampled, start, cols, k)
+    rows = cu[:-1].long() + (num_sampled.long() - 1).clamp(min=0)
+    values, order = logits[rows].float().sort(dim=-1, descending=True, stable=True)
+    values = values[:, :k].masked_fill(values[:, :k].isnan(), float("-inf"))
+    assert torch.equal(packed[:, :k], values)
+    assert torch.equal(packed[:, k:], (order[:, :k] + start).float())
+    if dtype == torch.float32:
+        top, indices = logits[rows].topk(k, dim=-1)
+        assert torch.equal(packed[:, k:], (indices + start).float())
+
+
+def test_shard_candidate_ties_go_to_the_lower_column():
+    """Equal values rank by column, as the full-logits path orders them."""
+    from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+    logits = torch.zeros(1, 4096, device=DEVICE)
+    logits[0, [3000, 17, 2048, 900]] = 5.0
+    packed = tilelang_sampling.sink_shard_top(
+        logits,
+        _cu([1]),
+        torch.ones(1, dtype=torch.int32, device=DEVICE),
+        0,
+        4096,
+        3,
+    )
+    assert packed[0, 3:].tolist() == [17.0, 900.0, 2048.0]
+
+
 def test_greedy_shards_match_the_full_logits():
     """Greedy verification from vocabulary shards (one rank here) gives the
     same tokens and alternates as the full logits."""
