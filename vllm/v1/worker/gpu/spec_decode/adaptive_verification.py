@@ -16,6 +16,7 @@ from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.utils import CpuGpuBuffer
+from vllm.v1.worker.gpu import tilelang_inputs
 from vllm.v1.worker.gpu.async_utils import stream
 from vllm.v1.worker.gpu.attn_utils import (
     get_attn_cg_support,
@@ -406,9 +407,7 @@ class AdaptiveVerificationManager:
         # capacities enters holding each request's valid draft count (the kernel
         # uses it to bound eligible slots) and leaves holding the admitted count.
         capacities = self._batch_draft_capacity[:num_reqs]
-        if draft_budget == 0:
-            capacities.zero_()
-        else:
+        if draft_budget:
             async_tensor_h2d(scheduled_drafts, out=capacities)
             if draft_budget < int(scheduled_drafts.sum()):
                 _assign_draft_token_budget(
@@ -421,19 +420,17 @@ class AdaptiveVerificationManager:
 
         num_non_draft_tokens_gpu = self._num_non_draft_tokens[:num_reqs]
         async_tensor_h2d(num_non_draft_tokens, out=num_non_draft_tokens_gpu)
-        self._cu_num_logits[:1].zero_()
-        torch.cumsum(
-            capacities + self.num_bonus_tokens,
-            dim=0,
-            out=self._cu_num_logits[1 : num_reqs + 1],
+        # Both prefix sums and query_start_loc's tail in one kernel, which zeroes
+        # capacities on a step without drafts.
+        tilelang_inputs.adaptive_offsets(
+            capacities,
+            num_non_draft_tokens_gpu,
+            self._cu_num_logits,
+            self.query_start_loc,
+            self.num_bonus_tokens,
+            num_tokens,
+            drafted=draft_budget > 0,
         )
-        self.query_start_loc[:1].zero_()
-        torch.cumsum(
-            capacities + num_non_draft_tokens_gpu,
-            dim=0,
-            out=self.query_start_loc[1 : num_reqs + 1],
-        )
-        self.query_start_loc[num_reqs + 1 :].fill_(num_tokens)
         return (
             self._cu_num_logits[: num_reqs + 1],
             self.query_start_loc,

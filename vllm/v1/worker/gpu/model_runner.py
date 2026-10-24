@@ -2116,6 +2116,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             + ((self.num_speculative_steps + 1,) if self.num_speculative_steps else ()),
             commits=commits,
         )
+        if self.adaptive_verification is not None:
+            from vllm.v1.worker.gpu import tilelang_inputs
+
+            tilelang_inputs.declare(tilelang_inputs.adaptive_offsets_calls)
         self.req_states.register_warmups()
         if not samples:
             return

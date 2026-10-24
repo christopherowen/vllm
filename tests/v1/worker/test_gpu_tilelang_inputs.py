@@ -653,6 +653,53 @@ def test_expand_idx_mapping(num_reqs, idx_dtype):
     assert torch.equal(ref_pos, ours_pos)
 
 
+def _adaptive_offsets_ref(capacities, non_draft, cu, starts, bonus, tokens, drafted):
+    """reallocate_drafts' torch chain before the port."""
+    num_reqs = capacities.shape[0]
+    if not drafted:
+        capacities.zero_()
+    cu[:1].zero_()
+    torch.cumsum(capacities + bonus, dim=0, out=cu[1 : num_reqs + 1])
+    starts[:1].zero_()
+    torch.cumsum(capacities + non_draft, dim=0, out=starts[1 : num_reqs + 1])
+    starts[num_reqs + 1 :].fill_(tokens)
+
+
+# The batch's request counts, and counts at and across the scan's 256-request passes.
+@pytest.mark.parametrize("num_reqs", REQUEST_COUNTS[1:] + (255, 256, 257, 600))
+@pytest.mark.parametrize("drafted", [True, False])
+def test_adaptive_offsets(num_reqs, drafted):
+    """reallocate_drafts' offsets: both prefix sums, query_start_loc's tail and, on a
+    step without drafts, the zeroed capacities, in buffers longer than the batch."""
+    gen = _gen(num_reqs + 17)
+    size = num_reqs + 7
+    capacities = _randint(0, DRAFTS + 1, (size,), gen)
+    non_draft = _randint(0, MAX_TOKENS, (size,), gen)
+    cu = _garbage((size + 1,), torch.int32, gen)
+    starts = _garbage((size + 1,), torch.int32, gen)
+    bonus, tokens = 1, int(_randint(0, 1 << 20, (1,), gen))
+    results = []
+    for kind in ("ref", "ours"):
+        buffers = [capacities.clone(), cu.clone(), starts.clone()]
+        args = (
+            buffers[0][:num_reqs],
+            non_draft[:num_reqs],
+            buffers[1],
+            buffers[2],
+            bonus,
+            tokens,
+            drafted,
+        )
+        if kind == "ref":
+            _adaptive_offsets_ref(*args)
+        else:
+            tli.adaptive_offsets(*args)
+        results.append(buffers)
+    torch.accelerator.synchronize()
+    for r, o in zip(*results):
+        assert torch.equal(r, o)
+
+
 def _post_update_case(num_reqs, width, gen, vocab=64):
     idx = _idx(num_reqs, gen)
     if num_reqs > 2:

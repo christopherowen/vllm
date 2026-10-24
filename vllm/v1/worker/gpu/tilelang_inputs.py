@@ -565,6 +565,120 @@ def zero_kv_blocks(
     )
 
 
+# --- Adaptive verification's offsets ------------------------------------------
+
+_SCAN = 256  # requests a pass of the offsets' scan
+
+
+@T.macro
+def _scan_step(a, b, tx, offset):
+    """One Hillis-Steele step of two inclusive scans in shared memory."""
+    left_a = T.alloc_var(T.int32, init=T.if_then_else(tx >= offset, a[tx - offset], 0))
+    left_b = T.alloc_var(T.int32, init=T.if_then_else(tx >= offset, b[tx - offset], 0))
+    T.sync_threads()
+    a[tx] = a[tx] + left_a
+    b[tx] = b[tx] + left_b
+    T.sync_threads()
+
+
+@tilelang.jit(pass_configs=_PASS)
+def adaptive_offsets_kernel():
+    """``AdaptiveVerificationManager.reallocate_drafts``' offsets in one block, the
+    torch chain's values: ``cu_num_logits = [0, cumsum(capacities + bonus)]``,
+    ``query_start_loc = [0, cumsum(capacities + non_draft)]``, and every later entry
+    of ``query_start_loc`` ``num_tokens``. A step without drafts (``drafted`` 0)
+    zeroes ``capacities`` first. The scans take 256 requests a pass, each pass
+    carrying the last one's totals."""
+    num_reqs, non_draft_len, cu_len, starts_len = T.dynamic(
+        "num_reqs, non_draft_len, cu_len, starts_len"
+    )
+
+    @T.prim_func
+    def adaptive_offsets(
+        capacities: T.Tensor((num_reqs,), T.int32),
+        non_draft: T.Tensor((non_draft_len,), T.int32),
+        cu_num_logits: T.Tensor((cu_len,), T.int32),
+        query_start_loc: T.Tensor((starts_len,), T.int32),
+        bonus: T.int32,
+        num_tokens: T.int32,
+        drafted: T.int32,
+    ):
+        with T.Kernel(1, threads=_SCAN):
+            tx = T.get_thread_binding()
+            a = T.alloc_shared((_SCAN,), T.int32)
+            b = T.alloc_shared((_SCAN,), T.int32)
+            carry_a = T.alloc_var(T.int32, init=0)
+            carry_b = T.alloc_var(T.int32, init=0)
+            if tx == 0:
+                cu_num_logits[0] = 0
+                query_start_loc[0] = 0
+            for chunk in T.serial(T.ceildiv(num_reqs, _SCAN)):
+                req = chunk * _SCAN + tx
+                inside = req < num_reqs
+                capacity = T.alloc_var(
+                    T.int32,
+                    init=T.if_then_else(
+                        inside & (drafted != 0),
+                        capacities[T.min(req, num_reqs - 1)],
+                        0,
+                    ),
+                )
+                if inside & (drafted == 0):
+                    capacities[req] = 0
+                a[tx] = T.if_then_else(inside, capacity + bonus, 0)
+                b[tx] = T.if_then_else(
+                    inside, capacity + non_draft[T.min(req, num_reqs - 1)], 0
+                )
+                T.sync_threads()
+                _scan_step(a, b, tx, 1)
+                _scan_step(a, b, tx, 2)
+                _scan_step(a, b, tx, 4)
+                _scan_step(a, b, tx, 8)
+                _scan_step(a, b, tx, 16)
+                _scan_step(a, b, tx, 32)
+                _scan_step(a, b, tx, 64)
+                _scan_step(a, b, tx, 128)
+                if inside:
+                    cu_num_logits[req + 1] = carry_a + a[tx]
+                    query_start_loc[req + 1] = carry_b + b[tx]
+                carry_a = carry_a + a[_SCAN - 1]
+                carry_b = carry_b + b[_SCAN - 1]
+                T.sync_threads()
+            for chunk in T.serial(T.ceildiv(starts_len, _SCAN)):
+                index = chunk * _SCAN + tx
+                if (index > num_reqs) & (index < starts_len):
+                    query_start_loc[index] = num_tokens
+
+    return adaptive_offsets
+
+
+def adaptive_offsets(
+    capacities: torch.Tensor,
+    non_draft: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    bonus: int,
+    num_tokens: int,
+    drafted: bool,
+) -> None:
+    """``reallocate_drafts``' launch: ``cu_num_logits[: n + 1]`` and all of
+    ``query_start_loc`` for the ``n`` requests of ``capacities``, which a step
+    without drafts zeroes."""
+    _kernel(adaptive_offsets_kernel)(
+        capacities,
+        non_draft,
+        cu_num_logits,
+        query_start_loc,
+        bonus,
+        num_tokens,
+        int(drafted),
+    )
+
+
+def adaptive_offsets_calls() -> list:
+    return [_call(adaptive_offsets_kernel)]
+
+
 # --- Step inputs --------------------------------------------------------------
 
 
