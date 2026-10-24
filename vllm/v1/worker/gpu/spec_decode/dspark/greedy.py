@@ -2,15 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Allocation-free greedy reduction of base logits and sequential Markov bias."""
 
-from typing import Any
-
 import torch
 
-from vllm.model_executor.warmup.jit_warmup_triton_helper import (
-    TritonWarmupTensor,
-    triton_kernel_dispatcher_with_warmup,
-    triton_warmup_inputs,
-)
 from vllm.triton_utils import tl, triton
 
 _BLOCK = 2048
@@ -26,6 +19,7 @@ def _first_argmax(av, ai, bv, bi):
     return tl.where(take_a, av, bv), tl.where(take_a, ai, bi)
 
 
+# Reference for ``tilelang_sampling``; the runner no longer launches it.
 @triton.jit
 def _partial_argmax(
     base,
@@ -54,6 +48,7 @@ def _partial_argmax(
     tl.store(indices + row * PARTS + part, index)
 
 
+# Reference for ``tilelang_sampling``; the runner no longer launches it.
 @triton.jit
 def _partial_argmax_logits(
     logits,
@@ -75,6 +70,7 @@ def _partial_argmax_logits(
     tl.store(indices + row * PARTS + part, index)
 
 
+# Reference for ``tilelang_sampling``; the runner no longer launches it.
 @triton.jit
 def _finish_argmax(
     values,
@@ -92,6 +88,7 @@ def _finish_argmax(
     tl.store(output + row * output_stride, result)
 
 
+# Reference for ``tilelang_sampling``; the runner no longer launches it.
 @triton.jit
 def _finish_argmax_pair(
     values,
@@ -110,6 +107,7 @@ def _finish_argmax_pair(
     tl.store(pairs + row * 2 + 1, (result + vocab_start).to(tl.float32))
 
 
+# Reference for ``tilelang_sampling``; the runner no longer launches it.
 @triton.jit
 def _select_first_argmax(
     pairs,
@@ -130,95 +128,6 @@ def _select_first_argmax(
     tl.store(output + row * output_stride, result)
 
 
-def _partial_argmax_warmup_inputs(
-    *,
-    base_dtype: torch.dtype,
-    base_stride: int,
-    base_aligned: bool,
-    bias_dtype: torch.dtype,
-    bias_stride: int,
-    vocab: int,
-) -> dict[str, Any]:
-    parts = triton.cdiv(vocab, _BLOCK)
-    return triton_warmup_inputs(
-        _partial_argmax,
-        TritonWarmupTensor(base_dtype, aligned=base_aligned),
-        TritonWarmupTensor(bias_dtype),
-        TritonWarmupTensor(torch.float32),
-        TritonWarmupTensor(torch.int32),
-        base_stride,
-        bias_stride,
-        vocab,
-        parts,
-        _BLOCK,
-        grid=(1,),
-    )
-
-
-def _partial_argmax_logits_warmup_inputs(
-    *, dtype: torch.dtype, stride: int, vocab: int
-) -> dict[str, Any]:
-    return triton_warmup_inputs(
-        _partial_argmax_logits,
-        TritonWarmupTensor(dtype),
-        TritonWarmupTensor(torch.float32),
-        TritonWarmupTensor(torch.int32),
-        stride,
-        vocab,
-        triton.cdiv(vocab, _BLOCK),
-        _BLOCK,
-        grid=(1,),
-    )
-
-
-def _finish_argmax_pair_warmup_inputs(
-    *, vocab: int, vocab_start: int
-) -> dict[str, Any]:
-    parts = triton.cdiv(vocab, _BLOCK)
-    return triton_warmup_inputs(
-        _finish_argmax_pair,
-        TritonWarmupTensor(torch.float32),
-        TritonWarmupTensor(torch.int32),
-        TritonWarmupTensor(torch.float32),
-        vocab_start,
-        parts,
-        triton.next_power_of_2(parts),
-        grid=(1,),
-    )
-
-
-def _select_first_argmax_warmup_inputs(
-    *,
-    ranks: int,
-    output_dtype: torch.dtype,
-    output_stride: int,
-    output_aligned: bool,
-) -> dict[str, Any]:
-    return triton_warmup_inputs(
-        _select_first_argmax,
-        TritonWarmupTensor(torch.float32),
-        TritonWarmupTensor(output_dtype, aligned=output_aligned),
-        output_stride,
-        ranks,
-        triton.next_power_of_2(ranks),
-        grid=(1,),
-    )
-
-
-_partial_argmax_launcher = triton_kernel_dispatcher_with_warmup(
-    warmup_inputs=_partial_argmax_warmup_inputs
-)(_partial_argmax)
-_partial_argmax_logits_launcher = triton_kernel_dispatcher_with_warmup(
-    warmup_inputs=_partial_argmax_logits_warmup_inputs
-)(_partial_argmax_logits)
-_finish_argmax_pair_launcher = triton_kernel_dispatcher_with_warmup(
-    warmup_inputs=_finish_argmax_pair_warmup_inputs
-)(_finish_argmax_pair)
-_select_first_argmax_launcher = triton_kernel_dispatcher_with_warmup(
-    warmup_inputs=_select_first_argmax_warmup_inputs
-)(_select_first_argmax)
-
-
 def register_greedy_markov_shard_pair_warmup(
     *,
     base_dtype: torch.dtype,
@@ -229,30 +138,26 @@ def register_greedy_markov_shard_pair_warmup(
     vocab: int,
     vocab_start: int,
 ) -> None:
-    """Register the kernels ``greedy_markov_shard_pair`` launches for one layout
-    of its inputs: rows ``base_stride`` and ``bias_stride`` elements apart, the
-    base logits' first element 16-byte aligned or not, ``vocab`` columns of the
-    shard starting at global index ``vocab_start``; FP32/int32 scratch."""
-    _partial_argmax_launcher.register_warmup(
-        base_dtype=base_dtype,
-        base_stride=base_stride,
-        base_aligned=base_aligned,
-        bias_dtype=bias_dtype,
-        bias_stride=bias_stride,
-        vocab=vocab,
+    """Declare the kernels ``greedy_markov_shard_pair`` launches for base logits
+    and a Markov bias of these dtypes (the TileLang kernels take any stride,
+    alignment, shard and offset)."""
+    from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+    tilelang_sampling.declare(
+        lambda: tilelang_sampling.greedy_calls(markov=[(base_dtype, bias_dtype)])
     )
-    _finish_argmax_pair_launcher.register_warmup(vocab=vocab, vocab_start=vocab_start)
 
 
 def register_greedy_shard_pair_warmup(
     *, logits_dtype: torch.dtype, logits_stride: int, vocab: int, vocab_start: int
 ) -> None:
-    """Register the kernels ``greedy_shard_pair`` launches for freshly allocated
-    logits of ``logits_dtype`` whose rows are ``logits_stride`` elements apart."""
-    _partial_argmax_logits_launcher.register_warmup(
-        dtype=logits_dtype, stride=logits_stride, vocab=vocab
+    """Declare the kernels ``greedy_shard_pair`` launches for logits of
+    ``logits_dtype``."""
+    from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+    tilelang_sampling.declare(
+        lambda: tilelang_sampling.greedy_calls(logits=[logits_dtype])
     )
-    _finish_argmax_pair_launcher.register_warmup(vocab=vocab, vocab_start=vocab_start)
 
 
 def register_select_first_argmax_warmup(
@@ -262,14 +167,26 @@ def register_select_first_argmax_warmup(
     output_stride: int,
     output_aligned: bool,
 ) -> None:
-    """Register ``select_first_argmax`` for ``ranks`` freshly gathered pairs per
-    row and an output column of ``output_dtype``, ``output_stride`` elements per
-    row, whose first element is 16-byte aligned or not."""
-    _select_first_argmax_launcher.register_warmup(
-        ranks=ranks,
-        output_dtype=output_dtype,
-        output_stride=output_stride,
-        output_aligned=output_aligned,
+    """Declare ``select_first_argmax`` for an output column of
+    ``output_dtype``."""
+    from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+    tilelang_sampling.declare(
+        lambda: tilelang_sampling.greedy_calls(select=[output_dtype])
+    )
+
+
+def register_sample_greedy_markov_warmup(
+    *, dtype: torch.dtype, output_dtype: torch.dtype
+) -> None:
+    """Declare the kernels ``sample_greedy_markov`` launches for base logits and
+    a Markov bias of ``dtype`` and an output column of ``output_dtype``."""
+    from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+    tilelang_sampling.declare(
+        lambda: tilelang_sampling.greedy_calls(
+            markov=[(dtype, dtype)], finish_outputs=[output_dtype]
+        )
     )
 
 
@@ -290,35 +207,10 @@ def greedy_markov_shard_pair(
     ``select_first_argmax`` reproduces the full-vocabulary argmax, ties and
     NaNs included, because shards hold ascending index ranges.
     """
-    if base_logits.shape != markov_bias.shape:
-        raise ValueError(
-            "DSpark greedy base logits and Markov bias must have identical shapes: "
-            f"{tuple(base_logits.shape)} != {tuple(markov_bias.shape)}"
-        )
-    rows, vocab = base_logits.shape
-    if vocab_start + vocab > 1 << 24:
-        raise ValueError("vocabulary indices must stay exact in FP32")
-    parts = triton.cdiv(vocab, _BLOCK)
-    if min(partial_values.numel(), partial_indices.numel()) < rows * parts:
-        raise ValueError("DSpark greedy scratch is smaller than the logits require")
-    _partial_argmax_launcher[(rows, parts)](
-        base_logits,
-        markov_bias,
-        partial_values,
-        partial_indices,
-        base_logits.stride(0),
-        markov_bias.stride(0),
-        vocab,
-        parts,
-        _BLOCK,
-    )
-    _finish_argmax_pair_launcher[(rows,)](
-        partial_values,
-        partial_indices,
-        pairs,
-        vocab_start,
-        parts,
-        triton.next_power_of_2(parts),
+    from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+    tilelang_sampling.greedy_markov_shard_pair(
+        base_logits, markov_bias, vocab_start, pairs, partial_values, partial_indices
     )
 
 
@@ -333,45 +225,19 @@ def greedy_shard_pair(
     """``greedy_markov_shard_pair`` without a bias: each row's ``(max, global
     index)`` over the first ``vocab`` columns of one vocabulary shard of
     ``logits`` (its padding columns excluded), into FP32 ``pairs`` ([rows, 2])."""
-    rows = logits.shape[0]
-    if vocab > logits.shape[1]:
-        raise ValueError("the shard's real vocabulary exceeds its logits")
-    if vocab_start + vocab > 1 << 24:
-        raise ValueError("vocabulary indices must stay exact in FP32")
-    parts = triton.cdiv(vocab, _BLOCK)
-    if min(partial_values.numel(), partial_indices.numel()) < rows * parts:
-        raise ValueError("greedy scratch is smaller than the logits require")
-    _partial_argmax_logits_launcher[(rows, parts)](
-        logits,
-        partial_values,
-        partial_indices,
-        logits.stride(0),
-        vocab,
-        parts,
-        _BLOCK,
-    )
-    _finish_argmax_pair_launcher[(rows,)](
-        partial_values,
-        partial_indices,
-        pairs,
-        vocab_start,
-        parts,
-        triton.next_power_of_2(parts),
+    from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+    tilelang_sampling.greedy_shard_pair(
+        logits, vocab, vocab_start, pairs, partial_values, partial_indices
     )
 
 
 def select_first_argmax(pairs: torch.Tensor, output: torch.Tensor) -> None:
     """Reduce all-gathered shard pairs ([rows, 2 * ranks], FP32) to the first
     maximum's global index, written to ``output`` (one per row)."""
-    rows, width = pairs.shape
-    ranks = width // 2
-    _select_first_argmax_launcher[(rows,)](
-        pairs,
-        output,
-        output.stride(0),
-        ranks,
-        triton.next_power_of_2(ranks),
-    )
+    from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+    tilelang_sampling.select_first_argmax(pairs, output)
 
 
 def scratch_shape(max_requests: int, vocabulary_size: int) -> tuple[int, int]:
@@ -403,31 +269,8 @@ def sample_greedy_markov(
     Raises:
         ValueError: Input shapes differ or scratch cannot hold every partial.
     """
-    if base_logits.shape != markov_bias.shape:
-        raise ValueError(
-            "DSpark greedy base logits and Markov bias must have identical shapes: "
-            f"{tuple(base_logits.shape)} != {tuple(markov_bias.shape)}"
-        )
-    rows, vocab = base_logits.shape
-    parts = triton.cdiv(vocab, _BLOCK)
-    if min(partial_values.numel(), partial_indices.numel()) < rows * parts:
-        raise ValueError("DSpark greedy scratch is smaller than the logits require")
-    _partial_argmax_launcher[(rows, parts)](
-        base_logits,
-        markov_bias,
-        partial_values,
-        partial_indices,
-        base_logits.stride(0),
-        markov_bias.stride(0),
-        vocab,
-        parts,
-        _BLOCK,
-    )
-    _finish_argmax[(rows,)](
-        partial_values,
-        partial_indices,
-        output,
-        output.stride(0),
-        parts,
-        triton.next_power_of_2(parts),
+    from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+    tilelang_sampling.sample_greedy_markov(
+        base_logits, markov_bias, output, partial_values, partial_indices
     )

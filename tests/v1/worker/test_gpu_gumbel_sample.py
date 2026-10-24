@@ -21,7 +21,12 @@ pytest.importorskip("triton")
 if not torch.cuda.is_available():
     pytest.skip("CUDA required for Gumbel sampler tests", allow_module_level=True)
 
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample, warmup_processed_gumbel
+from vllm.v1.worker.gpu.sample import tilelang_sampling
+from vllm.v1.worker.gpu.sample.gumbel import (
+    gumbel_sample,
+    register_sampling_warmups,
+    warmup_processed_gumbel,
+)
 
 DEVICE = "cuda"
 VOCAB_SIZE = 200_000
@@ -34,21 +39,12 @@ Z_TOLERANCE = 10.0
 
 
 @pytest.mark.parametrize("vocab_size", [257, 129280])
-@pytest.mark.parametrize("use_fp64", [False, True])
-def test_processed_gumbel_warmup_covers_seeded_target_sampling(
-    monkeypatch, vocab_size, use_fp64
-):
+def test_processed_gumbel_warmup_covers_seeded_target_sampling(vocab_size):
     """Explicitly seeded FP32 requests must not JIT after server warmup."""
-    from triton import knobs
-
     device = torch.device(DEVICE)
-    warmup_processed_gumbel(vocab_size, device, use_fp64=use_fp64)
+    warmup_processed_gumbel(vocab_size, device)
     torch.accelerator.synchronize()
-
-    def unexpected_compile(**kwargs):
-        pytest.fail("Seeded target sampling compiled after sampler warmup")
-
-    monkeypatch.setattr(knobs.runtime, "jit_post_compile_hook", unexpected_compile)
+    compiled = set(tilelang_sampling._KERNELS)
     for rows in (1, 2, 7, 8, 16, 31):
         logits = torch.zeros(rows, vocab_size, device=device)
         # InputBatch uses np.intp / torch.int64 request mappings.
@@ -64,11 +60,38 @@ def test_processed_gumbel_warmup_covers_seeded_target_sampling(
             position,
             apply_temperature=False,
             is_drafting=False,
-            use_fp64=use_fp64,
         )
         assert sampled.shape == (rows,)
         assert ((sampled >= 0) & (sampled < vocab_size)).all()
     torch.accelerator.synchronize()
+    assert set(tilelang_sampling._KERNELS) == compiled, (
+        "seeded target sampling compiled after sampler warmup"
+    )
+
+
+def test_fp64_draw_is_rejected():
+    """The TileLang sampler draws in FP32 only: use_fp64_gumbel fails at
+    startup, and a direct FP64 call fails rather than drawing in FP32."""
+    with pytest.raises(ValueError, match="FP32 only"):
+        register_sampling_warmups(
+            logits=((torch.bfloat16, 1024),),
+            processed_logits_strides=(1024,),
+            vocab_size=1024,
+            use_fp64=True,
+        )
+    logits = torch.zeros(1, 1024, device=DEVICE)
+    zeros = torch.zeros(1, dtype=torch.int64, device=DEVICE)
+    with pytest.raises(ValueError, match="FP32 only"):
+        gumbel_sample(
+            logits,
+            zeros,
+            torch.ones(1, device=DEVICE),
+            zeros,
+            zeros,
+            apply_temperature=False,
+            is_drafting=False,
+            use_fp64=True,
+        )
 
 
 def _make_heavy_tailed_counts(seed: int = 1234) -> torch.Tensor:
@@ -160,13 +183,12 @@ def _sample_histogram(
 # ----------------------------- Accuracy ------------------------------------
 
 
-@pytest.mark.parametrize("use_fp64", [False, True])
-def test_sampling_matches_target_distribution(use_fp64: bool):
+def test_sampling_matches_target_distribution():
     counts = _make_heavy_tailed_counts()
     total = counts.sum().item()
     logits = _counts_to_logits(counts)
 
-    sampled = _sample(logits, NUM_SAMPLES, use_fp64=use_fp64)
+    sampled = _sample(logits, NUM_SAMPLES)
     assert sampled.min() >= 0 and sampled.max() < VOCAB_SIZE
 
     # The dominant token (index 0) and the aggregate tail are the two

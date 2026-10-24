@@ -43,6 +43,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
 from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
     greedy_markov_shard_pair,
     register_greedy_markov_shard_pair_warmup,
+    register_sample_greedy_markov_warmup,
     register_select_first_argmax_warmup,
     sample_greedy_markov,
     scratch_shape,
@@ -224,14 +225,28 @@ class DSparkSpeculator(DFlashSpeculator):
     def register_warmups(
         self, block_table_layouts: Sequence[DraftBlockTableLayout]
     ) -> None:
-        """Also register the vocabulary-parallel greedy reduction of each draft
-        position: its base logits and Markov bias are this rank's shards, written
-        in the draft head's dtype; draft position ``i`` is column ``i`` of both
-        the base logits' ``[requests, positions, shard]`` view and the draft
-        tokens."""
+        """Also register the greedy reduction of each draft position: the
+        vocabulary-parallel one, whose base logits and Markov bias are this rank's
+        shards, written in the draft head's dtype (draft position ``i`` is column
+        ``i`` of both the base logits' ``[requests, positions, shard]`` view and
+        the draft tokens); or the full-vocabulary one, when no logits cache,
+        vocabulary map or estimator needs the logits."""
         super().register_warmups(block_table_layouts)
         local_head = getattr(self.model, "supports_local_draft_argmax", lambda: False)()
-        if self._draft_topk is not None or not self._vocab_parallel_greedy(local_head):
+        if self._draft_topk is not None:
+            return
+        if not self._vocab_parallel_greedy(local_head):
+            processor = getattr(self.model, "logits_processor", None)
+            if (
+                not local_head
+                and processor is not None
+                and self.draft_logits is None
+                and self.model.draft_id_to_target_id is None
+                and getattr(self, "acceptance_estimator", None) is None
+            ):
+                register_sample_greedy_markov_warmup(
+                    dtype=processor.head_dtype, output_dtype=self.draft_tokens.dtype
+                )
             return
         vocab_start, shard_vocab = self.model.draft_vocab_shard
         dtype, head_width, markov_width = self.model.draft_logits_local_layout

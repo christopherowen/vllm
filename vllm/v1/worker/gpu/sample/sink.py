@@ -18,17 +18,11 @@ the metric.
 """
 
 from dataclasses import dataclass
-from typing import Any
 
 import torch
 
 from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.logger import init_logger
-from vllm.model_executor.warmup.jit_warmup_triton_helper import (
-    TritonWarmupTensor,
-    triton_kernel_dispatcher_with_warmup,
-    triton_warmup_inputs,
-)
 from vllm.triton_utils import tl, triton
 from vllm.v1.sample.sink import NUM_SINK_EVENT_FIELDS, SinkConfig, SinkRow
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_scores
@@ -40,6 +34,7 @@ logger = init_logger(__name__)
 _CANDIDATE_BLOCK_SIZE = 1024
 
 
+# Reference for ``tilelang_sampling``; the runner no longer launches it.
 @triton.jit
 def _sink_candidates_kernel(
     # [num_reqs, num_blocks * NUM_CANDIDATES]
@@ -118,6 +113,7 @@ def _sink_candidates_kernel(
         scores = tl.where(offsets == idx, float("-inf"), scores)
 
 
+# Reference for ``tilelang_sampling``; the runner no longer launches it.
 @triton.jit
 def _sink_policy_kernel(
     # Verification results, updated in place for rejected draft zeros.
@@ -287,102 +283,6 @@ def _sink_policy_kernel(
     tl.atomic_add(counts_ptr + 2, ((not decoding) & row0_flag).to(tl.int64))
 
 
-def _candidates_warmup_inputs(
-    *,
-    logits_dtype: torch.dtype,
-    logits_stride: int,
-    vocab_size: int,
-    sampled_stride: int,
-    num_candidates: int,
-    use_fp64: bool,
-    mask_rejected_draft: bool,
-) -> dict[str, Any]:
-    int32 = TritonWarmupTensor(torch.int32)
-    int64 = TritonWarmupTensor(torch.int64)
-    num_blocks = triton.cdiv(vocab_size, _CANDIDATE_BLOCK_SIZE)
-    return triton_warmup_inputs(
-        _sink_candidates_kernel,
-        TritonWarmupTensor(torch.float64 if use_fp64 else torch.float32),
-        int64,
-        num_blocks * num_candidates,
-        TritonWarmupTensor(logits_dtype),
-        logits_stride,
-        vocab_size,
-        int32,
-        int32,
-        int64,
-        sampled_stride,
-        int32,
-        int64,
-        TritonWarmupTensor(torch.float32),
-        int64,
-        int64,
-        grid=(1,),
-        BLOCK_SIZE=_CANDIDATE_BLOCK_SIZE,
-        NUM_CANDIDATES=num_candidates,
-        USE_FP64=use_fp64,
-        MASK_REJECTED_DRAFT=mask_rejected_draft,
-    )
-
-
-def _policy_warmup_inputs(
-    *,
-    sampled_width: int,
-    num_alternates: int,
-    rejection: bool,
-    logprobs: bool,
-    bin_counts_stride: int,
-) -> dict[str, Any]:
-    int8 = TritonWarmupTensor(torch.int8)
-    int32 = TritonWarmupTensor(torch.int32)
-    int64 = TritonWarmupTensor(torch.int64)
-    float32 = TritonWarmupTensor(torch.float32)
-    return triton_warmup_inputs(
-        _sink_policy_kernel,
-        int64,
-        int32,
-        int32,
-        int64,
-        int32,
-        int32,
-        float32,
-        int64,
-        int32,
-        int64,
-        int8,
-        int8,
-        float32,
-        int32,
-        int64,
-        float32,
-        int64,
-        int64,
-        float32,
-        int64,
-        int32,
-        int32,
-        int32,
-        bin_counts_stride,
-        int64,
-        grid=(1,),
-        NUM_ALTERNATES=max(num_alternates, 1),
-        REJECTION=rejection,
-        LOGPROBS=logprobs,
-        SAMPLED_WIDTH=sampled_width,
-        PADDED_WIDTH=triton.next_power_of_2(sampled_width + 1),
-        PADDED_ALTERNATES=triton.next_power_of_2(max(num_alternates, 1)),
-        NUM_EVENT_FIELDS=NUM_SINK_EVENT_FIELDS,
-    )
-
-
-_candidates_launcher = triton_kernel_dispatcher_with_warmup(
-    warmup_inputs=_candidates_warmup_inputs
-)(_sink_candidates_kernel)
-_policy_launcher = triton_kernel_dispatcher_with_warmup(
-    warmup_inputs=_policy_warmup_inputs
-)(_sink_policy_kernel)
-
-
 @dataclass
 class SinkCut:
     """The logits the cut overwrote, for the restore."""
@@ -434,6 +334,10 @@ class SinkSampler:
         device: torch.device,
         use_fp64_gumbel: bool,
     ):
+        if use_fp64_gumbel:
+            raise ValueError(
+                "use_fp64_gumbel: the V2 runner's TileLang sampler draws in FP32 only"
+            )
         if config.column >= hidden_size:
             raise ValueError(
                 f"sink detector column {config.column} is outside the hidden "
@@ -541,37 +445,21 @@ class SinkSampler:
         """The next ``max_retries`` candidates of each request's last draw
         from the full-vocabulary scores it was drawn from (after sampling
         parameters, with the cut applied)."""
-        num_reqs = idx_mapping.shape[0]
-        vocab_size = min(logits.shape[1], self.vocab_size)
-        num_blocks = triton.cdiv(vocab_size, _CANDIDATE_BLOCK_SIZE)
-        num_candidates = num_blocks * self.num_candidates
-        values_dtype = torch.float64 if self.use_fp64_gumbel else torch.float32
-        values = torch.empty(
-            (num_reqs, num_candidates), dtype=values_dtype, device=self.device
-        )
-        indices = torch.empty(
-            (num_reqs, num_candidates), dtype=torch.int64, device=self.device
-        )
-        _candidates_launcher[(num_reqs, num_blocks)](
-            values,
-            indices,
-            num_candidates,
+        from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+        values, indices = tilelang_sampling.sink_candidates(
             logits,
-            logits.stride(0),
-            vocab_size,
+            min(logits.shape[1], self.vocab_size),
             cu_num_logits,
             num_sampled,
             sampled,
-            sampled.stride(0),
             drafts,
             idx_mapping,
             temperature,
             seeds,
             pos,
-            BLOCK_SIZE=_CANDIDATE_BLOCK_SIZE,
-            NUM_CANDIDATES=self.num_candidates,
-            USE_FP64=self.use_fp64_gumbel,
-            MASK_REJECTED_DRAFT=mask_rejected_draft,
+            self.num_candidates,
+            mask_rejected_draft,
         )
         return self._merge(values, indices, num_sampled, sampled)
 
@@ -701,7 +589,9 @@ class SinkSampler:
                     num_reqs, dtype=torch.int64, device=self.device
                 )
         new_tokens = alternates.tokens if alternates is not None else self.alternates
-        _policy_launcher[(num_reqs,)](
+        from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+        tilelang_sampling.sink_policy(
             sampled,
             num_sampled,
             num_rejected,
@@ -725,15 +615,11 @@ class SinkSampler:
             self.tries,
             total_len,
             bin_counts,
-            bin_counts.stride(0),
             self.counts,
-            NUM_ALTERNATES=max(self.num_alternates, 1),
-            REJECTION=self.rejection,
-            LOGPROBS=logprobs,
-            SAMPLED_WIDTH=sampled_width,
-            PADDED_WIDTH=triton.next_power_of_2(sampled_width + 1),
-            PADDED_ALTERNATES=triton.next_power_of_2(max(self.num_alternates, 1)),
-            NUM_EVENT_FIELDS=NUM_SINK_EVENT_FIELDS,
+            self.num_alternates,
+            self.rejection,
+            logprobs,
+            NUM_SINK_EVENT_FIELDS,
         )
         return out
 
@@ -781,29 +667,20 @@ class SinkSampler:
         sampled_widths: tuple[int, ...],
         bin_counts_stride: int,
     ) -> None:
-        """Register the kernels a step launches: the policy for each sampled
+        """Declare the kernels a step launches: the policy for each sampled
         width, and the alternates of the raw and processed target logits
-        (``(dtype, row stride)``)."""
-        for logprobs in (False, True):
-            for width in sampled_widths:
-                _policy_launcher.register_warmup(
-                    sampled_width=width,
-                    num_alternates=self.num_alternates,
-                    rejection=self.rejection,
-                    logprobs=logprobs and self.rejection,
-                    bin_counts_stride=bin_counts_stride,
-                )
-        if not self.rejection:
-            return
-        targets = (*logits, *((torch.float32, s) for s in processed_logits_strides))
-        for dtype, stride in targets:
-            for width in sampled_widths:
-                _candidates_launcher.register_warmup(
-                    logits_dtype=dtype,
-                    logits_stride=stride,
-                    vocab_size=self.vocab_size,
-                    sampled_stride=width,
-                    num_candidates=self.num_candidates,
-                    use_fp64=self.use_fp64_gumbel,
-                    mask_rejected_draft=width > 1,
-                )
+        (``(dtype, row stride)``; the TileLang kernels take any stride)."""
+        from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+        logits_dtypes = [dtype for dtype, _ in logits]
+        if processed_logits_strides:
+            logits_dtypes.append(torch.float32)
+        tilelang_sampling.declare(
+            lambda: tilelang_sampling.sink_calls(
+                logits_dtypes=logits_dtypes,
+                sampled_widths=sampled_widths,
+                num_alternates=self.num_alternates,
+                rejection=self.rejection,
+                num_event_fields=NUM_SINK_EVENT_FIELDS,
+            )
+        )

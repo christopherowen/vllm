@@ -14,16 +14,9 @@ target's argmax; the first mismatch commits the argmax, and a fully accepted
 block commits the argmax at the bonus position.
 """
 
-from typing import Any
-
 import torch
 
 from vllm.distributed import tensor_model_parallel_all_gather
-from vllm.model_executor.warmup.jit_warmup_triton_helper import (
-    TritonWarmupTensor,
-    triton_kernel_dispatcher_with_warmup,
-    triton_warmup_inputs,
-)
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
     greedy_shard_pair,
@@ -52,6 +45,7 @@ def vocab_parallel_argmax(
     return ids
 
 
+# Reference for ``tilelang_sampling``; the runner no longer launches it.
 @triton.jit
 def _greedy_rejection_kernel(
     sampled_ptr,
@@ -88,25 +82,6 @@ def _greedy_rejection_kernel(
     tl.store(num_sampled_ptr + req_idx, (accepted_length + 1).to(tl.int32))
 
 
-def _greedy_rejection_warmup_inputs(*, num_speculative_steps: int) -> dict[str, Any]:
-    return triton_warmup_inputs(
-        _greedy_rejection_kernel,
-        TritonWarmupTensor(torch.int64),
-        num_speculative_steps + 1,
-        TritonWarmupTensor(torch.int32),
-        TritonWarmupTensor(torch.int64),
-        TritonWarmupTensor(torch.int32),
-        TritonWarmupTensor(torch.int32),
-        grid=(1,),
-        num_warps=1,
-    )
-
-
-_greedy_rejection_launcher = triton_kernel_dispatcher_with_warmup(
-    warmup_inputs=_greedy_rejection_warmup_inputs
-)(_greedy_rejection_kernel)
-
-
 def register_greedy_verification_warmups(
     *,
     logits_dtype: torch.dtype,
@@ -116,7 +91,7 @@ def register_greedy_verification_warmups(
     tp_size: int,
     num_speculative_steps: int,
 ) -> None:
-    """Register the kernels ``vocab_parallel_argmax`` and ``greedy_rejection_sample``
+    """Declare the kernels ``vocab_parallel_argmax`` and ``greedy_rejection_sample``
     launch: this rank's shard of ``compute_logits_local`` (``logits_dtype``, rows
     ``logits_stride`` elements apart, ``vocab`` real columns from global index
     ``vocab_start``), drafts and logits offsets from the input batch (int32)."""
@@ -129,8 +104,12 @@ def register_greedy_verification_warmups(
     register_select_first_argmax_warmup(
         ranks=tp_size, output_dtype=torch.int64, output_stride=1, output_aligned=True
     )
-    _greedy_rejection_launcher.register_warmup(
-        num_speculative_steps=num_speculative_steps
+    from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+    tilelang_sampling.declare(
+        lambda: tilelang_sampling.greedy_calls(
+            rejection_widths=[num_speculative_steps + 1]
+        )
     )
 
 
@@ -145,18 +124,8 @@ def greedy_rejection_sample(
     Returns ``sampled`` ([num_reqs, num_speculative_steps + 1], int64) and
     ``num_sampled`` ([num_reqs], int32), the committed prefix of each row.
     """
-    num_reqs = cu_num_logits.shape[0] - 1
-    sampled = draft_sampled.new_empty(
-        num_reqs, num_speculative_steps + 1, dtype=torch.int64
+    from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+    return tilelang_sampling.greedy_rejection_sample(
+        target_ids, draft_sampled, cu_num_logits, num_speculative_steps
     )
-    num_sampled = sampled.new_empty(num_reqs, dtype=torch.int32)
-    _greedy_rejection_launcher[(num_reqs,)](
-        sampled,
-        sampled.stride(0),
-        num_sampled,
-        target_ids,
-        draft_sampled,
-        cu_num_logits,
-        num_warps=1,
-    )
-    return sampled, num_sampled

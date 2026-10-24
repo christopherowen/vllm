@@ -1,15 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Sequence
-from typing import Any
 
 import torch
 
-from vllm.model_executor.warmup.jit_warmup_triton_helper import (
-    TritonWarmupTensor,
-    triton_kernel_dispatcher_with_warmup,
-    triton_warmup_inputs,
-)
 from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 
 # Smallest positive value produced by Triton's fp32 `tl.rand`. Used to clamp
@@ -28,6 +22,7 @@ _TL_RAND_MIN = tl.constexpr(4.6566127342e-10) if HAS_TRITON else 4.6566127342e-1
 _DRAFT_NOISE_SALT = tl.constexpr(1 << 30) if HAS_TRITON else (1 << 30)
 
 
+# Reference for ``tilelang_sampling``; the runner no longer launches it.
 @triton.jit
 def _temperature_kernel(
     logits_ptr,
@@ -54,45 +49,14 @@ def _temperature_kernel(
     tl.store(logits_ptr + token_idx * logits_stride + block, logits, mask=mask)
 
 
-_TEMPERATURE_BLOCK_SIZE = 8192
-
-
-def _temperature_warmup_inputs(
-    *, logits_stride: int, vocab_size: int
-) -> dict[str, Any]:
-    return triton_warmup_inputs(
-        _temperature_kernel,
-        TritonWarmupTensor(torch.float32),
-        logits_stride,
-        TritonWarmupTensor(torch.int64),
-        TritonWarmupTensor(torch.float32),
-        vocab_size,
-        grid=(1,),
-        BLOCK_SIZE=_TEMPERATURE_BLOCK_SIZE,
-    )
-
-
-_temperature_launcher = triton_kernel_dispatcher_with_warmup(
-    warmup_inputs=_temperature_warmup_inputs
-)(_temperature_kernel)
-
-
 def apply_temperature(
     logits: torch.Tensor,
     expanded_idx_mapping: torch.Tensor,
     temperature: torch.Tensor,
 ) -> None:
-    num_tokens, vocab_size = logits.shape
-    BLOCK_SIZE = _TEMPERATURE_BLOCK_SIZE
-    num_blocks = triton.cdiv(vocab_size, BLOCK_SIZE)
-    _temperature_launcher[(num_tokens, num_blocks)](
-        logits,
-        logits.stride(0),
-        expanded_idx_mapping,
-        temperature,
-        vocab_size,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
+    from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+    tilelang_sampling.apply_temperature(logits, expanded_idx_mapping, temperature)
 
 
 @triton.jit
@@ -256,6 +220,7 @@ def gumbel_block_argmax(
     )
 
 
+# Reference for ``tilelang_sampling``; the runner no longer launches it.
 @triton.jit
 def _gumbel_sample_kernel(
     local_argmax_ptr,
@@ -315,54 +280,6 @@ def _gumbel_sample_kernel(
     tl.store(local_max_ptr + token_idx * local_max_stride + block_idx, value)
 
 
-_GUMBEL_BLOCK_SIZE = 1024
-
-
-def _gumbel_sample_warmup_inputs(
-    *,
-    logits: Sequence[tuple[torch.dtype, int]],
-    vocab_size: int,
-    apply_temperature: bool,
-    is_drafting: bool,
-    use_fp64: bool,
-) -> list[dict[str, Any]]:
-    num_blocks = triton.cdiv(vocab_size, _GUMBEL_BLOCK_SIZE)
-    int64 = TritonWarmupTensor(torch.int64)
-    local_max = TritonWarmupTensor(torch.float64 if use_fp64 else torch.float32)
-    return [
-        triton_warmup_inputs(
-            _gumbel_sample_kernel,
-            int64,
-            num_blocks,
-            local_max,
-            num_blocks,
-            None,
-            0,
-            0,
-            None,
-            TritonWarmupTensor(dtype),
-            logits_stride,
-            int64,
-            int64,
-            int64,
-            TritonWarmupTensor(torch.float32),
-            vocab_size,
-            grid=(1,),
-            BLOCK_SIZE=_GUMBEL_BLOCK_SIZE,
-            IS_DRAFTING=is_drafting,
-            APPLY_TEMPERATURE=apply_temperature,
-            USE_FP64=use_fp64,
-            PER_TOKEN_COL=False,
-        )
-        for dtype, logits_stride in logits
-    ]
-
-
-_gumbel_sample_launcher = triton_kernel_dispatcher_with_warmup(
-    warmup_inputs=_gumbel_sample_warmup_inputs
-)(_gumbel_sample_kernel)
-
-
 def register_sampling_warmups(
     *,
     logits: Sequence[tuple[torch.dtype, int]],
@@ -370,21 +287,48 @@ def register_sampling_warmups(
     vocab_size: int,
     use_fp64: bool,
 ) -> None:
-    """Register the target sampler's temperature scaling (of the processed FP32
-    logits, rows ``processed_logits_strides`` apart) and its Gumbel-max sampling
-    without a logits cache, of ``vocab_size``-wide logits given as ``(dtype, row
-    stride)`` pairs, with int64 request indices, seeds and positions and FP32
-    temperatures."""
-    for logits_stride in processed_logits_strides:
-        _temperature_launcher.register_warmup(
-            logits_stride=logits_stride, vocab_size=vocab_size
+    """Declare the target sampler's temperature scaling of processed FP32 logits
+    and its Gumbel-max sampling without a logits cache of logits of each
+    ``(dtype, row stride)``; the TileLang kernels take any stride."""
+    from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+    if use_fp64:
+        raise ValueError(
+            "use_fp64_gumbel: the V2 runner's TileLang sampler draws in FP32 only"
         )
-    _gumbel_sample_launcher.register_warmup(
-        logits=tuple(logits),
-        vocab_size=vocab_size,
-        apply_temperature=False,
-        is_drafting=False,
-        use_fp64=use_fp64,
+    tilelang_sampling.declare(
+        lambda: tilelang_sampling.sampling_calls(
+            [dtype for dtype, _ in logits], temperature=bool(processed_logits_strides)
+        )
+    )
+
+
+def register_drafting_warmups(
+    *,
+    logits_dtypes: Sequence[torch.dtype],
+    cache_dtype: torch.dtype,
+    use_fp64: bool,
+) -> None:
+    """Declare a speculator's probabilistic draft sampling: the temperature in the
+    kernel, the drafting noise stream and the logits cache of ``cache_dtype``, for
+    logits of each of ``logits_dtypes`` and a step column of either index type,
+    one per token or shared."""
+    from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+    if use_fp64:
+        raise ValueError(
+            "use_fp64_gumbel: the V2 runner's TileLang sampler draws in FP32 only"
+        )
+    tilelang_sampling.declare(
+        lambda: [
+            call
+            for dtype in dict.fromkeys(logits_dtypes)
+            for col_dtype in (torch.int32, torch.int64)
+            for per_token_col in (False, True)
+            for call in tilelang_sampling.drafting_calls(
+                dtype, cache_dtype, col_dtype, per_token_col
+            )
+        ]
     )
 
 
@@ -400,50 +344,20 @@ def gumbel_sample(
     logits_cache_col: torch.Tensor | None = None,  # scalar or [num_tokens]
     use_fp64: bool = False,
 ) -> torch.Tensor:
-    # Enforce contiguity on non-strided input tensors
-    expanded_idx_mapping = expanded_idx_mapping.contiguous()
-    pos = pos.contiguous()
-    if logits_cache_col is not None:
-        logits_cache_col = logits_cache_col.contiguous()
-    num_tokens, vocab_size = logits.shape
-    if logits_cache is not None:
-        assert logits_cache.size(-1) >= vocab_size, (
-            f"draft logits cache vocab dim ({logits_cache.size(-1)}) is narrower "
-            f"than the sampled logits ({vocab_size}). Cached logits would be "
-            "truncated."
-        )
-    BLOCK_SIZE = _GUMBEL_BLOCK_SIZE
-    num_blocks = triton.cdiv(vocab_size, BLOCK_SIZE)
-    local_argmax = logits.new_empty(num_tokens, num_blocks, dtype=torch.int64)
-    local_max_dtype = torch.float64 if use_fp64 else torch.float32
-    local_max = logits.new_empty(num_tokens, num_blocks, dtype=local_max_dtype)
-    per_token_col = logits_cache_col is not None and logits_cache_col.dim() > 0
-    _gumbel_sample_launcher[(num_tokens, num_blocks)](
-        local_argmax,
-        local_argmax.stride(0),
-        local_max,
-        local_max.stride(0),
-        logits_cache,
-        logits_cache.stride(0) if logits_cache is not None else 0,
-        logits_cache.stride(1) if logits_cache is not None else 0,
-        logits_cache_col,
+    from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+    return tilelang_sampling.gumbel_sample(
         logits,
-        logits.stride(0),
         expanded_idx_mapping,
+        temperature,
         seed,
         pos,
-        temperature,
-        vocab_size,
-        BLOCK_SIZE=BLOCK_SIZE,
-        IS_DRAFTING=is_drafting,
-        APPLY_TEMPERATURE=apply_temperature,
-        USE_FP64=use_fp64,
-        PER_TOKEN_COL=per_token_col,
+        apply_temperature,
+        is_drafting,
+        logits_cache,
+        logits_cache_col,
+        use_fp64,
     )
-    # NOTE(woosuk): Use int64 for later indexing.
-    max_block_idx = local_max.argmax(dim=-1, keepdim=True)
-    sampled = local_argmax.gather(dim=-1, index=max_block_idx).view(-1)
-    return sampled
 
 
 def warmup_processed_gumbel(
