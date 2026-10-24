@@ -293,3 +293,28 @@ def test_ced_indices_preserves_last_rows_and_padding(lengths, padding):
     )
     ced.indices(starts, compact, actual, nr, nt)
     assert torch.equal(reference, actual)
+
+
+@pytest.mark.parametrize("rows", [1, 22, 158, 4096])
+def test_ced_token_metadata_matches_the_torch_chain(rows):
+    """The decoder's per-token metadata in one launch: the gathered fields with
+    -1 at negative indices (0 lengths) and 0 past the step's rows, as
+    ``gather_rows`` then ``masked_fill`` wrote them."""
+    from vllm.models.deepseek_v4_1.ced import gather_rows
+    from vllm.models.deepseek_v4_1.tilelang import ced
+
+    g = torch.Generator(device="cuda").manual_seed(rows)
+    tokens = 4200
+    positions = torch.randint(0, 1 << 20, (tokens,), generator=g, device="cuda")
+    reqs = torch.randint(0, 16, (tokens,), generator=g, device="cuda").int()
+    slots = torch.randint(-1, 1 << 24, (tokens,), generator=g, device="cuda")
+    lengths = torch.randint(0, 1 << 16, (tokens,), generator=g, device="cuda").int()
+    indices = torch.randint(-1, tokens + 3, (rows,), generator=g, device="cuda")
+    valid = indices >= 0
+    expected = [
+        gather_rows(field, indices).masked_fill(~valid, -1)
+        for field in (positions, reqs, slots)
+    ] + [gather_rows(lengths, indices)]
+    actual = ced.token_metadata(indices, positions, reqs, slots, lengths)
+    for a, e in zip(actual, expected):
+        assert a.dtype == e.dtype and torch.equal(a, e)

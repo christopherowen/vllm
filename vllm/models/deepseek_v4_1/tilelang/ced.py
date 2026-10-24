@@ -220,6 +220,65 @@ def indices(starts, compact_starts, output, nr, nt):
     indices_kernel(compact_starts.shape[0] - 1)(starts, compact_starts, output, nr, nt)
 
 
+@tilelang.jit(pass_configs=_PASS)
+def token_metadata_kernel():
+    """The decoder's per-token attention metadata at the CED indices, a thread a
+    decoder row: positions, request ids and slots (-1 at an invalid index, as the
+    native metadata's sentinels) and cache lengths (0 there); an index past the
+    step's rows reads 0, as ``gather_rows`` gives it. ``decoder_metadata``
+    gathered each field and masked three of them with torch. Every load issues
+    before the stores, clamped into the step's rows."""
+    rows, tokens = T.dynamic("rows, tokens")
+
+    @T.prim_func
+    def ced_token_metadata(
+        indices: T.Tensor((rows,), T.int64),
+        positions: T.Tensor((tokens,), T.int64),
+        reqs: T.Tensor((tokens,), T.int32),
+        slots: T.Tensor((tokens,), T.int64),
+        lengths: T.Tensor((tokens,), T.int32),
+        positions_out: T.Tensor((rows,), T.int64),
+        reqs_out: T.Tensor((rows,), T.int32),
+        slots_out: T.Tensor((rows,), T.int64),
+        lengths_out: T.Tensor((rows,), T.int32),
+    ):
+        with T.Kernel(T.ceildiv(rows, 128), threads=128) as bx:
+            row = bx * 128 + T.get_thread_binding()
+            index = T.alloc_var(T.int64, init=indices[T.min(row, rows - 1)])
+            source = T.alloc_var(T.int64, init=T.max(T.min(index, tokens - 1), 0))
+            position = T.alloc_var(T.int64, init=positions[source])
+            req = T.alloc_var(T.int32, init=reqs[source])
+            slot = T.alloc_var(T.int64, init=slots[source])
+            length = T.alloc_var(T.int32, init=lengths[source])
+            if row < rows:
+                # gather_rows' zero past the step's rows, then the sentinels at the
+                # negative indices, as the torch chain wrote them.
+                valid = index >= 0
+                inside = valid & (index < tokens)
+                positions_out[row] = T.if_then_else(
+                    valid, T.if_then_else(inside, position, T.int64(0)), T.int64(-1)
+                )
+                reqs_out[row] = T.if_then_else(
+                    valid, T.if_then_else(inside, req, 0), -1
+                )
+                slots_out[row] = T.if_then_else(
+                    valid, T.if_then_else(inside, slot, T.int64(0)), T.int64(-1)
+                )
+                lengths_out[row] = T.if_then_else(inside, length, 0)
+
+    return ced_token_metadata
+
+
+def token_metadata(indices, positions, reqs, slots, lengths):
+    """``(positions, req_id_per_token, slot_mapping, cache_lengths)`` of the
+    decoder rows ``indices`` selects."""
+    rows = indices.shape[0]
+    outs = tuple(field.new_empty(rows) for field in (positions, reqs, slots, lengths))
+    if rows:
+        token_metadata_kernel()(indices, positions, reqs, slots, lengths, *outs)
+    return outs
+
+
 _ITEMSIZE = {
     "bool": 1,
     "int8": 1,

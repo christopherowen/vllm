@@ -207,6 +207,7 @@ class CEDState:
         prepare.declare(
             lambda: [
                 prepare.call(ced_kernels.indices_kernel, self.max_requests),
+                prepare.call(ced_kernels.token_metadata_kernel),
                 # Packed rows of each layout. A source view of wider rows would
                 # stop its first CED step with KernelNotPreparedError.
                 *(
@@ -289,13 +290,14 @@ class CEDState:
         plan = self.plan
         assert plan is not None
         indices = self.indices[: plan.num_tokens]
-        # Generic packing zeros invalid rows; native metadata uses -1 sentinels.
-        valid = indices >= 0
-
-        def gather(field, sentinel=0):
-            result = gather_rows(field, indices)
-            return result if sentinel == 0 else result.masked_fill(~valid, sentinel)
-
+        # The native metadata's sentinels at invalid rows: -1, and 0 lengths.
+        positions, reqs, slots, lengths = ced_kernels.token_metadata(
+            indices,
+            metadata.positions,
+            metadata.req_id_per_token,
+            metadata.slot_mapping,
+            metadata.cache_lengths,
+        )
         return replace(
             metadata,
             num_actual_tokens=plan.num_tokens,
@@ -303,10 +305,10 @@ class CEDState:
             query_start_loc=self.starts,
             request_positions=self.request_positions,
             live_counts=self.counts,
-            positions=gather(metadata.positions, -1),
-            req_id_per_token=gather(metadata.req_id_per_token, -1),
-            slot_mapping=gather(metadata.slot_mapping, -1),
-            cache_lengths=gather(metadata.cache_lengths),
+            positions=positions,
+            req_id_per_token=reqs,
+            slot_mapping=slots,
+            cache_lengths=lengths,
             is_decode=plan.max_query_len <= 1,
             decoder=None,
             swa_replay_start=self.replay_start,
