@@ -3,7 +3,24 @@
 """Reasoning-marker cache and budget candidates, including draft boundaries."""
 
 from vllm.tilelang_utils import T, tilelang
-from vllm.v1.worker.gpu.sample.tilelang_controls import _DTYPES, _PASS
+from vllm.v1.worker.gpu.sample.tilelang_controls import _DTYPES, _PASS, _declare
+
+
+def register_thinking(
+    *, logits_strides, tokens_stride, start_len, natural_len, end_len
+):
+    _declare(
+        marker_cache_kernel,
+        [(tokens_stride, dtype, start_len, natural_len) for dtype in _DTYPES.values()],
+    )
+    _declare(
+        thinking_kernel,
+        [
+            (stride, tokens_stride, dtype, start_len, natural_len, end_len)
+            for stride in logits_strides
+            for dtype in _DTYPES.values()
+        ],
+    )
 
 
 @tilelang.jit(pass_configs=_PASS)

@@ -5,7 +5,54 @@
 import torch
 
 from vllm.tilelang_utils import T, tilelang
-from vllm.v1.worker.gpu.sample.tilelang_controls import _DTYPES, _PASS
+from vllm.v1.worker.gpu.sample.tilelang_controls import _DTYPES, _PASS, _declare
+
+
+def register_bad_words(
+    *,
+    logits_stride,
+    bad_word_token_ids_stride,
+    bad_word_offsets_stride,
+    all_token_ids_stride,
+):
+    _declare(
+        bad_words_kernel,
+        [
+            (
+                logits_stride,
+                bad_word_token_ids_stride,
+                bad_word_offsets_stride,
+                all_token_ids_stride,
+                dtype,
+            )
+            for dtype in _DTYPES.values()
+        ],
+    )
+
+
+def register_prompt_ids(*, all_token_ids_stride):
+    _declare(
+        prompt_ids_kernel, [(all_token_ids_stride, dtype) for dtype in _DTYPES.values()]
+    )
+
+
+def register_fill_ids():
+    _declare(
+        fill_ids_kernel,
+        [
+            (mapping, sampled, topk)
+            for mapping in _DTYPES.values()
+            for sampled in _DTYPES.values()
+            for topk in _DTYPES.values()
+        ],
+    )
+
+
+def register_nan_counts(*, logits, vocab_size):
+    _declare(
+        nan_count_kernel,
+        [(vocab_size, stride, str(dtype)[6:]) for dtype, stride in logits],
+    )
 
 
 @tilelang.jit(pass_configs=_PASS)

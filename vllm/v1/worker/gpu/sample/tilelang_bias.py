@@ -3,7 +3,40 @@
 """Allowed-token, sparse-bias and minimum-length candidate."""
 
 from vllm.tilelang_utils import T, tilelang
-from vllm.v1.worker.gpu.sample.tilelang_controls import _DTYPES, _PASS
+from vllm.v1.worker.gpu.sample.tilelang_controls import _DTYPES, _PASS, _declare
+
+
+def register_bias(
+    *,
+    vocab_size,
+    logits_strides,
+    allowed_stride,
+    bias_ids_stride,
+    bias_stride,
+    stop_stride,
+    width,
+):
+    _declare(
+        bias_kernel,
+        [
+            (
+                vocab_size,
+                stride,
+                allowed_stride,
+                bias_ids_stride,
+                bias_stride,
+                stop_stride,
+                width,
+                restore,
+                index_dtype,
+                position_dtype,
+            )
+            for stride in logits_strides
+            for restore in (False, True)
+            for index_dtype in _DTYPES.values()
+            for position_dtype in _DTYPES.values()
+        ],
+    )
 
 
 @tilelang.jit(pass_configs=_PASS)
