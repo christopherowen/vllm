@@ -470,6 +470,15 @@ def post_streams(hidden_size: int, threads: int = 128):
     return mhc_post
 
 
+# Shared memory each collapse block holds without using it, which caps residency at
+# four blocks an SM. On GB10 the long-prefill collapse reads the four streams faster
+# with fewer blocks resident (TileKernels' kernel is capped by its own shared memory);
+# decode is not limited by residency. Round 4a of the TileLang completion experiment,
+# three passes against TileKernels: -2.2% to -3.0% at 8K and 16K prefill tokens and
+# -4% to -8% at decode.
+_COLLAPSE_RESERVE = 24 * 1024
+
+
 @tilelang.jit(pass_configs=_PASS_CONFIGS)
 def collapse_streams(hidden_size: int, threads: int = 128):
     """The streams' weighted sum, TileKernels' ``mhc_pre_apply_mix_fwd`` to the bit:
@@ -479,7 +488,8 @@ def collapse_streams(hidden_size: int, threads: int = 128):
     zero, each stream's term added by one fused multiply-add, streams in order,
     and one rounding to BF16. Starting from zero rather than the first product
     matters only in sign: four negative-zero products sum to positive zero, as
-    TileKernels' do. The thread mapping is ``post_streams``'.
+    TileKernels' do. The thread mapping is ``post_streams``'; each block holds
+    ``_COLLAPSE_RESERVE`` bytes of shared memory.
     """
     assert hidden_size % (threads * VEC) == 0
     blocks = hidden_size // (threads * VEC)
@@ -492,12 +502,17 @@ def collapse_streams(hidden_size: int, threads: int = 128):
         out: T.Tensor((M, hidden_size), T.bfloat16),
     ):
         with T.Kernel(M * blocks, threads=threads) as pid:
+            tx = T.get_thread_binding()
             token = pid // blocks
-            col = (pid % blocks * threads + T.get_thread_binding()) * VEC
+            col = (pid % blocks * threads + tx) * VEC
             sv = T.alloc_local((MULT * VEC,), T.bfloat16)
             ov = T.alloc_local((VEC,), T.bfloat16)
             mv = T.alloc_local((MULT,), T.float32)
             acc = T.alloc_var(T.float32)
+            # Held, not used: the one write keeps the allocation, and with it the cap.
+            reserve = T.alloc_shared((_COLLAPSE_RESERVE // 4,), T.float32)
+            if tx == 0:
+                reserve[0] = T.float32(0)
             for m in T.vectorized(MULT):
                 mv[m] = mix[token, m]
             for m in T.unroll(MULT):
