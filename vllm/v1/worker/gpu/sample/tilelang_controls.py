@@ -59,15 +59,12 @@ def min_p_kernel(vocab: int, stride: int, index_dtype: str, threads: int = 128):
         with T.Kernel(rows, threads=threads) as row:
             T.import_source(_HEADER)
             maximum = T.alloc_fragment((block,), "float32")
-            invalid = T.alloc_fragment((block,), "int32")
             reduced = T.alloc_fragment((1,), "float32")
-            any_nan = T.alloc_fragment((1,), "int32")
             value = T.alloc_local((1,), "float32")
             minimum = T.alloc_local((1,), "float32")
             minimum[0] = thresholds[mapping[row]]
             if minimum[0] != 0:
                 T.fill(maximum, -T.infinity("float32"))
-                T.clear(invalid)
                 for start in T.serial(T.ceildiv(vocab, block)):
                     for col in T.Parallel(block):
                         index = start * block + col
@@ -75,24 +72,21 @@ def min_p_kernel(vocab: int, stride: int, index_dtype: str, threads: int = 128):
                         if index < vocab:
                             value[0] = logits[T.cast(row, "int64"), index]
                         maximum[col] = T.max(maximum[col], value[0])
-                        invalid[col] |= T.cast(T.isnan(value[0]), "int32")
                 T.reduce_max(maximum, reduced, dim=0)
-                T.reduce_max(invalid, any_nan, dim=0)
                 minimum[0] = reduced[0] + T.call_extern(
                     "float32", "vllm_control_log", minimum[0]
                 )
-                # Triton's maximum propagates NaNs. A NaN threshold filters nothing.
-                if any_nan[0] == 0:
-                    for start in T.serial(T.ceildiv(vocab, block)):
-                        for col in T.Parallel(block):
-                            index = start * block + col
-                            if index < vocab:
-                                value[0] = logits[T.cast(row, "int64"), index]
-                                logits[T.cast(row, "int64"), index] = T.if_then_else(
-                                    value[0] < minimum[0],
-                                    -T.infinity("float32"),
-                                    value[0],
-                                )
+                # The maximum reduction ignores isolated NaNs, as Triton does.
+                for start in T.serial(T.ceildiv(vocab, block)):
+                    for col in T.Parallel(block):
+                        index = start * block + col
+                        if index < vocab:
+                            value[0] = logits[T.cast(row, "int64"), index]
+                            logits[T.cast(row, "int64"), index] = T.if_then_else(
+                                value[0] < minimum[0],
+                                -T.infinity("float32"),
+                                value[0],
+                            )
 
     return min_p
 

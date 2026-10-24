@@ -20,9 +20,12 @@ def assert_bits(actual, expected):
         # NaN payloads are not part of the logits-processor contract.
         assert torch.equal(torch.isnan(actual), torch.isnan(expected))
         valid = ~torch.isnan(expected)
-        assert torch.equal(
-            actual[valid].view(torch.int32), expected[valid].view(torch.int32)
-        )
+        mismatch = (actual.view(torch.int32) != expected.view(torch.int32)) & valid
+        examples = mismatch.nonzero()[:8]
+        assert not mismatch.any(), [
+            (index.tolist(), actual[tuple(index)].item(), expected[tuple(index)].item())
+            for index in examples
+        ]
     else:
         assert torch.equal(actual, expected)
 
@@ -42,6 +45,10 @@ def min_p_case(rows, vocab, index_dtype, *, padded=False, nonfinite=False):
             logits[1, 0] = float("nan")
         if rows > 2:
             logits[2, -1] = float("inf")
+        if rows > 3:
+            logits[3].fill_(float("nan"))
+        if rows > 4 and vocab > 1024:
+            logits[4, :1024] = float("nan")
     return logits, mapping, thresholds
 
 
