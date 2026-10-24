@@ -290,3 +290,70 @@ def test_nan_count_ignores_padded_columns(dtype, vocab):
     output = auxiliary.count_nans(logits)
     assert_bits(output, expected)
     assert torch.equal(output, torch.isnan(logits).sum(-1))
+
+
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("vocab", [128, 8193, 129280])
+@pytest.mark.parametrize("restore", [False, True])
+def test_bias_preserves_allowed_logits_and_applies_bias_before_stop_mask(
+    index_dtype, vocab, restore
+):
+    from vllm.v1.worker.gpu.sample import tilelang_bias
+    from vllm.v1.worker.gpu.sample.logit_bias import _bias_kernel
+
+    torch.manual_seed(81419)
+    states, rows, width = 11, 6, 32
+    logits = torch.randn((rows, vocab + 13), device="cuda")[:, :vocab]
+    mapping = torch.tensor([8, 2, 4, 7, 1, 5], device="cuda", dtype=index_dtype)
+    positions = torch.arange(rows, device="cuda", dtype=torch.int64) + 3
+    num_allowed = torch.zeros(states, device="cuda", dtype=torch.int32)
+    num_allowed[mapping[::2]] = width
+    allowed = torch.arange(width, device="cuda", dtype=torch.int32).repeat(states, 1)
+    num_bias = torch.full_like(num_allowed, width)
+    bias_ids = allowed.clone()
+    biases = torch.randn((states, width), device="cuda")
+    min_lens = torch.full_like(num_allowed, 5)
+    num_stops = torch.full_like(num_allowed, 3)
+    restore_rows = torch.ones_like(num_allowed)
+    stops = torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32).repeat(states, 1)
+    expected = torch.empty_strided(logits.shape, logits.stride(), device="cuda")
+    expected.copy_(logits)
+    _bias_kernel[(rows,)](
+        expected,
+        expected.stride(0),
+        vocab,
+        mapping,
+        num_allowed,
+        allowed,
+        allowed.stride(0),
+        num_bias,
+        bias_ids,
+        bias_ids.stride(0),
+        biases,
+        biases.stride(0),
+        positions,
+        min_lens,
+        num_stops,
+        restore_rows,
+        stops,
+        stops.stride(0),
+        BLOCK_SIZE=width,
+        LOGITS_BLOCK_SIZE=8192,
+        CHECK_ALL_MASKED_ROWS=restore,
+    )
+    tilelang_bias.apply_logit_bias(
+        logits,
+        mapping,
+        positions,
+        num_allowed,
+        allowed,
+        num_bias,
+        bias_ids,
+        biases,
+        min_lens,
+        num_stops,
+        restore_rows,
+        stops,
+        restore,
+    )
+    assert_bits(logits, expected)

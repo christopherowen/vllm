@@ -26,6 +26,16 @@ MIN_TOKENS = 10
 POS = 5
 
 
+@pytest.fixture(params=["triton", "tilelang"], autouse=True)
+def bias_implementation(request, monkeypatch):
+    if request.param == "tilelang":
+        from vllm.v1.worker.gpu.sample import logit_bias, tilelang_bias
+
+        monkeypatch.setattr(
+            logit_bias, "apply_logit_bias", tilelang_bias.apply_logit_bias
+        )
+
+
 def _params(structured: bool) -> SamplingParams:
     return SamplingParams(
         min_tokens=MIN_TOKENS,
