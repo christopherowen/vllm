@@ -10,11 +10,6 @@ import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
-from vllm.model_executor.warmup.jit_warmup_triton_helper import (
-    TritonWarmupTensor,
-    triton_kernel_dispatcher_with_warmup,
-    triton_warmup_inputs,
-)
 from vllm.models.deepseek_v4_1.ced import (
     CED_WINDOW,
     CEDState,
@@ -34,6 +29,8 @@ from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
 
 
+# The reference ``tilelang.lookback.gather_lookback_kernel`` is tested against;
+# the model state no longer launches it.
 @triton.jit(do_not_specialize=["num_reqs"])
 def _gather_lookback_kernel(
     lookback_ptr,
@@ -64,28 +61,6 @@ def _gather_lookback_kernel(
         other=-1,
     )
     tl.store(lookback_ptr + batch_idx * DEPTH + offs, ids, mask=offs < DEPTH)
-
-
-def _gather_lookback_warmup_inputs(
-    *, depth: int, all_token_ids_stride: int
-) -> dict[str, Any]:
-    return triton_warmup_inputs(
-        _gather_lookback_kernel,
-        TritonWarmupTensor(torch.int32),
-        TritonWarmupTensor(torch.int64),
-        TritonWarmupTensor(torch.int32),
-        TritonWarmupTensor(torch.int32),
-        all_token_ids_stride,
-        1,
-        grid=(1,),
-        DEPTH=depth,
-        BLOCK_DEPTH=triton.next_power_of_2(depth),
-    )
-
-
-_gather_lookback_launcher = triton_kernel_dispatcher_with_warmup(
-    warmup_inputs=_gather_lookback_warmup_inputs
-)(_gather_lookback_kernel)
 
 
 def _nonfinal_skip_policy(
@@ -214,9 +189,17 @@ class DeepseekV41ModelState(DefaultModelState):
             self.lookback_token_ids = torch.full(
                 (self.max_num_reqs, depth), -1, dtype=torch.int32, device=device
             )
-            # The runner's token history is [max_num_reqs, max_model_len].
-            _gather_lookback_launcher.register_warmup(
-                depth=depth, all_token_ids_stride=self.max_model_len
+            # Rows of every batch size share one kernel; the runner's
+            # batch-to-request-state index is int64 (np.intp).
+            from vllm.models.deepseek_v4_1.tilelang import lookback, prepare
+
+            prepare.declare(
+                lambda: [
+                    prepare.call(
+                        lookback.gather_lookback_kernel,
+                        *lookback.gather_lookback_key(depth, "int64"),
+                    )
+                ]
             )
         from .model import DeepseekV4Model
 
@@ -406,17 +389,14 @@ class DeepseekV41ModelState(DefaultModelState):
         window = self.lookback_token_ids
         if window is None:
             return model_inputs
-        all_token_ids = req_states.all_token_ids.gpu
-        depth = window.shape[1]
-        _gather_lookback_launcher[(window.shape[0],)](
+        from vllm.models.deepseek_v4_1.tilelang.lookback import gather_lookback
+
+        # Every row: the batch's requests' windows, then -1.
+        gather_lookback(
             window,
             input_batch.idx_mapping,
             req_states.num_computed_tokens.gpu,
-            all_token_ids,
-            all_token_ids.stride(0),
-            input_batch.idx_mapping.shape[0],
-            DEPTH=depth,
-            BLOCK_DEPTH=triton.next_power_of_2(depth),
+            req_states.all_token_ids.gpu,
         )
         model_inputs["lookback_token_ids"] = window
         for model in self.disk_engram_models:

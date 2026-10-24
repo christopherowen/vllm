@@ -18,7 +18,6 @@ from vllm.v1.worker import utils as worker_utils
 from vllm.v1.worker.utils import (
     AttentionGroup,
     KVBlockZeroer,
-    _zero_kv_blocks_kernel,
 )
 
 
@@ -266,14 +265,13 @@ def test_large_dsv4_launch_geometry(monkeypatch):
     assert seg_page_sizes.tolist() == page_sizes
     assert (max_chunks, blk_size, n_segs) == (10, 1024, 181)
 
-    captured_grids = []
+    launches = []
 
-    class FakeKernel:
-        def __getitem__(self, grid):
-            captured_grids.append(grid)
-            return lambda *args, **kwargs: None
+    def fake_zero(seg_addrs, strides, pages, block_ids, max_page_size_el):
+        assert seg_addrs.dtype == torch.int64  # the address table, viewed as int64
+        launches.append((block_ids.numel(), seg_addrs.numel(), max_page_size_el))
 
-    monkeypatch.setattr(worker_utils, "_zero_kv_blocks_launcher", FakeKernel())
+    monkeypatch.setattr(worker_utils, "_zero_kv_blocks", fake_zero)
     monkeypatch.setattr(
         worker_utils,
         "async_tensor_h2d",
@@ -284,7 +282,9 @@ def test_large_dsv4_launch_geometry(monkeypatch):
 
     old_max_chunks = max(page_sizes) // 4
     assert math.prod((n_blocks, n_segs, old_max_chunks)) > 2**31 - 1
-    assert captured_grids == [(n_blocks, n_segs, max_chunks)]
+    # One launch of (blocks, segments, 1024-element chunks) blocks: ten chunks
+    # cover the largest page.
+    assert launches == [(n_blocks, n_segs, max_chunks * blk_size)]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -292,7 +292,7 @@ def test_warmup_compiles_for_all_block_counts():
     """After warmup, no launch should trigger a first-request JIT compile.
 
     The block count is carried by the launch grid, so changing it must reuse
-    the warmup's compiled kernel.
+    the warmup's compiled kernel (one TileLang kernel, no compile-time key).
     """
     device = torch.device("cuda")
     num_blocks = 64
@@ -310,12 +310,11 @@ def test_warmup_compiles_for_all_block_counts():
         1,  # n_segs
     )
 
+    from vllm.v1.worker.gpu import tilelang_inputs
+
     def compiled_variants() -> set:
-        return {
-            key
-            for caches in _zero_kv_blocks_kernel.device_caches.values()
-            for key in caches[0]
-        }
+        factory = id(tilelang_inputs.zero_kv_blocks_kernel)
+        return {key for key in tilelang_inputs._KERNELS if key[0] == factory}
 
     zeroer.warmup(num_blocks)
     torch.accelerator.synchronize()

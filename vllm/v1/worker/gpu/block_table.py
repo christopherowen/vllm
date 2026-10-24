@@ -1,15 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
-from typing import Any
 
 import torch
 
-from vllm.model_executor.warmup.jit_warmup_triton_helper import (
-    TritonWarmupTensor,
-    triton_kernel_dispatcher_with_warmup,
-    triton_warmup_inputs,
-)
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheSpec
@@ -120,6 +114,14 @@ class BlockTables:
         self.block_table_ptrs = self._make_ptr_tensor(
             [b.gpu for b in self.block_tables]
         )
+        # The TileLang kernels read pointer tables as int64 (same bits).
+        self._block_table_ptrs_i64 = self.block_table_ptrs.view(torch.int64)
+        from vllm.v1.worker.gpu import tilelang_inputs
+
+        # The gather's blocks: each group's 1024-column chunks of a row.
+        self._gather_chunks = tilelang_inputs.gather_chunks(
+            [b.gpu.stride(0) for b in self.block_tables], self.device
+        )
         self.block_table_strides = torch.tensor(
             [b.gpu.stride(0) for b in self.block_tables],
             dtype=torch.int64,
@@ -141,6 +143,7 @@ class BlockTables:
             self.group_cp_sizes_list, dtype=torch.int32, device=self.device
         )
         self.input_block_table_ptrs = self._make_ptr_tensor(self.input_block_tables)
+        self._input_block_table_ptrs_i64 = self.input_block_table_ptrs.view(torch.int64)
 
     def get_group_cp_parameters(self, group_id: int) -> tuple[int, int, int]:
         group_cp_size = self.group_cp_sizes_list[group_id]
@@ -180,7 +183,7 @@ class BlockTables:
             # Multiple groups: apply all block tables with one fused kernel.
             assert self.fused_writer is not None
             self.fused_writer.apply(
-                self.block_tables, self.block_table_ptrs, self.block_table_strides
+                self.block_tables, self._block_table_ptrs_i64, self.block_table_strides
             )
         self.num_blocks.copy_to_uva()
 
@@ -195,21 +198,22 @@ class BlockTables:
             return ()
         if out is None:
             out = tuple(self.input_block_tables)
-            out_ptrs = self.input_block_table_ptrs
+            dst_ptrs = self._input_block_table_ptrs_i64
         else:
             assert out_ptrs is not None
             assert len(out) == self.num_kv_cache_groups
-        num_reqs = idx_mapping.shape[0]
-        # Launch kernel with num_reqs_padded to fuse zeroing of padded rows.
-        _gather_block_tables_launcher[(self.num_kv_cache_groups, num_reqs_padded)](
+            dst_ptrs = out_ptrs.view(torch.int64)
+        from vllm.v1.worker.gpu import tilelang_inputs
+
+        # Every row up to num_reqs_padded: the padded rows are zeroed.
+        tilelang_inputs.gather_block_tables(
             idx_mapping,
-            self.block_table_ptrs,
-            out_ptrs,
+            self._block_table_ptrs_i64,
+            dst_ptrs,
             self.block_table_strides,
             self.num_blocks.gpu,
-            self.num_blocks.gpu.stride(0),
-            num_reqs,
-            BLOCK_SIZE=1024,  # type: ignore
+            self._gather_chunks,
+            num_reqs_padded,
         )
         return tuple(bt[:num_reqs_padded] for bt in out)
 
@@ -236,30 +240,26 @@ class BlockTables:
     ) -> torch.Tensor:
         if self.num_kv_cache_groups == 0:
             return (self.slot_mappings if out is None else out)[:, :num_tokens_padded]
-        num_reqs = idx_mapping.shape[0]
-        num_groups = self.num_kv_cache_groups
         slot_mappings = self.slot_mappings if out is None else out
-        _compute_slot_mappings_launcher[(num_groups, num_reqs + 1)](
-            slot_mappings.shape[1],
+        from vllm.v1.worker.gpu import tilelang_inputs
+
+        # Pads from the step's token count to the end of each row.
+        tilelang_inputs.compute_slot_mappings(
             idx_mapping,
             query_start_loc,
             positions,
-            self.block_table_ptrs,
+            self._block_table_ptrs_i64,
             self.block_table_strides,
             self.num_blocks.gpu,
-            self.num_blocks.gpu.stride(0),
             self.block_sizes_tensor,
             self.kernel_block_sizes_tensor,
             self.slot_mapping_enabled,
             self.slot_mapping_circular,
             self.group_cp_sizes,
             slot_mappings,
-            slot_mappings.stride(0),
             self.cp_rank,
-            CP_SIZE=self.cp_size,
-            CP_INTERLEAVE=self.cp_interleave,
-            PAD_ID=PAD_SLOT_ID,
-            TRITON_BLOCK_SIZE=1024,  # type: ignore
+            self.cp_size,
+            self.cp_interleave,
         )
         return slot_mappings[:, :num_tokens_padded]
 
@@ -273,6 +273,10 @@ class BlockTables:
         # with the same memory address as that used during the model's forward pass,
         # rather than allocating a new tensor.
         return self.slot_mappings[:, :num_tokens]
+
+
+# The Triton kernels below are the reference the TileLang kernels
+# (``tilelang_inputs``) are tested against; the runner no longer launches them.
 
 
 @triton.jit(do_not_specialize=["num_reqs"])
@@ -410,83 +414,12 @@ def _compute_slot_mappings_kernel(
         tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)
 
 
-def _gather_block_tables_warmup_inputs(*, max_num_reqs: int) -> dict[str, Any]:
-    pointers = TritonWarmupTensor(torch.uint64)
-    return triton_warmup_inputs(
-        _gather_block_tables_kernel,
-        TritonWarmupTensor(torch.int64),
-        pointers,
-        pointers,
-        TritonWarmupTensor(torch.int64),
-        TritonWarmupTensor(torch.int32),
-        max_num_reqs,
-        1,
-        grid=(1,),
-        BLOCK_SIZE=1024,
-    )
-
-
-def _compute_slot_mappings_warmup_inputs(
-    *,
-    max_num_reqs: int,
-    max_num_batched_tokens: int,
-    cp_rank: int,
-    cp_size: int,
-    cp_interleave: int,
-) -> dict[str, Any]:
-    int32 = TritonWarmupTensor(torch.int32)
-    int64 = TritonWarmupTensor(torch.int64)
-    boolean = TritonWarmupTensor(torch.bool)
-    return triton_warmup_inputs(
-        _compute_slot_mappings_kernel,
-        max_num_batched_tokens,
-        int64,
-        int32,
-        int64,
-        TritonWarmupTensor(torch.uint64),
-        int64,
-        int32,
-        max_num_reqs,
-        int32,
-        int32,
-        boolean,
-        boolean,
-        int32,
-        int64,
-        max_num_batched_tokens,
-        cp_rank,
-        grid=(1,),
-        CP_SIZE=cp_size,
-        CP_INTERLEAVE=cp_interleave,
-        PAD_ID=PAD_SLOT_ID,
-        TRITON_BLOCK_SIZE=1024,
-    )
-
-
-_gather_block_tables_launcher = triton_kernel_dispatcher_with_warmup(
-    warmup_inputs=_gather_block_tables_warmup_inputs
-)(_gather_block_tables_kernel)
-_compute_slot_mappings_launcher = triton_kernel_dispatcher_with_warmup(
-    warmup_inputs=_compute_slot_mappings_warmup_inputs
-)(_compute_slot_mappings_kernel)
-
-
-def register_block_table_warmups(
-    *,
-    max_num_reqs: int,
-    max_num_batched_tokens: int,
-    cp_rank: int,
-    cp_size: int,
-    cp_interleave: int,
-) -> None:
-    """Register the gather of a step's block tables and its slot mappings for
+def declare_block_table_kernels(*, cp_size: int, cp_interleave: int) -> None:
+    """Declare the gather of a step's block tables and its slot mappings for
     ``BlockTables`` with at least one KV cache group (per-group geometry is tensor
     data, not part of the kernels' keys)."""
-    _gather_block_tables_launcher.register_warmup(max_num_reqs=max_num_reqs)
-    _compute_slot_mappings_launcher.register_warmup(
-        max_num_reqs=max_num_reqs,
-        max_num_batched_tokens=max_num_batched_tokens,
-        cp_rank=cp_rank,
-        cp_size=cp_size,
-        cp_interleave=cp_interleave,
+    from vllm.v1.worker.gpu import tilelang_inputs
+
+    tilelang_inputs.declare(
+        lambda: tilelang_inputs.block_table_calls(cp_size, cp_interleave)
     )

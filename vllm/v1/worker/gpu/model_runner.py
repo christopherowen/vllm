@@ -122,13 +122,12 @@ from vllm.v1.worker.gpu.attn_utils import (
 )
 from vllm.v1.worker.gpu.block_table import (
     BlockTables,
-    register_block_table_warmups,
+    declare_block_table_kernels,
     slot_mapping_mode,
 )
 from vllm.v1.worker.gpu.boundary_checkpoint import BoundaryCheckpointState
 from vllm.v1.worker.gpu.buffer_utils import (
-    FusedStagedWriter,
-    register_staged_write_warmup,
+    declare_staged_write_kernels,
     set_default_max_concurrency,
 )
 from vllm.v1.worker.gpu.cp_utils import maybe_prepare_dcp_local_seq_lens
@@ -152,6 +151,7 @@ from vllm.v1.worker.gpu.input_batch import (
     InputBuffers,
     assign_dummy_blocks,
     combine_sampled_and_draft_tokens,
+    declare_input_batch_kernels,
     expand_idx_mapping,
     get_num_sampled_and_rejected,
     post_update,
@@ -231,8 +231,8 @@ from vllm.v1.worker.utils import (
     add_kv_sharing_layers_to_kv_cache_groups,
     clear_layer_kv_caches,
     copy_kv_cache_blocks_inplace,
+    declare_zero_kv_blocks_kernel,
     get_uniform_decode_token_count,
-    register_zero_kv_blocks_warmup,
 )
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
@@ -2068,19 +2068,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return self._greedy_verification
 
     def declare_step_kernels(self) -> None:
-        """Register the Triton kernels that input preparation, sampling, greedy
+        """Declare the kernels that input preparation, sampling, greedy
         verification and the drafter launch: for the runner's buffers, the loaded
         LM head's dtype and vocabulary shards, and the block tables of the KV cache
-        groups its spec gives (the KV cache does not exist yet).
+        groups its spec gives (the KV cache does not exist yet). Input preparation
+        and the commit of sampled tokens (TileLang) run on every rank; a stage
+        before the last commits the last stage's tokens without query starts or
+        output-token counts. Sampling and verification run on the last.
 
         The worker calls this while preparing kernels, after the engine core set
         the KV cache layout the groups depend on.
         """
         from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
 
-        if not self.is_last_pp_rank or self.is_pooling_model:
-            return
-        assert self.sampler is not None
         kv_cache_groups = get_kv_cache_groups(
             self.vllm_config, self.get_kv_cache_spec()
         )
@@ -2096,22 +2096,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and dead_rows_enabled()
             and self.batch_sharder is None
         )
-        register_input_batch_warmups(
-            max_num_reqs=self.input_buffers.seq_lens.shape[0],
-            next_prefill_tokens_stride=self.req_states.next_prefill_tokens.stride(0),
+        samples = self.is_last_pp_rank and not self.is_pooling_model
+        if not samples:
+            # A stage before the last commits what the last stage sampled.
+            commits = () if self.is_pooling_model else ((False, False, False),)
+        elif self.vllm_config.use_request_boundary_checkpoints:
+            # With boundary captures, and logits-only steps without query starts.
+            commits = ((True, True, True), (True, False, False), (True, True, False))
+        else:
+            commits = ((True, True, False),)
+        declare_input_batch_kernels(
             num_lookahead=self.req_states.next_prefill_tokens.shape[0],
-            all_token_ids_stride=self.req_states.all_token_ids.gpu.stride(0),
-            draft_tokens_stride=self.req_states.draft_tokens.stride(0),
             num_speculative_steps=self.req_states.draft_tokens.shape[-1],
             num_new_sampled_tokens=self.model_state.num_new_sampled_tokens_per_step,
-            dead_rows_confidence_stride=self.num_speculative_steps
-            if dead_rows
-            else None,
-            output_bin_counts_stride=self.sampler.penalties_state.output_bin_counts.stride(
-                0
-            ),
+            dead_rows=dead_rows,
+            # The sampler's one column, and verification's num_speculative_steps + 1.
+            sampled_widths=(1,)
+            + ((self.num_speculative_steps + 1,) if self.num_speculative_steps else ()),
+            commits=commits,
         )
         self.req_states.register_warmups()
+        if not samples:
+            return
+        assert self.sampler is not None
+        register_input_batch_warmups(dead_rows=dead_rows)
 
         language_model = self._language_model()
         head = getattr(language_model, "lm_head", None)
@@ -2188,27 +2196,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def _register_kv_cache_warmups(
         self, kv_cache_groups: list[KVCacheGroupSpec], kernel_block_sizes: list[int]
     ) -> None:
-        """Register the block-table kernels and KV block zeroing for the KV cache
-        groups ``initialize_kv_cache`` will receive (their layout does not depend
-        on the number of blocks)."""
+        """Declare the staged writes, the block-table kernels and KV block zeroing
+        for the KV cache groups ``initialize_kv_cache`` will receive (their layout
+        does not depend on the number of blocks)."""
+        # Every staged tensor's write (request and sampling states, block
+        # tables): the kernels are keyed by element type alone.
+        declare_staged_write_kernels()
         if not kv_cache_groups:
             return
-        register_block_table_warmups(
-            max_num_reqs=self.max_num_reqs,
-            max_num_batched_tokens=self.max_num_tokens,
-            cp_rank=self.dcp_rank,
+        declare_block_table_kernels(
             cp_size=self.dcp_size,
             cp_interleave=self.parallel_config.cp_kv_cache_interleave_size,
         )
-        if len(kv_cache_groups) > 1:
-            FusedStagedWriter.register_warmup()
-        else:
-            spec = kv_cache_groups[0].kv_cache_spec
-            register_staged_write_warmup(
-                torch.int32,
-                self._block_table_width(spec, self._block_table_max_model_len())
-                * (spec.block_size // kernel_block_sizes[0]),
-            )
         kv_cache_config = KVCacheConfig(
             num_blocks=0, kv_cache_tensors=[], kv_cache_groups=kv_cache_groups
         )
@@ -2225,7 +2224,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if isinstance(layer_spec, AttentionSpec)
         ]
         if page_sizes:
-            register_zero_kv_blocks_warmup(max(page_sizes) // 4)
+            declare_zero_kv_blocks_kernel()
 
     def _draft_block_table_layouts(
         self, kv_cache_groups: list[KVCacheGroupSpec], kernel_block_sizes: list[int]

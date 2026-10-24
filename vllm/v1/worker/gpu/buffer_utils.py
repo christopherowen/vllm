@@ -2,17 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Sequence
 from functools import partial
-from typing import Any
 
 import numpy as np
 import torch
 
 from vllm.logger import init_logger
-from vllm.model_executor.warmup.jit_warmup_triton_helper import (
-    TritonWarmupTensor,
-    triton_kernel_dispatcher_with_warmup,
-    triton_warmup_inputs,
-)
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import (
@@ -167,6 +161,8 @@ class StagedWriteTensor:
             # GPU to save GPU memory
             self._uva_buf = UvaBuffer(size, dtype)
             self.gpu = self._uva_buf.uva()
+        # The write kernel addresses rows of the flat tensor by its row stride.
+        self._flat_gpu = self.gpu.view(-1)
 
         self._staged_write_indices: list[int] = []
         self._staged_write_starts: list[int] = []
@@ -217,24 +213,29 @@ class StagedWriteTensor:
                 self._staged_write_contents
             )
 
+        from vllm.v1.worker.gpu import tilelang_inputs
+
         # Write diffs to the GPU buffer
-        _apply_write_launcher[(n,)](
-            self.gpu,
+        tilelang_inputs.apply_staged_writes(
+            self._flat_gpu,
             self.gpu.stride(0),
             indices_uva,
             starts_uva,
             write_contents,
             cu_lens_uva,
-            None,
-            BLOCK_SIZE=1024,
-            MULTI_GROUP=False,
+            self._staged_write_cu_lens,
         )
         # Clear the staged writes
         self.clear_staged_writes()
 
     def register_warmup(self) -> None:
-        """Register ``apply_write`` for this tensor's dtype and row stride."""
-        register_staged_write_warmup(self.dtype, self.gpu.stride(0))
+        """Declare ``apply_write`` for this tensor's element type."""
+        from vllm.v1.worker.gpu import tilelang_inputs
+
+        dtype = self.dtype
+        tilelang_inputs.declare(
+            lambda: tilelang_inputs.staged_write_calls(dtypes=(dtype,), fused=False)
+        )
 
     def clear_staged_writes(self) -> None:
         self._staged_write_indices.clear()
@@ -260,8 +261,12 @@ class FusedStagedWriter:
 
     @staticmethod
     def register_warmup() -> None:
-        """Register ``apply`` (int32 contents through per-group pointers)."""
-        _apply_write_launcher.register_warmup(dtype=None, output_stride=None)
+        """Declare ``apply`` (int32 contents through per-group pointers)."""
+        from vllm.v1.worker.gpu import tilelang_inputs
+
+        tilelang_inputs.declare(
+            lambda: tilelang_inputs.staged_write_calls(dtypes=(), fused=True)
+        )
 
     def apply(
         self,
@@ -269,7 +274,9 @@ class FusedStagedWriter:
         output_ptrs: torch.Tensor,
         output_strides: torch.Tensor,
     ) -> None:
-        """Apply and clear the staged writes of `tensors` with one kernel."""
+        """Apply and clear the staged writes of `tensors` with one kernel.
+
+        ``output_ptrs``: the tensors' data pointers as int64."""
         group_ids: list[int] = []
         indices: list[int] = []
         starts: list[int] = []
@@ -297,7 +304,9 @@ class FusedStagedWriter:
         cu_lens_uva = self.cu_lens.copy_to_uva(cu_lens)
         contents_gpu = async_tensor_h2d(contents, device=self.device, dtype=torch.int32)
 
-        _apply_write_launcher[(len(group_ids),)](
+        from vllm.v1.worker.gpu import tilelang_inputs
+
+        tilelang_inputs.apply_fused_staged_writes(
             output_ptrs,
             output_strides,
             indices_uva,
@@ -305,13 +314,14 @@ class FusedStagedWriter:
             contents_gpu,
             cu_lens_uva,
             group_ids_uva,
-            BLOCK_SIZE=1024,
-            MULTI_GROUP=True,
+            cu_lens,
         )
         for t in tensors:
             t.clear_staged_writes()
 
 
+# The reference the TileLang write (``tilelang_inputs.apply_write_kernel``) is
+# tested against; the runner no longer launches it.
 @triton.jit
 def _apply_write_kernel(
     output_ptr,  # MULTI_GROUP: ptr-to-ptrs [num_groups]; else: data ptr
@@ -357,46 +367,10 @@ def _load_ptr(ptr_to_ptr, elem_dtype):
     return tl.multiple_of(ptr, 16)
 
 
-def _apply_write_warmup_inputs(
-    *, dtype: torch.dtype | None, output_stride: int | None
-) -> dict[str, Any]:
-    """``dtype=None``: the fused multi-group write (``FusedStagedWriter``)."""
-    int32 = TritonWarmupTensor(torch.int32)
-    if dtype is None:
-        return triton_warmup_inputs(
-            _apply_write_kernel,
-            TritonWarmupTensor(torch.uint64),
-            TritonWarmupTensor(torch.int64),
-            int32,
-            int32,
-            int32,
-            int32,
-            int32,
-            grid=(1,),
-            BLOCK_SIZE=1024,
-            MULTI_GROUP=True,
-        )
-    return triton_warmup_inputs(
-        _apply_write_kernel,
-        TritonWarmupTensor(dtype),
-        output_stride,
-        int32,
-        int32,
-        TritonWarmupTensor(dtype),
-        int32,
-        None,
-        grid=(1,),
-        BLOCK_SIZE=1024,
-        MULTI_GROUP=False,
-    )
+def declare_staged_write_kernels() -> None:
+    """Declare the write of every element type a ``StagedWriteTensor`` may have and
+    ``FusedStagedWriter``'s: keyed by element type alone, they cover the request
+    and sampling states' tensors, including those that declare nothing."""
+    from vllm.v1.worker.gpu import tilelang_inputs
 
-
-_apply_write_launcher = triton_kernel_dispatcher_with_warmup(
-    warmup_inputs=_apply_write_warmup_inputs
-)(_apply_write_kernel)
-
-
-def register_staged_write_warmup(dtype: torch.dtype, output_stride: int) -> None:
-    """Register ``StagedWriteTensor.apply_write`` for a tensor of ``dtype`` whose
-    rows are ``output_stride`` elements apart (for tensors not built yet)."""
-    _apply_write_launcher.register_warmup(dtype=dtype, output_stride=output_stride)
+    tilelang_inputs.declare(tilelang_inputs.staged_write_calls)

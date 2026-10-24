@@ -15,7 +15,6 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 from vllm.triton_utils import tl, triton
 from vllm.utils import random_uuid
 from vllm.utils.math_utils import cdiv
-from vllm.v1.core.boundary_checkpoint import NUM_BOUNDARY_CHECKPOINT_SLOTS
 from vllm.v1.worker.gpu.boundary_checkpoint import (
     BoundaryCheckpointState,
     prepare_boundary_capture,
@@ -312,6 +311,7 @@ def assign_dummy_blocks(
         ].to(block_table.dtype)
 
 
+# Reference for ``tilelang_inputs``; the runner no longer launches it.
 @triton.jit
 def _prepare_prefill_inputs_kernel(
     input_ids_ptr,
@@ -371,24 +371,20 @@ def prepare_prefill_inputs(
     prefill_len: torch.Tensor,
     num_computed_tokens: torch.Tensor,
 ) -> None:
-    num_reqs = idx_mapping.shape[0]
-    num_lookahead = next_prefill_tokens.shape[0]
-    _prepare_prefill_inputs_launcher[(num_reqs,)](
+    from vllm.v1.worker.gpu import tilelang_inputs
+
+    tilelang_inputs.prepare_prefill_inputs(
         input_ids,
         next_prefill_tokens,
-        next_prefill_tokens.stride(0),
-        num_lookahead,
         idx_mapping,
         query_start_loc,
         all_token_ids,
-        all_token_ids.stride(0),
         prefill_len,
         num_computed_tokens,
-        BLOCK_SIZE=1024,
-        LOOKAHEAD_BLOCK=triton.next_power_of_2(num_lookahead),
     )
 
 
+# Reference for ``tilelang_inputs``; the runner no longer launches it.
 @triton.jit
 def _prepare_pos_seq_lens_kernel(
     pos_ptr,
@@ -433,20 +429,15 @@ def prepare_pos_seq_lens(
     pos: torch.Tensor,
     seq_lens: torch.Tensor,
 ) -> None:
-    num_reqs = idx_mapping.shape[0]
-    # NOTE(woosuk): We do +1 because the last thread block is used
-    # to pad unused seq_lens as 0 for full CUDA graphs.
-    _prepare_pos_seq_lens_launcher[(num_reqs + 1,)](
-        pos,
-        seq_lens,
-        idx_mapping,
-        query_start_loc,
-        num_computed_tokens,
-        seq_lens.shape[0],
-        BLOCK_SIZE=1024,
+    from vllm.v1.worker.gpu import tilelang_inputs
+
+    # The last block pads unused seq_lens as 0 for full CUDA graphs.
+    tilelang_inputs.prepare_pos_seq_lens(
+        idx_mapping, query_start_loc, num_computed_tokens, pos, seq_lens
     )
 
 
+# Reference for ``tilelang_inputs``; the runner no longer launches it.
 @triton.jit
 def _combine_sampled_and_draft_tokens_kernel(
     input_ids_ptr,
@@ -567,16 +558,15 @@ def combine_sampled_and_draft_tokens(
     assert num_new_sampled_tokens in (0, 1), (
         f"num_new_sampled_tokens must be 0 or 1, got {num_new_sampled_tokens}"
     )
-    # use idx_mapping.shape[0] for actual request count
-    num_reqs = idx_mapping.shape[0]
-    num_speculative_steps = draft_tokens.shape[-1]
+    from vllm.v1.worker.gpu import tilelang_inputs
 
     logits_indices = torch.empty(
         num_logits,
         dtype=torch.int64,
         device=input_ids.device,
     )
-    _combine_sampled_and_draft_tokens_launcher[(num_reqs,)](
+    # A request covers up to next_power_of_2(drafts + new sampled tokens) logits.
+    tilelang_inputs.combine_sampled_and_draft_tokens(
         input_ids,
         idx_mapping,
         last_sampled_tokens,
@@ -584,27 +574,10 @@ def combine_sampled_and_draft_tokens(
         seq_lens,
         prefill_len,
         draft_tokens,
-        draft_tokens.stride(0),
         cu_num_logits,
         logits_indices,
-        *(
-            (
-                dead_rows.confidence,
-                dead_rows.confidence.stride(0),
-                dead_rows.is_padding.view(torch.uint8),
-                dead_rows.cut,
-                dead_rows.log_tau,
-            )
-            if dead_rows is not None
-            else (input_ids, 0, input_ids, input_ids, 0.0)
-        ),
-        NUM_NEW_SAMPLED_TOKENS=num_new_sampled_tokens,
-        DEAD_ROWS=dead_rows is not None,
-        # NOTE(woosuk): Add num_new_sampled_tokens to ensure the block covers the
-        # last sampled token in addition to all draft tokens.
-        BLOCK_SIZE=triton.next_power_of_2(
-            num_speculative_steps + num_new_sampled_tokens
-        ),
+        num_new_sampled_tokens,
+        dead_rows,
     )
     return logits_indices
 
@@ -666,6 +639,7 @@ def get_num_sampled_and_rejected(
     return num_sampled, num_rejected
 
 
+# Reference for ``tilelang_inputs``; the runner no longer launches it.
 @triton.jit
 def _post_update_kernel(
     idx_mapping_ptr,
@@ -786,34 +760,21 @@ def post_update(
     boundary_state: BoundaryCheckpointState | None = None,
     boundary_capture: torch.Tensor | None = None,
 ) -> None:
-    num_reqs = idx_mapping.shape[0]
-    _post_update_launcher[(num_reqs,)](
+    from vllm.v1.worker.gpu import tilelang_inputs
+
+    tilelang_inputs.post_update(
         idx_mapping,
         num_computed_tokens,
         last_sampled_tokens,
         output_bin_counts,
-        output_bin_counts.stride(0) if output_bin_counts is not None else 0,
         sampled_tokens,
-        sampled_tokens.stride(0),
         num_sampled,
         num_rejected,
         query_start_loc,
         all_token_ids,
-        all_token_ids.stride(0),
         total_len,
-        boundary_state.metadata if boundary_state is not None else None,
-        boundary_state.stop_tokens if boundary_state is not None else None,
-        boundary_state.seen if boundary_state is not None else None,
-        boundary_capture[0] if boundary_capture is not None else None,
-        boundary_capture[1] if boundary_capture is not None else None,
-        boundary_capture[2] if boundary_capture is not None else None,
-        NUM_CAPTURES=(
-            NUM_BOUNDARY_CHECKPOINT_SLOTS if boundary_capture is not None else 0
-        ),
-        BOUNDARY_METADATA_WIDTH=(
-            boundary_state.metadata.shape[1] if boundary_state is not None else 0
-        ),
-        num_warps=1,
+        boundary_state if boundary_capture is not None else None,
+        boundary_capture,
     )
 
 
@@ -849,6 +810,7 @@ def post_update_num_computed_tokens(
     )
 
 
+# Reference for ``tilelang_inputs``; the runner no longer launches it.
 @triton.jit
 def _expand_idx_mapping_kernel(
     idx_mapping_ptr,
@@ -875,99 +837,20 @@ def expand_idx_mapping(
     cu_num_logits: torch.Tensor,
     max_expand_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    num_reqs = idx_mapping.shape[0]
+    from vllm.v1.worker.gpu import tilelang_inputs
+
     expanded_idx_mapping = idx_mapping.new_empty(total_num_logits)
     expanded_local_pos = torch.empty(
         total_num_logits, dtype=torch.int32, device=idx_mapping.device
     )
-    _expand_idx_mapping_launcher[(num_reqs,)](
+    tilelang_inputs.expand_idx_mapping(
         idx_mapping,
         expanded_idx_mapping,
         expanded_local_pos,
         cu_num_logits,
-        BLOCK_SIZE=triton.next_power_of_2(max_expand_len),
+        max_expand_len,
     )
     return expanded_idx_mapping, expanded_local_pos
-
-
-def _prepare_prefill_inputs_warmup_inputs(
-    *, next_prefill_tokens_stride: int, num_lookahead: int, all_token_ids_stride: int
-) -> dict[str, Any]:
-    int32 = TritonWarmupTensor(torch.int32)
-    return triton_warmup_inputs(
-        _prepare_prefill_inputs_kernel,
-        int32,
-        int32,
-        next_prefill_tokens_stride,
-        num_lookahead,
-        TritonWarmupTensor(torch.int64),
-        int32,
-        int32,
-        all_token_ids_stride,
-        int32,
-        int32,
-        grid=(1,),
-        BLOCK_SIZE=1024,
-        LOOKAHEAD_BLOCK=triton.next_power_of_2(num_lookahead),
-    )
-
-
-def _prepare_pos_seq_lens_warmup_inputs(*, max_num_reqs: int) -> dict[str, Any]:
-    int32 = TritonWarmupTensor(torch.int32)
-    int64 = TritonWarmupTensor(torch.int64)
-    return triton_warmup_inputs(
-        _prepare_pos_seq_lens_kernel,
-        int64,
-        int32,
-        int64,
-        int32,
-        int32,
-        max_num_reqs,
-        grid=(1,),
-        BLOCK_SIZE=1024,
-    )
-
-
-def _combine_sampled_and_draft_tokens_warmup_inputs(
-    *,
-    draft_tokens_stride: int,
-    num_speculative_steps: int,
-    num_new_sampled_tokens: int,
-    dead_rows_confidence_stride: int | None,
-) -> dict[str, Any]:
-    int32 = TritonWarmupTensor(torch.int32)
-    int64 = TritonWarmupTensor(torch.int64)
-    dead_rows = dead_rows_confidence_stride is not None
-    return triton_warmup_inputs(
-        _combine_sampled_and_draft_tokens_kernel,
-        int32,
-        int64,
-        int64,
-        int32,
-        int32,
-        int32,
-        int64,
-        draft_tokens_stride,
-        int32,
-        int64,
-        *(
-            (
-                TritonWarmupTensor(torch.float32),
-                dead_rows_confidence_stride,
-                TritonWarmupTensor(torch.uint8),
-                int32,
-                0.0,
-            )
-            if dead_rows
-            else (int32, 0, int32, int32, 0.0)
-        ),
-        grid=(1,),
-        NUM_NEW_SAMPLED_TOKENS=num_new_sampled_tokens,
-        DEAD_ROWS=dead_rows,
-        BLOCK_SIZE=triton.next_power_of_2(
-            num_speculative_steps + num_new_sampled_tokens
-        ),
-    )
 
 
 def _get_num_sampled_and_rejected_warmup_inputs(*, dead_rows: bool) -> dict[str, Any]:
@@ -986,123 +869,47 @@ def _get_num_sampled_and_rejected_warmup_inputs(*, dead_rows: bool) -> dict[str,
     )
 
 
-def _post_update_warmup_inputs(
-    *,
-    output_bin_counts_stride: int | None,
-    sampled_tokens_stride: int,
-    all_token_ids_stride: int,
-) -> dict[str, Any]:
-    int32 = TritonWarmupTensor(torch.int32)
-    int64 = TritonWarmupTensor(torch.int64)
-    return triton_warmup_inputs(
-        _post_update_kernel,
-        int64,
-        int32,
-        int64,
-        int32 if output_bin_counts_stride is not None else None,
-        output_bin_counts_stride if output_bin_counts_stride is not None else 0,
-        int64,
-        sampled_tokens_stride,
-        int32,
-        int32,
-        int32,
-        int32,
-        all_token_ids_stride,
-        int32,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        grid=(1,),
-        NUM_CAPTURES=0,
-        BOUNDARY_METADATA_WIDTH=0,
-        num_warps=1,
-    )
-
-
-def _expand_idx_mapping_warmup_inputs(*, max_expand_len: int) -> dict[str, Any]:
-    int64 = TritonWarmupTensor(torch.int64)
-    int32 = TritonWarmupTensor(torch.int32)
-    return triton_warmup_inputs(
-        _expand_idx_mapping_kernel,
-        int64,
-        int64,
-        int32,
-        int32,
-        grid=(1,),
-        BLOCK_SIZE=triton.next_power_of_2(max_expand_len),
-    )
-
-
-_prepare_prefill_inputs_launcher = triton_kernel_dispatcher_with_warmup(
-    warmup_inputs=_prepare_prefill_inputs_warmup_inputs
-)(_prepare_prefill_inputs_kernel)
-_prepare_pos_seq_lens_launcher = triton_kernel_dispatcher_with_warmup(
-    warmup_inputs=_prepare_pos_seq_lens_warmup_inputs
-)(_prepare_pos_seq_lens_kernel)
-_combine_sampled_and_draft_tokens_launcher = triton_kernel_dispatcher_with_warmup(
-    warmup_inputs=_combine_sampled_and_draft_tokens_warmup_inputs
-)(_combine_sampled_and_draft_tokens_kernel)
 _get_num_sampled_and_rejected_launcher = triton_kernel_dispatcher_with_warmup(
     warmup_inputs=_get_num_sampled_and_rejected_warmup_inputs
 )(_get_num_sampled_and_rejected_kernel)
-_post_update_launcher = triton_kernel_dispatcher_with_warmup(
-    warmup_inputs=_post_update_warmup_inputs
-)(_post_update_kernel)
-_expand_idx_mapping_launcher = triton_kernel_dispatcher_with_warmup(
-    warmup_inputs=_expand_idx_mapping_warmup_inputs
-)(_expand_idx_mapping_kernel)
 
 
-def register_input_batch_warmups(
+def register_input_batch_warmups(*, dead_rows: bool) -> None:
+    """Register the Triton count of a step's sampled and rejected tokens (the
+    sampler family's), with its dead-row variant when adaptive verification marks
+    dead rows."""
+    for dead in (False, True) if dead_rows else (False,):
+        _get_num_sampled_and_rejected_launcher.register_warmup(dead_rows=dead)
+
+
+def declare_input_batch_kernels(
     *,
-    max_num_reqs: int,
-    next_prefill_tokens_stride: int,
     num_lookahead: int,
-    all_token_ids_stride: int,
-    draft_tokens_stride: int,
     num_speculative_steps: int,
     num_new_sampled_tokens: int,
-    dead_rows_confidence_stride: int | None,
-    output_bin_counts_stride: int | None,
+    dead_rows: bool,
+    sampled_widths: Sequence[int],
+    commits: Sequence[tuple[bool, bool, bool]],
 ) -> None:
-    """Register the kernels that prepare a step's inputs from the request states
-    and commit its sampled tokens, for the runner's persistent buffers: rows of
-    ``max_num_reqs`` requests, the request states' strides, and the dead-row
-    variants when adaptive verification marks dead rows (its confidences are
-    ``dead_rows_confidence_stride`` apart). Sampled tokens are one column per
-    request from the sampler, ``num_speculative_steps + 1`` from verification.
+    """Declare the TileLang kernels that prepare a step's inputs from the request
+    states and commit its sampled tokens: prefill inputs (``num_lookahead`` tokens
+    ahead), positions and sequence lengths, the draft combine (with its dead-row
+    variant when adaptive verification marks dead rows), the logits index expansion
+    when drafting, and the commit of sampled tokens of each of ``sampled_widths``
+    columns (one from the sampler, ``num_speculative_steps + 1`` from
+    verification) in each of the rank's ``commits``: whether it updates
+    output-token counts, has the step's query starts and records request-boundary
+    captures. Their keys hold no buffer shape or stride.
     """
-    _prepare_prefill_inputs_launcher.register_warmup(
-        next_prefill_tokens_stride=next_prefill_tokens_stride,
-        num_lookahead=num_lookahead,
-        all_token_ids_stride=all_token_ids_stride,
-    )
-    _prepare_pos_seq_lens_launcher.register_warmup(max_num_reqs=max_num_reqs)
-    dead_row_variants: tuple[int | None, ...] = (None,)
-    if dead_rows_confidence_stride is not None:
-        dead_row_variants += (dead_rows_confidence_stride,)
-    for confidence_stride in dead_row_variants:
-        _combine_sampled_and_draft_tokens_launcher.register_warmup(
-            draft_tokens_stride=draft_tokens_stride,
+    from vllm.v1.worker.gpu import tilelang_inputs
+
+    tilelang_inputs.declare(
+        lambda: tilelang_inputs.input_batch_calls(
+            num_lookahead=num_lookahead,
             num_speculative_steps=num_speculative_steps,
             num_new_sampled_tokens=num_new_sampled_tokens,
-            dead_rows_confidence_stride=confidence_stride,
+            dead_rows=dead_rows,
+            sampled_widths=sampled_widths,
+            commits=commits,
         )
-        _get_num_sampled_and_rejected_launcher.register_warmup(
-            dead_rows=confidence_stride is not None
-        )
-    sampled_tokens_strides = (1,)
-    if num_speculative_steps > 0:
-        sampled_tokens_strides += (num_speculative_steps + 1,)
-        _expand_idx_mapping_launcher.register_warmup(
-            max_expand_len=num_speculative_steps + num_new_sampled_tokens
-        )
-    for sampled_tokens_stride in sampled_tokens_strides:
-        _post_update_launcher.register_warmup(
-            output_bin_counts_stride=output_bin_counts_stride,
-            sampled_tokens_stride=sampled_tokens_stride,
-            all_token_ids_stride=all_token_ids_stride,
-        )
+    )

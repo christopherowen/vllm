@@ -17,11 +17,6 @@ from vllm.model_executor.layers.mamba.mamba_mixer2 import share_replayssm_ring_t
 from vllm.model_executor.layers.utils import warmup_rocm_skinny_gemm_workspaces
 from vllm.model_executor.models.interfaces import MultiModalEmbeddings
 from vllm.model_executor.models.utils import extract_layer_index
-from vllm.model_executor.warmup.jit_warmup_triton_helper import (
-    TritonWarmupTensor,
-    triton_kernel_dispatcher_with_warmup,
-    triton_warmup_inputs,
-)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
@@ -61,6 +56,8 @@ def raise_if_nan_logits(num_nans_in_logits: Mapping[str, int]) -> None:
     raise RuntimeError(f"NaNs detected in logits: {corrupted_requests}")
 
 
+# The reference the TileLang zeroing (``gpu.tilelang_inputs.zero_kv_blocks_kernel``)
+# is tested against; the runner no longer launches it.
 @triton.jit
 def _zero_kv_blocks_kernel(
     seg_addrs_ptr,
@@ -112,34 +109,30 @@ def zero_kv_blocks_block_size(max_page_size_el: int) -> int:
     return min(1 << (max_page_size_el - 1).bit_length(), 1024)
 
 
-def _zero_kv_blocks_warmup_inputs(*, block_size: int) -> dict[str, Any]:
-    int64 = TritonWarmupTensor(torch.int64)
-    return triton_warmup_inputs(
-        _zero_kv_blocks_kernel,
-        TritonWarmupTensor(torch.uint64),
-        int64,
-        int64,
-        int64,
-        grid=(1,),
-        BLOCK_SIZE=block_size,
-    )
+def declare_zero_kv_blocks_kernel() -> None:
+    """Declare KV block zeroing (one kernel for every page size and block count)."""
+    from vllm.v1.worker.gpu import tilelang_inputs
+
+    tilelang_inputs.declare(tilelang_inputs.zero_kv_blocks_calls)
 
 
-_zero_kv_blocks_launcher = triton_kernel_dispatcher_with_warmup(
-    warmup_inputs=_zero_kv_blocks_warmup_inputs
-)(_zero_kv_blocks_kernel)
+def _zero_kv_blocks(
+    seg_addrs: torch.Tensor,
+    seg_block_strides: torch.Tensor,
+    seg_page_sizes: torch.Tensor,
+    block_ids: torch.Tensor,
+    max_page_size_el: int,
+) -> None:
+    """Zero each segment's page of each block (TileLang: ``seg_addrs`` as int64)."""
+    from vllm.v1.worker.gpu import tilelang_inputs
 
-
-def register_zero_kv_blocks_warmup(max_page_size_el: int) -> None:
-    """Register KV block zeroing for a cache whose largest kernel-block page is
-    ``max_page_size_el`` int32 elements."""
-    _zero_kv_blocks_launcher.register_warmup(
-        block_size=zero_kv_blocks_block_size(max_page_size_el)
+    tilelang_inputs.zero_kv_blocks(
+        seg_addrs, seg_block_strides, seg_page_sizes, block_ids, max_page_size_el
     )
 
 
 class KVBlockZeroer:
-    """Manages efficient zeroing of KV cache blocks via a Triton kernel.
+    """Manages efficient zeroing of KV cache blocks via a TileLang kernel.
 
     Construct once after KV caches are allocated to precompute segment
     addresses, then call :meth:`zero_block_ids` each step to zero
@@ -155,7 +148,7 @@ class KVBlockZeroer:
         num_blocks: int,
         runner_only_attn_layers: set[str] | None = None,
     ) -> None:
-        """Precompute the absolute-address table for the Triton zeroing kernel.
+        """Precompute the absolute-address table for the zeroing kernel.
 
         Each entry is the absolute byte address of a segment start on the
         GPU, so segments in different CUDA allocations work correctly.
@@ -266,23 +259,18 @@ class KVBlockZeroer:
         """Zero the KV cache memory for the given block IDs."""
         if not block_ids or self._meta is None:
             return
-        (
-            seg_addrs,
-            seg_block_strides,
-            seg_page_sizes,
-            max_chunks,
-            blk_size,
-            n_segs,
-        ) = self._meta
-        n_blocks = len(block_ids)
+        seg_addrs, seg_block_strides, seg_page_sizes, max_chunks, blk_size, _ = (
+            self._meta
+        )
         idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
-        grid = (n_blocks, n_segs, max_chunks)
-        _zero_kv_blocks_launcher[grid](
-            seg_addrs,
+        # max_chunks pages of blk_size (at most 1024) int32s cover the largest
+        # page, as the kernel's 1024-element chunks do.
+        _zero_kv_blocks(
+            seg_addrs.view(torch.int64),
             seg_block_strides,
             seg_page_sizes,
             idx,
-            BLOCK_SIZE=blk_size,
+            max_chunks * blk_size,
         )
 
     def warmup(self, num_kv_blocks: int) -> None:
