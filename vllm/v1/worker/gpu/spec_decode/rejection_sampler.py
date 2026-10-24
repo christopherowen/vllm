@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from vllm.config import SpeculativeConfig
+from vllm.config import SpeculativeConfig, get_current_vllm_config
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     TritonWarmupTensor,
@@ -32,9 +32,11 @@ from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.sink import SinkAlternates, SinkSampler
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
+    _RESAMPLE_BLOCK_SIZE,
     register_rejection_sample_warmups,
     rejection_sample,
 )
+from vllm.v1.worker.gpu.spec_decode.tilelang_resampled import register_insert
 
 # Cap on the FP32 target-logits buffer materialized by apply_sampling_params.
 # TODO(mgoin): Chunking is a workaround. The rejection kernels already upcast
@@ -158,7 +160,18 @@ class RejectionSampler:
         """Register verification of target logits given as ``(dtype, row stride)``
         pairs, raw (``logits``) or after sampling parameters (``processed_logits``),
         and the logprobs of verified tokens. Draft logits and watermarking are not
-        covered: their kernels keep compiling at first use."""
+        covered by Triton warmup; the TileLang insertion is always declared."""
+        register_insert(
+            triton.cdiv(vocab_size, _RESAMPLE_BLOCK_SIZE),
+            self.sampler.use_fp64_gumbel,
+            self.num_speculative_steps + 1,
+        )
+        if has_draft_logits:
+            register_insert(
+                get_current_vllm_config().parallel_config.tensor_parallel_size,
+                self.sampler.use_fp64_gumbel,
+                self.num_speculative_steps + 1,
+            )
         if has_draft_logits or self.watermark_key is not None:
             return
         register_rejection_sample_warmups(

@@ -17,6 +17,10 @@ from vllm.v1.worker.gpu.sample.gumbel import (
     tl_rand32,
 )
 from vllm.v1.worker.gpu.sample.watermark import philox_gumbel_block_argmax
+from vllm.v1.worker.gpu.spec_decode.tilelang_resampled import (
+    insert_resampled,
+    register_insert,
+)
 
 
 @triton.jit
@@ -1220,28 +1224,6 @@ def _resample_warmup_inputs(
     )
 
 
-def _insert_resampled_warmup_inputs(
-    *, num_speculative_steps: int, vocab_size: int, use_fp64: bool
-) -> dict[str, Any]:
-    num_blocks = triton.cdiv(vocab_size, _RESAMPLE_BLOCK_SIZE)
-    return triton_warmup_inputs(
-        _insert_resampled_kernel,
-        TritonWarmupTensor(torch.int64),
-        num_speculative_steps + 1,
-        TritonWarmupTensor(torch.int32),
-        TritonWarmupTensor(torch.int64),
-        num_blocks,
-        TritonWarmupTensor(torch.float64 if use_fp64 else torch.float32),
-        num_blocks,
-        num_blocks,
-        TritonWarmupTensor(torch.int32),
-        TritonWarmupTensor(torch.int64),
-        TritonWarmupTensor(torch.float32),
-        grid=(1,),
-        PADDED_RESAMPLE_NUM_BLOCKS=triton.next_power_of_2(num_blocks),
-    )
-
-
 _compute_local_logits_stats_launcher = triton_kernel_dispatcher_with_warmup(
     warmup_inputs=_compute_local_logits_stats_warmup_inputs
 )(_compute_local_logits_stats_kernel)
@@ -1254,9 +1236,6 @@ _rejection_launcher = triton_kernel_dispatcher_with_warmup(
 _resample_launcher = triton_kernel_dispatcher_with_warmup(
     warmup_inputs=_resample_warmup_inputs
 )(_resample_kernel)
-_insert_resampled_launcher = triton_kernel_dispatcher_with_warmup(
-    warmup_inputs=_insert_resampled_warmup_inputs
-)(_insert_resampled_kernel)
 
 
 def register_rejection_sample_warmups(
@@ -1300,10 +1279,10 @@ def register_rejection_sample_warmups(
             use_block_verification=use_block_verification,
             use_fp64=use_fp64,
         )
-    _insert_resampled_launcher.register_warmup(
-        num_speculative_steps=num_speculative_steps,
-        vocab_size=vocab_size,
-        use_fp64=use_fp64,
+    register_insert(
+        triton.cdiv(vocab_size, _RESAMPLE_BLOCK_SIZE),
+        use_fp64,
+        num_speculative_steps + 1,
     )
 
 
@@ -1578,27 +1557,20 @@ def rejection_sample(
             vp,
             use_fp64=use_fp64,
         )
-        resample_num_blocks = resampled_local_max.shape[1]
-        _insert_resampled_launcher[(num_reqs,)](
+        insert_resampled(
             sampled,
-            sampled.stride(0),
             num_sampled,
             resampled_local_argmax,
-            resampled_local_argmax.stride(0),
             resampled_local_max,
-            resampled_local_max.stride(0),
-            resample_num_blocks,
             cu_num_logits,
             expanded_idx_mapping,
             temperature,
-            PADDED_RESAMPLE_NUM_BLOCKS=triton.next_power_of_2(resample_num_blocks),
         )
         return sampled, num_sampled
 
     # Resample the rejected/bonus tokens.
     RESAMPLE_BLOCK_SIZE = _RESAMPLE_BLOCK_SIZE
     resample_num_blocks = triton.cdiv(vocab_size, RESAMPLE_BLOCK_SIZE)
-    padded_resample_num_blocks = triton.next_power_of_2(resample_num_blocks)
     resampled_local_argmax = target_logits.new_empty(
         num_reqs, resample_num_blocks, dtype=torch.int64
     )
@@ -1642,18 +1614,13 @@ def rejection_sample(
     )
 
     # Insert the resampled tokens into the output sampled.
-    _insert_resampled_launcher[(num_reqs,)](
+    insert_resampled(
         sampled,
-        sampled.stride(0),
         num_sampled,
         resampled_local_argmax,
-        resampled_local_argmax.stride(0),
         resampled_local_max,
-        resampled_local_max.stride(0),
-        resample_num_blocks,
         cu_num_logits,
         expanded_idx_mapping,
         temperature,
-        PADDED_RESAMPLE_NUM_BLOCKS=padded_resample_num_blocks,
     )
     return sampled, num_sampled

@@ -1104,3 +1104,233 @@ def test_multiround_rejection_sample_is_unbiased(
         _assert_distribution_match(
             output[:, position], target_probs, device, label=f"position {position}"
         )
+
+
+@pytest.mark.parametrize("blocks", [1, 3, 4, 32, 33, 127, 129])
+@pytest.mark.parametrize("value_dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_insert_resampled_exact_tokens_and_counts(blocks, value_dtype, index_dtype):
+    """DS41F partials and TP3/TP4 winners preserve ties, skips and view padding."""
+    from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
+        _insert_resampled_kernel,
+    )
+    from vllm.v1.worker.gpu.spec_decode.tilelang_resampled import insert_resampled
+
+    torch.manual_seed(7319)
+    n = 17
+    widths = torch.randint(1, 7, (n,), device="cuda", dtype=torch.int32)
+    counts = torch.arange(n, device="cuda", dtype=torch.int32) % widths
+    saved_counts = counts.clone()
+    cu = torch.cat((widths.new_zeros(1), widths.cumsum(0).int()))
+    states = torch.randperm(n + 11, device="cuda")[:n].to(index_dtype)
+    mapping = states.repeat_interleave(widths.long())
+    temp = torch.ones(n + 11, device="cuda")
+    temp[states[9::2].long()] = 0
+    values_storage = torch.full(
+        (n, blocks + 5), 123.0, device="cuda", dtype=value_dtype
+    )
+    values = values_storage[:, 2 : blocks + 2]
+    values.normal_()
+    values[0] = float("nan")
+    values[1] = -float("inf")
+    values[2] = -1
+    values[2, 0] = values[2, -1] = 10
+    values[3] = float("nan")
+    values[3, blocks // 2] = -7
+    values[4, 0] = values[4, -1] = float("inf")
+    values[5] = -float("inf")
+    values[5, 0], values[5, -1] = -0.0, 0.0
+    values[6] = 1
+    values[6, -1] = 1 + (2**-40 if value_dtype == torch.float64 else 2**-20)
+    values[7] = 0
+    values[7, -1] = torch.finfo(value_dtype).tiny / 2
+    values[8] = -1
+    values[8, -1] = -torch.finfo(value_dtype).tiny / 2
+    ids_storage = torch.full((n, blocks + 3), -777, device="cuda", dtype=torch.int64)
+    ids = ids_storage[:, 1 : blocks + 1]
+    ids.copy_(torch.randint(0, 129280, ids.shape, device="cuda"))
+    sampled_storage = torch.full((n, 9), -999, device="cuda", dtype=torch.int64)
+    sampled = sampled_storage[:, 1:7]
+    sampled.copy_(torch.randint(0, 129280, sampled.shape, device="cuda"))
+    saved = sampled_storage.clone()
+    expected = sampled.clone()
+    clean = torch.where(values.isnan(), -float("inf"), values)
+    winners = ids.gather(1, clean.argmax(1, keepdim=True)).squeeze(1)
+    should_insert = (temp[states.long()] != 0) | (counts == widths - 1)
+    rows = torch.arange(n, device="cuda")[should_insert]
+    expected[rows, counts[rows].long()] = winners[rows]
+    original_storage = saved.clone()
+    original = original_storage[:, 1:7]
+    original_counts = counts.clone()
+    _insert_resampled_kernel[(n,)](
+        original,
+        original.stride(0),
+        original_counts,
+        ids,
+        ids.stride(0),
+        values,
+        values.stride(0),
+        blocks,
+        cu,
+        mapping,
+        temp,
+        PADDED_RESAMPLE_NUM_BLOCKS=1 << (blocks - 1).bit_length(),
+    )
+    insert_resampled(sampled, counts, ids, values, cu, mapping, temp)
+    assert torch.equal(sampled, expected)
+    assert torch.equal(sampled, original)
+    assert torch.equal(counts, saved_counts + 1)
+    assert torch.equal(counts, original_counts)
+    assert torch.equal(sampled_storage[:, 0], saved[:, 0])
+    assert torch.equal(sampled_storage[:, 7:], saved[:, 7:])
+    assert (ids_storage[:, 0] == -777).all()
+    assert (values_storage[:, 0] == 123).all()
+
+    # The actual graph replays read the current count, not a captured host value.
+    counts.copy_(saved_counts)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        insert_resampled(sampled, counts, ids, values, cu, mapping, temp)
+    torch.cuda.current_stream().wait_stream(stream)
+    counts.copy_(saved_counts)
+    capture = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(capture):
+        insert_resampled(sampled, counts, ids, values, cu, mapping, temp)
+    for delta in range(2):
+        sampled_storage.copy_(saved)
+        replay_counts = (saved_counts + delta) % widths
+        counts.copy_(replay_counts)
+        replay_expected = sampled.clone()
+        changed = (temp[states.long()] != 0) | (replay_counts == widths - 1)
+        rows = torch.arange(n, device="cuda")[changed]
+        replay_expected[rows, replay_counts[rows].long()] = winners[rows]
+        capture.replay()
+        assert torch.equal(sampled, replay_expected)
+        assert torch.equal(counts, replay_counts + 1)
+
+
+def test_insert_resampled_owner_prepares_runtime_keys():
+    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+    from vllm.models.deepseek_v4_1.tilelang import prepare
+    from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
+        register_rejection_sample_warmups,
+    )
+    from vllm.v1.worker.gpu.spec_decode.tilelang_resampled import insert_kernel
+
+    registry = JitWarmupRegistry(None)
+    with registry.activate():
+        for fp64 in (False, True):
+            register_rejection_sample_warmups(
+                logits=[(torch.float32, 129280)],
+                vocab_size=129280,
+                num_speculative_steps=5,
+                synthetic_mode=False,
+                use_block_verification=True,
+                use_fp64=fp64,
+            )
+    calls = [c for c in prepare.declared_calls(registry) if c[0] is insert_kernel]
+    assert len(calls) == 4
+    prepare.prepare_declared(registry)
+
+
+@pytest.mark.parametrize("temperature", [0.0, 1.0])
+def test_ds41f_verification_emits_same_tokens_with_insert_port(
+    monkeypatch, temperature
+):
+    """Public verification preserves tokens at DS41F vocabulary and draft width."""
+    from vllm.v1.worker.gpu.spec_decode import rejection_sampler_utils as utils
+    from vllm.v1.worker.gpu.spec_decode.tilelang_resampled import insert_resampled
+
+    def original(sampled, counts, ids, values, cu, mapping, temp):
+        utils._insert_resampled_kernel[(counts.numel(),)](
+            sampled,
+            sampled.stride(0),
+            counts,
+            ids,
+            ids.stride(0),
+            values,
+            values.stride(0),
+            values.shape[1],
+            cu,
+            mapping,
+            temp,
+            PADDED_RESAMPLE_NUM_BLOCKS=1 << (values.shape[1] - 1).bit_length(),
+        )
+
+    torch.manual_seed(5297)
+    inputs = _build_rejection_sample_inputs(
+        torch.randn(129280, device="cuda"),
+        torch.randn(129280, device="cuda"),
+        5,
+        temperature,
+        num_trials=4,
+    )
+    inputs["draft_logits"] = None
+    monkeypatch.setattr(utils, "insert_resampled", original)
+    expected, expected_counts = rejection_sample(
+        **inputs,
+        num_speculative_steps=5,
+        use_block_verification=True,
+    )
+    monkeypatch.setattr(utils, "insert_resampled", insert_resampled)
+    sampled, counts = rejection_sample(
+        **inputs,
+        num_speculative_steps=5,
+        use_block_verification=True,
+    )
+    valid = torch.arange(6, device="cuda")[None, :] < counts[:, None]
+    assert torch.equal(counts, expected_counts)
+    assert torch.equal(sampled[valid], expected[valid])
+
+
+def test_insert_resampled_empty_batch_is_noop():
+    from vllm.v1.worker.gpu.spec_decode.tilelang_resampled import insert_resampled
+
+    sampled = torch.empty((0, 6), device="cuda", dtype=torch.int64)
+    counts = torch.empty(0, device="cuda", dtype=torch.int32)
+    ids = torch.empty((0, 127), device="cuda", dtype=torch.int64)
+    values = torch.empty((0, 127), device="cuda")
+    cu = torch.zeros(1, device="cuda", dtype=torch.int32)
+    mapping = torch.empty(0, device="cuda", dtype=torch.int64)
+    temp = torch.empty(0, device="cuda")
+    insert_resampled(sampled, counts, ids, values, cu, mapping, temp)
+    assert sampled.numel() == counts.numel() == 0
+
+
+@pytest.mark.parametrize("tp", [3, 4])
+@pytest.mark.parametrize("draft_logits,watermark", [(True, None), (False, 42)])
+def test_insert_resampled_prepared_before_optional_warmup_return(
+    monkeypatch, tp, draft_logits, watermark
+):
+    """Optional verification modes must declare insertion before cache freeze."""
+    from types import SimpleNamespace
+
+    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+    from vllm.models.deepseek_v4_1.tilelang import prepare
+    from vllm.v1.worker.gpu.spec_decode import rejection_sampler as module
+    from vllm.v1.worker.gpu.spec_decode.tilelang_resampled import insert_kernel
+
+    monkeypatch.setattr(
+        module,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(
+            parallel_config=SimpleNamespace(tensor_parallel_size=tp)
+        ),
+    )
+    owner = module.RejectionSampler.__new__(module.RejectionSampler)
+    owner.sampler = SimpleNamespace(use_fp64_gumbel=False)
+    owner.num_speculative_steps = 5
+    owner.watermark_key = watermark
+    registry = JitWarmupRegistry(None)
+    with registry.activate():
+        owner.register_warmups(
+            logits=[(torch.float32, 129280)],
+            processed_logits=[(torch.float32, 129280)],
+            vocab_size=129280,
+            has_draft_logits=draft_logits,
+        )
+    calls = [c for c in prepare.declared_calls(registry) if c[0] is insert_kernel]
+    assert {args[0] for _, args, _ in calls} == ({127, tp} if draft_logits else {127})
+    assert len(calls) == (4 if draft_logits else 2)
+    prepare.prepare_declared(registry)
