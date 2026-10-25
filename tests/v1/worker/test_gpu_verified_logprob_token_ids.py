@@ -25,7 +25,7 @@ from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
 from vllm.sampling_params import SamplingParams
 from vllm.v1.worker.gpu import tilelang_inputs
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
-from vllm.v1.worker.gpu.sample import logprob, states
+from vllm.v1.worker.gpu.sample import logprob, states, tilelang_logprob
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.sink import SinkAlternates
 from vllm.v1.worker.gpu.spec_decode import rejection_sampler
@@ -100,7 +100,7 @@ def _fill_logprob_token_ids(
         valid[row, : 1 + len(tokens)] = True
 
 
-def _ranks(out, logits, _logits_stride, token_ids, _vocab_size, BLOCK_SIZE):
+def _token_ranks(logits, token_ids, out):
     chosen = logits.gather(1, token_ids.view(-1, 1).long())
     out.copy_((logits >= chosen).sum(1))
 
@@ -126,7 +126,7 @@ def host_runner(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         logprob, "_fill_logprob_token_ids_kernel", HostKernel(_fill_logprob_token_ids)
     )
-    monkeypatch.setattr(logprob, "_ranks_launcher", HostKernel(_ranks))
+    monkeypatch.setattr(tilelang_logprob, "token_ranks", _token_ranks)
     monkeypatch.setattr(
         logprob,
         "compute_token_logprobs",
