@@ -329,14 +329,17 @@ def all_reduce_rank_order(
     all-reduce's arithmetic: its rows (padded to a multiple of ``world``) are
     reduce-scattered in rank order, then all-gathered, which moves bits without
     arithmetic. A row has the same bits as the one-shot path would give it. The
-    padding rows are summed and gathered like the others and then dropped, so
-    they are not filled: whatever they hold reaches no real row."""
+    padding rows (zeros, TileLang's fill) are summed and gathered like the others,
+    then dropped."""
     rows = input_tensor.shape[0]
     flat = input_tensor.reshape(rows, -1)
     padded = -(-rows // world) * world
     if padded != rows or not flat.is_contiguous():
+        from vllm.models.deepseek_v4_1.tilelang import columns
+
         buffer = flat.new_empty((padded, flat.shape[1]))
         buffer[:rows].copy_(flat)
+        columns.zero_(buffer[rows:])
     else:
         buffer = flat
     own = reduce_scatter_rank_order(comm, buffer, rank, world)

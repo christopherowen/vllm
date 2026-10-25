@@ -37,11 +37,12 @@ row and then compacts.
 - Collectives see ``Tp = N * ceil(T / N)`` rows; each rank owns ``L = Tp / N``
   rows, rank r the padded rows ``[r * L, (r + 1) * L)``.
 - Kernels never see more than T rows: gathered tensors are used as ``[:T]``.
-- Reduce-scatter inputs are Tp-row buffers whose pad rows are zero; unreduced
-  parts (see "Unreduced results") leave their pad rows unwritten.
-- The last rank's local rows can include pad rows. Every op on local rows is
-  row-wise and every gather keeps the first T rows, so a pad row's values,
-  whatever they are (arbitrary after unreduced parts), never reach a real row.
+- Reduce-scatter inputs and unreduced parts are Tp-row buffers whose pad rows
+  are zero (TileLang's zero fill).
+- The last rank's local rows can include pad rows. They stay finite and are
+  never read back into real outputs: every op on local rows is row-wise and every
+  gather keeps the first T rows. Zeros keep their values, and the routing and
+  expert work they cause, the same in every run.
 
 ## Where each op runs
 
@@ -77,8 +78,7 @@ sum: every rank's partial of this rank's rows is exchanged into one
 hands it on as ``RankOrderParts``. TileLang mHC's ``post_pre`` adds the parts in
 rank order as it loads them, the same arithmetic and the same bits as the
 rank-order reduce-scatter; any other consumer calls ``sum()``. Only real rows are
-projected into the buffers: the pad rows of the last rank's block are neither
-projected nor filled (``Rows``).
+projected into the buffers; the pad rows of the last rank's block are zeroed.
 """
 
 from collections.abc import Iterator
@@ -326,6 +326,7 @@ class SPRows:
         the parts, and the chunks are exchanged into the parts; with ``slices``
         > 1 each slice is exchanged on the side stream while the next is
         projected."""
+        from vllm.models.deepseek_v4_1.tilelang import columns
         from vllm.models.deepseek_v4_1.tilelang.collectives import exchange_into
 
         local, world, tokens = self.local_rows, self.world_size, self.num_tokens
@@ -336,6 +337,7 @@ class SPRows:
         if slices == 1 and not per_block:
             flat = send.view(world * local, *row_shape)
             project(0, tokens, flat[:tokens])
+            columns.zero_(flat[tokens:])
             parts[self.rank].copy_(send[self.rank])
             if then is not None:
                 then()
@@ -353,6 +355,7 @@ class SPRows:
                 real = max(0, min(stop, tokens) - start)
                 if real:
                     project(start, start + real, dest[owner, lo : lo + real])
+                columns.zero_(dest[owner, lo + real : hi])
             if side is not None:
                 side.wait_stream(main)
                 with torch.cuda.stream(side):

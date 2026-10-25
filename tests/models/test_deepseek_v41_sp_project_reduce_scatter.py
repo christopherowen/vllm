@@ -67,8 +67,8 @@ def test_unreduced_parts_hold_every_block(monkeypatch, tokens, rank, slices, per
     """Unreduced rows send every other rank's block, slice by slice, and keep this
     rank's own block in its slot of the parts (the other ranks stood in by
     copies of it). Only real rows are projected; the pad rows of the last rank's
-    block are not filled (nothing is zeroed), and whatever they hold stays in
-    them: the real rows' parts and sums are the zero-padded projection's."""
+    block are zeroed by TileLang's fill (never torch's), so the parts and their
+    sums are the zero-padded projection's, pad rows included."""
     from types import SimpleNamespace
 
     from vllm.models.deepseek_v4_1.tilelang import collectives
@@ -81,7 +81,7 @@ def test_unreduced_parts_hold_every_block(monkeypatch, tokens, rank, slices, per
     monkeypatch.setattr(sp_prefill, "get_tp_group", lambda: group)
 
     def refuse(self, *args, **kwargs):
-        raise AssertionError("a pad row was filled")
+        raise AssertionError("a pad row was zeroed by torch")
 
     monkeypatch.setattr(torch.Tensor, "zero_", refuse)
     sent = []
@@ -118,24 +118,20 @@ def test_unreduced_parts_hold_every_block(monkeypatch, tokens, rank, slices, per
     padded[:tokens] = source
     blocks = padded.view(world, rows.local_rows, 8)
     local = rows.local_rows
-
-    def real(owner):  # the real rows of the owner's block
-        return max(0, min(local, tokens - owner * local))
-
     assert parts.shape == (world, local, 8)
     for peer in range(world):
-        assert torch.equal(parts[peer, : real(rank)], blocks[rank, : real(rank)])
+        assert torch.equal(parts[peer], blocks[rank])
     sent = torch.cat(sent, dim=1)
     for peer in range(world):
         if peer != rank:
-            assert torch.equal(sent[peer, : real(peer)], blocks[peer, : real(peer)])
+            assert torch.equal(sent[peer], blocks[peer])
     projected = sorted(i for start, stop in calls for i in range(start, stop))
     assert projected == list(range(tokens))
     assert order == [len(calls)]
     total = sp_prefill.materialize(sp_prefill.unreduced_parts(parts))
     assert torch.equal(total, collectives.rank_order_sum(list(parts)))
     zero_padded = collectives.rank_order_sum([blocks[rank]] * world)
-    assert torch.equal(total[: real(rank)], zero_padded[: real(rank)])
+    assert torch.equal(total, zero_padded)
 
 
 @pytest.mark.parametrize("tokens", [37, 40, 205])
