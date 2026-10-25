@@ -24,6 +24,68 @@ def test_compressor_cache_rejects_duplicate_prefix_without_replacing_owner():
     assert config.compilation_config.static_forward_context[other.prefix] is other
 
 
+@pytest.mark.cpu_test
+def test_v41_caches_skip_per_allocation_zeroing(monkeypatch):
+    """DeepSeek V4.1's byte pages (window, compressed latents, index keys) sit
+    beside the compressors' FP32 rings, and every one declares that no unwritten
+    slot reaches a result, as DeepSeek's reference reads only written slots: the
+    cache is mixed-precision yet needs no per-allocation zeroing (its pool starts
+    zeroed). The poison check still fills every new block."""
+    from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention, _Cache
+    from vllm.models.deepseek_v4_1.compressor import CompressorStateCache
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
+
+    monkeypatch.delenv("VLLM_KV_CACHE_POISON", raising=False)
+    ratios = [0] * 43
+    ratios[2], ratios[20] = 2, 1
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=256, swa_block_size=None),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                num_hidden_layers=40,
+                kv_source_layer_ids=[2, 20],
+                compress_ratios=ratios,
+            )
+        ),
+        speculative_config=None,
+    )
+    specs = {}
+    for layer in (0, 2, 20, 24, 40):  # target, KV sources, CED decoder, drafter
+        cache = _Cache(
+            config,
+            f"model.layers.{layer}.self_attn.swa_cache",
+            kind="swa",
+            window=128,
+            draft=layer >= 40,
+        )
+        specs[cache.prefix] = cache.get_kv_cache_spec(config)
+    for layer, ratio in ((2, 2), (20, 1)):
+        prefix = f"model.layers.{layer}.self_attn"
+        specs[prefix] = DeepseekV4Attention.get_kv_cache_spec(
+            SimpleNamespace(is_kv_source=True, compress_ratio=ratio), config
+        )
+        index = _Cache(config, f"{prefix}.indexer.k_cache", kind="index", ratio=ratio)
+        specs[index.prefix] = index.get_kv_cache_spec(config)
+    ring = CompressorStateCache(
+        config, "model.layers.2.self_attn.compressor.state_cache"
+    )
+    specs[ring.prefix] = ring.get_kv_cache_spec(config)
+
+    assert all(spec.uses_only_written_slots for spec in specs.values())
+    cache = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec([name], spec) for name, spec in specs.items()
+        ],
+    )
+    assert cache.has_mixed_precision_kv_cache
+    assert not cache.needs_kv_cache_zeroing
+    monkeypatch.setenv("VLLM_KV_CACHE_POISON", "1")
+    assert cache.needs_kv_cache_zeroing
+
+
 def test_compressor_ring_writes_follow_the_worker_slot_mapping():
     """Ring metadata emits a write only for rows with a valid worker slot. With
     the runner's per-spec settings, a verify step past the ring capacity writes

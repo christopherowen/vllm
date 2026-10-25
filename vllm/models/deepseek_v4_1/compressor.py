@@ -106,12 +106,15 @@ class CompressorStateCache(nn.Module, AttentionLayerBase):
         self.kv_cache = cache.view(cache.shape[0], -1)
 
     def get_kv_cache_spec(self, config):
+        # The gather reads a request's slot only after the request wrote it (an
+        # odd first position; every ring starts at an even one).
         return CircularBufferSpec(
             block_size=self.block_size,
             num_kv_heads=1,
             head_size=1024,
             head_size_v=0,
             dtype=torch.float32,
+            uses_only_written_slots=True,
         )
 
     def get_attn_backend(self):
