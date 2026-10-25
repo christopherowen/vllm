@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DeepSeek V4.1 configuration on GB10: kernel-family routing and TP3 head padding."""
+"""DeepSeek V4.1 configuration on GB10: kernel routing and TP3 head padding."""
 
 from types import SimpleNamespace
 
@@ -12,28 +12,34 @@ from vllm.models.deepseek_v4_1.nvidia.model import _select_dsv4_attn_cls
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 
-def test_kernel_family_routes_deepseek_v41(monkeypatch) -> None:
-    """VLLM_DS41_KERNEL_BACKEND picks one kernel family for the whole model: its
-    attention backend and class, and the linear and MoE backends."""
-    from vllm import envs
+@pytest.mark.parametrize("component", ["linear_backend", "moe_backend"])
+def test_tilelang_runs_deepseek_v41(component) -> None:
+    """TileLang's kernels run the whole model: its attention backend and class, the
+    linear and MoE backends, and aligned prefill chunks; another backend fails."""
     from vllm.models.deepseek_v4_1.tilelang.attention import (
         DeepseekV41TileLangAttention,
     )
 
-    monkeypatch.setattr(envs, "VLLM_DS41_KERNEL_BACKEND", "tilelang", raising=False)
-    backend, attention_cls = AttentionBackendEnum.TILELANG, DeepseekV41TileLangAttention
+    backend = AttentionBackendEnum.TILELANG
     kernel = SimpleNamespace(linear_backend="auto", moe_backend="auto")
     config = SimpleNamespace(
         attention_config=SimpleNamespace(backend=None),
         kernel_config=kernel,
+        scheduler_config=SimpleNamespace(align_prefill_chunks=False),
         speculative_config=None,
     )
 
     DeepseekV41ForCausalLMConfig.verify_and_update_config(config)
 
     assert config.attention_config.backend is backend
-    assert _select_dsv4_attn_cls(config) is attention_cls
+    assert _select_dsv4_attn_cls(config) is DeepseekV41TileLangAttention
     assert kernel.linear_backend == kernel.moe_backend == "tilelang"
+    assert config.scheduler_config.align_prefill_chunks
+
+    setattr(kernel, component, "b12x")
+    with pytest.raises(ValueError, match="requires the tilelang"):
+        DeepseekV41ForCausalLMConfig.verify_and_update_config(config)
+    setattr(kernel, component, "tilelang")
 
     config.attention_config.backend = AttentionBackendEnum.FLASH_ATTN
     with pytest.raises(ValueError, match=f"requires the {backend.name} attention"):

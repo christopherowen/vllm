@@ -30,7 +30,7 @@ class _Registry:
         self._trace.append("compile")
 
 
-def _worker(monkeypatch, runner, family: str = "b12x") -> Worker:
+def _worker(monkeypatch, runner) -> Worker:
     worker = Worker.__new__(Worker)  # no GPU, no init: only preparation is used
     worker.model_runner = runner
     worker.vllm_config = None
@@ -41,50 +41,21 @@ def _worker(monkeypatch, runner, family: str = "b12x") -> Worker:
     monkeypatch.setattr(
         gpu_worker_module, "set_current_vllm_config", lambda _: contextlib.nullcontext()
     )
-    monkeypatch.setattr(
-        gpu_worker_module.envs, "VLLM_DS41_KERNEL_BACKEND", family, raising=False
-    )
     return worker
 
 
-def test_step_kernels_register_while_collecting_before_the_registry_compiles(
-    monkeypatch,
-):
-    trace: list[str] = []
-    runner = SimpleNamespace(
-        jit_warmup_registry=_Registry(trace),
-        declare_step_kernels=lambda: trace.append("step kernels"),
-    )
-    _worker(monkeypatch, runner)._prepare_kernels()
-    assert trace == ["collect", "step kernels", "collected", "compile"]
-
-
-def test_a_runner_without_step_kernels_still_compiles_its_registry(monkeypatch):
-    trace: list[str] = []
-    runner = SimpleNamespace(jit_warmup_registry=_Registry(trace))
-    _worker(monkeypatch, runner)._prepare_kernels()
-    assert trace == ["compile"]
-
-
-def test_tilelang_kernels_compile_and_freeze_before_binding(monkeypatch):
-    """TileLang: declare from the loaded model, compile, warm, add the step's
-    kernels, compile the registry, return the compile heap, freeze, bind, and
-    only then watch for compiles."""
+def _record_preparation(monkeypatch, trace: list[str], registry, calls: int = 0):
+    """The TileLang preparation steps, recorded; ``calls`` declared calls."""
     from vllm.models.deepseek_v4_1.tilelang import prepare
     from vllm.utils import jit_monitor
 
-    trace: list[str] = []
-    registry = _Registry(trace)
-    target, drafter = object(), object()
-
     def declare_modules(model, draft):
-        assert (model, draft) == (target, drafter)
         trace.append("declare")
 
     def prepare_declared(active):
         assert active is registry
         trace.append("prepare")
-        return 3
+        return calls
 
     record = lambda name: lambda *args, **kwargs: trace.append(name)  # noqa: E731
     monkeypatch.setattr(prepare, "declare_modules", declare_modules)
@@ -94,13 +65,58 @@ def test_tilelang_kernels_compile_and_freeze_before_binding(monkeypatch):
     monkeypatch.setattr(prepare, "freeze", record("freeze"))
     monkeypatch.setattr(prepare, "bind_declared", record("bind"))
     monkeypatch.setattr(jit_monitor, "activate", record("monitor"))
+
+
+def test_step_kernels_register_while_collecting_before_the_registry_compiles(
+    monkeypatch,
+):
+    trace: list[str] = []
+    registry = _Registry(trace)
+    runner = SimpleNamespace(
+        jit_warmup_registry=registry,
+        model=object(),
+        declare_step_kernels=lambda: trace.append("step kernels"),
+    )
+    _record_preparation(monkeypatch, trace, registry)
+    _worker(monkeypatch, runner)._prepare_kernels()
+    assert trace == [
+        "collect", "declare", "collected", "prepare", "warm",
+        "collect", "step kernels", "collected", "compile",
+    ]  # fmt: skip
+
+
+def test_a_runner_without_step_kernels_still_compiles_its_registry(monkeypatch):
+    trace: list[str] = []
+    registry = _Registry(trace)
+    runner = SimpleNamespace(jit_warmup_registry=registry, model=object())
+    _record_preparation(monkeypatch, trace, registry)
+    _worker(monkeypatch, runner)._prepare_kernels()
+    assert trace == ["collect", "declare", "collected", "prepare", "warm", "compile"]
+
+
+def test_tilelang_kernels_compile_and_freeze_before_binding(monkeypatch):
+    """Declare from the loaded model, compile, warm, add the step's kernels, compile
+    the registry, return the compile heap, freeze, bind, and only then watch for
+    compiles."""
+    from vllm.models.deepseek_v4_1.tilelang import prepare
+
+    trace: list[str] = []
+    registry = _Registry(trace)
+    target, drafter = object(), object()
+    _record_preparation(monkeypatch, trace, registry, calls=3)
+
+    def declare_modules(model, draft):
+        assert (model, draft) == (target, drafter)
+        trace.append("declare")
+
+    monkeypatch.setattr(prepare, "declare_modules", declare_modules)
     runner = SimpleNamespace(
         jit_warmup_registry=registry,
         model=target,
         speculator=SimpleNamespace(model=drafter),
         declare_step_kernels=lambda: trace.append("step kernels"),
     )
-    _worker(monkeypatch, runner, "tilelang")._prepare_kernels()
+    _worker(monkeypatch, runner)._prepare_kernels()
     assert trace == [
         "collect", "declare", "collected", "prepare", "warm",
         "collect", "step kernels", "collected", "compile",

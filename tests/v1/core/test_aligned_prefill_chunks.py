@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Aligned prefill chunks: a chunk ends at an absolute multiple of the threshold."""
 
+import functools
 import json
 from types import SimpleNamespace
 
@@ -67,7 +68,12 @@ def _scheduled(monkeypatch, tmp_path, aligned):
     # The scheduler fixtures live in the source tree's tests, not in every image.
     utils = pytest.importorskip("tests.v1.core.utils")
     create_requests, create_scheduler = utils.create_requests, utils.create_scheduler
-    monkeypatch.setattr(scheduler_module, "ALIGN_PREFILL_CHUNKS", aligned)
+    # DeepSeek V4.1's configuration sets the flag; this OPT model takes it here.
+    monkeypatch.setattr(
+        utils,
+        "SchedulerConfig",
+        functools.partial(utils.SchedulerConfig, align_prefill_chunks=aligned),
+    )
     (tmp_path / "config.json").write_text(json.dumps(_OPT_CONFIG))
     scheduler = create_scheduler(
         model=str(tmp_path),

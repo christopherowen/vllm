@@ -75,23 +75,23 @@ def test_nonfinal_limits_skip_only_unread_chunks():
 
 
 @pytest.mark.parametrize(
-    ("backend", "spec", "align", "aligned", "expected"),
+    ("spec", "align", "aligned", "expected"),
     [
-        ("tilelang", "dspark", 4048, True, (199, 4048)),
-        ("tilelang", None, 4048, True, None),
-        ("b12x", "dspark", 4048, True, None),
-        ("tilelang", "mtp", 4048, True, None),
-        ("tilelang", "dspark", 198, True, None),
-        ("tilelang", "dspark", 4048, False, None),
+        ("dspark", 4048, True, (199, 4048)),
+        (None, 4048, True, None),
+        ("mtp", 4048, True, None),
+        ("dspark", 198, True, None),
+        ("dspark", 4048, False, None),
     ],
 )
-def test_nonfinal_skip_policy(monkeypatch, backend, spec, align, aligned, expected):
+def test_nonfinal_skip_policy(spec, align, aligned, expected):
     from vllm.models.deepseek_v4_1.nvidia.model_state import _nonfinal_skip_policy
 
-    monkeypatch.setenv("VLLM_DS41_KERNEL_BACKEND", backend)
     config = SimpleNamespace(
         scheduler_config=SimpleNamespace(
-            long_prefill_token_threshold=align, enable_chunked_prefill=True
+            long_prefill_token_threshold=align,
+            enable_chunked_prefill=True,
+            align_prefill_chunks=aligned,
         ),
         model_config=SimpleNamespace(hf_config=SimpleNamespace(sliding_window=128)),
         speculative_config=None
@@ -106,9 +106,9 @@ def test_nonfinal_skip_policy(monkeypatch, backend, spec, align, aligned, expect
     )
     if expected is None:
         with pytest.raises(ValueError):
-            _nonfinal_skip_policy(config, aligned_chunks=aligned)
+            _nonfinal_skip_policy(config)
     else:
-        assert _nonfinal_skip_policy(config, aligned_chunks=aligned) == expected
+        assert _nonfinal_skip_policy(config) == expected
 
 
 def _state(lengths, seq_lens=None, full=None, prefix=None):

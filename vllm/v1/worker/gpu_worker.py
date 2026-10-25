@@ -1419,8 +1419,6 @@ class Worker(WorkerBase):
 
     def _startup_progress(self) -> str:
         """What this rank's heartbeat reports besides its phase."""
-        if envs.VLLM_DS41_KERNEL_BACKEND != "tilelang":
-            return ""
         from vllm.models.deepseek_v4_1.tilelang.prepare import PROGRESS
 
         done, total = PROGRESS.snapshot()
@@ -1433,8 +1431,8 @@ class Worker(WorkerBase):
     def _prepare_kernels(self) -> None:
         """Compile every declared JIT kernel before any distributed work.
 
-        DeepSeek V4.1's TileLang family declares each call its loaded modules can
-        make; the runner's JIT registry holds the Triton kernels its samplers and
+        DeepSeek V4.1 declares each TileLang call its loaded modules can make;
+        the runner's JIT registry holds the Triton kernels its samplers and
         model state registered, and the runner adds its step's kernels here, once
         the KV cache layout is set. They compile here on this rank alone,
         TileLang's in one thread pool, and TileLang's kernel cache is then frozen,
@@ -1446,20 +1444,18 @@ class Worker(WorkerBase):
             return
         self._set_startup_phase("preparing kernels")
         started = time.monotonic()
-        tilelang_calls = 0
         # Declarations read the scheduler sizing and model configuration.
         with set_current_vllm_config(self.vllm_config):
-            if envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
-                from vllm.models.deepseek_v4_1.tilelang import prepare
+            from vllm.models.deepseek_v4_1.tilelang import prepare
 
-                speculator = getattr(self.model_runner, "speculator", None)
-                with registry.activate():
-                    prepare.declare_modules(
-                        self.model_runner.model, getattr(speculator, "model", None)
-                    )
-                tilelang_calls = prepare.prepare_declared(registry)
-                with torch.inference_mode():
-                    prepare.warm_declared(registry)
+            speculator = getattr(self.model_runner, "speculator", None)
+            with registry.activate():
+                prepare.declare_modules(
+                    self.model_runner.model, getattr(speculator, "model", None)
+                )
+            tilelang_calls = prepare.prepare_declared(registry)
+            with torch.inference_mode():
+                prepare.warm_declared(registry)
             # A step's Triton kernels (input preparation, sampling, verification,
             # drafting), specialized on the runner's buffers, the loaded heads and
             # the block tables of the KV cache groups (the layout is set by now).

@@ -79,6 +79,12 @@ class SchedulerConfig:
     """For chunked prefill, a request is considered long if the prompt is
     longer than this number of tokens. 0 disables the cap (default)."""
 
+    align_prefill_chunks: bool = False
+    """Prefill chunks end at absolute multiples of `long_prefill_token_threshold`,
+    whatever else the step holds; otherwise a chunk takes whatever budget the
+    step's other requests leave. Set by models whose temperature-0 determinism
+    needs it (DeepSeek V4.1)."""
+
     max_num_queued_reqs: int | None = Field(default=None, ge=0)
     """Maximum number of requests that can be in-flight (waiting or running)
     at the same time, or None for no limit. When the limit is reached, new

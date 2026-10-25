@@ -28,8 +28,9 @@ from .base_device_communicator import DeviceCommunicatorBase
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
+    from sparknet.integration.vllm import SparknetOneShotAllReduce
+
     from .b12x_pcie_all_reduce import B12xPcieAllReduce
-    from .b12x_roce_all_reduce import B12xRoceAllReduce
 
 
 # PyNCCL communicators shared by groups over the same ranks and device
@@ -79,7 +80,7 @@ def _release_pynccl(comm, key: tuple | None) -> None:
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
-    b12x_ar_comm: "B12xPcieAllReduce | B12xRoceAllReduce | None"
+    b12x_ar_comm: "B12xPcieAllReduce | SparknetOneShotAllReduce | None"
 
     def __init__(
         self,
@@ -132,29 +133,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 and envs.VLLM_ENABLE_PCIE_ALLREDUCE
                 and envs.VLLM_PCIE_ALLREDUCE_BACKEND == "b12x"
             )
-            if envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
-                # DS4.1's TileLang family always runs sparknet's one-shot
-                # collectives; vLLM's RoCE switch is not read for it.
-                if envs.VLLM_ENABLE_ROCE_ALLREDUCE:
-                    raise ValueError(
-                        "VLLM_ENABLE_ROCE_ALLREDUCE does not apply to the TileLang "
-                        "kernel family, whose one-shot collectives are always on"
-                    )
-                if not use_custom_allreduce:
-                    raise ValueError(
-                        "sparknet's one-shot collectives need custom all-reduce"
-                    )
-                use_roce_allreduce = True
-            else:
-                if envs.VLLM_ENABLE_ROCE_ALLREDUCE and not use_custom_allreduce:
-                    raise ValueError(
-                        "RoCEnante was requested but custom all-reduce is disabled"
-                    )
-                use_roce_allreduce = (
-                    use_custom_allreduce and envs.VLLM_ENABLE_ROCE_ALLREDUCE
+            # Tensor-parallel groups always run sparknet's one-shot collectives
+            # (a single-node group skips them); vLLM's RoCE switch selected
+            # B12X's, which is gone.
+            if envs.VLLM_ENABLE_ROCE_ALLREDUCE:
+                raise ValueError(
+                    "VLLM_ENABLE_ROCE_ALLREDUCE selected B12X's RoCE collectives, "
+                    "which are gone; sparknet's one-shot collectives are always on"
                 )
-            if use_b12x_allreduce or use_roce_allreduce:
-                use_flashinfer_allreduce = False
+            if not use_custom_allreduce:
+                raise ValueError(
+                    "sparknet's one-shot collectives need custom all-reduce"
+                )
+            use_roce_allreduce = True
+            use_flashinfer_allreduce = False
 
         self.use_custom_allreduce = use_custom_allreduce
         self.use_torch_symm_mem = use_torch_symm_mem
@@ -213,25 +205,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 global_ranks=self.ranks,
             )
         elif self.use_roce_allreduce and self.world_size > 1:
-            # Multi-node DGX Spark one-shot RDMA collectives: sparknet's for
-            # DS4.1's TileLang kernel family (configured by its SPARKNET_ROCE_*
-            # settings), b12x.comm.roce's for B12X. Both carry the same
-            # protocol (B12X's with spark-ds41f's RoCE patches).
-            roce_options = {}
-            if envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
-                from sparknet.integration.vllm import (
-                    SparknetOneShotAllReduce as RoceAllReduce,
-                )
+            # Multi-node DGX Spark one-shot RDMA collectives: sparknet's
+            # (configured by its SPARKNET_ROCE_* settings).
+            from sparknet.integration.vllm import SparknetOneShotAllReduce
 
-                from vllm.distributed.parallel_state import in_the_same_node_as
+            from vllm.distributed.parallel_state import in_the_same_node_as
 
-                roce_options["in_the_same_node"] = in_the_same_node_as(
-                    self.cpu_group, source_rank=0
-                )
-            else:
-                from .b12x_roce_all_reduce import B12xRoceAllReduce as RoceAllReduce
-
-            self.b12x_ar_comm = RoceAllReduce(
+            self.b12x_ar_comm = SparknetOneShotAllReduce(
                 group=self.cpu_group,
                 device_group=self.device_group,
                 device=self.device,
@@ -239,7 +219,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 nccl_available=(
                     self.pynccl_comm is not None and not self.pynccl_comm.disabled
                 ),
-                **roce_options,
+                in_the_same_node=in_the_same_node_as(self.cpu_group, source_rank=0),
             )
             self._roce_policy = not self.b12x_ar_comm.disabled
             if self._roce_policy:
@@ -485,10 +465,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
     @property
     def rank_order_reduce_scatter(self) -> bool:
-        """Whether ``reduce_scatter`` is DS4.1's rank-order one (its TileLang
-        family on the RoCE policy), so an exchange of unreduced chunks plus the
-        rank-order sum may stand in for it."""
-        return self._roce_policy and envs.VLLM_DS41_KERNEL_BACKEND == "tilelang"
+        """Whether ``reduce_scatter`` is the rank-order one (the RoCE policy), so an
+        exchange of unreduced chunks plus the rank-order sum may stand in for it."""
+        return self._roce_policy
 
     def roce_failure(self) -> str | None:
         """The one-shot collectives' failure report, or None.
@@ -498,7 +477,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         waited for. Readable after the stop (the record is in pinned host
         memory).
         """
-        if self._roce_policy and envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
+        if self._roce_policy:
             return self.b12x_ar_comm.failure()
         return None
 
@@ -524,7 +503,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 raise RuntimeError("Selected B12X all-reduce returned None")
             return out
 
-        if self._roce_policy and envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
+        if self._roce_policy:
             # Past the one-shot dispatch limit (CED decoder steps of 205 rows or
             # more), keep its arithmetic: NCCL's ring rounds every hop and adds
             # in another order, so a row's bits would depend on its step's size.
@@ -535,11 +514,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
             return all_reduce_rank_order(
                 self.pynccl_comm, input_, self.rank_in_group, self.world_size
             )
-        if self._roce_policy:
-            out = self.pynccl_comm.all_reduce(input_)
-            if out is None:
-                raise RuntimeError("RoCEnante policy: PyNCCL all-reduce returned None")
-            return out
 
         fi_ar_comm = self.fi_ar_comm
         use_fi_ar = (
@@ -685,13 +659,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             output_size, dtype=input_.dtype, device=input_.device
         )
         pynccl_comm.all_gather(output_tensor, input_.contiguous())
-        if (
-            dim > 0
-            and dim == input_.dim() - 1
-            and envs.VLLM_DS41_KERNEL_BACKEND == "tilelang"
-        ):
-            # DS4.1's TileLang family: the rank-major shards side by side in one
-            # TileLang launch, not torch's movedim and reshape copy.
+        if dim > 0 and dim == input_.dim() - 1:
+            # The rank-major shards side by side in one TileLang launch, not
+            # torch's movedim and reshape copy.
             from vllm.models.deepseek_v4_1.tilelang.collectives import (
                 concat_rank_shards,
             )
@@ -739,10 +709,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         chunk_size = input_tensor.shape[0] // world_size
         output_shape = (chunk_size,) + input_tensor.shape[1:]
 
-        if self._roce_policy and envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
-            # DS4.1's TileLang family: the one-shot all-reduce's arithmetic, so a
-            # row reduces to the same bits whether its step was reduce-scattered
-            # (prefill sequence parallelism) or all-reduced.
+        if self._roce_policy:
+            # The one-shot all-reduce's arithmetic, so a row reduces to the same
+            # bits whether its step was reduce-scattered (prefill sequence
+            # parallelism) or all-reduced.
             from vllm.models.deepseek_v4_1.tilelang.collectives import (
                 reduce_scatter_rank_order,
             )
@@ -951,7 +921,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.world_size == 1:
             return tensor
 
-        if self._roce_policy and envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
+        if self._roce_policy:
             return self._broadcast_one_shot(tensor, src)
 
         pynccl_comm = self.pynccl_comm

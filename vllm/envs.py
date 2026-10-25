@@ -222,9 +222,7 @@ if TYPE_CHECKING:
     VLLM_DS41_MARKOV_NVFP4: bool = False
     VLLM_DS41_DRAFT_NVFP4_HEAD: bool = False
     VLLM_DS41_PACKED_BF16_LM_HEAD: bool = False
-    VLLM_DS41_ATTENTION_COMPUTE: Literal["bf16", "reference", "auto"] = "bf16"
     VLLM_DS41_HEAD_DTYPE: Literal["float32", "model"] = "float32"
-    VLLM_DS41_KERNEL_BACKEND: Literal["b12x", "tilelang"] = "b12x"
     VLLM_STARTUP_HEARTBEAT_TIMEOUT_S: float = 120.0
     VLLM_DS41_ENGRAM_OVERLAP: bool = True
     WEIGHTLESS_STEER_PATH: str | None = None
@@ -292,8 +290,6 @@ if TYPE_CHECKING:
     VLLM_PCIE_ALLREDUCE_BACKEND: Literal["b12x"] = "b12x"
     VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE: str = "84KB"
     VLLM_ENABLE_ROCE_ALLREDUCE: bool = False
-    VLLM_ROCE_ALLREDUCE_MAX_SIZE: str = "2MB"
-    VLLM_ROCE_ALLGATHER_MAX_SIZE: str = "16MB"
     VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE: str = "84KB"
     VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE: str = "off"
     VLLM_PCIE_DMA_MIN_BYTES: str = "6MB"
@@ -1901,18 +1897,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DS41_PACKED_BF16_LM_HEAD": lambda: bool(
         int(os.getenv("VLLM_DS41_PACKED_BF16_LM_HEAD", "0"))
     ),
-    # Arithmetic of the DeepSeek V4.1 b12x sparse attention. "bf16" computes
-    # like DeepSeek's reference sparse_attn (BF16 Q, KV dequantized to BF16,
-    # BF16 P, FP32 accumulation) with split-K decode; "reference" also runs
-    # decode rows single-pass, which reproduces the reference kernel's
-    # tile-ordered softmax bit for bit at some low-concurrency decode speed;
-    # "auto" lets the b12x tuner pick FP8 internals (Q and P quantized, KV
-    # re-encoded; about 3% relative error) or BF16 per plan.
-    "VLLM_DS41_ATTENTION_COMPUTE": env_with_choices(
-        "VLLM_DS41_ATTENTION_COMPUTE",
-        "bf16",
-        ["bf16", "reference", "auto"],
-    ),
     # Default output-head dtype of DeepSeek V4.1 and its DSpark drafter when
     # hf_overrides names none. "float32" computes the logits in FP32 like
     # DeepSeek's reference head; "model" keeps the model dtype, which the exact
@@ -1922,13 +1906,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_DS41_HEAD_DTYPE",
         "float32",
         ["float32", "model"],
-    ),
-    # DeepSeek V4.1 kernel family on SM12x: "b12x" or "tilelang". It selects
-    # the attention, linear and MoE backends; explicit flags must agree.
-    "VLLM_DS41_KERNEL_BACKEND": env_with_choices(
-        "VLLM_DS41_KERNEL_BACKEND",
-        "b12x",
-        ["b12x", "tilelang"],
     ),
     # A startup rendezvous waits for the other ranks as long as they are alive,
     # however long they take to load and prepare kernels. A missing rank whose
@@ -2315,19 +2292,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PCIE_ALLREDUCE_BACKEND": env_with_choices(
         "VLLM_PCIE_ALLREDUCE_BACKEND", "b12x", ["b12x"]
     ),
-    # Maximum input sizes dispatched to the low-latency one-shot kernels.
-    # Enable the b12x one-shot RoCE all-reduce for multi-node TP (DGX Spark).
+    # Selected b12x's one-shot RoCE all-reduce, which is gone: tensor-parallel
+    # groups refuse it (sparknet's one-shot collectives serve multi-node TP).
     "VLLM_ENABLE_ROCE_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_ENABLE_ROCE_ALLREDUCE", "0"))
     ),
-    "VLLM_ROCE_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
-        "VLLM_ROCE_ALLREDUCE_MAX_SIZE", "2MB"
-    ),
-    # Largest per-rank shard routed to the RoCE all-gather
-    # (e.g. logits [rows, vocab/tp]).
-    "VLLM_ROCE_ALLGATHER_MAX_SIZE": lambda: os.getenv(
-        "VLLM_ROCE_ALLGATHER_MAX_SIZE", "16MB"
-    ),
+    # Maximum input sizes dispatched to the low-latency one-shot kernels.
     "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
         "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "84KB"
     ),

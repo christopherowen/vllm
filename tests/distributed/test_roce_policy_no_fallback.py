@@ -12,7 +12,6 @@ import pytest
 import torch
 import torch.distributed
 
-import vllm.envs as envs
 from vllm.distributed.device_communicators import cuda_communicator
 from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
@@ -81,13 +80,6 @@ def test_gather_is_not_part_of_the_policy():
         _policy_communicator().gather(torch.zeros(4))
 
 
-def test_broadcast_runs_on_pynccl():
-    pynccl = _PyNccl()
-    tensor = torch.zeros(4)
-    assert _policy_communicator(pynccl).broadcast(tensor, src=0) is tensor
-    assert pynccl.calls == [("broadcast", 0)]
-
-
 def test_batch_isend_irecv_runs_on_pynccl():
     pynccl = _PyNccl()
     _policy_communicator(pynccl).batch_isend_irecv([object(), object()])
@@ -129,8 +121,7 @@ class _SparknetAdapter(_OneShot):
         return self.report
 
 
-def test_failure_report_comes_from_the_one_shot_runtime(monkeypatch):
-    monkeypatch.setattr(envs, "VLLM_DS41_KERNEL_BACKEND", "tilelang", raising=False)
+def test_failure_report_comes_from_the_one_shot_runtime():
     comm = _policy_communicator()
     comm.b12x_ar_comm = _SparknetAdapter(report="saw nothing from rank 2")
     assert comm.roce_failure() == "saw nothing from rank 2"
@@ -156,18 +147,15 @@ class _GatheringAdapter(_OneShot):
         return torch.cat([base + 100 * r for r in range(self.world)])
 
 
-def _tilelang_communicator(monkeypatch, rank, eligible=True):
-    monkeypatch.setattr(envs, "VLLM_DS41_KERNEL_BACKEND", "tilelang", raising=False)
-    comm = _policy_communicator()
+def _one_shot_communicator(rank, eligible=True, pynccl=None):
+    comm = _policy_communicator(pynccl)
     comm.rank_in_group = rank
     comm.b12x_ar_comm = _GatheringAdapter(comm.world_size, eligible)
     return comm
 
 
-def test_tilelang_broadcast_keeps_the_source_copy_of_the_one_shot_all_gather(
-    monkeypatch,
-):
-    comm = _tilelang_communicator(monkeypatch, rank=1)
+def test_broadcast_keeps_the_source_copy_of_the_one_shot_all_gather():
+    comm = _one_shot_communicator(rank=1)
     tensor = torch.full((2, 3), -1.0)
     assert comm.broadcast(tensor, src=2) is tensor
     assert torch.equal(tensor, (torch.arange(6.0) + 200).view(2, 3))
@@ -175,8 +163,8 @@ def test_tilelang_broadcast_keeps_the_source_copy_of_the_one_shot_all_gather(
     assert comm.pynccl_comm.calls == []
 
 
-def test_tilelang_broadcast_source_keeps_its_own_bytes(monkeypatch):
-    comm = _tilelang_communicator(monkeypatch, rank=2)
+def test_broadcast_source_keeps_its_own_bytes():
+    comm = _one_shot_communicator(rank=2)
     tensor = torch.full((2, 3), 7.0)
     comm.broadcast(tensor, src=2)
     assert torch.equal(tensor, torch.full((2, 3), 7.0))
@@ -184,8 +172,8 @@ def test_tilelang_broadcast_source_keeps_its_own_bytes(monkeypatch):
     assert comm.b12x_ar_comm.gathers == [((6,), 0)]
 
 
-def test_tilelang_broadcast_refuses_what_the_all_gather_cannot_take(monkeypatch):
-    comm = _tilelang_communicator(monkeypatch, rank=1, eligible=False)
+def test_broadcast_refuses_what_the_all_gather_cannot_take():
+    comm = _one_shot_communicator(rank=1, eligible=False)
     with pytest.raises(RuntimeError, match="one-shot broadcast cannot take"):
         comm.broadcast(torch.zeros(4), src=0)
     assert comm.pynccl_comm.calls == []
@@ -202,11 +190,14 @@ def _group(device_communicator):
 
 def test_group_broadcast_goes_through_the_policy():
     """The TP group's broadcast (DSpark's per-step confidences) never reaches
-    the PyTorch process group under the policy."""
+    the PyTorch process group under the policy: the one-shot all-gather takes it."""
     pynccl = _PyNccl()
+    comm = _one_shot_communicator(rank=1, pynccl=pynccl)
     tensor = torch.zeros(4)
-    assert _group(_policy_communicator(pynccl)).broadcast(tensor, src=0) is tensor
-    assert pynccl.calls == [("broadcast", 0)]
+    assert _group(comm).broadcast(tensor, src=0) is tensor
+    assert torch.equal(tensor, torch.arange(4.0))
+    assert comm.b12x_ar_comm.gathers == [((4,), 0)]
+    assert pynccl.calls == []
 
 
 def test_group_broadcast_without_a_policy_keeps_the_process_group(monkeypatch):

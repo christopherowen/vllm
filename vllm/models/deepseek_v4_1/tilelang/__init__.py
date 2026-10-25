@@ -1,9 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DeepSeek-V4.1 kernels in TileLang for SM120 / SM121.
-
-Selected by ``VLLM_DS41_KERNEL_BACKEND=tilelang``:
-
+"""DeepSeek-V4.1 kernels in TileLang for SM120 / SM121:
 
 - ``sparse_mla``: compressed sparse MLA over the SWA and indexed caches;
 - ``indexer``: MXFP4 index scores, exact top-k and candidate lists;

@@ -6,7 +6,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
@@ -63,22 +62,17 @@ def _gather_lookback_kernel(
     tl.store(lookback_ptr + batch_idx * DEPTH + offs, ids, mask=offs < DEPTH)
 
 
-def _nonfinal_skip_policy(
-    vllm_config: VllmConfig, *, aligned_chunks: bool
-) -> tuple[int, int]:
+def _nonfinal_skip_policy(vllm_config: VllmConfig) -> tuple[int, int]:
     """Validate the serving contract before enabling CED's nonfinal row skip."""
     scheduler = vllm_config.scheduler_config
     spec = vllm_config.speculative_config
     if (
-        envs.VLLM_DS41_KERNEL_BACKEND != "tilelang"
-        or not aligned_chunks
+        not scheduler.align_prefill_chunks
         or not scheduler.enable_chunked_prefill
         or spec is None
         or not spec.use_dspark()
     ):
-        raise ValueError(
-            "CED skip requires TileLang, aligned chunked prefill and DSpark"
-        )
+        raise ValueError("CED skip requires aligned chunked prefill and DSpark")
     align = scheduler.long_prefill_token_threshold
     hf = vllm_config.model_config.hf_config
     window = getattr(spec.draft_model_config.hf_config, "sliding_window", None)
@@ -160,10 +154,8 @@ class DeepseekV41ModelState(DefaultModelState):
             self.ced_state = CEDState(
                 self.max_num_reqs, self.max_num_tokens, capacities, device
             )
-            from vllm.v1.core.sched.scheduler import ALIGN_PREFILL_CHUNKS
-
             self._ced_skip_min_rows, self._ced_chunk_align = _nonfinal_skip_policy(
-                vllm_config, aligned_chunks=ALIGN_PREFILL_CHUNKS
+                vllm_config
             )
             hf = self.model_config.hf_config
             parallel = vllm_config.parallel_config

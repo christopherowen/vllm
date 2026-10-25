@@ -102,12 +102,6 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
-# Prefill chunks that end at absolute multiples of long_prefill_token_threshold,
-# whatever else the step holds (DeepSeek V4.1 temperature-0 determinism, under
-# its TileLang kernel family). Otherwise a chunk takes whatever budget the step's
-# other requests leave.
-ALIGN_PREFILL_CHUNKS = envs.VLLM_DS41_KERNEL_BACKEND == "tilelang"
-
 
 def _build_kv_connector_block_state(
     kv_cache_config: KVCacheConfig,
@@ -363,7 +357,7 @@ class Scheduler(SchedulerInterface):
         self.use_eagle_block_drop = False
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
-        if ALIGN_PREFILL_CHUNKS:
+        if self.scheduler_config.align_prefill_chunks:
             self._check_aligned_prefill_chunks()
         self.num_prefill_lookahead = vllm_config.num_prefill_lookahead_tokens
         self.dynamic_sd_lookup: list[int] | None = None
@@ -1201,7 +1195,10 @@ class Scheduler(SchedulerInterface):
                 ):
                     num_new_tokens = self.scheduler_config.long_prefill_token_threshold
                 aligned_chunk = None
-                if ALIGN_PREFILL_CHUNKS and request.is_prefill_chunk:
+                if (
+                    self.scheduler_config.align_prefill_chunks
+                    and request.is_prefill_chunk
+                ):
                     aligned_chunk = num_new_tokens = self._aligned_prefill_chunk(
                         request.num_computed_tokens, num_new_tokens
                     )
@@ -1814,7 +1811,10 @@ class Scheduler(SchedulerInterface):
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
                     aligned_chunk = None
-                    if ALIGN_PREFILL_CHUNKS and num_new_tokens > 1:
+                    if (
+                        self.scheduler_config.align_prefill_chunks
+                        and num_new_tokens > 1
+                    ):
                         aligned_chunk = num_new_tokens = self._aligned_prefill_chunk(
                             num_computed_tokens, num_new_tokens
                         )
