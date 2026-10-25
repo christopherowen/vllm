@@ -5277,3 +5277,136 @@ def test_deepseek_v4_annotation_requires_model_type():
     )
 
     assert not any(g.is_eagle_group for g in groups)
+
+
+def _ds41_layer_specs() -> dict[str, KVCacheSpec]:
+    """DeepSeek V4.1 Flash's cache specs in registration order
+    (`vllm/models/deepseek_v4_1`): 40 target layers and DSpark's three drafter
+    layers. Every layer has a 128-token window; the KV sources 2, 8, 14 (ratio
+    2) and 20 (ratio 1) add compressed latents, indexer keys and, at ratio 2,
+    compressor states. From the CED decoder (layer 20) on, and in the drafter,
+    windows replay a bounded prefix instead of caching it; the drafter's
+    windows retain one more token."""
+    ratios = {2: 2, 8: 2, 14: 2, 20: 1}
+
+    def compressed(head_size: int, content: int, ratio: int) -> MLAAttentionSpec:
+        return MLAAttentionSpec(
+            block_size=256,
+            num_kv_heads=1,
+            head_size=head_size,
+            state_content_bytes=content,
+            dtype=torch.uint8,
+            tokens_per_state=ratio,
+            cache_dtype_str="b12x_dsv41",
+        )
+
+    specs: dict[str, KVCacheSpec] = {}
+    for layer in range(43):
+        prefix = f"model.layers.{layer}.self_attn"
+        draft = layer >= 40
+        bounded = draft or layer >= 20
+        if layer in ratios:
+            specs[prefix] = compressed(512, 288, ratios[layer])
+        specs[f"{prefix}.swa_cache"] = SlidingWindowMLASpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=512,
+            state_content_bytes=528,
+            dtype=torch.uint8,
+            cache_dtype_str="b12x_dsv41",
+            sliding_window=128,
+            extra_retained_tokens=int(draft),
+            prefix_cache_enabled=not bounded,
+            prefill_replay_window=128 if bounded else 0,
+        )
+        if ratios.get(layer) == 2:
+            specs[f"{prefix}.compressor.state_cache"] = CircularBufferSpec(
+                block_size=8,
+                num_kv_heads=1,
+                head_size=1024,
+                head_size_v=0,
+                dtype=torch.float32,
+            )
+        if layer in ratios:
+            specs[f"{prefix}.indexer.k_cache"] = compressed(68, 68, ratios[layer])
+    return specs
+
+
+def _ds41_scheduler_groups() -> tuple[list[KVCacheGroupSpec], KVCacheConfig]:
+    groups = get_kv_cache_groups(
+        _spec_decode_grouping_config(model_type="deepseek_v41"), _ds41_layer_specs()
+    )
+    scheduler = generate_scheduler_kv_cache_config(
+        [KVCacheConfig(num_blocks=64, kv_cache_tensors=[], kv_cache_groups=groups)]
+    )
+    return groups, scheduler
+
+
+def _layer_index(name: str) -> int:
+    return int(name.split(".")[2])
+
+
+def test_ds41_scheduler_window_groups_retain_the_drafters_token():
+    """A window group's one block table serves all its layers, so its scheduler
+    spec must retain what its most demanding layer needs: the drafter's block
+    reads `window` tokens before its first query, one more than a target layer."""
+    groups, scheduler = _ds41_scheduler_groups()
+    # As the TP4 boots log them: 7 window groups, the compressed group, the
+    # compressor ring, 8 window groups.
+    assert [g.kv_cache_spec.block_size for g in groups] == (
+        [128] * 7 + [256, 8] + [128] * 8
+    )
+    drafter_groups = [
+        i
+        for i, group in enumerate(groups)
+        if any(_layer_index(name) >= 40 for name in group.layer_names)
+    ]
+    # The drafter shares the CED decoder's prefix policy, so its windows sit in
+    # three groups behind target layers.
+    assert len(drafter_groups) == 3
+    for i in drafter_groups:
+        assert _layer_index(groups[i].layer_names[0]) < 40
+    for worker, group in zip(groups, scheduler.kv_cache_groups):
+        if not isinstance(group.kv_cache_spec, SlidingWindowSpec):
+            continue
+        layers = worker.kv_cache_spec.kv_cache_specs.values()
+        retained = max(spec.extra_retained_tokens for spec in layers)
+        assert group.kv_cache_spec.extra_retained_tokens == retained
+    assert all(
+        scheduler.kv_cache_groups[i].kv_cache_spec.extra_retained_tokens == 1
+        for i in drafter_groups
+    )
+
+
+def test_ds41_drafter_window_survives_a_step_whose_rows_are_all_rejected():
+    """When every row of a step is rejected (sink rejection replacing draft
+    zero), DSpark's draft block starts at the step's first position q0 and
+    reads from q0 - 128. With no step in flight the scheduler frees on q0, so
+    at q0 = 127 (mod 128) the block holding q0 - 128 must stay."""
+    from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
+
+    groups, scheduler = _ds41_scheduler_groups()
+    drafter = next(
+        i
+        for i, group in enumerate(groups)
+        if any(_layer_index(name) >= 40 for name in group.layer_names)
+    )
+    spec = scheduler.kv_cache_groups[drafter].kv_cache_spec
+    pool = BlockPool(num_gpu_blocks=8, enable_caching=False, hash_block_size=128)
+    manager = SlidingWindowManager(
+        spec,
+        block_pool=pool,
+        enable_caching=False,
+        kv_cache_group_id=drafter,
+        scheduler_block_size=spec.block_size,
+        max_admission_blocks_per_request=10**9,
+    )
+    q0 = 3 * 128 + 127
+    blocks = pool.get_new_blocks((q0 + 6) // 128 + 1)
+    manager.req_to_blocks["r"] = list(blocks)
+    manager.remove_skipped_blocks("r", processed_computed_tokens=q0)
+    held = manager.req_to_blocks["r"]
+    # Blocks 0-1 are behind the drafter's window; block 2 holds q0 - 128.
+    assert held[:2] == [pool.null_block] * 2
+    assert held[(q0 - 128) // 128] is blocks[(q0 - 128) // 128]

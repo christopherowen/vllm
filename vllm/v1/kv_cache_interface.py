@@ -1328,6 +1328,26 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         return next(iter(self.kv_cache_specs.values()))
 
     @property
+    def scheduler_spec(self) -> KVCacheSpec:
+        """The one spec the scheduler manages the group's block table by.
+
+        Layers of one sliding-window group can retain different numbers of
+        trailing tokens (a drafter beside target layers), and the shared block
+        table must keep what the most demanding layer reads.
+        """
+        first = self.first_spec
+        if not isinstance(first, SlidingWindowSpec):
+            return first
+        retained = max(
+            spec.extra_retained_tokens
+            for spec in self.kv_cache_specs.values()
+            if isinstance(spec, SlidingWindowSpec)
+        )
+        if retained == first.extra_retained_tokens:
+            return first
+        return replace(first, extra_retained_tokens=retained)
+
+    @property
     def prefill_replay_tokens(self) -> int:
         return max(spec.prefill_replay_tokens for spec in self.kv_cache_specs.values())
 

@@ -2821,11 +2821,9 @@ def generate_scheduler_kv_cache_config(
     cfg = copy.deepcopy(kv_cache_configs[0])
     for group in cfg.kv_cache_groups:
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
-            # All layers in the UniformTypeKVCacheSpecs have the same type,
-            # so use an arbitrary one to initialize the scheduler.
-            group.kv_cache_spec = next(
-                iter(group.kv_cache_spec.kv_cache_specs.values())
-            )
+            # All layers in the UniformTypeKVCacheSpecs have the same type, so
+            # one of them initializes the scheduler, retaining what all need.
+            group.kv_cache_spec = group.kv_cache_spec.scheduler_spec
     return cfg
 
 
