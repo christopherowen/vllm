@@ -308,6 +308,53 @@ def test_decode_metadata_equals_chunk_and_pages(lengths, draft, replay, main_pag
     _live_equal(main_pages, pages, live, rows)
 
 
+@pytest.mark.parametrize(
+    "main_width, read_width", [(1100, 1100), (4096, 4096), (4096, 2500)]
+)
+@pytest.mark.parametrize("main_page", [64, 256])
+def test_decode_metadata_wide_tables(main_width, read_width, main_page):
+    """Rows whose live pages span several of the page part's column groups, up to the
+    4,096 columns of a 1M context's table (the other tests' tables fit in one)."""
+    page, window, width, rows = 64, 128, 128, 64
+    g = torch.Generator().manual_seed(main_width + read_width + main_page)
+    reqs = torch.randint(-1, R, (rows,), generator=g, dtype=torch.int32)
+    # Visible entries from none to past the table's width: full, partial and empty
+    # groups, and rows without a request.
+    visible = torch.randint(
+        -3, (read_width + 2) * main_page, (rows,), generator=g, dtype=torch.int32
+    )
+    pos = torch.randint(0, 2000, (rows,), generator=g)
+    table = torch.randint(
+        0, 1 << 20, (R, read_width + 8), generator=g, dtype=torch.int32
+    )
+    table[:, 3] = 0  # holes
+    qsl = torch.arange(R + 1, dtype=torch.int32)
+    request_positions = torch.randint(-5, 900, (R,), generator=g)
+    reqs, visible, pos, qsl, request_positions = (
+        t.to(DEVICE) for t in (reqs, visible, pos, qsl, request_positions)
+    )
+    table = table.to(DEVICE)[:, :read_width]
+    swa = torch.full((rows, width), 7, dtype=torch.int32, device=DEVICE)
+    lengths_out = torch.full((rows,), 7, dtype=torch.int32, device=DEVICE)
+    top = torch.full((rows,), 7, dtype=torch.int32, device=DEVICE)
+    main_pages = torch.full((rows, main_width), 7, dtype=torch.int32, device=DEVICE)
+    metadata.decode_metadata(
+        pos, reqs, table, swa, lengths_out, top, visible, qsl, request_positions,
+        reqs, table, main_pages, 0, rows, read_width, page=page, window=window,
+        draft=False, main_page=main_page,
+    )  # fmt: skip
+    expected = _ref_chunk(
+        pos, reqs, table, visible, qsl, request_positions, 0, rows, width, page,
+        window, False, None,
+    )  # fmt: skip
+    for actual, reference in zip((swa, lengths_out, top), expected):
+        _rows_equal(actual, reference, rows)
+    pages = _ref_pages(reqs, table, 0, rows, main_width, read_width)
+    live = _live_columns(reqs, visible, 0, rows, main_page, read_width, main_width)
+    assert int(live.max()) > 4 * 128, "no row spans more than one column group"
+    _live_equal(main_pages, pages, live, rows)
+
+
 @torch.inference_mode()
 def test_metadata_refresh_preserves_padded_graph_domain_and_addresses():
     from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadataBuilder
