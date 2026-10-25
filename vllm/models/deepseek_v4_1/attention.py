@@ -848,6 +848,18 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         calls.append(writer_call("swa", self.swa_cache_layer.block_size, SLOT_DTYPE))
         if self.compressor is not None:
             calls.append(writer_call("indexed", self._main_page, SLOT_DTYPE))
+        else:
+            # _gather_front: prefill SP's BF16 front, the index head weights beside
+            # the normalized halves.
+            from vllm.models.deepseek_v4_1.tilelang import columns
+
+            widths = (self.q_lora_rank, 512)
+            if self.indexer is not None:
+                widths += (self.indexer.heads,)
+                key = columns.copy_columns_key(self.indexer.heads, torch.bfloat16)
+                calls.append(prepare.call(columns.copy_columns_kernel, *key))
+            key = columns.split_columns_key(widths, torch.bfloat16)
+            calls.append(prepare.call(columns.split_columns_kernel, *key))
         return calls
 
     def _declare_mla(self, mode: str, capacity: int, metadata_specs, device):
@@ -1445,6 +1457,24 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             return torch.empty_like(hidden_states)
         return _attention(hidden_states, positions, self.prefix, global_kv_ready)
 
+    def _gather_front(self, sp_rows, hidden_states, qr, kv):
+        """Sequence-parallel prefill's row-wise front of every row, as contiguous
+        parts (normalized Q, normalized KV, the indexer's head weights, all BF16):
+        one all-gather of this rank's rows side by side. The norms write their
+        halves into the gather's buffer in place and the head weights are copied
+        beside them."""
+        from vllm.models.deepseek_v4_1.tilelang import columns
+
+        q = self.q_lora_rank
+        widths = (q, 512) + (() if self.indexer is None else (self.indexer.heads,))
+        front = qr.new_empty(qr.shape[0], sum(widths))
+        self.q_norm(qr, out=front[:, :q])
+        self.kv_norm(kv, out=front[:, q : q + 512])
+        if self.indexer is not None:
+            weights = self.indexer.weights_proj(hidden_states)
+            columns.copy_columns(weights, front[:, q + 512 :])
+        return columns.split_columns(sp_rows.gather(front), widths)
+
     def _forward(self, positions, hidden_states):
         if not self._ready:
             raise PreparationResourceUnavailableError(
@@ -1458,17 +1488,23 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             # its product, narrower than the hidden state, is gathered.
             qr_kv, _ = self.fused_wqa_wkv(hidden_states)
             qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
-            parts = [self.q_norm(qr), self.kv_norm(kv)]
-            if self.indexer is not None:
-                parts.append(self.indexer.weights_proj(hidden_states))
-            if len({part.dtype for part in parts}) == 1:
-                widths = [part.shape[-1] for part in parts]
-                parts = sp_rows.gather(torch.cat(parts, dim=-1)).split(widths, dim=-1)
+            if kernels.uses_tilelang():
+                parts = self._gather_front(sp_rows, hidden_states, qr, kv)
             else:
-                parts = [sp_rows.gather(part) for part in parts]
-            qr, kv = parts[0].contiguous(), parts[1].contiguous()
+                parts = [self.q_norm(qr), self.kv_norm(kv)]
+                if self.indexer is not None:
+                    parts.append(self.indexer.weights_proj(hidden_states))
+                if len({part.dtype for part in parts}) == 1:
+                    widths = [part.shape[-1] for part in parts]
+                    parts = sp_rows.gather(torch.cat(parts, dim=-1)).split(
+                        widths, dim=-1
+                    )
+                else:
+                    parts = [sp_rows.gather(part) for part in parts]
+                parts = [part.contiguous() for part in parts]
+            qr, kv = parts[0], parts[1]
             if self.indexer is not None:
-                index_weights = parts[2].contiguous()
+                index_weights = parts[2]
             hidden_states = None
             rows = sp_rows.num_tokens
         else:
