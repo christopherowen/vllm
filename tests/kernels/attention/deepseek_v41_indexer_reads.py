@@ -88,8 +88,28 @@ def run_case(mod, page_size: int, extents: tuple[int, ...], candidates: bool) ->
         lengths,
         active,
     ]
-    if candidates:
-        # Ascending visible positions, some masked; the counts end inside a tile.
+    if candidates and hasattr(mod, "_candidate_block"):
+        # Block ids as the candidate source writes them: ascending, the block holding
+        # the row's last position always kept (its rows past the end lie past the
+        # count, unwritten), one block masked, -1 padding past them.
+        block = mod.CANDIDATE_BLOCK
+        chosen = torch.full(
+            (rows, width // block), -1, dtype=torch.int32, device=DEVICE
+        )
+        counts = []
+        for r, extent in enumerate(extents):
+            last = (extent - 1) // block
+            n = max(1, (last + 1) * 2 // 3)
+            picked = torch.randperm(last, generator=gen, device=DEVICE)[: n - 1]
+            ids = torch.cat([picked.sort().values, torch.tensor([last], device=DEVICE)])
+            chosen[r, : ids.numel()] = ids.to(torch.int32)
+            if ids.numel() > 2:
+                chosen[r, ids.numel() // 2] = -1
+            counts.append(block * (ids.numel() - 1) + extent - block * last)
+        args += [chosen, torch.tensor(counts, dtype=torch.int32, device=DEVICE)]
+    elif candidates:
+        # A position-list module (the release's): ascending visible positions, some
+        # masked; the counts end inside a tile.
         chosen = torch.full((rows, width), -1, dtype=torch.int32, device=DEVICE)
         counts = []
         for r, extent in enumerate(extents):

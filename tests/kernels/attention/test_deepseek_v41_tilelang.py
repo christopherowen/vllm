@@ -267,9 +267,11 @@ def _ref_scores(inp, page_size, extent, positions_of):
 
 
 def _ref_topk(scores, extent, topk, group=1, gather=None):
-    """Larger scores first, then lower positions; ascending, ``-1`` padded."""
+    """Larger scores first, then lower positions; ascending, ``-1`` padded. Grouped
+    selections return block ids and their count of positions below the extent;
+    ``gather`` (candidate rows) maps entries to positions."""
     rows = scores.shape[0]
-    out = torch.full((rows, topk * group), -1, dtype=torch.int32, device=DEVICE)
+    out = torch.full((rows, topk), -1, dtype=torch.int32, device=DEVICE)
     counts = torch.zeros(rows, dtype=torch.int32, device=DEVICE)
     for r in range(rows):
         n = int(extent[r])
@@ -284,15 +286,35 @@ def _ref_topk(scores, extent, topk, group=1, gather=None):
         order = torch.sort(values, descending=True, stable=True).indices
         chosen = order[values[order] > float("-inf")][:topk].sort().values
         if group > 1:
-            pos = (
-                chosen[:, None] * group + torch.arange(group, device=DEVICE)
-            ).flatten()
-            chosen = torch.where(pos < n, pos, -1)
-            counts[r] = int((chosen >= 0).sum())
+            pos = chosen[:, None] * group + torch.arange(group, device=DEVICE)
+            counts[r] = int((pos < n).sum())
         elif gather is not None:
             chosen = gather[r, chosen]
         out[r, : chosen.numel()] = chosen.to(torch.int32)
     return out, counts
+
+
+def _expanded(ids, counts, group=CANDIDATE_BLOCK):
+    """Each block's ``group`` positions below its row's count, ``-1`` elsewhere (and
+    for a masked block): the candidate positions a block-id list stands for."""
+    rows, blocks = ids.shape
+    j = torch.arange(blocks * group, device=DEVICE)
+    block = ids[:, j // group]
+    pos = block * group + j % group
+    live = (j[None] < counts[:, None]) & (block >= 0)
+    return torch.where(live, pos, -1).to(torch.int32)
+
+
+def _release_expansion(ids, extent, group=CANDIDATE_BLOCK):
+    """The release's position list of selected blocks: every block's ``group``
+    positions, ``-1`` from the extent on, then ``-1`` padding (26382f5cf)."""
+    rows, blocks = ids.shape
+    out = torch.full((rows, blocks * group), -1, dtype=torch.int32, device=DEVICE)
+    for r in range(rows):
+        chosen = ids[r][ids[r] >= 0].long()
+        pos = (chosen[:, None] * group + torch.arange(group, device=DEVICE)).flatten()
+        out[r, : pos.numel()] = torch.where(pos < extent[r], pos, -1).to(torch.int32)
+    return out
 
 
 def _dense_extent(inp, width):
@@ -371,26 +393,28 @@ def test_indexer_nonfinite_query_scale(page_size=64, rows=4, context=4096):
             assert torch.equal(scores[i, : extent[i]], clean[i, : extent[i]]), i
 
 
-def test_indexer_candidates(page_size=64, rows=3, context=8192):
+def test_indexer_candidates(page_size=64, rows=4, context=8192):
+    """Reindex rows read block-id candidate lists, as the source layer publishes
+    them: candidate ``j`` is position ``ids[j // 8] * 8 + j % 8``, the last block
+    holding the row's last position (here only partly). A masked block's candidates
+    score ``-inf``; an empty row selects nothing."""
     inp = _index_inputs(rows, context, page_size)
     width = CANDIDATE_BLOCKS * CANDIDATE_BLOCK
     gen = _gen(7)
-    candidate_lengths = torch.randint(
-        width // 8,
-        context // 2,
-        (rows,),
-        generator=gen,
-        device=DEVICE,
-        dtype=torch.int32,
+    candidates = torch.full(
+        (rows, CANDIDATE_BLOCKS), -1, dtype=torch.int32, device=DEVICE
     )
-    candidates = torch.full((rows, width), -1, dtype=torch.int32, device=DEVICE)
-    for r in range(rows):
-        n = int(candidate_lengths[r])
-        chosen = torch.randperm(int(inp["lengths"][r]), generator=gen, device=DEVICE)[
-            :n
-        ]
-        candidates[r, :n] = chosen.sort().values.to(torch.int32)
-    candidates[0, 5] = -1  # masked candidates score -inf
+    candidate_lengths = torch.zeros(rows, dtype=torch.int32, device=DEVICE)
+    for r in range(rows - 1):  # the last row stays empty
+        visible = int(inp["lengths"][r]) - 3  # the last block partly visible
+        last = (visible - 1) // CANDIDATE_BLOCK
+        n = int(torch.randint(64, last + 1, (1,), generator=gen, device=DEVICE))
+        chosen = torch.randperm(last, generator=gen, device=DEVICE)[: n - 1]
+        ids = torch.cat([chosen.sort().values, torch.tensor([last], device=DEVICE)])
+        candidates[r, :n] = ids.to(torch.int32)
+        last_visible = visible - last * CANDIDATE_BLOCK  # 1 to 8 positions
+        candidate_lengths[r] = (n - 1) * CANDIDATE_BLOCK + last_visible
+    candidates[0, 1] = -1  # a masked block: its candidates score -inf
     plan = IndexerV41Plan(width, page_size, candidates=True)
     args = (
         inp[k]
@@ -406,11 +430,13 @@ def test_indexer_candidates(page_size=64, rows=3, context=8192):
     )
     out, scores = plan.run(*args, candidates, candidate_lengths)
     extent = candidate_lengths.clamp(0, width).tolist()
-    ref = _ref_scores(inp, page_size, extent, lambda r: candidates[r, : extent[r]])
+    positions = _expanded(candidates, candidate_lengths)
+    ref = _ref_scores(inp, page_size, extent, lambda r: positions[r, : extent[r]])
     for r in range(rows):
         assert torch.equal(scores[r, : extent[r]], ref[r]), f"row {r} scores differ"
-    expected, _ = _ref_topk(scores, extent, INDEX_TOPK, gather=candidates)
+    expected, _ = _ref_topk(scores, extent, INDEX_TOPK, gather=positions)
     assert torch.equal(out, expected)
+    assert bool((out[rows - 1] == -1).all())
 
 
 def _compute_sanitizer() -> str | None:
@@ -486,7 +512,7 @@ def test_indexer_publishes_candidates(page_size=64, rows=2, context=20000):
     width = (context + page_size - 1) // page_size * page_size
     plan = IndexerV41Plan(width, page_size, candidate_blocks=True)
     candidate_out = torch.full(
-        (rows, CANDIDATE_BLOCKS * CANDIDATE_BLOCK), -7, dtype=torch.int32, device=DEVICE
+        (rows, CANDIDATE_BLOCKS), -7, dtype=torch.int32, device=DEVICE
     )
     counts = torch.full((rows,), -7, dtype=torch.int32, device=DEVICE)
     args = (
@@ -552,21 +578,25 @@ def test_indexer_reads_only_live_pages(candidates, page_size=64, rows=4, context
     )
     extra: tuple = ()
     if candidates:
+        # Block ids as the candidate source writes them: ascending, the block holding
+        # the row's last position always kept (partly visible), -1 padding past them.
         width = CANDIDATE_BLOCKS * CANDIDATE_BLOCK
         gen = _gen(7)
-        candidate_lengths = torch.tensor(
-            [1, 600, 2048, 4096], dtype=torch.int32, device=DEVICE
+        candidates_in = torch.full(
+            (rows, CANDIDATE_BLOCKS), -1, dtype=torch.int32, device=DEVICE
         )
-        candidates_in = torch.full((rows, width), -1, dtype=torch.int32, device=DEVICE)
-        for r in range(rows):
-            n = int(candidate_lengths[r])
-            chosen = torch.randperm(
-                int(inp["lengths"][r]), generator=gen, device=DEVICE
-            )[:n]
-            candidates_in[r, :n] = chosen.sort().values.to(torch.int32)
-        candidates_in[2, 5] = -1  # a masked candidate looks up column 0
+        counts = []
+        for r, n in enumerate((1, 75, 256, 512)):
+            visible = int(inp["lengths"][r])
+            last = (visible - 1) // CANDIDATE_BLOCK
+            chosen = torch.randperm(last, generator=gen, device=DEVICE)[: n - 1]
+            ids = torch.cat([chosen.sort().values, torch.tensor([last], device=DEVICE)])
+            candidates_in[r, :n] = ids.to(torch.int32)
+            counts.append((n - 1) * CANDIDATE_BLOCK + visible - last * CANDIDATE_BLOCK)
+        candidates_in[2, 5] = -1  # a masked block looks up column 0
+        candidate_lengths = torch.tensor(counts, dtype=torch.int32, device=DEVICE)
         extra = (candidates_in, candidate_lengths)
-        extent = candidate_lengths.clamp(0, width).tolist()
+        extent = counts
     else:
         width = (context + page_size - 1) // page_size * page_size
         extent = _dense_extent(inp, width)
@@ -579,6 +609,48 @@ def test_indexer_reads_only_live_pages(candidates, page_size=64, rows=4, context
             f"row {r} looked up a page past its live pages"
         )
     assert torch.equal(out, clean_out)
+
+
+def test_candidate_chain_matches_the_release_positions(page_size=64, context=20000):
+    """The source layer's block ids stand for exactly the release's position list
+    (blocks expanded, ``-1`` from the extent on), so the reindex layer that reads
+    them scores and selects the release's positions bit for bit: rows with more
+    visible blocks than are kept, a partly visible last block, few blocks, none."""
+    rows = 4
+    inp = _index_inputs(rows, context, page_size)
+    inp["lengths"] = torch.tensor(
+        [context, context - 3, 1003, 0], dtype=torch.int32, device=DEVICE
+    )
+    width = (context + page_size - 1) // page_size * page_size
+    source = IndexerV41Plan(width, page_size, candidate_blocks=True)
+    names = ("q_packed", "q_scales", "weights", "pool", "page_table", "lengths")
+    ids = torch.full((rows, CANDIDATE_BLOCKS), -7, dtype=torch.int32, device=DEVICE)
+    counts = torch.full((rows,), -7, dtype=torch.int32, device=DEVICE)
+    _, scores = source.run(
+        *(inp[k] for k in names),
+        inp["active"],
+        candidate_out=ids,
+        candidate_out_lengths=counts,
+    )
+    extent = _dense_extent(inp, width)
+    expected_ids, expected_counts = _ref_topk(
+        scores, extent, CANDIDATE_BLOCKS, CANDIDATE_BLOCK
+    )
+    assert torch.equal(ids, expected_ids) and torch.equal(counts, expected_counts)
+    positions = _release_expansion(ids, extent)
+    # No position list of the release has a hole before its count.
+    assert torch.equal(_expanded(ids, counts), positions)
+
+    reindex = IndexerV41Plan(
+        CANDIDATE_BLOCKS * CANDIDATE_BLOCK, page_size, candidates=True
+    )
+    out, re_scores = reindex.run(*(inp[k] for k in names), inp["active"], ids, counts)
+    re_extent = counts.tolist()
+    ref = _ref_scores(inp, page_size, re_extent, lambda r: positions[r, : re_extent[r]])
+    for r in range(rows):
+        assert torch.equal(re_scores[r, : re_extent[r]], ref[r]), f"row {r} scores"
+    expected, _ = _ref_topk(re_scores, re_extent, INDEX_TOPK, gather=positions)
+    assert torch.equal(out, expected)
 
 
 def _tie_scores(rows, width, seed=3):
@@ -611,7 +683,7 @@ def test_topk_routes(width, topk, group, rows=4):
     )
     active = torch.tensor([width], dtype=torch.int32, device=DEVICE)
     op = IndexerTopK(width, topk, group)
-    indices = torch.full((rows, topk * group), -7, dtype=torch.int32, device=DEVICE)
+    indices = torch.full((rows, topk), -7, dtype=torch.int32, device=DEVICE)
     values = torch.empty((rows, topk), dtype=torch.bfloat16, device=DEVICE)
     counts = (
         torch.full((rows,), -7, dtype=torch.int32, device=DEVICE) if group > 1 else None

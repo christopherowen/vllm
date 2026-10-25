@@ -36,6 +36,7 @@ from vllm.models.deepseek_v4_1.sparse_mla import (
     tilelang_builder_kernels,
 )
 from vllm.models.deepseek_v4_1.tilelang import prepare
+from vllm.models.deepseek_v4_1.tilelang.indexer import CANDIDATE_BLOCKS
 from vllm.models.deepseek_v41.common.rope import build_deepseek_v4_rope
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
@@ -520,7 +521,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             if self.layer_id == self.candidate_source_layer:
                 specs.extend(
                     (
-                        ("_candidates", (self.capacity, 16384), torch.int32),
+                        # The block ids the candidate source publishes, a row.
+                        ("_candidates", (self.capacity, CANDIDATE_BLOCKS), torch.int32),
                         ("_candidate_lens", (self.capacity,), torch.int32),
                     )
                 )
