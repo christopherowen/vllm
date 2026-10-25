@@ -63,8 +63,7 @@ def tilelang_builder_kernels(kv_cache_spec, max_requests: int) -> list:
 
     ratio, page, circular = _group_geometry(kv_cache_spec)
     return [
-        prepare.call(tl_metadata.requests_kernel, max_requests),
-        prepare.call(tl_metadata.tokens_kernel, max_requests, page, ratio, circular),
+        prepare.call(tl_metadata.builder_kernel, max_requests, page, ratio, circular)
     ]
 
 
@@ -112,30 +111,23 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
 
     def _build_tilelang(self, cm, table) -> None:
         """The step's request starts and positions, then each token's request,
-        position, slot and visible length."""
+        position, slot and visible length, in one launch."""
         from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
 
-        tl_metadata.requests(
-            cm.query_start_loc,
-            cm.seq_lens,
-            self.starts,
-            self.request_positions,
-            self.counts,
-            cm.num_reqs,
-            cm.num_actual_tokens,
-        )
-        tl_metadata.tokens(
+        tl_metadata.builder(
             cm.query_start_loc,
             cm.seq_lens,
             table,
             cm.slot_mapping,
+            self.starts,
+            self.request_positions,
+            self.counts,
             self.positions,
             self.reqs,
             self.slots,
             self.lengths,
             cm.num_reqs,
             cm.num_actual_tokens,
-            max_requests=self.requests,
             page=self.page,
             ratio=self.ratio,
             circular=self.circular,

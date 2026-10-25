@@ -11,6 +11,10 @@ including which rows each launch writes:
   state is emitted) and visible compressed length, over the rows of the first
   ``ceil(nt / 128)`` blocks of 128 (the readable domain; capacity rows past it keep
   their contents).
+
+  ``builder`` writes both in one launch: every KV-cache group's builder runs them
+  each step (26 groups at DS4.1's decode, target and drafter), and the pair of
+  kernels it replaced was two launches a group.
 - ``chunk``: per row its sliding-window page indices (-1 holes), window length and
   top-k length.
 - ``pages``: per row its request's page table, block 0 and holes as -1, over the
@@ -38,41 +42,11 @@ def _search_steps(requests: int) -> int:
 
 
 @tilelang.jit(pass_configs=_PASS)
-def requests_kernel(max_requests: int):
-    starts_len = T.dynamic("starts_len")
-    seq_len = T.dynamic("seq_len")
-
-    @T.prim_func
-    def metadata_requests(
-        starts: T.Tensor((starts_len,), T.int32),
-        seq: T.Tensor((seq_len,), T.int32),
-        out_starts: T.Tensor((max_requests + 1,), T.int32),
-        positions: T.Tensor((max_requests,), T.int64),
-        counts: T.Tensor((2,), T.int32),
-        nr: T.int32,
-        nt: T.int32,
-    ):
-        with T.Kernel(T.ceildiv(max_requests + 1, _BLOCK), threads=_BLOCK) as bx:
-            r = bx * _BLOCK + T.get_thread_binding()
-            if r <= max_requests:
-                start = T.if_then_else(r <= nr, starts[r], nt)
-                end = T.if_then_else(r < nr, starts[r + 1], nt)
-                out_starts[r] = start
-                if r < max_requests:
-                    positions[r] = T.if_then_else(
-                        r < nr,
-                        T.Cast(T.int64, seq[r] - (end - start)),
-                        T.int64(-1),
-                    )
-            if r == 0:
-                counts[0] = nt
-                counts[1] = nr
-
-    return metadata_requests
-
-
-@tilelang.jit(pass_configs=_PASS)
-def tokens_kernel(max_requests: int, page: int, ratio: int, circular: bool):
+def builder_kernel(max_requests: int, page: int, ratio: int, circular: bool):
+    """A metadata builder's ``requests`` and ``tokens`` in one launch: the request
+    blocks first (``ceil((max_requests + 1) / 128)``), then the token blocks (the
+    first ``ceil(nt / 128)`` blocks of rows). The two parts read only the step's
+    inputs, never each other's outputs."""
     cover = T.dynamic("cover")  # rows written: the first ceil(nt / 128) blocks
     starts_len = T.dynamic("starts_len")
     seq_len = T.dynamic("seq_len")
@@ -81,13 +55,17 @@ def tokens_kernel(max_requests: int, page: int, ratio: int, circular: bool):
     table_stride = T.dynamic("table_stride")
     slot_rows = T.dynamic("slot_rows")
     steps = _search_steps(max_requests)
+    request_blocks = (max_requests + 1 + _BLOCK - 1) // _BLOCK
 
     @T.prim_func
-    def metadata_tokens(
+    def metadata_builder(
         starts: T.Tensor((starts_len,), T.int32),
         seq: T.Tensor((seq_len,), T.int32),
         table: T.StridedTensor((table_rows, table_cols), (table_stride, 1), T.int32),
         input_slots: T.Tensor((slot_rows,), T.int64),
+        out_starts: T.Tensor((max_requests + 1,), T.int32),
+        request_positions: T.Tensor((max_requests,), T.int64),
+        counts: T.Tensor((2,), T.int32),
         positions: T.Tensor((cover,), T.int64),
         reqs: T.Tensor((cover,), T.int32),
         slots: T.Tensor((cover,), T.int64),
@@ -95,53 +73,72 @@ def tokens_kernel(max_requests: int, page: int, ratio: int, circular: bool):
         nr: T.int32,
         nt: T.int32,
     ):
-        with T.Kernel(T.ceildiv(cover, _BLOCK), threads=_BLOCK) as bx:
-            t = bx * _BLOCK + T.get_thread_binding()
+        with T.Kernel(request_blocks + T.ceildiv(cover, _BLOCK), threads=_BLOCK) as bx:
+            tx = T.get_thread_binding()
             bounds = T.alloc_local((2,), T.int32)
-            if t < cover:
-                # The request whose rows contain t (Triton's upper-bound search).
-                bounds[0] = 0
-                bounds[1] = nr
-                for _ in T.serial(steps):
-                    if bounds[0] < bounds[1]:
-                        mid = (bounds[0] + bounds[1]) // 2
-                        end_mid = T.if_then_else(mid < nr, starts[mid + 1], nt)
-                        if end_mid <= t:
-                            bounds[0] = mid + 1
-                        else:
-                            bounds[1] = mid
-                lo = bounds[0]
-                live = (t < nt) & (lo < nr)
-                start = T.if_then_else(live, starts[lo], 0)
-                end = T.if_then_else(live, starts[lo + 1], 0)
-                sq = T.if_then_else(live, seq[lo], 0)
-                pos = T.Cast(T.int64, sq) - T.Cast(T.int64, end - start) + (t - start)
-                input_slot = T.if_then_else(t < nt, input_slots[t], T.int64(-1))
-                if circular:
-                    valid0 = live & (pos >= 0)
-                else:
-                    valid0 = live & (pos >= 0) & (input_slot >= 0)
-                logical = T.truncdiv(pos, ratio)
-                page_col = T.int64(0) if circular else T.truncdiv(logical, page)
-                valid1 = valid0 & (page_col < table_cols)
-                block = T.if_then_else(
-                    valid1, T.Cast(T.int64, table[lo, page_col]), T.int64(0)
-                )
-                valid = valid1 & (block > 0)
-                slot = block * page + T.truncmod(logical, page)
-                emit = valid & (T.truncmod(pos + 1, ratio) == 0)
-                if circular:
-                    # Only a request's last ring-size rows take a ring slot: the
-                    # earlier rows of a long chunk would share them.
-                    emit = emit & (t >= end - page)
-                positions[t] = T.if_then_else(valid, pos, T.int64(-1))
-                reqs[t] = T.if_then_else(valid, lo, -1)
-                slots[t] = T.if_then_else(emit, slot, T.int64(-1))
-                visible[t] = T.if_then_else(
-                    valid, T.Cast(T.int32, T.truncdiv(pos + 1, ratio)), 0
-                )
+            if bx < request_blocks:
+                r = bx * _BLOCK + tx
+                if r <= max_requests:
+                    start = T.if_then_else(r <= nr, starts[r], nt)
+                    end = T.if_then_else(r < nr, starts[r + 1], nt)
+                    out_starts[r] = start
+                    if r < max_requests:
+                        request_positions[r] = T.if_then_else(
+                            r < nr,
+                            T.Cast(T.int64, seq[r] - (end - start)),
+                            T.int64(-1),
+                        )
+                if r == 0:
+                    counts[0] = nt
+                    counts[1] = nr
+            else:
+                t = (bx - request_blocks) * _BLOCK + tx
+                if t < cover:
+                    # The request whose rows contain t (Triton's upper-bound search).
+                    bounds[0] = 0
+                    bounds[1] = nr
+                    for _ in T.serial(steps):
+                        if bounds[0] < bounds[1]:
+                            mid = (bounds[0] + bounds[1]) // 2
+                            end_mid = T.if_then_else(mid < nr, starts[mid + 1], nt)
+                            if end_mid <= t:
+                                bounds[0] = mid + 1
+                            else:
+                                bounds[1] = mid
+                    lo = bounds[0]
+                    live = (t < nt) & (lo < nr)
+                    start = T.if_then_else(live, starts[lo], 0)
+                    end = T.if_then_else(live, starts[lo + 1], 0)
+                    sq = T.if_then_else(live, seq[lo], 0)
+                    pos = (
+                        T.Cast(T.int64, sq) - T.Cast(T.int64, end - start) + (t - start)
+                    )
+                    input_slot = T.if_then_else(t < nt, input_slots[t], T.int64(-1))
+                    if circular:
+                        valid0 = live & (pos >= 0)
+                    else:
+                        valid0 = live & (pos >= 0) & (input_slot >= 0)
+                    logical = T.truncdiv(pos, ratio)
+                    page_col = T.int64(0) if circular else T.truncdiv(logical, page)
+                    valid1 = valid0 & (page_col < table_cols)
+                    block = T.if_then_else(
+                        valid1, T.Cast(T.int64, table[lo, page_col]), T.int64(0)
+                    )
+                    valid = valid1 & (block > 0)
+                    slot = block * page + T.truncmod(logical, page)
+                    emit = valid & (T.truncmod(pos + 1, ratio) == 0)
+                    if circular:
+                        # Only a request's last ring-size rows take a ring slot: the
+                        # earlier rows of a long chunk would share them.
+                        emit = emit & (t >= end - page)
+                    positions[t] = T.if_then_else(valid, pos, T.int64(-1))
+                    reqs[t] = T.if_then_else(valid, lo, -1)
+                    slots[t] = T.if_then_else(emit, slot, T.int64(-1))
+                    visible[t] = T.if_then_else(
+                        valid, T.Cast(T.int32, T.truncdiv(pos + 1, ratio)), 0
+                    )
 
-    return metadata_tokens
+    return metadata_builder
 
 
 def _window_macro(page, window, width, draft, replay, threads, per_thread):
@@ -357,23 +354,17 @@ def pages_kernel(width: int, page: int):
     return metadata_pages
 
 
-def requests(starts, seq, out_starts, positions, counts, nr: int, nt: int) -> None:
-    """Request starts, first positions and live counts (module docstring)."""
-    requests_kernel(positions.shape[0])(
-        starts, seq, out_starts, positions, counts, nr, nt
-    )
-
-
-def tokens(
-    starts, seq, table, input_slots, positions, reqs, slots, visible, nr: int,
-    nt: int, *, max_requests: int, page: int, ratio: int, circular: bool,
+def builder(
+    starts, seq, table, input_slots, out_starts, request_positions, counts, positions,
+    reqs, slots, visible, nr: int, nt: int, *, page: int, ratio: int, circular: bool,
 ) -> None:  # fmt: skip
-    """Per-token metadata, for the rows of the first ``max(1, ceil(nt / 128))``
-    blocks."""
+    """``requests`` then ``tokens`` (module docstring), one launch: the request
+    starts, positions and counts, and the token rows of the first
+    ``max(1, ceil(nt / 128))`` blocks."""
     cover = min(positions.shape[0], max(1, -(-nt // _BLOCK)) * _BLOCK)
-    tokens_kernel(max_requests, page, ratio, circular)(
-        starts, seq, table, input_slots, positions[:cover], reqs[:cover],
-        slots[:cover], visible[:cover], nr, nt,
+    builder_kernel(request_positions.shape[0], page, ratio, circular)(
+        starts, seq, table, input_slots, out_starts, request_positions, counts,
+        positions[:cover], reqs[:cover], slots[:cover], visible[:cover], nr, nt,
     )  # fmt: skip
 
 
@@ -423,14 +414,12 @@ def pages(
 
 
 __all__ = [
+    "builder",
+    "builder_kernel",
     "chunk",
     "chunk_kernel",
     "decode_metadata",
     "decode_metadata_kernel",
     "pages",
     "pages_kernel",
-    "requests",
-    "requests_kernel",
-    "tokens",
-    "tokens_kernel",
 ]

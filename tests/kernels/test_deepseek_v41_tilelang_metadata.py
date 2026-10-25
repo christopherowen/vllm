@@ -179,32 +179,29 @@ def _live_equal(actual, expected, live, rows, sentinel=7):
     assert bool((actual[~inside] == sentinel).all())
 
 
-@pytest.mark.parametrize("lengths", STEPS)
-def test_requests(lengths):
-    s, nr, nt = _step(lengths, seed=len(lengths))
-    out_starts = torch.full((R + 1,), 7, dtype=torch.int32, device=DEVICE)
-    pos = torch.full((R,), 7, dtype=torch.int64, device=DEVICE)
-    counts = torch.full((2,), 7, dtype=torch.int32, device=DEVICE)
-    metadata.requests(s["qsl"], s["seq"], out_starts, pos, counts, nr, nt)
-    for actual, expected in zip((out_starts, pos, counts), _ref_requests(s, nr, nt)):
-        assert torch.equal(actual.cpu().long(), expected)
-
-
 TOKEN_CASES = [(64, 1, False), (64, 4, False), (32, 2, False), (8, 2, True)]
 
 
 @pytest.mark.parametrize("lengths", STEPS)
 @pytest.mark.parametrize("page, ratio, circular", TOKEN_CASES)
-def test_tokens(lengths, page, ratio, circular):
+def test_builder(lengths, page, ratio, circular):
+    """One launch writes the request and the token metadata: the request
+    outputs whole, the token rows of the readable domain, and nothing past it."""
     s, nr, nt = _step(lengths, seed=page + ratio + len(lengths))
+    out_starts = torch.full((R + 1,), 7, dtype=torch.int32, device=DEVICE)
+    request_pos = torch.full((R,), 7, dtype=torch.int64, device=DEVICE)
+    counts = torch.full((2,), 7, dtype=torch.int32, device=DEVICE)
     pos = torch.full((CAP,), 7, dtype=torch.int64, device=DEVICE)
     reqs = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
     slots = torch.full((CAP,), 7, dtype=torch.int64, device=DEVICE)
     visible = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
-    metadata.tokens(
-        s["qsl"], s["seq"], s["table"], s["slots"], pos, reqs, slots, visible,
-        nr, nt, max_requests=R, page=page, ratio=ratio, circular=circular,
+    metadata.builder(
+        s["qsl"], s["seq"], s["table"], s["slots"], out_starts, request_pos, counts,
+        pos, reqs, slots, visible, nr, nt, page=page, ratio=ratio, circular=circular,
     )  # fmt: skip
+    requests = (out_starts, request_pos, counts)
+    for actual, expected in zip(requests, _ref_requests(s, nr, nt)):
+        assert torch.equal(actual.cpu().long(), expected)
     expected = _ref_tokens(s, nr, nt, page, ratio, circular)
     cover = expected[0].shape[0]
     for actual, reference in zip((pos, reqs, slots, visible), expected):
@@ -212,13 +209,16 @@ def test_tokens(lengths, page, ratio, circular):
 
 
 def _token_metadata(s, nr, nt, page):
+    out_starts = torch.empty(R + 1, dtype=torch.int32, device=DEVICE)
+    request_pos = torch.empty(R, dtype=torch.int64, device=DEVICE)
+    counts = torch.empty(2, dtype=torch.int32, device=DEVICE)
     pos = torch.empty(CAP, dtype=torch.int64, device=DEVICE)
     reqs = torch.empty(CAP, dtype=torch.int32, device=DEVICE)
     slots = torch.empty(CAP, dtype=torch.int64, device=DEVICE)
     visible = torch.empty(CAP, dtype=torch.int32, device=DEVICE)
-    metadata.tokens(
-        s["qsl"], s["seq"], s["table"], s["slots"], pos, reqs, slots, visible, nr, nt,
-        max_requests=R, page=page, ratio=1, circular=False,
+    metadata.builder(
+        s["qsl"], s["seq"], s["table"], s["slots"], out_starts, request_pos, counts,
+        pos, reqs, slots, visible, nr, nt, page=page, ratio=1, circular=False,
     )  # fmt: skip
     return pos, reqs, visible
 
