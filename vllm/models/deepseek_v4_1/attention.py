@@ -255,7 +255,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         prefix,
         topk_indices_buffer=None,
         aux_stream_list=None,
-        candidate_block_buffer=None,
     ):
         super().__init__()
         self.config = vllm_config

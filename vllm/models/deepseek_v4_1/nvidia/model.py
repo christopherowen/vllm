@@ -91,7 +91,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         prefix,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
-        candidate_block_buffer: torch.Tensor | None = None,
         engram_layout: EngramLayout | None = None,
     ):
         super().__init__()
@@ -119,7 +118,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             prefix=f"{prefix}.attn",
             topk_indices_buffer=topk_indices_buffer,
             aux_stream_list=aux_stream_list,
-            candidate_block_buffer=candidate_block_buffer,
         )
         if self.use_sequence_parallel:
             self.attn.wo_b.reduce_results = False
@@ -451,20 +449,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             dtype=torch.int32,
         )
 
-        # Two-level candidate filtering: the indexer at
-        # candidate_source_layer_id publishes the top candidate blocks of
-        # compressed positions here; later ratio-1 indexers (24/28/32/36)
-        # mask their scores with it.
-        candidate_source_layer = getattr(config, "candidate_source_layer_id", -1)
-        candidate_topk_blocks = getattr(config, "candidate_topk_blocks", 0)
-        if candidate_source_layer >= 0 and candidate_topk_blocks > 0:
-            self.candidate_block_buffer = torch.empty(
-                vllm_config.scheduler_config.max_num_batched_tokens,
-                candidate_topk_blocks,
-                dtype=torch.int32,
-            )
-        else:
-            self.candidate_block_buffer = None
+        # Two-level candidate filtering needs no buffer here: the attention of
+        # candidate_source_layer_id keeps the candidates it publishes for the
+        # later ratio-1 indexers (24/28/32/36) in its own staging (_candidates).
 
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -486,7 +473,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
                 aux_stream_list=aux_stream_list,
-                candidate_block_buffer=self.candidate_block_buffer,
                 engram_layout=self.engram_layout,
             ),
             prefix=f"{prefix}.layers",

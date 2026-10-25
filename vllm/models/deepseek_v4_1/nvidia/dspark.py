@@ -268,12 +268,6 @@ class DSparkDeepseekV4Model(nn.Module):
         )
         self.main_norm = kernels.rms_norm(config.hidden_size, eps=config.rms_norm_eps)
 
-        self.topk_indices_buffer = torch.empty(
-            vllm_config.scheduler_config.max_num_batched_tokens,
-            config.index_topk,
-            dtype=torch.int32,
-        )
-
         current_vllm_config = get_current_vllm_config()
         self._l2pf_ready = False
         self.layers = nn.ModuleList(
@@ -281,11 +275,16 @@ class DSparkDeepseekV4Model(nn.Module):
                 DeepseekV4DecoderLayer(
                     current_vllm_config,
                     prefix=maybe_prefix(prefix, f"layers.{self.num_hidden_layers + i}"),
-                    topk_indices_buffer=self.topk_indices_buffer,
                 )
                 for i in range(self.num_dspark_layers)
             ]
         )
+        # The drafter's layers attend to their window only (compress ratio 0): no
+        # indexed attention reads a top-k buffer, so none is allocated for them.
+        if any(layer.attn.compress_ratio for layer in self.layers):
+            raise ValueError(
+                "DSpark draft layers must be window-only (compress ratio 0)"
+            )
         # A draft forward routes one query block per request, as DSparkSpeculator
         # lays it out: the speculative tokens, plus the anchor unless the drafter
         # predicts from it.
