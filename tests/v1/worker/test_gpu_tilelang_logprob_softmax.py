@@ -1,15 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""``tilelang_logprob.topk_log_softmax`` against the Triton kernel it replaces,
-``logprob._topk_log_softmax_kernel`` launched as production launched it, bit for bit
-(outputs compared as FP32 bit patterns): FP32 and bf16 logits; rows at 16-byte
-addresses and strides (Triton's 16-byte runs), at an odd stride and at a base past
-16 bytes (one element a thread); the DeepSeek V4.1 vocabulary, a tensor-parallel
-shard and odd widths; 0 to 2100 requested tokens; rows of infinities, NaN, ties,
-signed zeros, extreme and subnormal magnitudes, and exponentials that underflow to
-subnormals. Then the call sites: ``compute_token_logprobs`` and
-``compute_topk_scores`` launch the TileLang kernel only, a CUDA graph replays it,
-and the runner declares the calls it launches."""
+"""``tilelang_logprob.topk_log_softmax`` against an FP64 reference of Barron,
+Gnanapragasam and Tschannen's log-softmax ("A Fix for Softmax and Cross-Entropy",
+Eq. 5) on the same logits, and against today's arithmetic, the Triton kernel
+``logprob._topk_log_softmax_kernel`` launched as production launched it (the
+release's TileLang port matched it bit for bit):
+
+- every output within its rounding bound of the reference (the shifted logit's and
+  the output's rounding, an ULP of the log-sum-exp, the sum's relative error and,
+  for sums in FP32's subnormal range, an absolute subnormal per column), with the
+  reference's NaN and infinities;
+- never further from the reference than today's output beyond that rounding;
+- exact where today's collapses: the paper's z = [9, -9, -9], and margins of the
+  top logit over the others' log-sum-exp from 4 to 100 nats around FP32's cliff at
+  16.6, the maximum at the row's first, middle and last column (today's sum loses
+  the blocks added after the maximum's);
+- a row's bits do not depend on its batch or the run.
+
+FP32 and bf16 logits; rows at 16-byte addresses and strides (Triton's 16-byte runs),
+at an odd stride and at a base past 16 bytes (one element a thread); the DeepSeek
+V4.1 vocabulary, a tensor-parallel shard, odd widths and whole steps of the kernel's
+reads; 0 to 2100 requested tokens; rows of infinities, NaN, ties, signed zeros,
+extreme and subnormal magnitudes, and exponentials that underflow to subnormals. Then the call sites:
+``compute_token_logprobs`` and ``compute_topk_scores`` launch the TileLang kernel
+only, a CUDA graph replays it, and the runner declares the calls it launches."""
+
+import math
 
 import pytest
 import torch
@@ -40,6 +56,17 @@ CASES = ("random", "wide", "ties", "peaked", "special")
 # What the padding past each row holds: a read of it would win the maximum.
 PAD = 1.0e4
 SENTINEL = 12345.0
+# The sum of the other columns' exponentials, S, within this of its value: each
+# exponential within 1.4e-7 |x - max| + 2^-22 of its own (the shift's and the
+# log2(e) product's roundings, log2(e) in FP32, ex2.approx): 1.1e-5 at the 75 nats
+# the margins test reaches; then the blocked sum's roundings (the CPU emulation in
+# experiments/2026-10-25-softmax-fix measures about 1e-6). Columns whose
+# exponentials are subnormal add up to one subnormal each.
+S_RELATIVE = 2e-5
+SUBNORMAL = 2.0**-149
+# Today's sum and this one round independently: the allowance for this one's error
+# over today's.
+S_ALLOWANCE = 4e-6
 
 
 def _bits(x: torch.Tensor) -> torch.Tensor:
@@ -59,7 +86,7 @@ def _assert_same(ours: torch.Tensor, theirs: torch.Tensor, what: str) -> None:
     raise AssertionError(
         f"{what}: {differ.shape[0]} of {a.numel()} elements differ, first at "
         f"{first}: ours {[ours[tuple(i)].item() for i in first]}, "
-        f"Triton's {[theirs[tuple(i)].item() for i in first]}"
+        f"expected {[theirs[tuple(i)].item() for i in first]}"
     )
 
 
@@ -158,10 +185,11 @@ def _ids(values: torch.Tensor, topk: int, seed: int) -> torch.Tensor:
     return ids
 
 
-# --- The two launches ----------------------------------------------------------
+# --- The launches and the reference ---------------------------------------------
 
 
 def _triton(logits: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+    """Today's arithmetic."""
     rows, vocab = logits.shape
     out = torch.full((rows, ids.shape[1]), SENTINEL, device=DEVICE)
     logprob._topk_log_softmax_kernel[(rows,)](
@@ -183,25 +211,103 @@ def _tilelang(logits: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _reference(logits: torch.Tensor, ids: torch.Tensor):
+    """Eq. 5 in FP64 on the kernel's FP32 view of ``logits``: with M the row's
+    maximum (NaN ignored), S the sum of exp(x - M) over the columns that are not M,
+    plus exp(M - M) for each of M's ties but one, the requested tokens' log
+    probabilities ``shifted - log1p(S)`` (``shifted`` exactly 0 at M). Returns them,
+    their shifted logits, and each row's S and log1p(S) ([rows, 1])."""
+    v = logits.float().double()
+    m = torch.where(torch.isnan(v), float("-inf"), v).amax(dim=1, keepdim=True)
+    tie = v == m
+    ties = tie.sum(dim=1, keepdim=True).double()
+    terms = torch.where(tie, torch.zeros_like(v), torch.exp(v - m))
+    extra = torch.where(ties > 1, (ties - 1) * torch.exp(m - m), torch.zeros_like(m))
+    s = terms.sum(dim=1, keepdim=True) + extra
+    lse = torch.log1p(s)
+    picked = v.gather(1, ids.long())
+    shifted = torch.where(picked == m, torch.zeros_like(picked), picked - m)
+    return shifted - lse, shifted, s, lse
+
+
+def _ulp(x: torch.Tensor) -> torch.Tensor:
+    """The FP32 ULP at |x| (FP64)."""
+    a = x.abs().float()
+    return (torch.nextafter(a, torch.full_like(a, float("inf"))) - a).double()
+
+
+def _assert_accurate(ours, theirs, logits, ids, what: str):
+    """``ours`` against the reference: its NaN and infinities, every finite output
+    within its rounding bound, and never further from it than today's output
+    (``theirs``) beyond the two sums' independent roundings. Returns the reference
+    and each output's S (for the callers' own checks)."""
+    vocab = logits.shape[1]
+    ref, shifted, s, lse = _reference(logits, ids)
+    s, lse = s.expand_as(ref), lse.expand_as(ref)
+    expect = ref.float()
+    nan = torch.isnan(expect)
+    if not torch.equal(torch.isnan(ours), nan):
+        at = (torch.isnan(ours) != nan).nonzero()[:5].tolist()
+        raise AssertionError(f"{what}: NaN where the reference has none or the "
+                             f"reverse, at {at}")  # fmt: skip
+    inf = torch.isinf(expect)
+    _assert_same(ours[inf], expect[inf], f"{what}: infinities")
+    finite = ~nan & ~inf
+    error = (ours.double() - ref).abs()
+    floor = vocab * SUBNORMAL
+    bound = (
+        0.5 * _ulp(shifted) + _ulp(ref) + _ulp(lse) + S_RELATIVE * s / (1 + s) + floor
+    )
+    bad = finite & ~(error <= bound)
+    if bad.any():
+        at = bad.nonzero()[:5].tolist()
+        raise AssertionError(
+            f"{what}: {int(bad.sum())} outputs outside their bound, first at {at}: "
+            f"ours {[ours[tuple(i)].item() for i in at]}, reference "
+            f"{[ref[tuple(i)].item() for i in at]}, bound "
+            f"{[bound[tuple(i)].item() for i in at]}"
+        )
+    today = finite & torch.isfinite(theirs)
+    allowance = _ulp(ref) + _ulp(lse) + S_ALLOWANCE * s / (1 + s) + floor
+    worse = today & ~(error <= (theirs.double() - ref).abs() + allowance)
+    if worse.any():
+        at = worse.nonzero()[:5].tolist()
+        raise AssertionError(
+            f"{what}: {int(worse.sum())} outputs further from the reference than "
+            f"today's, first at {at}: ours {[ours[tuple(i)].item() for i in at]}, "
+            f"today's {[theirs[tuple(i)].item() for i in at]}, reference "
+            f"{[ref[tuple(i)].item() for i in at]}"
+        )
+    return ref, s
+
+
 def _check(logits: torch.Tensor, ids: torch.Tensor, what: str) -> torch.Tensor:
     before = logits.clone()
     ours = _tilelang(logits, ids)
     theirs = _triton(logits, ids)
-    _assert_same(ours, theirs, what)
     _assert_same(logits, before, f"{what}: logits")
+    _assert_accurate(ours, theirs, logits, ids, what)
     return ours
 
 
-# --- Bits ---------------------------------------------------------------------
+# --- Accuracy -----------------------------------------------------------------
+
+
+# Besides DeepSeek V4.1's widths and odd ones, whole steps with no guarded one: a
+# step is 1024 threads x 2 loads x a run of 1 (2048 columns), 4 FP32 (8192) or 8
+# bf16 (16384).
+STEPS = (2048, 8192, 16384)
 
 
 @pytest.mark.parametrize("case", CASES)
 @pytest.mark.parametrize(
-    "vocab", [VOCAB, SHARD, 1, 7, 1023, 1025, 8193, 16391], ids=lambda v: f"v{v}"
+    "vocab",
+    [VOCAB, SHARD, 1, 7, 1023, 1025, 8193, 16391, *STEPS],
+    ids=lambda v: f"v{v}",
 )
 @pytest.mark.parametrize("layout", LAYOUTS)
 @pytest.mark.parametrize("dtype", DTYPES, ids=str)
-def test_log_softmax_matches_triton(dtype, layout, vocab, case):
+def test_log_softmax_matches_fp64(dtype, layout, vocab, case):
     """A sampled token and twenty logprobs a row."""
     values = _values(12, vocab, case, seed=vocab + len(case))
     logits = _logits(values, dtype, layout)
@@ -230,24 +336,80 @@ def test_batch_sizes(dtype, rows):
     _check(logits, _ids(values, 21, rows), f"{dtype} {rows} rows")
 
 
-@pytest.mark.parametrize("vocab", [1024, 8192], ids=lambda v: f"v{v}")
 @pytest.mark.parametrize("dtype", DTYPES, ids=str)
-def test_layout_decides_the_bits(dtype, vocab):
-    """The tests see the layout: on 16-byte rows the one-element layout adds the
-    exponentials in another order, and some log probability differs from Triton's
-    (one block: the guarded chunk; eight: one chunk of vector loads). Few blocks,
-    so a block sum's last bits reach the row's."""
-    values = _values(256, vocab, "random", seed=5)
-    logits = _logits(values, dtype, "aligned")
-    ids = _ids(values, 21, 5)
+def test_paper_example(dtype):
+    """z = [9, -9, -9]: the top token's log probability is -log1p(2 e^-18) =
+    -3.046e-8, its complement 1 - p = 3.046e-8; today's is exactly 0 (so 1 - p
+    is 0). The others' -18 - 3e-8 rounds to -18 in FP32 either way."""
+    logits = _logits(torch.tensor([[9.0, -9.0, -9.0]], device=DEVICE), dtype, "aligned")
+    ids = torch.tensor([[0, 1, 2]], device=DEVICE)
+    ours = _tilelang(logits, ids)
     theirs = _triton(logits, ids)
-    _assert_same(_tilelang(logits, ids), theirs, "vector layout")
-    other = torch.full_like(theirs, SENTINEL)
-    tls._kernel(
-        tilelang_logprob.topk_log_softmax_kernel,
-        *tilelang_logprob.topk_log_softmax_key(dtype, 1),
-    )(other, logits, ids, ids[:1].view(torch.bool))
-    assert not torch.equal(_bits(other), _bits(theirs))
+    _assert_accurate(ours, theirs, logits, ids, f"paper example {dtype}")
+    others = 2 * math.exp(-18.0)
+    expected = -math.log1p(others)
+    assert abs(ours[0, 0].item() - expected) <= S_RELATIVE * abs(expected)
+    complement = -torch.expm1(ours[0, :1]).item()
+    assert abs(complement - others / (1 + others)) <= S_RELATIVE * complement
+    assert theirs[0, 0].item() == 0.0
+    assert ours[0, 1].item() == ours[0, 2].item() == -18.0
+
+
+# Margins of the top logit over the others' log-sum-exp, nats: FP32's cliff
+# (2^-24, 16.6) inside; past about 75 here the largest of the other exponentials
+# turn subnormal, past 87.3 S itself, and past about 103 it underflows (the
+# reference's log probability is then below FP32's smallest subnormal too).
+MARGINS = (4, 8, 10, 12, 13, 14, 15, 16, 16.3, 16.6, 16.9, 17.5, 18, 20, 25, 30,
+           36.7, 40, 50, 60, 70, 80, 87, 90, 95, 100)  # fmt: skip
+
+
+@pytest.mark.parametrize("column", ["first", "middle", "last"])
+@pytest.mark.parametrize("dtype", DTYPES, ids=str)
+def test_margins_around_the_cliff(dtype, column):
+    """The top token's log probability, -log1p(S) = -S (1 - S / 2 ...), from margin
+    4 to 100, the maximum at the row's first, middle or last column: within
+    S_RELATIVE of the reference while S is at least a normal FP32 number a column
+    (its subnormal terms then add at most 2^-24 of it), and within a subnormal a
+    column below that (``_assert_accurate``). Today's is exactly 0 once S is below
+    2^-25, wherever the maximum sits; short of that its sum loses each block added
+    after the maximum's block below half an ULP of 1, so its error depends on the
+    column: never better than ours."""
+    g = torch.Generator(device=DEVICE).manual_seed(16)
+    others = torch.randn(VOCAB, generator=g, device=DEVICE) * 2
+    lse = torch.logsumexp(others.double(), 0).item()
+    col = {"first": 0, "middle": VOCAB // 2, "last": VOCAB - 1}[column]
+    values = others.repeat(len(MARGINS), 1)
+    values[:, col] = torch.tensor([lse + m for m in MARGINS], device=DEVICE)
+    logits = _logits(values, dtype, "aligned")
+    ids = torch.full((len(MARGINS), 1), col, dtype=torch.int64, device=DEVICE)
+    ours = _tilelang(logits, ids)
+    theirs = _triton(logits, ids)
+    ref, s = _assert_accurate(ours, theirs, logits, ids, f"margins {dtype} {column}")
+    assert torch.equal(ids[:, 0], logits.float().argmax(dim=1))
+    normal = s[:, 0] >= VOCAB * 2.0**-126
+    assert normal.sum() >= 20
+    relative = ((ours[:, 0].double() - ref[:, 0]) / ref[:, 0]).abs()
+    assert (relative[normal] <= S_RELATIVE).all(), relative[normal].max().item()
+    assert (ours[normal, 0] < 0).all()
+    tiny = s[:, 0] < 2.0**-25
+    assert tiny.any() and (theirs[tiny, 0] == 0).all()
+    assert (ours[tiny & normal, 0] < 0).all()
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=str)
+def test_rows_do_not_depend_on_the_batch_or_the_run(dtype):
+    """Batch invariance and determinism: a row's bits are those it gets alone, and
+    the same on every launch."""
+    values = _values(96, VOCAB, "peaked", seed=96)
+    values[48:] = _values(48, VOCAB, "random", seed=97)
+    logits = _logits(values, dtype, "aligned")
+    ids = _ids(values, 21, 96)
+    whole = _tilelang(logits, ids)
+    _assert_same(_tilelang(logits, ids), whole, "second launch")
+    for r in (0, 1, 47, 48, 95):
+        alone = _tilelang(logits[r : r + 1], ids[r : r + 1])
+        _assert_same(alone, whole[r : r + 1], f"row {r} alone")
+    _assert_same(_tilelang(logits[40:60], ids[40:60]), whole[40:60], "rows 40-59")
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=str)
@@ -275,7 +437,7 @@ def test_compute_token_logprobs_launches_tilelang(dtype, monkeypatch):
     values = _values(5, VOCAB, "random", seed=11)
     logits = _logits(values, dtype, "aligned")
     ids = _ids(values, 21, 11)
-    expected = _triton(logits, ids)
+    expected = _check(logits, ids, f"{dtype} token logprobs")
     calls = []
     launch = tilelang_logprob.topk_log_softmax
 
@@ -309,9 +471,10 @@ def test_compute_topk_scores(dtype, num_logprobs):
     sampled = torch.randint(VOCAB, (6,), generator=g, device=DEVICE)
     result = logprob.compute_topk_scores(logits, num_logprobs, sampled)
     assert result.logprob_token_ids.shape == (6, 1 + num_logprobs)
+    ids = result.logprob_token_ids.contiguous()
     _assert_same(
         result.logprobs,
-        _triton(logits, result.logprob_token_ids.contiguous()),
+        _check(logits, ids, f"topk scores {num_logprobs}"),
         f"topk scores {num_logprobs}",
     )
 
@@ -335,7 +498,7 @@ def test_cuda_graph_replay():
     ids.copy_(_ids(fresh, 21, 4))
     out.fill_(SENTINEL)
     graph.replay()
-    _assert_same(out, _triton(logits, ids), "graph replay")
+    _assert_same(out, _check(logits, ids, "graph replay"), "graph replay")
 
 
 # --- Preparation --------------------------------------------------------------

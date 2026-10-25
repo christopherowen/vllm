@@ -16,9 +16,10 @@ from vllm.v1.worker.gpu.sample import tilelang_auxiliary, tilelang_topk_ids
 _MAX_TOPK_BLOCK = 1024
 
 
-# The reference the TileLang log-softmax (``tilelang_logprob.topk_log_softmax``) is
-# tested against, launched as production launched it (BLOCK_SIZE=1024,
-# TOPK_BLOCK_SIZE=_MAX_TOPK_BLOCK, four warps); the sampler no longer launches it.
+# The arithmetic the TileLang log-softmax (``tilelang_logprob.topk_log_softmax``)
+# fixed, which its tests measure it against, launched as production launched it
+# (BLOCK_SIZE=1024, TOPK_BLOCK_SIZE=_MAX_TOPK_BLOCK, four warps); the sampler no
+# longer launches it.
 @triton.jit(do_not_specialize=["topk"])
 def _topk_log_softmax_kernel(
     output_ptr,

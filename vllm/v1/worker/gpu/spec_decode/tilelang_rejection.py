@@ -2,10 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """TileLang kernels of the V2 runner's rejection sampler, for production's
 verification: one-hot (greedy) drafts, block verification, FP32 draws and no
-watermark. Each kernel is the contract of the Triton kernels it replaces in
-``rejection_sampler_utils``, bit for bit, NaN and infinite logits included, and
+watermark. Each kernel replaces Triton kernels of ``rejection_sampler_utils`` and
 writes the elements they write and no others (the Triton kernels stay importable
-as the tests' reference and serve every other configuration):
+as the tests' baseline and serve every other configuration):
 
 - ``local_stats``: ``_compute_local_logits_stats_kernel`` without draft logits
 - ``verify``: ``_compute_cumulative_log_p_kernel`` without draft logits and
@@ -15,24 +14,43 @@ as the tests' reference and serve every other configuration):
 ``rejection_sample`` inserts the resampled token, as for every configuration
 (``tilelang_resampled``).
 
-The arithmetic is Triton 3.7's for sm_121a, read from the kernels' PTX and SASS:
-``tl.exp`` is ``ex2.approx.f32`` (subnormals kept) of the product with log2(e),
-``tl.log`` libdevice's ``__nv_logf`` as Triton bundles it (``vllm_control_log``),
-``/`` is ``div.full.f32``, and every add, product and FMA rounds to nearest as the
-header writes it (nvcc would contract them otherwise). The random stream, the Gumbel
-noise and the argmax order are ``tilelang_sampling``'s.
+The argmaxes, maxima, uniform draws, greedy verification and resampling are the
+Triton kernels' bit for bit, NaN and infinite logits included. The probabilities
+follow Barron, Gnanapragasam and Tschannen's fix ("A Fix for Softmax and
+Cross-Entropy", Eq. 5), which Triton's arithmetic lacks. With M a row's maximum and
+S the sum of exp(z - M) over its other columns, the log-softmax is the shifted
+logit z - M (exactly 0 at the maximum) minus log1p(S). Triton sums every column, the
+maximum's exp(0) = 1 among them, and subtracts M + log(sum) from the logit: the sum
+rounds to 1 once S is below half an FP32 ULP of 1 (a margin past 16.6 nats), every
+block added after the maximum's loses what it holds below that half ULP, and
+M + log(sum) rounds at the magnitude of M (an ULP of 32 is 3.8e-6), so a confident
+draft's log probability came out 0 or a few ULPs of M off. Block verification's
+threshold then took 1 - m and 1 - p of probabilities near 1, which cancel. Here:
+
+- ``local_stats``: a sampled row's block sum leaves out one column holding the
+  block's maximum (its other ties add exp(0) each, ``vllm_others``).
+- ``verify``: a step's S is the block sums rescaled to the row's maximum, each with
+  its left-out column back (1 + sum), except the first block that holds the row's
+  maximum; the draft's log probability is its shifted logit minus log1p(S), the
+  rejected row's log-sum-exp M + log1p(S); the threshold p (1 - m) / (1 - p m)
+  takes both complements from ``expm1`` of the logs (``vllm_block_threshold``).
+
+The rest of the arithmetic is Triton 3.7's for sm_121a, read from the kernels' PTX
+and SASS: ``tl.exp`` is ``ex2.approx.f32`` (subnormals kept) of the product with
+log2(e), and every add, product and FMA rounds to nearest as the header writes it
+(nvcc would contract them otherwise). ``log1p`` and ``expm1`` are CUDA's (libdevice,
+within an ULP; these kernels compile without fast math). The random stream, the
+Gumbel noise and the argmax order are ``tilelang_sampling``'s.
 
 A vocabulary block's statistics (8192 columns, four warps) follow Triton's layout
 (``_triton_run``): a thread holds 64 elements, sums their exponentials in register
-order, then the warp sums at XOR distances 16 to 1 and threads 0-3 at 2 and 1. The
-maxima ignore NaN, so any order gives them; the argmax is the Gumbel sampler's.
+order, then the warp sums at XOR distances 16 to 1 and threads 0-3 at 2 and 1; its
+count of the maximum's ties (exact in FP32) reduces the same way. The maxima ignore
+NaN, so any order gives them; the argmax is the Gumbel sampler's.
 
-A row's log-sum-exp over its blocks (``_compute_global_logsumexp``) runs on one warp
-in Triton, the blocks padded to a power of two, block ``k`` at lanes ``k`` and
-``k + padded`` (and so on), reduced at XOR distances ``padded / 2`` to 1. LLVM fuses
-the first level's product into an FMA: lane 0 adds its own product unrounded to its
-partner's rounded one, so lanes reach different sums, and lane 0, which stores, is
-the contract. Here ``padded`` lanes take a row, the first of them as Triton's lane 0.
+A row's S over its blocks runs on ``padded`` lanes, Triton's padded block count (a
+power of two, at most one warp): lane ``k`` takes block ``k``, its term rounded,
+reduced at XOR distances ``padded / 2`` to 1 (every lane reaches the same sum).
 
 Every comparison NaN decides is made in the header: TVM's simplifier rewrites
 ``a <= b`` as ``!(b < a)``, which a NaN flips.
@@ -45,7 +63,7 @@ from collections.abc import Sequence
 import torch
 
 from vllm.tilelang_utils import T, tilelang
-from vllm.v1.worker.gpu.sample import tilelang_controls, tilelang_sampling
+from vllm.v1.worker.gpu.sample import tilelang_sampling
 from vllm.v1.worker.gpu.sample.tilelang_sampling import (
     _DTYPES,
     _PASS,
@@ -78,8 +96,6 @@ _MAX_LANES = 32
 _HEADER = (
     # Philox, the Gumbel noise and the argmax combine.
     tilelang_sampling._HEADER
-    # vllm_control_log: tl.log, Triton's bundled libdevice __nv_logf.
-    + tilelang_controls._HEADER
     + r"""
 // tl.exp of an FP32 value: the product with log2(e), then ex2.approx.f32 without
 // flush-to-zero (ptxas keeps subnormal results).
@@ -112,11 +128,6 @@ __device__ __forceinline__ float vllm_mul(float a, float b) {
   asm("mul.rn.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
   return c;
 }
-__device__ __forceinline__ float vllm_fma(float a, float b, float c) {
-  float d;
-  asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(d) : "f"(a), "f"(b), "f"(c));
-  return d;
-}
 // max.f32: a NaN gives way to the other operand.
 __device__ __forceinline__ float vllm_max(float a, float b) {
   float c;
@@ -129,10 +140,88 @@ __device__ __forceinline__ float vllm_exp_from(float x, float m) {
   return vllm_exp(vllm_sub(x, m));
 }
 
-// A row's log-sum-exp from its maximum and its rescaled sum: m + log(s).
-__device__ __forceinline__ float vllm_lse(float m, float s) {
-  return vllm_add(m, vllm_control_log(s));
+// expm1 within an ULP: CUDA's (libdevice), compiled without fast math.
+__device__ __forceinline__ float vllm_expm1(float x) { return expm1f(x); }
+
+// Barron, Gnanapragasam and Tschannen's log-softmax ("A Fix for Softmax and
+// Cross-Entropy", Eq. 5), from a row's maximum m. These compute every value and
+// select, in PTX: a C conditional lets nvcc predicate the exponential instead,
+// which costs a column several instructions.
+//
+// A logit's shift x - m, exactly 0 where x is the maximum (an infinite one
+// included).
+__device__ __forceinline__ float vllm_shifted(float x, float m) {
+  float y;
+  asm("{\n"
+      ".reg .pred tie;\n"
+      ".reg .b32 d;\n"
+      "sub.rn.f32 d, %1, %2;\n"
+      "setp.eq.f32 tie, %1, %2;\n"
+      "selp.f32 %0, 0f00000000, d, tie;\n"
+      "}"
+      : "=f"(y)
+      : "f"(x), "f"(m));
+  return y;
 }
+
+// tl.exp(x - m) of a column that is not the maximum (NaN is not), 0 for one that is.
+__device__ __forceinline__ float vllm_other_exp(float x, float m) {
+  float y;
+  asm("{\n"
+      ".reg .pred tie;\n"
+      ".reg .b32 t, e;\n"
+      "sub.rn.f32 t, %1, %2;\n"
+      "mul.rn.f32 t, t, 0f3FB8AA3B;\n"
+      "ex2.approx.f32 e, t;\n"
+      "setp.eq.f32 tie, %1, %2;\n"
+      "selp.f32 %0, 0f00000000, e, tie;\n"
+      "}"
+      : "=f"(y)
+      : "f"(x), "f"(m));
+  return y;
+}
+
+// 1 for a column holding the maximum, else 0: its ties, counted exactly in FP32.
+__device__ __forceinline__ float vllm_tie(float x, float m) {
+  float y;
+  asm("set.eq.f32.f32 %0, %1, %2;" : "=f"(y) : "f"(x), "f"(m));
+  return y;
+}
+
+// int: x is the maximum m.
+__device__ __forceinline__ int vllm_is_max(float x, float m) {
+  int y;
+  asm("{\n"
+      ".reg .pred tie;\n"
+      "setp.eq.f32 tie, %1, %2;\n"
+      "selp.s32 %0, 1, 0, tie;\n"
+      "}"
+      : "=r"(y)
+      : "f"(x), "f"(m));
+  return y;
+}
+
+// S, the others' sum: the columns that are not the maximum (sum), and of the
+// maximum's ``ties`` all but one, exp(m - m) each (1; NaN for an infinite maximum,
+// as the paper's z - z_max).
+__device__ __forceinline__ float vllm_others(float sum, float ties, float m) {
+  return ties > 1.0f
+             ? vllm_add(sum, vllm_mul(vllm_sub(ties, 1.0f), vllm_exp_from(m, m)))
+             : sum;
+}
+
+// A row's S from its block sums: NaN where its two or more columns are all -inf
+// (the paper's z - z_max is -inf - -inf there, as in ``vllm_others``), which the
+// block sums cannot tell, since a block whose maximum is -inf sums to 0.
+__device__ __forceinline__ float vllm_row_others(float others, float m, int columns) {
+  return (m == __uint_as_float(0xff800000u) && columns > 1)
+             ? __uint_as_float(0x7fffffffu)
+             : others;
+}
+
+// The log-sum-exp past the maximum, softplus(-margin) = log1p(S): CUDA's log1pf
+// (libdevice, within an ULP).
+__device__ __forceinline__ float vllm_softplus(float others) { return log1pf(others); }
 
 // A sampled row's block sum of exponentials, kept while the block's maximum is
 // above -inf (a NaN maximum is not), else 0.
@@ -180,25 +269,17 @@ __device__ __forceinline__ float vllm_uniform(unsigned int word) {
 }
 
 // Block verification's acceptance threshold for a one-hot draft followed by a valid
-// one, from the prefix's joint ratio p and the next draft's target probability m:
-// the residual mass p * (1 - m) over residual + 1 - p, which Triton contracts to
-// fma(p, 1 - m, 1) - p; div.full.f32, and 1 where that is not positive.
-__device__ __forceinline__ float vllm_block_threshold(float p, float m) {
-  float h;
-  asm("{\n"
-      ".reg .pred positive;\n"
-      ".reg .b32 rest, residual, denom, ratio;\n"
-      "sub.rn.f32 rest, 0f3F800000, %2;\n"
-      "mul.rn.f32 residual, %1, rest;\n"
-      "fma.rn.f32 denom, %1, rest, 0f3F800000;\n"
-      "sub.rn.f32 denom, denom, %1;\n"
-      "setp.gt.f32 positive, denom, 0f00000000;\n"
-      "div.full.f32 ratio, residual, denom;\n"
-      "selp.f32 %0, ratio, 0f3F800000, positive;\n"
-      "}"
-      : "=f"(h)
-      : "f"(p), "f"(m));
-  return h;
+// one, from the logs of the prefix's joint ratio p and of the next draft's target
+// probability m: the residual mass p (1 - m) over residual + 1 - p, which is
+// 1 - p m. Both complements are -expm1 of a log, never 1 - x of a probability near
+// 1, where it cancels (1 - m was 0 once m rounded to 1); the quotient is IEEE's,
+// and the threshold 1 where the denominator is not positive (p = m = 1, or NaN).
+__device__ __forceinline__ float vllm_block_threshold(float log_p, float log_m) {
+  const float residual = vllm_mul(vllm_exp(log_p), -vllm_expm1(log_m));
+  const float denom = -vllm_expm1(vllm_add(log_p, log_m));
+  float ratio;
+  asm("div.rn.f32 %0, %1, %2;" : "=f"(ratio) : "f"(residual), "f"(denom));
+  return denom > 0.0f ? ratio : 1.0f;
 }
 
 // u <= h, ordered: a NaN threshold accepts nothing.
@@ -243,10 +324,11 @@ def local_stats_kernel(logits_dtype: str, idx_dtype: str, step_dtype: str, run: 
     threads per ``(logits row, vocabulary block of 8192)``; rows at a bonus position
     (``expanded_local_pos >= num_speculative_steps``) are left alone. A greedy row
     stores its block's argmax (global, int64) and maximum, a sampled row its block's
-    maximum and the sum of ``exp(logit - maximum)`` (0 unless the maximum is above
-    -inf). A thread's 64 elements come in runs of ``run`` (``_triton_run``), all
-    loaded with the request's state index: Triton loads them once the temperature is
-    known, a round trip later."""
+    maximum and the sum of ``exp(logit - maximum)`` over its columns but one holding
+    the maximum (``vllm_others``; 0 unless the maximum is above -inf). A thread's 64
+    elements come in runs of ``run`` (``_triton_run``), all loaded with the request's
+    state index: Triton loads them once the temperature is known, a round trip
+    later."""
     rows, vocab, blocks = T.dynamic("rows, vocab, blocks")
     # Inputs may be longer than the batch: each has its own length.
     idx_len, step_len, temp_len = T.dynamic("idx_len, step_len, temp_len")
@@ -275,9 +357,11 @@ def local_stats_kernel(logits_dtype: str, idx_dtype: str, step_dtype: str, run: 
             other = T.alloc_local((1,), T.float32)
             other_index = T.alloc_local((1,), T.int32)
             total = T.alloc_local((1,), T.float32)
+            ties = T.alloc_local((1,), T.float32)
             partial = T.alloc_shared((_WARPS,), T.float32)
             partial_index = T.alloc_shared((_WARPS,), T.int32)
             partial_sum = T.alloc_shared((_WARPS,), T.float32)
+            partial_ties = T.alloc_shared((_WARPS,), T.float32)
             maximum = T.alloc_shared((1,), T.float32)
             if run > 1:
                 # The launch checked it: a 16-byte base and a stride of 16 elements.
@@ -325,24 +409,38 @@ def local_stats_kernel(logits_dtype: str, idx_dtype: str, step_dtype: str, run: 
                         maximum[0] = best[0]
                     T.sync_threads()
                     best[0] = maximum[0]
-                    # The exponentials in register order, the first two added first.
+                    # The other columns' exponentials in register order, the first
+                    # two added first; the maximum's columns counted.
                     total[0] = T.call_extern(
-                        "float32", "vllm_exp_from", values[0], best[0]
+                        "float32", "vllm_other_exp", values[0], best[0]
                     )
+                    ties[0] = T.call_extern("float32", "vllm_tie", values[0], best[0])
                     for j in T.unroll(1, _STATS_PER_THREAD):
                         total[0] = T.call_extern(
                             "float32",
                             "vllm_add",
                             total[0],
                             T.call_extern(
-                                "float32", "vllm_exp_from", values[j], best[0]
+                                "float32", "vllm_other_exp", values[j], best[0]
                             ),
                         )
+                        ties[0] = T.call_extern(
+                            "float32",
+                            "vllm_add",
+                            ties[0],
+                            T.call_extern("float32", "vllm_tie", values[j], best[0]),
+                        )
                     _block_reduce(total, partial_sum, tx, "vllm_add")
+                    _block_reduce(ties, partial_ties, tx, "vllm_add")
                     if tx == 0:
                         local_max[t, blk] = best[0]
                         local_sumexp[t, blk] = T.call_extern(
-                            "float32", "vllm_live_sum", best[0], total[0]
+                            "float32",
+                            "vllm_live_sum",
+                            best[0],
+                            T.call_extern(
+                                "float32", "vllm_others", total[0], ties[0], best[0]
+                            ),
                         )
 
     return local_stats
@@ -410,8 +508,9 @@ def verify_kernel(
     + 1). Each draft step takes ``lanes`` threads, one a vocabulary block: they load
     its statistics, its draft and the draft's target logit at once, every load at an
     index that exists whatever the masks say, the masks as selects, and reduce them
-    to the step's log-sum-exp and the draft's log probability (as Triton's lane 0),
-    the greedy step's target argmax, and the step's uniform draw. Thread 0 then runs
+    to the step's log-sum-exp and the draft's log probability (the paper's Eq. 5),
+    the greedy step's target argmax, and the step's uniform draw; each step's first
+    thread then folds its cumulative log ratio and threshold. Thread 0 then runs
     both kernels' loops over the drafts from shared memory, where Triton's take two
     or three dependent round trips to memory a step. The step's cumulative log ratio
     is stored as the cumulative kernel stores it, for sampled requests only; the
@@ -461,6 +560,7 @@ def verify_kernel(
             step = tx // lanes
             block = tx % lanes
             row_max = T.alloc_local((1,), T.float32)
+            first = T.alloc_local((1,), T.int32)
             total = T.alloc_local((1,), T.float32)
             best = T.alloc_local((1,), T.float32)
             best_index = T.alloc_local((1,), T.int32)
@@ -471,6 +571,8 @@ def verify_kernel(
             uniform_s = T.alloc_shared((groups,), T.float32)
             draft_s = T.alloc_shared((groups,), T.int64)
             target_s = T.alloc_shared((groups,), T.int64)
+            cumulative_s = T.alloc_shared((groups,), T.float32)
+            threshold_s = T.alloc_shared((groups,), T.float32)
 
             start = T.alloc_var(T.int32, init=cu_num_logits[req])
             end = T.alloc_var(T.int32, init=cu_num_logits[req + 1])
@@ -502,36 +604,44 @@ def verify_kernel(
                 init=T.cast(logits[row, T.max(draft, T.int64(0))], T.float32),
             )
 
-            # _compute_global_logsumexp: the blocks' maximum, then their sums
-            # rescaled to it, the first level's product fused into its add.
+            # The step's S: the blocks' maximum, the first block holding it (a NaN
+            # maximum holds none), then the block sums rescaled to it, each with its
+            # left-out column back (1 + sum) except the first block's.
             row_max[0] = maximum
             for distance in _distances(lanes):
                 row_max[0] = T.call_extern(
                     "float32", "vllm_max", row_max[0], T.shfl_xor(row_max[0], distance)
                 )
-            scale = T.alloc_var(
-                T.float32,
-                init=T.call_extern("float32", "vllm_exp_from", maximum, row_max[0]),
+            first[0] = T.if_then_else(
+                T.call_extern("int32", "vllm_is_max", maximum, row_max[0]) != 0,
+                block,
+                lanes,
             )
-            if lanes == 1:
-                total[0] = T.call_extern("float32", "vllm_mul", scale, sumexp)
-            else:
-                total[0] = T.call_extern(
+            for distance in _distances(lanes):
+                first[0] = T.min(first[0], T.shfl_xor(first[0], distance))
+            total[0] = T.if_then_else(
+                block == first[0],
+                sumexp,
+                T.call_extern(
                     "float32",
-                    "vllm_fma",
-                    scale,
-                    sumexp,
-                    T.shfl_xor(
-                        T.call_extern("float32", "vllm_mul", scale, sumexp), lanes // 2
-                    ),
+                    "vllm_mul",
+                    T.call_extern("float32", "vllm_exp_from", maximum, row_max[0]),
+                    T.call_extern("float32", "vllm_add", T.float32(1), sumexp),
+                ),
+            )
+            for distance in _distances(lanes):
+                total[0] = T.call_extern(
+                    "float32", "vllm_add", total[0], T.shfl_xor(total[0], distance)
                 )
-                for distance in _distances(lanes)[1:]:
-                    total[0] = T.call_extern(
-                        "float32", "vllm_add", total[0], T.shfl_xor(total[0], distance)
-                    )
-            lse = T.alloc_var(
+            softplus = T.alloc_var(
                 T.float32,
-                init=T.call_extern("float32", "vllm_lse", row_max[0], total[0]),
+                init=T.call_extern(
+                    "float32",
+                    "vllm_softplus",
+                    T.call_extern(
+                        "float32", "vllm_row_others", total[0], row_max[0], vocab
+                    ),
+                ),
             )
 
             # _compute_global_target_argmax: NaN maxima count as -inf, and the lower
@@ -550,18 +660,51 @@ def verify_kernel(
                 False,
             )
             if block == 0:
-                lse_s[step] = lse
-                log_prob_s[step] = T.call_extern("float32", "vllm_sub", logit, lse)
+                lse_s[step] = T.call_extern("float32", "vllm_add", row_max[0], softplus)
+                log_prob_s[step] = T.call_extern(
+                    "float32",
+                    "vllm_sub",
+                    T.call_extern("float32", "vllm_shifted", logit, row_max[0]),
+                    softplus,
+                )
                 uniform_s[step] = T.call_extern("float32", "vllm_uniform", word)
                 draft_s[step] = draft
                 target_s[step] = target
+            T.sync_threads()
+
+            # Each step's cumulative log ratio and block verification's threshold at
+            # once: the step's first thread folds the steps through it in order,
+            # with a -1 placeholder leaving the ratio as it was, so the bits are a
+            # serial loop's. The threshold is the prefix's joint ratio, or that of
+            # the residual mass when a valid draft follows (from the logs of the
+            # ratio and of the next step's draft probability).
+            if block == 0:  # noqa: SIM102
+                if step < steps:
+                    log_p = T.alloc_var(T.float32, init=T.float32(0))
+                    for k in tuple(range(steps)):
+                        if k <= step:
+                            log_p = T.if_then_else(
+                                draft_s[k] >= 0,
+                                T.call_extern(
+                                    "float32", "vllm_log_ratio", log_p, log_prob_s[k]
+                                ),
+                                log_p,
+                            )
+                    cumulative_s[step] = log_p
+                    after = T.alloc_var(T.int32, init=T.min(step + 1, steps - 1))
+                    threshold_s[step] = T.if_then_else(
+                        (step + 1 < steps) & (draft_s[after] >= 0),
+                        T.call_extern(
+                            "float32", "vllm_block_threshold", log_p, log_prob_s[after]
+                        ),
+                        T.call_extern("float32", "vllm_exp", log_p),
+                    )
             T.sync_threads()
 
             if tx == 0:
                 greedy = T.alloc_var(
                     T.int32, init=T.cast(temp == T.float32(0), T.int32)
                 )
-                log_p = T.alloc_var(T.float32, init=T.float32(0))
                 accepted = T.alloc_var(T.int64, init=T.int64(0))
                 verifying = T.alloc_var(T.int32, init=1)
                 for i in tuple(range(steps)):
@@ -570,16 +713,9 @@ def verify_kernel(
                         valid = T.cast(drafted >= 0, T.int32)
                         token = T.max(drafted, T.int64(0))
                         if greedy == 0:
-                            # The cumulative ratio, which a -1 placeholder leaves
-                            # as it was; a placeholder ends verification.
-                            log_p = T.if_then_else(
-                                valid != 0,
-                                T.call_extern(
-                                    "float32", "vllm_log_ratio", log_p, log_prob_s[i]
-                                ),
-                                log_p,
-                            )
-                            cumulative[start + i] = log_p
+                            # The cumulative ratio; a placeholder ends
+                            # verification.
+                            cumulative[start + i] = cumulative_s[i]
                             verifying = verifying & valid
                         if verifying != 0:
                             if greedy != 0:
@@ -595,30 +731,14 @@ def verify_kernel(
                                 accepted = accepted + T.cast(hit, T.int64)
                                 verifying = hit
                             else:
-                                # Block verification: the prefix's joint ratio,
-                                # or the threshold of the residual mass when a
-                                # valid draft follows (its log probability is the
-                                # next step's).
-                                threshold = T.alloc_var(
-                                    T.float32,
-                                    init=T.call_extern("float32", "vllm_exp", log_p),
-                                )
-                                if i + 1 < steps:  # noqa: SIM102
-                                    if draft_s[i + 1] >= 0:
-                                        threshold = T.call_extern(
-                                            "float32",
-                                            "vllm_block_threshold",
-                                            threshold,
-                                            T.call_extern(
-                                                "float32", "vllm_exp", log_prob_s[i + 1]
-                                            ),
-                                        )
+                                # Block verification: the last step whose draw is
+                                # at most its threshold ends the accepted block.
                                 accepted = T.if_then_else(
                                     T.call_extern(
                                         "int32",
                                         "vllm_at_most",
                                         uniform_s[i],
-                                        threshold,
+                                        threshold_s[i],
                                     )
                                     != 0,
                                     T.int64(i + 1),

@@ -1350,8 +1350,9 @@ def rejection_sample(
         and not use_fp64
     ):
         # One-hot drafts, block verification and FP32 draws, without watermark,
-        # run as TileLang kernels (tilelang_rejection), the contract of the Triton
-        # kernels below, which serve every other configuration.
+        # run as TileLang kernels (tilelang_rejection): the Triton kernels below
+        # with the softmax fixed in their probabilities. Those serve every other
+        # configuration.
         sampled, num_sampled, resampled_local_argmax, resampled_local_max = (
             verify_and_resample(
                 target_logits,
