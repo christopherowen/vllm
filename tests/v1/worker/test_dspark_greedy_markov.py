@@ -15,8 +15,16 @@ from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
 
 
 @pytest.mark.parametrize("needs_distribution", [False, True])
-def test_sequential_sharded_sampling_preserves_each_token(needs_distribution):
+def test_sequential_sharded_sampling_preserves_each_token(
+    needs_distribution, monkeypatch
+):
+    from vllm.v1.worker.gpu import tilelang_inputs
     from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+
+    # The heads' TileLang row gather (its own GPU test) as torch, on the host.
+    monkeypatch.setattr(
+        tilelang_inputs, "gather_hidden_rows", lambda source, indices: source[indices]
+    )
 
     shared = torch.zeros(2, dtype=torch.int64)
     seen_anchors = []
