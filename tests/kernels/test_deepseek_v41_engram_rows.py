@@ -307,7 +307,6 @@ def test_host_hash_equals_the_gpu_hash():
     out = torch.empty((padded, 2, HEADS), dtype=torch.int64, device="cuda")
     engram_hash(
         ids,
-        ids == IMAGE_SENTINEL,
         torch.tensor(starts, dtype=torch.int32, device="cuda"),
         torch.tensor(history, dtype=torch.int64, device="cuda"),
         token_map.cuda(),

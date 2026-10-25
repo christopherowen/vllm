@@ -5,9 +5,10 @@
 For token ``t`` of request ``r`` (the last request whose query starts at or before
 ``t``) and head ``h`` of Engram layer ``l``, the sources are the compressed ids of
 tokens ``t``, ``t - 1``, ``t - 2`` and ``t - 3``: query tokens while they are in the
-request's query, then its three committed history tokens, then nothing. A query
-token compresses through the tokenizer map unless it is an image token or out of
-vocabulary; a history token unless it is the image sentinel or out of vocabulary.
+request's query, then its three committed history tokens, then nothing. A token
+compresses through the tokenizer map unless it is the image sentinel or out of
+vocabulary (the image tokens are the sentinel's ids: no mask kernel before the
+hash).
 From the first missing source on, every lag takes the pad id (the compressed id of
 token 2). Heads 0-7 hash 2-grams, 8-15 3-grams and 16-23 4-grams::
 
@@ -37,17 +38,19 @@ PAD_TOKEN = 2
 def engram_hash_kernel(
     layers: int, vocab: int, ids_dtype: str = "int64", history_dtype: str = "int64"
 ):
+    """``out`` may be any ``[rows, layers, 24]`` view with a contiguous head
+    dimension: a layer-major buffer's permutation writes each layer's plane."""
     threads = (layers * HEADS + 31) // 32 * 32
     tokens = T.dynamic("tokens")
     seqs1 = T.dynamic("seqs1")  # requests + 1
     history_rows = T.dynamic("history_rows")
     history_stride = T.dynamic("history_stride")
     out_rows = T.dynamic("out_rows")
+    out_token_stride, out_layer_stride = T.dynamic("out_token_stride, out_layer_stride")
 
     @T.prim_func
     def engram_hash(
         ids: T.Tensor((tokens,), ids_dtype),
-        image_mask: T.Tensor((tokens,), T.bool),
         starts: T.Tensor((seqs1,), T.int32),
         history: T.StridedTensor(
             (history_rows, HISTORY), (history_stride, 1), history_dtype
@@ -56,7 +59,9 @@ def engram_hash_kernel(
         multipliers: T.Tensor((layers, LAGS), T.int64),
         primes: T.Tensor((layers, HEADS), T.int64),
         offsets: T.Tensor((layers, HEADS), T.int64),
-        out: T.Tensor((out_rows, layers, HEADS), T.int64),
+        out: T.StridedTensor(
+            (out_rows, layers, HEADS), (out_token_stride, out_layer_stride, 1), T.int64
+        ),
         num_seqs: T.Tensor((1,), T.int32),
         num_tokens: T.Tensor((1,), T.int32),
     ):
@@ -91,7 +96,7 @@ def engram_hash_kernel(
                         relative = t - start - lag
                         if relative >= 0:
                             raw = T.cast(ids[t - lag], T.int64)
-                            if raw >= 0 and raw < vocab and not image_mask[t - lag]:
+                            if raw >= 0 and raw < vocab and raw != IMAGE_SENTINEL:
                                 source = token_map[raw]
                         elif relative >= -HISTORY:
                             raw = T.cast(history[request, HISTORY + relative], T.int64)
@@ -112,7 +117,6 @@ def engram_hash_kernel(
 )
 def engram_hash(
     ids: torch.Tensor,
-    image_mask: torch.Tensor,
     starts: torch.Tensor,
     history: torch.Tensor,
     token_map: torch.Tensor,
@@ -124,9 +128,10 @@ def engram_hash(
     num_tokens: torch.Tensor,
 ) -> None:
     """Hash ``ids`` ([T], int32 or int64; T may include padding past the live count
-    ``starts[-1]``) into ``out`` ([>= T, layers, 24] int64) and write the request
-    and live token counts. ``history`` (int32 or int64; the runner keeps int32)
-    holds each request's last three committed token ids, oldest first."""
+    ``starts[-1]``) into ``out`` ([>= T, layers, 24] int64, any view with contiguous
+    heads) and write the request and live token counts. ``history`` (int32 or
+    int64; the runner keeps int32) holds each request's last three committed token
+    ids, oldest first."""
     if ids.numel() == 0:
         return
     kernel = engram_hash_kernel(
@@ -137,7 +142,6 @@ def engram_hash(
     )
     kernel(
         ids,
-        image_mask,
         starts,
         history,
         token_map,
@@ -153,7 +157,6 @@ def engram_hash(
 @engram_hash.register_fake
 def _engram_hash_fake(
     ids,
-    image_mask,
     starts,
     history,
     token_map,

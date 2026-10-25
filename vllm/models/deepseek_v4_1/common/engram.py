@@ -431,8 +431,8 @@ class NgramHashState(nn.Module):
     def run_native(self, ids, mask, starts, history, out):
         """Hash ``ids`` for every Engram layer into ``out`` [T, layers, 24].
 
-        ``mask`` marks the tokens to hash under the B12X kernels, and the image
-        tokens to exclude (DeepSeek's mask) under the TileLang kernels.
+        ``mask`` marks the tokens to hash under the B12X kernels; the TileLang
+        hash finds the image tokens (the sentinel's ids) itself and takes None.
         """
         retain_cuda_graph_capture_resource(self)
         c = self.layout.caps[0]
@@ -448,7 +448,6 @@ class NgramHashState(nn.Module):
 
             engram_hash(
                 ids,
-                mask,
                 starts,
                 history,
                 self._tl_token_map,
@@ -501,7 +500,7 @@ class NgramHashState(nn.Module):
             dtype=torch.int64,
             device=input_ids.device,
         )
-        mask = dead_mask if kernels.uses_tilelang() else ~dead_mask
+        mask = None if kernels.uses_tilelang() else ~dead_mask
         self.run_native(input_ids, mask, query_start_loc, lookback_token_ids, out)
         return out
 
@@ -793,16 +792,23 @@ class ParallelEngramEmbedding(nn.Module):
         if ENGRAM_TIMELINE:
             _record_timeline(rows, self.caps.tp_rank, self.caps.layer_id)
 
-    def stage_rows(self, indices, num_tokens, stream, early=None):
-        """Queue a step's rows: copy its row IDs (``indices`` [tokens, 24], the GPU's
-        hash) and live token count, then hand the step to the reader with the IDs the
-        host hashed (``early`` [tokens, 24] int64 on the host, or None). Returns at
-        once; the forward's ``gather_rows`` waits for the rows."""
+    def share_hashes(self, hashes, num_tokens):
+        """Read each step's row IDs (``hashes`` [max_tokens, 24], contiguous) and live
+        token count from the model's buffers, which its hash writes in place, instead
+        of this table's own."""
+        if hashes.shape != self.hashes.shape or not hashes.is_contiguous():
+            raise ValueError("Engram row IDs must be a contiguous [max_tokens, 24]")
+        self.hashes = hashes
+        self.num_tokens = num_tokens
+
+    def stage_rows(self, tokens, stream, early=None):
+        """Queue a step's rows: hand the reader the row IDs of its ``tokens`` tokens
+        (``hashes``, with the live token count in ``num_tokens``, both written before
+        on ``stream``) and the IDs the host hashed (``early`` [tokens, 24] int64 on the
+        host, or None). Returns at once; the forward's ``gather_rows`` waits for the
+        rows."""
         if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Disk Engram staging must run outside compile/capture")
-        tokens = indices.shape[0]
-        self.hashes[:tokens].copy_(indices)
-        self.num_tokens.copy_(num_tokens)
         self.disk_rows.stage(stream, self.hashes, tokens * 24, early)
 
     def stage_no_rows(self):
@@ -1051,8 +1057,8 @@ class Engram(nn.Module):
     def declare_kernels(self) -> None:
         """Declare the TileLang gate: on packed rows always, and on the column blocks
         of a column-parallel projection when the model runs prefill sequence
-        parallel (the blocked gate, one block per rank). The model always passes
-        the image-token mask."""
+        parallel (the blocked gate, one block per rank). The model passes the
+        step's int32 token ids, the gate finding the image sentinel itself."""
         if not kernels.uses_tilelang():
             return
         from vllm.models.deepseek_v4_1.tilelang import prepare
@@ -1062,7 +1068,7 @@ class Engram(nn.Module):
         )
 
         calls = [
-            prepare.call(engram_gate_kernel, self.hc_mult, self.dim, self.eps, True)
+            prepare.call(engram_gate_kernel, self.hc_mult, self.dim, self.eps, "int32")
         ]
         sequence_parallel = (
             0 < self.prefill_sp_min_rows <= self.embed_tokens.caps.max_tokens
@@ -1074,7 +1080,7 @@ class Engram(nn.Module):
                     self.hc_mult,
                     self.dim,
                     self.eps,
-                    True,
+                    "int32",
                     get_tensor_model_parallel_world_size(),
                     self.wkv.output_size_per_partition,
                 )
@@ -1087,12 +1093,13 @@ class Engram(nn.Module):
         )
         self.embed_tokens.open_disk_rows()
 
-    def stage_rows(self, hash_ids, num_tokens, stream, early=None):
-        """Queue this step's disk rows (``early``: the IDs the host hashed); the
-        forward gathers them."""
+    def stage_rows(self, tokens, stream, early=None):
+        """Queue the disk rows of this step's ``tokens`` tokens (their row IDs in
+        ``embed_tokens.hashes``; ``early``: the IDs the host hashed); the forward
+        gathers them."""
         self.invalidate_disk_output()
-        self.embed_tokens.stage_rows(hash_ids, num_tokens, stream, early)
-        self._disk_prepared_tokens = hash_ids.shape[0]
+        self.embed_tokens.stage_rows(tokens, stream, early)
+        self._disk_prepared_tokens = tokens
         self._disk_prepared = True
 
     def prepare_embeddings(self, hash_ids):
@@ -1112,8 +1119,9 @@ class Engram(nn.Module):
     def forward(self, hidden_states, hash_ids, token_mask=None, sp_rows=None):
         """Gate ``hidden_states`` with this layer's Engram rows.
 
-        ``token_mask`` marks the tokens to gate under the B12X kernels, and the
-        image tokens to pass through (DeepSeek's mask) under the TileLang kernels.
+        ``token_mask`` marks the tokens to gate under the B12X kernels; under the
+        TileLang kernels it is the step's token ids (the image sentinel's rows pass
+        through).
 
         With ``sp_rows`` (prefill sequence parallelism) ``hidden_states`` holds
         this rank's rows while ``hash_ids`` and ``token_mask`` cover every
@@ -1183,7 +1191,7 @@ class Engram(nn.Module):
                 engram_gate_blocked,
             )
 
-            # The TileLang model passes DeepSeek's image-token mask (True skips).
+            # The TileLang model passes the token ids: the sentinel's rows pass.
             gate = engram_gate_blocked if blocked else engram_gate
             gate(
                 state,

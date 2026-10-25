@@ -94,7 +94,7 @@ def _case(lengths, padding, seed):
 
 
 def _expected(token_map, ids, history, starts, geometry):
-    image = ids == IMAGE_SENTINEL
+    image = ids == IMAGE_SENTINEL  # the hash finds the sentinel in the ids itself
     live = int(starts[-1])
     tokens = ids[:live].clamp(0, VOCAB - 1).tolist()
     keep = ((ids[:live] < VOCAB) & ~image[:live]).tolist()
@@ -113,28 +113,34 @@ def _expected(token_map, ids, history, starts, geometry):
         )
         for layer in range(len(LAYERS))
     ]
-    return torch.stack(rows, dim=1), image
+    return torch.stack(rows, dim=1)
 
 
+@pytest.mark.parametrize("layer_major", [False, True])
 @pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("history_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize(
     "lengths, padding",
     [((1,), 0), ((6, 1, 3, 6), 5), ((700, 1, 2, 1300), 0), ((0, 4, 0, 2), 3)],
 )
-def test_engram_hash(lengths, padding, ids_dtype, history_dtype):
+def test_engram_hash(lengths, padding, ids_dtype, history_dtype, layer_major):
+    """``layer_major``: ``out`` is the permutation of a [layers, rows, 24] buffer,
+    as the model's disk Engram planes are."""
     geometry = _geometry(LAYERS)
     token_map, ids, history, starts = _case(lengths, padding, sum(lengths) + padding)
-    expected, image = _expected(token_map, ids, history, starts, geometry)
-    out = torch.full((ids.numel() + 2, len(LAYERS), 24), 7, dtype=torch.int64)
-    out, num_seqs, num_tokens = (
-        out.to(DEVICE),
+    expected = _expected(token_map, ids, history, starts, geometry)
+    rows = ids.numel() + 2
+    if layer_major:
+        out = torch.full((len(LAYERS), rows, 24), 7, dtype=torch.int64)
+        out = out.to(DEVICE).permute(1, 0, 2)
+    else:
+        out = torch.full((rows, len(LAYERS), 24), 7, dtype=torch.int64).to(DEVICE)
+    num_seqs, num_tokens = (
         torch.zeros(1, dtype=torch.int32, device=DEVICE),
         torch.zeros(1, dtype=torch.int32, device=DEVICE),
     )
     engram_hash(
         ids.to(DEVICE, ids_dtype),
-        image.to(DEVICE),
         starts.to(DEVICE),
         history.to(DEVICE, history_dtype),
         token_map.to(DEVICE),

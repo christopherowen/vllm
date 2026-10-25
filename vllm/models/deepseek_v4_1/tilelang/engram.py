@@ -11,7 +11,8 @@ the multi-stream residual. For each token and stream, with the stream's residual
     gate = sigmoid(copysign(sqrt(max(|dot|, 1e-6)), dot))
     out  = x + gate * v
 
-in FP32, rounded to BF16. Image tokens keep ``x``. The magnitude's floor compares
+in FP32, rounded to BF16. Image tokens (the step's ids equal to the image sentinel:
+no mask kernel before the gate) keep ``x``. The magnitude's floor compares
 and selects, as the reference's ``clamp_min``, so a NaN dot makes the stream NaN
 rather than gating it with the floor. One block per (token, stream)
 spreads a row's loads over the whole block, and every load (the value too) is
@@ -24,6 +25,8 @@ import tilelang
 import tilelang.language as T
 import torch
 
+from vllm.models.deepseek_v4_1.tilelang.engram_hash import IMAGE_SENTINEL
+
 # Gate magnitudes below this clamp to it before the square root.
 CLAMP = 1e-6
 
@@ -33,7 +36,7 @@ def engram_gate_kernel(
     hc_mult: int,
     hidden: int,
     eps: float,
-    has_mask: bool,
+    ids_dtype: str,
     threads: int = 256,
     vec: int = 4,
 ):
@@ -48,7 +51,7 @@ def engram_gate_kernel(
         x: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
         kv: T.Tensor((tokens, hc_mult + 1, hidden), T.bfloat16),
         weight: T.Tensor((hc_mult, hidden), T.float32),
-        image_mask: T.Tensor((tokens,), T.bool),
+        ids: T.Tensor((tokens,), ids_dtype),
         out: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
     ):
         with T.Kernel(hc_mult, tokens, threads=threads) as (h, t):
@@ -63,7 +66,7 @@ def engram_gate_kernel(
             for c in T.serial(chunks):
                 for i in T.vectorized(vec):
                     xs[c * vec + i] = x[t, h, (c * threads + tx) * vec + i]
-            if has_mask and image_mask[t]:
+            if T.cast(ids[t], T.int64) == IMAGE_SENTINEL:
                 for c in T.serial(chunks):
                     for i in T.vectorized(vec):
                         out[t, h, (c * threads + tx) * vec + i] = T.cast(
@@ -117,35 +120,40 @@ def engram_gate_kernel(
     return engram_gate
 
 
+def _dtype(ids: torch.Tensor) -> str:
+    return str(ids.dtype).removeprefix("torch.")
+
+
 @torch.library.custom_op("vllm::dsv41_tilelang_engram_gate", mutates_args=("out",))
 def engram_gate(
     x: torch.Tensor,
     kv: torch.Tensor,
     weight: torch.Tensor,
-    image_mask: torch.Tensor | None,
+    ids: torch.Tensor,
     out: torch.Tensor,
     eps: float,
     hc_mult: int,
 ) -> None:
     """Gate ``x`` ([T, hc_mult * D]) with ``kv`` ([T, (hc_mult + 1) * D]: the keys,
     then the shared value) and the fused norm ``weight`` ([hc_mult * D], FP32) into
-    ``out``. ``image_mask`` marks tokens that pass through unchanged."""
+    ``out``. ``ids`` ([T], int32 or int64) are the step's token ids: the image
+    sentinel's rows pass through unchanged."""
     tokens = x.shape[0]
     if tokens == 0:
         return
     hidden = weight.numel() // hc_mult
-    kernel = engram_gate_kernel(hc_mult, hidden, eps, image_mask is not None)
+    kernel = engram_gate_kernel(hc_mult, hidden, eps, _dtype(ids))
     kernel(
         x.view(tokens, hc_mult, hidden),
         kv.view(tokens, hc_mult + 1, hidden),
         weight.view(hc_mult, hidden),
-        image_mask,
+        ids,
         out.view(tokens, hc_mult, hidden),
     )
 
 
 @engram_gate.register_fake
-def _engram_gate_fake(x, kv, weight, image_mask, out, eps, hc_mult):
+def _engram_gate_fake(x, kv, weight, ids, out, eps, hc_mult):
     return None
 
 
@@ -154,7 +162,7 @@ def engram_gate_blocked_kernel(
     hc_mult: int,
     hidden: int,
     eps: float,
-    has_mask: bool,
+    ids_dtype: str,
     blocks: int,
     block_cols: int,
     threads: int = 256,
@@ -174,7 +182,7 @@ def engram_gate_blocked_kernel(
         x: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
         kv: T.Tensor((blocks, rows, block_cols), T.bfloat16),
         weight: T.Tensor((hc_mult, hidden), T.float32),
-        image_mask: T.Tensor((tokens,), T.bool),
+        ids: T.Tensor((tokens,), ids_dtype),
         out: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
     ):
         with T.Kernel(hc_mult, tokens, threads=threads) as (h, t):
@@ -189,7 +197,7 @@ def engram_gate_blocked_kernel(
             for c in T.serial(chunks):
                 for i in T.vectorized(vec):
                     xs[c * vec + i] = x[t, h, (c * threads + tx) * vec + i]
-            if has_mask and image_mask[t]:
+            if T.cast(ids[t], T.int64) == IMAGE_SENTINEL:
                 for c in T.serial(chunks):
                     for i in T.vectorized(vec):
                         out[t, h, (c * threads + tx) * vec + i] = T.cast(
@@ -246,6 +254,7 @@ def engram_gate_blocked_kernel(
 
     return engram_gate_blocked
 
+
 @torch.library.custom_op(
     "vllm::dsv41_tilelang_engram_gate_blocked", mutates_args=("out",)
 )
@@ -253,7 +262,7 @@ def engram_gate_blocked(
     x: torch.Tensor,
     kv: torch.Tensor,
     weight: torch.Tensor,
-    image_mask: torch.Tensor | None,
+    ids: torch.Tensor,
     out: torch.Tensor,
     eps: float,
     hc_mult: int,
@@ -268,19 +277,19 @@ def engram_gate_blocked(
     hidden = weight.numel() // hc_mult
     blocks, _, block_cols = kv.shape
     kernel = engram_gate_blocked_kernel(
-        hc_mult, hidden, eps, image_mask is not None, blocks, block_cols
+        hc_mult, hidden, eps, _dtype(ids), blocks, block_cols
     )
     kernel(
         x.view(tokens, hc_mult, hidden),
         kv,
         weight.view(hc_mult, hidden),
-        image_mask,
+        ids,
         out.view(tokens, hc_mult, hidden),
     )
 
 
 @engram_gate_blocked.register_fake
-def _engram_gate_blocked_fake(x, kv, weight, image_mask, out, eps, hc_mult):
+def _engram_gate_blocked_fake(x, kv, weight, ids, out, eps, hc_mult):
     return None
 
 

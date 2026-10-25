@@ -146,11 +146,8 @@ def tiny_engram_checkpoint(tmp_path, dist_init):
         finally:
             torch.set_default_dtype(old_dtype)
         target.engram_hash = NgramHashState(None, layout, None)
-        target.register_buffer(
-            "prepared_engram_hashes",
-            torch.empty(8, len(caps), 24, dtype=torch.int64, device="cuda"),
-            persistent=False,
-        )
+        if memory == "disk":
+            target.register_engram_hashes()
         target.get_expert_mapping = lambda: []
         language = DeepseekV41LLMForCausalLM.__new__(DeepseekV41LLMForCausalLM)
         nn.Module.__init__(language)
@@ -256,7 +253,10 @@ def test_engram_descriptor_loading_preserves_ordinary_weights(
         indices = torch.arange(24, device="cuda").expand(4, -1).contiguous()
         count = torch.tensor([3], dtype=torch.int32, device="cuda")
         if table_memory == "disk":
-            engram.stage_rows(indices, count, torch.cuda.current_stream())
+            # The model's hash writes the layer's IDs and live count in place.
+            engram.embed_tokens.hashes[:4].copy_(indices)
+            engram.embed_tokens.num_tokens.copy_(count)
+            engram.stage_rows(4, torch.cuda.current_stream())
             engram.embed_tokens.gather_rows(engram.staged_rows)
         else:
             engram.embed_tokens.lookup_native(indices[:3], engram.staged_rows)
@@ -1005,6 +1005,9 @@ def test_disk_engram_model_allocates_hash_buffer_from_declared_caps(monkeypatch)
     hashes = model.prepared_engram_hashes
     assert hashes.shape == (13, 2, 24)
     assert hashes.dtype == torch.int64 and hashes.device == caps.device
+    # Layer-major: each layer's plane is a contiguous [max_tokens, 24].
+    assert hashes.permute(1, 0, 2).is_contiguous()
+    assert (hashes == -1).all()
     assert "prepared_engram_hashes" not in model.state_dict()
 
 
@@ -1075,7 +1078,9 @@ def test_disk_rows_read_whole_table_sources(tmp_path, dist_init, tp_rank):
         output = module.staged_rows
         address = output.data_ptr()
         for shift in (0, 1):
-            module.stage_rows(ids + shift, count, torch.cuda.current_stream())
+            embed.hashes[:capacity].copy_(ids + shift)
+            embed.num_tokens.copy_(count)
+            module.stage_rows(capacity, torch.cuda.current_stream())
             embed.gather_rows(output)
             reference = weight.float()[ids.cpu() + shift].flatten(1).bfloat16()
             owned = torch.tensor([bool(embed.column_mask >> h & 1) for h in range(24)])
