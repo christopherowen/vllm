@@ -1154,6 +1154,116 @@ def sink_merge(
     return alternates
 
 
+# The alternates' rows: threads a block, and columns a thread copies.
+_SINK_ROWS_THREADS = 256
+_SINK_ROWS_PER_THREAD = 8
+SINK_ROWS_BLOCK = _SINK_ROWS_THREADS * _SINK_ROWS_PER_THREAD
+
+
+@tilelang.jit(pass_configs=_PASS)
+def sink_rows_kernel(logits_dtype: str, num_alternates: int, logits_mode: bool):
+    """``SinkSampler.alternate_logprobs_of``'s glue, the torch chain it replaces in
+    one launch: each request's row that drew its last sampled token,
+    ``cu_num_logits[r] + max(num_sampled[r] - 1, 0)`` in int64, copied whole into
+    ``rows[r]`` (``logits[rows]``), and its alternates clamped at 0
+    (``alternates.clamp(min=0)``), stored request by request (``tokens``, the
+    log-softmax's ids) and alternate by alternate (``tokens_by_alt``, a rank
+    launch's ids); with ``logits_mode``, also each alternate's logit as FP32 into
+    ``scores`` (``rows.gather(-1, tokens).to(torch.float32)``). Requests are on the
+    grid's x axis and blocks of ``SINK_ROWS_BLOCK`` columns on its y axis; a thread
+    loads its eight columns (``_SINK_ROWS_THREADS`` apart) before it stores them."""
+    alts = num_alternates
+    if not 1 <= alts <= _SINK_ROWS_THREADS:
+        raise ValueError(f"{alts} alternates: a block's threads take one each")
+    per = _SINK_ROWS_PER_THREAD
+    reqs, num_logits, vocab, cu_len, sampled_len = T.dynamic(
+        "reqs, num_logits, vocab, cu_len, sampled_len"
+    )
+    # 64-bit row offsets, for the logits and their dense copies alike.
+    logits_stride, rows_stride = T.dynamic("logits_stride, rows_stride", "int64")
+
+    @T.prim_func
+    def sink_rows(
+        logits: T.StridedTensor((num_logits, vocab), (logits_stride, 1), logits_dtype),
+        cu_num_logits: T.Tensor((cu_len,), T.int32),
+        num_sampled: T.Tensor((sampled_len,), T.int32),
+        alternates: T.Tensor((reqs, alts), T.int64),
+        rows: T.StridedTensor((reqs, vocab), (rows_stride, 1), logits_dtype),
+        tokens: T.Tensor((reqs, alts), T.int64),
+        tokens_by_alt: T.Tensor((alts, reqs), T.int64),
+        scores: T.Tensor((reqs, alts), T.float32),
+    ):
+        with T.Kernel(
+            reqs, T.ceildiv(vocab, SINK_ROWS_BLOCK), threads=_SINK_ROWS_THREADS
+        ) as (req, blk):
+            tx = T.get_thread_binding()
+            raw = T.alloc_local((per,), logits_dtype)
+            row = T.alloc_var(
+                T.int64,
+                init=T.cast(cu_num_logits[req], T.int64)
+                + T.max(T.cast(num_sampled[req], T.int64) - 1, T.int64(0)),
+            )
+            token = T.alloc_var(T.int64, init=T.int64(0))
+            for k in T.unroll(per):
+                if blk * SINK_ROWS_BLOCK + k * _SINK_ROWS_THREADS + tx < vocab:
+                    raw[k] = logits[
+                        row, blk * SINK_ROWS_BLOCK + k * _SINK_ROWS_THREADS + tx
+                    ]
+            for k in T.unroll(per):
+                if blk * SINK_ROWS_BLOCK + k * _SINK_ROWS_THREADS + tx < vocab:
+                    rows[req, blk * SINK_ROWS_BLOCK + k * _SINK_ROWS_THREADS + tx] = (
+                        raw[k]
+                    )
+            if (blk == 0) & (tx < alts):
+                token = T.max(alternates[req, tx], T.int64(0))
+                tokens[req, tx] = token
+                tokens_by_alt[tx, req] = token
+                if logits_mode:
+                    scores[req, tx] = T.cast(logits[row, token], T.float32)
+
+    return sink_rows
+
+
+def sink_rows_key(
+    logits_dtype: torch.dtype, num_alternates: int, logits_mode: bool
+) -> tuple:
+    return (_DTYPES[logits_dtype], num_alternates, logits_mode)
+
+
+def sink_rows(
+    logits: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    num_sampled: torch.Tensor,
+    alternates: torch.Tensor,
+    scores: torch.Tensor,
+    logits_mode: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``sink_rows_kernel``'s launch for ``[num_reqs, num_alternates]`` alternates
+    (both at least 1): the rows ``[num_reqs, vocab]`` in the logits' dtype, the
+    clamped alternates ``[num_reqs, num_alternates]`` and ``[num_alternates,
+    num_reqs]`` (int64); with ``logits_mode``, their logits into ``scores``."""
+    num_reqs, num_alternates = alternates.shape
+    device = logits.device
+    rows = torch.empty((num_reqs, logits.shape[1]), dtype=logits.dtype, device=device)
+    tokens = torch.empty((num_reqs, num_alternates), dtype=torch.int64, device=device)
+    tokens_by_alt = torch.empty(
+        (num_alternates, num_reqs), dtype=torch.int64, device=device
+    )
+    _kernel(
+        sink_rows_kernel, *sink_rows_key(logits.dtype, num_alternates, logits_mode)
+    )(
+        logits,
+        cu_num_logits,
+        num_sampled,
+        alternates.contiguous(),
+        rows,
+        tokens,
+        tokens_by_alt,
+        scores,
+    )
+    return rows, tokens, tokens_by_alt
+
+
 SINK_CANDIDATE_BLOCK = 1024
 
 
@@ -1400,7 +1510,11 @@ def sink_policy_kernel(
     Triton's order. The flagged-value maximum takes the lowest row among equal
     values (``row_values`` are finite: the detector stores them through
     ``nan_to_num``). Each buffer is passed flat; ``num_alternates`` is at least 1,
-    as the Triton launch's ``NUM_ALTERNATES``."""
+    as the Triton launch's ``NUM_ALTERNATES``. The step's alternate logprobs and
+    ranks are read at their request and alternate strides (the ranks are stored
+    alternate by alternate). With ``logprobs``, every request's recovered logprob
+    and rank is written, 0 where no draft zero was replaced: the zeros the Triton
+    launch's buffers were filled with."""
     alts = num_alternates
     width = sampled_width
     padded = _next_power_of_2(width + 1)
@@ -1450,6 +1564,10 @@ def sink_policy_kernel(
             (count_rows, count_cols), (count_stride, 1), T.int32
         ),
         counts: T.Tensor((3,), T.int64),
+        new_lp_req_stride: T.int64,
+        new_lp_alt_stride: T.int64,
+        new_rank_req_stride: T.int64,
+        new_rank_alt_stride: T.int64,
     ):
         with T.Kernel(reqs, threads=32) as req:
             tx = T.get_thread_binding()
@@ -1481,6 +1599,9 @@ def sink_policy_kernel(
                 sampled_n[0] = num_sampled[req]
                 if sampled_n[0] == 0:
                     # A prefill chunk: its row is not sampled.
+                    if logprobs:
+                        recovered_logprobs[req] = T.float32(0)
+                        recovered_ranks[req] = T.int64(0)
                     num_out[req] = 0
                     events[req, 0] = 0
                     events[req, 1] = 2
@@ -1557,6 +1678,9 @@ def sink_policy_kernel(
                             ]
                             num_out[req] = 1
                         else:
+                            if logprobs:
+                                recovered_logprobs[req] = T.float32(0)
+                                recovered_ranks[req] = T.int64(0)
                             # The last sampled token's draw provides the next
                             # alternates.
                             for a in T.serial(alts):
@@ -1566,12 +1690,14 @@ def sink_policy_kernel(
                                 if logprobs:
                                     alternate_logprobs[state[0] * alts + a] = (
                                         new_alternate_logprobs[
-                                            T.cast(req, T.int64) * alts + a
+                                            T.cast(req, T.int64) * new_lp_req_stride
+                                            + a * new_lp_alt_stride
                                         ]
                                     )
                                     alternate_ranks[state[0] * alts + a] = (
                                         new_alternate_ranks[
-                                            T.cast(req, T.int64) * alts + a
+                                            T.cast(req, T.int64) * new_rank_req_stride
+                                            + a * new_rank_alt_stride
                                         ]
                                     )
                             tries[state[0]] = 0
@@ -1656,10 +1782,15 @@ def sink_policy(
 ) -> None:
     """``SinkSampler.apply``'s launch, with the Triton launch's arguments (the
     placeholders where a variant has no buffer included); the per-slot and step
-    buffers are contiguous."""
+    buffers are contiguous, except the step's alternate logprobs and ranks
+    (``[num_reqs, alternates]``), which may be stored alternate by alternate. With
+    ``logprobs``, the recovered logprobs and ranks need no zeros first: every
+    request's is written."""
     num_reqs, sampled_width = sampled.shape
     if num_reqs == 0:
         return
+    new_lp, new_lp_strides = _alternate_columns(new_alternate_logprobs)
+    new_ranks, new_rank_strides = _alternate_columns(new_alternate_ranks)
     kernel = _kernel(
         sink_policy_kernel,
         *sink_policy_key(
@@ -1687,8 +1818,8 @@ def sink_policy(
         row_values,
         drafts,
         new_alternates.view(-1),
-        new_alternate_logprobs.view(-1),
-        new_alternate_ranks.view(-1),
+        new_lp,
+        new_ranks,
         alternates.view(-1),
         alternate_logprobs.view(-1),
         alternate_ranks.view(-1),
@@ -1696,6 +1827,23 @@ def sink_policy(
         total_len,
         bin_counts,
         counts,
+        *new_lp_strides,
+        *new_rank_strides,
+    )
+
+
+def _alternate_columns(
+    columns: torch.Tensor,
+) -> tuple[torch.Tensor, tuple[int, int]]:
+    """A ``[num_reqs, alternates]`` tensor stored request by request or alternate by
+    alternate, as its flat storage and its (request, alternate) strides."""
+    if columns.is_contiguous():
+        return columns.view(-1), (columns.stride(0), columns.stride(1))
+    if columns.t().is_contiguous():
+        return columns.t().view(-1), (columns.stride(0), columns.stride(1))
+    raise ValueError(
+        f"alternate columns of strides {columns.stride()} are neither request- "
+        "nor alternate-major"
     )
 
 
@@ -2594,12 +2742,14 @@ def sink_calls(
     num_alternates: int,
     rejection: bool,
     num_event_fields: int,
+    logits_mode: bool = False,
 ) -> list:
     """``SinkSampler``'s calls: the flags, with and without dead rows; the policy
     for each sampled width, with and without logprobs; with rejection on, the
     candidates of logits of each of
     ``logits_dtypes`` (a rejected draft masked when more than one row is
-    sampled)."""
+    sampled), and the alternates' rows for their logprobs (with ``logits_mode``,
+    their logits too)."""
     calls = [_call(sink_flags_kernel, dead_rows) for dead_rows in (False, True)]
     if rejection:
         # The cut and its restore, on raw and processed logits and on a rank's
@@ -2620,6 +2770,14 @@ def sink_calls(
             _call(sink_merge_kernel, True, num_alternates + 1, num_alternates),
             _call(sink_merge_kernel, False, 0, num_alternates),
         ]
+        if num_alternates:
+            calls += [
+                _call(
+                    sink_rows_kernel,
+                    *sink_rows_key(dtype, num_alternates, logits_mode),
+                )
+                for dtype in dict.fromkeys(logits_dtypes)
+            ]
     calls += [
         _call(
             sink_policy_kernel,

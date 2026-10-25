@@ -2229,6 +2229,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         0
                     ),
                     vocab_size=vocab_size,
+                    logits_mode=self.sampler.logprobs_mode
+                    in ("raw_logits", "processed_logits"),
                 )
         if self.rejection_sampler is not None and self._greedy_verification_available():
             assert head is not None and processor is not None

@@ -631,7 +631,12 @@ def _policy_state(reqs, width, slots, alternates, seed):
     "rejection,logprobs", [(True, True), (True, False), (False, False)]
 )
 @pytest.mark.parametrize("width", [6, 1])
-def test_sink_policy(rejection, logprobs, width):
+@pytest.mark.parametrize("alternate_major", [False, True])
+def test_sink_policy(rejection, logprobs, width, alternate_major):
+    """The policy against the Triton kernel. The Triton launch's recovered logprobs
+    and ranks were zero-filled by torch; the TileLang kernel writes every request's
+    (0 where none was recovered) over garbage. The step's alternate logprobs and
+    ranks may be views of alternate-major storage (the sink's ranks are)."""
     reqs, slots, alternates, fields = 23, 40, 3, 6
     cu, drafts, mapping, state = _policy_state(reqs, width, slots, alternates, 9)
     results = []
@@ -640,8 +645,17 @@ def test_sink_policy(rejection, logprobs, width):
         events = torch.full((reqs, fields), -9, dtype=torch.int32, device=DEVICE)
         tokens = torch.full((reqs, width + 1), -9, dtype=torch.int64, device=DEVICE)
         num_out = torch.full((reqs,), -9, dtype=torch.int32, device=DEVICE)
-        rec_lp = torch.full((reqs,), -9.0, device=DEVICE)
-        rec_rk = torch.full((reqs,), -9, dtype=torch.int64, device=DEVICE)
+        # Only a logprobs launch writes them: garbage for ours, zeros for Triton.
+        garbage = ours and logprobs
+        rec_lp = torch.full((reqs,), -9.0 if garbage else 0.0, device=DEVICE)
+        rec_rk = torch.full(
+            (reqs,), -9 if garbage else 0, dtype=torch.int64, device=DEVICE
+        )
+        new_logprobs, new_ranks = s["new_logprobs"], s["new_ranks"]
+        if ours and alternate_major:
+            new_logprobs = new_logprobs.t().contiguous().t()
+            new_ranks = new_ranks.t().contiguous().t()
+            assert not new_ranks.is_contiguous()
         args = (
             s["sampled"],
             s["num_sampled"],
@@ -658,8 +672,8 @@ def test_sink_policy(rejection, logprobs, width):
             s["values"],
             drafts,
             s["new_alternates"] if rejection else s["alternates"],
-            s["new_logprobs"] if logprobs else s["alt_logprobs"],
-            s["new_ranks"] if logprobs else s["alt_ranks"],
+            new_logprobs if logprobs else s["alt_logprobs"],
+            new_ranks if logprobs else s["alt_ranks"],
             s["alternates"],
             s["alt_logprobs"],
             s["alt_ranks"],
