@@ -628,6 +628,29 @@ def logits_rows_calls(index_dtype: torch.dtype) -> list:
     return [_call(logits_rows_kernel, *logits_rows_key(index_dtype))]
 
 
+# --- Rows the heads project ------------------------------------------------------
+
+
+def gather_hidden_rows(source: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    """``source[indices]`` for in-range indices: the hidden rows the LM head and the
+    drafter's head project, through the CED decoder's TileLang row copy (packed
+    rows, 16-byte pieces). A dummy batch's int32 indices are widened first."""
+    from vllm.models.deepseek_v4_1.tilelang import ced
+
+    out = source.new_empty((indices.shape[0], *source.shape[1:]))
+    if out.numel():
+        rows = indices if indices.dtype == torch.int64 else indices.long()
+        ced.copy_rows(source, rows, out, scatter=False)
+    return out
+
+
+def gather_hidden_rows_calls(dtype: torch.dtype, width: int) -> list:
+    from vllm.models.deepseek_v4_1.tilelang import ced
+
+    key = ced.packed_copy_rows_key(str(dtype).removeprefix("torch."), (width,), False)
+    return [_call(ced.copy_rows_kernel, *key)]
+
+
 # --- Padding rows -----------------------------------------------------------------
 
 _PADDING_THREADS = 256

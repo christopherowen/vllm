@@ -1158,7 +1158,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.step_timing.drafter_end()
 
         assert hidden_states is not None  # Last PP rank always has hidden_states
-        sample_hidden_states = hidden_states[input_batch.logits_indices]
+        sample_hidden_states = tilelang_inputs.gather_hidden_rows(
+            hidden_states, input_batch.logits_indices
+        )
         return hidden_states, sample_hidden_states
 
     @torch.inference_mode()
@@ -1954,7 +1956,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logits = all_to_all_logits(local_logits, shard_metadata)
             logits = logits[:, : self.vocab_size]
         else:
-            sample_hidden_states = hidden_states[input_batch.logits_indices]
+            sample_hidden_states = tilelang_inputs.gather_hidden_rows(
+                hidden_states, input_batch.logits_indices
+            )
             if self._verifies_greedily(input_batch, grammar_output):
                 output = self._verify_greedily(
                     sample_hidden_states, input_batch, sink_flags
@@ -2146,6 +2150,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return
         assert self.sampler is not None
         register_input_batch_warmups(dead_rows=dead_rows)
+        # The hidden rows the LM head projects (gather_hidden_rows).
+        hidden_size = self.model_config.get_hidden_size()
+        tilelang_inputs.declare(
+            lambda: tilelang_inputs.gather_hidden_rows_calls(self.dtype, hidden_size)
+        )
         # The logits rows' inputs (InputBatch.logits_rows): a step's logits
         # indices are int64, a dummy batch's int32.
         tilelang_inputs.declare(

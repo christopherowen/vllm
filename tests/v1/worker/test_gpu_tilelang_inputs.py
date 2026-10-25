@@ -653,6 +653,27 @@ def test_expand_idx_mapping(num_reqs, idx_dtype):
     assert torch.equal(ref_pos, ours_pos)
 
 
+@pytest.mark.parametrize("num_rows", [1, 6, 96, 1000])
+@pytest.mark.parametrize("index_dtype", [torch.int64, torch.int32])
+def test_gather_hidden_rows(num_rows, index_dtype):
+    """The hidden rows the heads project, against torch's indexing: repeated rows,
+    any order, a dummy batch's int32 indices."""
+    gen = _gen(num_rows + 9)
+    hidden = torch.randn(MAX_TOKENS // 8, 5120, generator=gen, device=DEVICE)
+    hidden = hidden.to(torch.bfloat16)
+    indices = _randint(0, hidden.shape[0], (num_rows,), gen, index_dtype)
+    if num_rows > 1:
+        indices[1] = indices[0]
+    out = tli.gather_hidden_rows(hidden, indices)
+    torch.accelerator.synchronize()
+    assert torch.equal(out.view(torch.int16), hidden[indices].view(torch.int16))
+    # The launch's key (CED's, from the source layout) is the declared one.
+    from vllm.models.deepseek_v4_1.tilelang import ced
+
+    ((_, declared, _),) = tli.gather_hidden_rows_calls(torch.bfloat16, 5120)
+    assert declared == ced.copy_rows_key("bfloat16", (5120,), (1,), 5120, False)
+
+
 @pytest.mark.parametrize("num_logits", [0, 1, 6, 96, 1000])
 @pytest.mark.parametrize("index_dtype", [torch.int64, torch.int32])
 def test_logits_rows(num_logits, index_dtype):
