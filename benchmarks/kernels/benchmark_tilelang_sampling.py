@@ -484,14 +484,40 @@ def markov_full_case(rows: int):
 
 
 def rejection_case(reqs: int):
+    """Greedy verification at TP4 from the gathered 16-byte pair rows, one launch,
+    against Triton's selection over the packed pairs and its verification."""
+    ranks = 4
+
     def make(sample: int):
         g = generator(sample)
         cu, _, drafts, _, _ = _verification_batch(reqs, g)
-        target = drafts[1:].long().clone()
-        target[::4] += 1
+        rows = reqs * WIDTH
+        # Each row's first maximum is mostly the draft that verifies it.
+        values = torch.randn(rows, ranks, generator=g, device=DEVICE)
+        index = torch.randint(0, VOCAB, (rows, ranks), generator=g, device=DEVICE)
+        best = values.argmax(-1)
+        index[torch.arange(rows, device=DEVICE), best] = drafts[1:].long()
+        index[::4, :] += 1
+        full = torch.zeros(rows, ranks, 4, device=DEVICE)
+        full[..., 0], full[..., 1] = values, index.float()
+        pairs = full.view(rows, 4 * ranks)
+        packed = full[..., :2].contiguous().view(rows, 2 * ranks)
+        target = torch.empty(rows, dtype=torch.int64, device=DEVICE)
+
+        def theirs():
+            triton_select(packed, target)
+            triton_greedy_rejection(target, drafts, cu, WIDTH - 1)
+
+        ours = tls.greedy_rejection_sample(pairs, drafts, cu, WIDTH - 1)
+        theirs()
+        expected = triton_greedy_rejection(target, drafts, cu, WIDTH - 1)
+        assert torch.equal(ours[1], expected[1])
+        for r in range(reqs):
+            n = int(expected[1][r])
+            assert torch.equal(ours[0][r, :n], expected[0][r, :n])
         return (
-            lambda: tls.greedy_rejection_sample(target, drafts, cu, WIDTH - 1),
-            lambda: triton_greedy_rejection(target, drafts, cu, WIDTH - 1),
+            lambda: tls.greedy_rejection_sample(pairs, drafts, cu, WIDTH - 1),
+            theirs,
         )
 
     return make
@@ -517,6 +543,7 @@ CASES = {
     "greedy_shard_pair": [(f"{r} rows", shard_pair_case(r)) for r in (6, 36, 96, 384)],
     "select_first_argmax": [(f"{r} rows", select_case(r)) for r in (1, 16, 96)],
     "sample_greedy_markov": [(f"{r} rows", markov_full_case(r)) for r in (1, 16)],
+    # The fused selection and verification against Triton's two launches.
     "greedy_rejection": [(f"{r} requests", rejection_case(r)) for r in (1, 16, 64)],
 }
 

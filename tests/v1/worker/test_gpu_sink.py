@@ -28,7 +28,7 @@ from vllm.v1.worker.gpu.sample.sink import SinkAlternates, SinkSampler
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import prepare_dflash_inputs
 from vllm.v1.worker.gpu.spec_decode.greedy_verification import (
     greedy_rejection_sample,
-    vocab_parallel_argmax,
+    vocab_parallel_pairs,
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 from vllm.v1.worker.gpu.states import RequestState
@@ -377,8 +377,8 @@ def test_greedy_shards_match_the_full_logits():
     # Request 0 rejects its second draft; request 1 takes the bonus.
     drafts[2] = (drafts[2] + 1) % vocab
     cu = _cu([3, 3])
-    target = vocab_parallel_argmax(logits, vocab, 0, 1)
-    sampled, num_sampled = greedy_rejection_sample(target, drafts, cu, k)
+    pairs = vocab_parallel_pairs(logits, vocab, 0, 1)
+    sampled, num_sampled = greedy_rejection_sample(pairs, drafts, cu, k)
     shard = sink.alternates_of_greedy_shards(
         logits, cu, num_sampled, sampled, 0, vocab, 1
     )

@@ -2490,75 +2490,135 @@ def sample_greedy_markov(
     )
 
 
+# select_first_argmax's masked pair: no real pair loses to it.
+_MASKED_INDEX = 1 << 30
+
+
 @tilelang.jit(pass_configs=_PASS)
-def greedy_rejection_kernel(width: int, drafts_dtype: str):
-    """``greedy_verification._greedy_rejection_kernel``: per request, drafts are
-    accepted while they equal the target's argmax (a -1 draft never is); the first
-    mismatch commits the argmax, and a fully accepted block commits the bonus
-    position's argmax. Positions after the first mismatch are not written."""
-    reqs, cu_len, targets_len, drafts_len = T.dynamic(
-        "reqs, cu_len, targets_len, drafts_len"
+def greedy_rejection_kernel(width: int, drafts_dtype: str, ranks: int, pair_width: int):
+    """``dspark.greedy._select_first_argmax`` and
+    ``greedy_verification._greedy_rejection_kernel`` in one launch, from the
+    all-gathered ``(value, index)`` pairs of each logits row ([rows, pair_width *
+    ranks] FP32, a rank's pair first in its ``pair_width`` columns), a warp a
+    request.
+
+    Lane ``j`` of a request with ``num_drafts`` drafts (``j <= num_drafts``) takes
+    position ``start + j``: it loads the row's ``ranks`` pairs, all before the
+    first combine, and reduces them in rank order with ``_first_keep_or_take``
+    (the selection's combine, a total order: NaN first, then the larger value,
+    then the smaller index; with ``ranks`` not a power of two, the masked pair the
+    selection pads with too), so the target is the selection's, bit for bit; the
+    lanes below ``num_drafts`` also stage the draft the position verifies. Lane 0
+    then runs the rejection kernel's loop from shared memory: drafts are accepted
+    while they equal the target (a -1 draft never is); the first mismatch commits
+    the target, and a fully accepted block commits the bonus position's. Positions
+    after the first mismatch are not written; ``num_sampled`` is the accepted
+    count plus one."""
+    if not 1 <= width <= 32:
+        raise ValueError(f"{width} sampled tokens a request: a warp takes them")
+    if not 1 <= ranks <= 32 or pair_width < 2:
+        raise ValueError(f"{ranks} ranks of {pair_width}-column pairs")
+    span = 1 << max(ranks - 1, 0).bit_length()
+    reqs, cu_len, drafts_len, rows, cols = T.dynamic(
+        "reqs, cu_len, drafts_len, rows, cols"
     )
+    pairs_stride = T.dynamic("pairs_stride", "int64")
 
     @T.prim_func
     def greedy_rejection(
         sampled: T.Tensor((reqs, width), T.int64),
         num_sampled: T.Tensor((reqs,), T.int32),
-        target_ids: T.Tensor((targets_len,), T.int64),
+        pairs: T.StridedTensor((rows, cols), (pairs_stride, 1), T.float32),
         draft_sampled: T.Tensor((drafts_len,), drafts_dtype),
         cu_num_logits: T.Tensor((cu_len,), T.int32),
     ):
         with T.Kernel(reqs, threads=32) as req:
+            T.import_source(_HEADER)
             tx = T.get_thread_binding()
-            start = T.alloc_local((1,), T.int64)
-            num_drafts = T.alloc_local((1,), T.int64)
+            values = T.alloc_local((ranks,), T.float32)
+            indices = T.alloc_local((ranks,), T.int32)
+            best = T.alloc_local((1,), T.float32)
+            best_index = T.alloc_local((1,), T.int32)
+            targets = T.alloc_shared((width,), T.int64)
+            drafts = T.alloc_shared((width,), T.int64)
             accepted = T.alloc_local((1,), T.int64)
             verifying = T.alloc_local((1,), T.int32)
-            draft = T.alloc_local((1,), T.int64)
-            target = T.alloc_local((1,), T.int64)
+            start = T.alloc_var(T.int64, init=T.cast(cu_num_logits[req], T.int64))
+            num_drafts = T.alloc_var(
+                T.int64, init=T.cast(cu_num_logits[req + 1], T.int64) - start - 1
+            )
+            if (tx < width) & (T.cast(tx, T.int64) <= num_drafts):
+                for k in tuple(range(ranks)):
+                    values[k] = pairs[start + tx, pair_width * k]
+                    indices[k] = T.cast(pairs[start + tx, pair_width * k + 1], T.int32)
+                best[0] = values[0]
+                best_index[0] = indices[0]
+                for k in tuple(range(1, ranks)):
+                    _first_keep_or_take(best, best_index, values[k], indices[k])
+                if span > ranks:
+                    _first_keep_or_take(
+                        best, best_index, -T.infinity(T.float32), _MASKED_INDEX
+                    )
+                targets[tx] = T.cast(best_index[0], T.int64)
+                if T.cast(tx, T.int64) < num_drafts:
+                    drafts[tx] = T.cast(draft_sampled[start + tx + 1], T.int64)
+            T.sync_threads()
             if tx == 0:
-                start[0] = T.cast(cu_num_logits[req], T.int64)
-                num_drafts[0] = T.cast(cu_num_logits[req + 1], T.int64) - start[0] - 1
                 accepted[0] = 0
                 verifying[0] = 1
-                for i in T.serial(num_drafts[0]):
-                    if verifying[0] != 0:
-                        draft[0] = T.cast(draft_sampled[start[0] + i + 1], T.int64)
-                        target[0] = target_ids[start[0] + i]
+                for i in tuple(range(width - 1)):
+                    if (num_drafts > i) & (verifying[0] != 0):
                         # -1 is a placeholder draft that is always rejected.
-                        if (target[0] == draft[0]) & (draft[0] >= 0):
-                            sampled[req, i] = draft[0]
+                        if (targets[i] == drafts[i]) & (drafts[i] >= 0):
+                            sampled[req, i] = drafts[i]
                             accepted[0] = accepted[0] + 1
                         else:
-                            sampled[req, i] = target[0]
+                            sampled[req, i] = targets[i]
                             verifying[0] = 0
-                if accepted[0] == num_drafts[0]:
-                    # Every draft accepted: the bonus position's argmax.
-                    sampled[req, num_drafts[0]] = target_ids[start[0] + num_drafts[0]]
+                if accepted[0] == num_drafts:
+                    # Every draft accepted: the bonus position's target.
+                    sampled[req, num_drafts] = targets[num_drafts]
                 num_sampled[req] = T.cast(accepted[0] + 1, T.int32)
 
     return greedy_rejection
 
 
+def greedy_rejection_key(
+    width: int, drafts_dtype: torch.dtype, ranks: int, pair_width: int
+) -> tuple:
+    return (width, _DTYPES[drafts_dtype], ranks, pair_width)
+
+
 def greedy_rejection_sample(
-    target_ids: torch.Tensor,
+    pairs: torch.Tensor,
     draft_sampled: torch.Tensor,
     cu_num_logits: torch.Tensor,
     num_speculative_steps: int,
+    pair_width: int = 4,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """``greedy_verification.greedy_rejection_sample``."""
+    """``greedy_verification.greedy_rejection_sample``: the targets selected from
+    the gathered pairs ([rows, pair_width * ranks] FP32) and the drafts verified
+    against them, in one launch."""
     num_reqs = cu_num_logits.shape[0] - 1
     sampled = draft_sampled.new_empty(
         num_reqs, num_speculative_steps + 1, dtype=torch.int64
     )
     num_sampled = sampled.new_empty(num_reqs, dtype=torch.int32)
     if num_reqs > 0:
+        if pairs.shape[1] % pair_width:
+            raise ValueError(
+                f"{pairs.shape[1]} pair columns are not whole {pair_width}-column pairs"
+            )
         kernel = _kernel(
             greedy_rejection_kernel,
-            num_speculative_steps + 1,
-            _DTYPES[draft_sampled.dtype],
+            *greedy_rejection_key(
+                num_speculative_steps + 1,
+                draft_sampled.dtype,
+                pairs.shape[1] // pair_width,
+                pair_width,
+            ),
         )
-        kernel(sampled, num_sampled, target_ids, draft_sampled, cu_num_logits)
+        kernel(sampled, num_sampled, pairs, draft_sampled, cu_num_logits)
     return sampled, num_sampled
 
 
@@ -2806,7 +2866,7 @@ def greedy_calls(
     logits: Sequence[torch.dtype] = (),
     select: Sequence[tuple[torch.dtype, int, int]] = (),
     finish_outputs: Sequence[torch.dtype] = (),
-    rejection_widths: Sequence[int] = (),
+    rejection: Sequence[tuple[int, int, int]] = (),
 ) -> list:
     """The greedy reductions' calls: ``greedy_markov_shard_pair`` /
     ``sample_greedy_markov`` for each ``(base, bias)`` dtype pair, and
@@ -2814,8 +2874,9 @@ def greedy_calls(
     element-wise reads, which the launch picks from the rows' alignment); the
     pair finish when there is a pair, ``select_first_argmax`` for each
     ``(output dtype, ranks, pair width)``, ``sample_greedy_markov``'s index finish
-    for each of ``finish_outputs``, and greedy verification for each sampled
-    width."""
+    for each of ``finish_outputs``, and greedy verification (its selection of the
+    targets included) for each ``(sampled width, ranks, pair width)`` of
+    ``rejection``."""
     calls = [
         _call(partial_argmax_kernel, *partial_argmax_key(base, bias, vector))
         for base, bias in markov
@@ -2840,8 +2901,10 @@ def greedy_calls(
         for dtype, ranks, width in select
     ]
     calls += [
-        _call(greedy_rejection_kernel, width, _DTYPES[dtype])
-        for width in rejection_widths
+        _call(
+            greedy_rejection_kernel, *greedy_rejection_key(width, dtype, ranks, pairs)
+        )
+        for width, ranks, pairs in rejection
         for dtype in (torch.int32, torch.int64)
     ]
     return _unique(calls)
