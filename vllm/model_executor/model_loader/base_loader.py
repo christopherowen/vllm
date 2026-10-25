@@ -9,6 +9,7 @@ import vllm.envs as envs
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
+from vllm.model_executor.model_loader import weight_digest
 from vllm.model_executor.model_loader.reload import finalize_layerwise_processing
 from vllm.model_executor.model_loader.utils import (
     initialize_model,
@@ -73,6 +74,9 @@ class BaseModelLoader(ABC):
 
             logger.debug("Loading weights on %s ...", load_device)
             self.load_weights(model, model_config)
+            if weight_digest.ENABLED:
+                # The loader's bytes, before processing turns them into kernel layouts.
+                weight_digest.log_weight_digest(model)
 
             # Log peak GPU memory after loading weights. This is needed
             # to have test coverage on peak memory for online quantization.
