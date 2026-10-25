@@ -37,9 +37,11 @@ row and then compacts.
 - Collectives see ``Tp = N * ceil(T / N)`` rows; each rank owns ``L = Tp / N``
   rows, rank r the padded rows ``[r * L, (r + 1) * L)``.
 - Kernels never see more than T rows: gathered tensors are used as ``[:T]``.
-- Reduce-scatter inputs are Tp-row buffers whose pad rows are zero.
-- The last rank's local rows can include pad rows. They stay finite and are
-  never read back into real outputs.
+- Reduce-scatter inputs are Tp-row buffers whose pad rows are zero; unreduced
+  parts (see "Unreduced results") leave their pad rows unwritten.
+- The last rank's local rows can include pad rows. Every op on local rows is
+  row-wise and every gather keeps the first T rows, so a pad row's values,
+  whatever they are (arbitrary after unreduced parts), never reach a real row.
 
 ## Where each op runs
 
@@ -74,7 +76,9 @@ sum: every rank's partial of this rank's rows is exchanged into one
 ``(N, L, hidden)`` buffer, this rank's own written in place, and the decoder layer
 hands it on as ``RankOrderParts``. TileLang mHC's ``post_pre`` adds the parts in
 rank order as it loads them, the same arithmetic and the same bits as the
-rank-order reduce-scatter; any other consumer calls ``sum()``.
+rank-order reduce-scatter; any other consumer calls ``sum()``. Only real rows are
+projected into the buffers: the pad rows of the last rank's block are neither
+projected nor filled (``Rows``).
 """
 
 from collections.abc import Iterator
@@ -332,7 +336,6 @@ class SPRows:
         if slices == 1 and not per_block:
             flat = send.view(world * local, *row_shape)
             project(0, tokens, flat[:tokens])
-            flat[tokens:].zero_()
             parts[self.rank].copy_(send[self.rank])
             if then is not None:
                 then()
@@ -350,8 +353,6 @@ class SPRows:
                 real = max(0, min(stop, tokens) - start)
                 if real:
                     project(start, start + real, dest[owner, lo : lo + real])
-                if real < hi - lo:
-                    dest[owner, lo + real : hi].zero_()
             if side is not None:
                 side.wait_stream(main)
                 with torch.cuda.stream(side):

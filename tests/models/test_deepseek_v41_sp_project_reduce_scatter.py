@@ -66,7 +66,9 @@ def test_wo_slices():
 def test_unreduced_parts_hold_every_block(monkeypatch, tokens, rank, slices, per_block):
     """Unreduced rows send every other rank's block, slice by slice, and keep this
     rank's own block in its slot of the parts (the other ranks stood in by
-    copies of it)."""
+    copies of it). Only real rows are projected; the pad rows of the last rank's
+    block are not filled (nothing is zeroed), and whatever they hold stays in
+    them: the real rows' parts and sums are the zero-padded projection's."""
     from types import SimpleNamespace
 
     from vllm.models.deepseek_v4_1.tilelang import collectives
@@ -77,6 +79,11 @@ def test_unreduced_parts_hold_every_block(monkeypatch, tokens, rank, slices, per
     )
     group = SimpleNamespace(device_communicator=SimpleNamespace(pynccl_comm="comm"))
     monkeypatch.setattr(sp_prefill, "get_tp_group", lambda: group)
+
+    def refuse(self, *args, **kwargs):
+        raise AssertionError("a pad row was filled")
+
+    monkeypatch.setattr(torch.Tensor, "zero_", refuse)
     sent = []
 
     def exchange_into(comm, chunks, parts, r, w):
@@ -104,25 +111,31 @@ def test_unreduced_parts_hold_every_block(monkeypatch, tokens, rank, slices, per
         per_block=per_block,
     )
     torch.cuda.synchronize()
+    monkeypatch.undo()
     if slices == 1 and not per_block:
         assert calls == [(0, tokens)]  # one projection
     padded = torch.zeros(rows.padded_rows, 8, device="cuda")
     padded[:tokens] = source
     blocks = padded.view(world, rows.local_rows, 8)
-    assert parts.shape == (world, rows.local_rows, 8)
+    local = rows.local_rows
+
+    def real(owner):  # the real rows of the owner's block
+        return max(0, min(local, tokens - owner * local))
+
+    assert parts.shape == (world, local, 8)
     for peer in range(world):
-        assert torch.equal(parts[peer], blocks[rank])
+        assert torch.equal(parts[peer, : real(rank)], blocks[rank, : real(rank)])
     sent = torch.cat(sent, dim=1)
     for peer in range(world):
         if peer != rank:
-            assert torch.equal(sent[peer], blocks[peer])
+            assert torch.equal(sent[peer, : real(peer)], blocks[peer, : real(peer)])
     projected = sorted(i for start, stop in calls for i in range(start, stop))
     assert projected == list(range(tokens))
     assert order == [len(calls)]
-    assert torch.equal(
-        sp_prefill.materialize(sp_prefill.unreduced_parts(parts)),
-        collectives.rank_order_sum(list(parts)),
-    )
+    total = sp_prefill.materialize(sp_prefill.unreduced_parts(parts))
+    assert torch.equal(total, collectives.rank_order_sum(list(parts)))
+    zero_padded = collectives.rank_order_sum([blocks[rank]] * world)
+    assert torch.equal(total[: real(rank)], zero_padded[: real(rank)])
 
 
 @pytest.mark.parametrize("tokens", [37, 40, 205])

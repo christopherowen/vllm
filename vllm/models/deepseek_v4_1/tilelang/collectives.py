@@ -326,14 +326,16 @@ def all_reduce_rank_order(
     comm, input_tensor: torch.Tensor, rank: int, world: int
 ) -> torch.Tensor:
     """The sum over ranks of ``input_tensor`` at any size, with the one-shot
-    all-reduce's arithmetic: its rows (zero-padded to a multiple of ``world``) are
+    all-reduce's arithmetic: its rows (padded to a multiple of ``world``) are
     reduce-scattered in rank order, then all-gathered, which moves bits without
-    arithmetic. A row has the same bits as the one-shot path would give it."""
+    arithmetic. A row has the same bits as the one-shot path would give it. The
+    padding rows are summed and gathered like the others and then dropped, so
+    they are not filled: whatever they hold reaches no real row."""
     rows = input_tensor.shape[0]
     flat = input_tensor.reshape(rows, -1)
     padded = -(-rows // world) * world
     if padded != rows or not flat.is_contiguous():
-        buffer = flat.new_zeros((padded, flat.shape[1]))
+        buffer = flat.new_empty((padded, flat.shape[1]))
         buffer[:rows].copy_(flat)
     else:
         buffer = flat

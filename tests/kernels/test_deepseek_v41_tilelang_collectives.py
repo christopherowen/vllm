@@ -165,6 +165,32 @@ def test_all_reduce_adds_as_the_one_shot_all_reduce(world, rows):
         assert torch.equal(out[rank], want)
 
 
+@pytest.mark.parametrize("world", [2, 3, 4])
+@pytest.mark.parametrize("rows", [1, 5, 13])
+def test_all_reduce_pads_without_a_fill(monkeypatch, world, rows):
+    """The padding rows are summed, gathered and dropped, never filled: with the
+    padded buffer's rows NaN (whatever the allocator left), every real row is still
+    the one-shot sum, bit for bit."""
+    allocate = torch.Tensor.new_empty
+
+    def poisoned(self, *args, **kwargs):
+        return allocate(self, *args, **kwargs).fill_(float("nan"))
+
+    def refuse(self, *args, **kwargs):
+        raise AssertionError("the padded buffer was zero-filled")
+
+    monkeypatch.setattr(torch.Tensor, "new_empty", poisoned)
+    monkeypatch.setattr(torch.Tensor, "new_zeros", refuse)
+    torch.manual_seed(world * 1000 + rows)
+    width = 24
+    inputs = [torch.randn(rows, width).to(torch.bfloat16) for _ in range(world)]
+    out = _run(inputs, all_reduce_rank_order)
+    want = _reference(inputs)
+    for rank in range(world):
+        assert out[rank].shape == (rows, width)
+        assert torch.equal(out[rank], want)
+
+
 def test_row_bits_do_not_depend_on_owner_or_batch():
     # One row's partials at every position of batches of two sizes: the reduced
     # row has the same bits wherever it lands and whichever rank owns it.
