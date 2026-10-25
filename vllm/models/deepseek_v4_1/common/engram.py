@@ -571,18 +571,16 @@ def column_shard(geometry, layer_index: int, tp_size: int, tp_rank: int):
     return tuple(range(tp_rank, columns, tp_size))
 
 
-def interleaved_rows(local: torch.Tensor, tp_size: int) -> torch.Tensor:
+def interleaved_rows(local: torch.Tensor) -> torch.Tensor:
     """Rows ``[T, 24 * 256]`` in column order from every rank's columns: ``local`` is
-    this rank's ``[T, (24 / tp_size) * 256]``, columns ``rank, rank + tp, ...``. The
-    all-gather lays them out rank-major, so rank r's k-th block is column k * tp + r;
-    a transpose puts them back. Exact copies: the same values as one reader's rows."""
+    this rank's ``[T, (24 / tp) * 256]``, columns ``rank, rank + tp, ...`` side by
+    side. All-gathered as 256-wide rows along the last dimension, rank r's k-th block
+    of token t lands at column k * tp + r of the token's row: the column order, with
+    no copy before or after the collective (the one-shot all-gather writes the layout
+    directly). Exact copies: the same values as one reader's rows."""
     tokens = local.shape[0]
-    gathered = tensor_model_parallel_all_gather(local, dim=-1)
-    return (
-        gathered.view(tokens, tp_size, 24 // tp_size, 256)
-        .transpose(1, 2)
-        .reshape(tokens, 24 * 256)
-    )
+    gathered = tensor_model_parallel_all_gather(local.view(-1, 256), dim=-1)
+    return gathered.view(tokens, 24 * 256)
 
 
 class ParallelEngramEmbedding(nn.Module):
@@ -895,12 +893,14 @@ class Engram(nn.Module):
             torch.empty(self.hc_mult * self.dim, dtype=torch.float32),
             persistent=False,
         )
-        # Zeroed: a gather writes only its own step's rows.
+        # Zeroed: a gather writes only its own step's rows. A disk table sharded on
+        # hash columns gathers only its own columns, side by side.
+        columns = self.embed_tokens.columns
         self.register_buffer(
             "staged_rows",
             torch.zeros(
                 caps.max_tokens,
-                6144,
+                6144 if columns is None else len(columns) * 256,
                 dtype=torch.bfloat16,
                 device=caps.device,
             ),
@@ -1140,17 +1140,9 @@ class Engram(nn.Module):
             raise RuntimeError("Disk Engram output is not prepared")
         if self.embed_tokens.table_memory == "disk":
             self.embed_tokens.gather_rows(self.staged_rows[: hash_ids.shape[0]])
-        columns = self.embed_tokens.columns
-        if columns is not None:
+        if self.embed_tokens.columns is not None:
             # This rank's gathered rows are its hash columns, every tp-th.
-            tp_size = 24 // len(columns)
-            tokens = hash_ids.shape[0]
-            local = (
-                self.staged_rows[:tokens]
-                .view(tokens, len(columns), tp_size, 256)[:, :, columns[0], :]
-                .reshape(tokens, len(columns) * 256)
-            )
-            rows = interleaved_rows(local, tp_size)
+            rows = interleaved_rows(self.staged_rows[: hash_ids.shape[0]])
         else:
             rows = tensor_model_parallel_all_reduce(
                 self.staged_rows[: hash_ids.shape[0]]

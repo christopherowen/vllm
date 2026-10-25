@@ -11,11 +11,11 @@ stream:
   that reports a failure, records the step and the time waited and stops the GPU,
   so no kernel after it reads stale rows. One wait per table and step: polling host
   memory from every gather block cost about 0.5 us a block.
-- the gather: one block per (head, token) dequantizes the row as b12x's Engram
-  lookup does (the value times its E8M0 scale, 2^-127 for byte 0 and NaN for 255,
-  rounded to BF16) into the token's head slice. A token past the step, or a row
-  outside this rank's shard or hash columns, loads nothing and writes zeros (the
-  reader leaves those slots untouched).
+- the gather: one block per (column, token) of this rank's hash columns dequantizes
+  the row as b12x's Engram lookup does (the value times its E8M0 scale, 2^-127 for
+  byte 0 and NaN for 255, rounded to BF16) into the token's slice of the column, the
+  rank's columns side by side. A token past the step, or a row outside this rank's
+  shard, loads nothing and writes zeros (the reader leaves those slots untouched).
 - the release: one thread writes the step it gathered into the control block, so the
   reader may now fill the buffers with the next step's early rows (those the host
   hashed while this step ran).
@@ -158,6 +158,18 @@ def engram_rows_release_kernel():
     return engram_rows_release
 
 
+def column_span(columns: int) -> tuple[int, int, int]:
+    """The hash columns of the 24-bit mask ``columns`` as (first, step, count): a
+    rank reads every ``step``-th column from its ``first`` (``column_shard``)."""
+    heads = [head for head in range(HEADS) if columns >> head & 1]
+    step = heads[1] - heads[0] if len(heads) > 1 else 1
+    if not heads or heads != list(range(heads[0], HEADS, step))[: len(heads)]:
+        raise ValueError(
+            f"Engram row columns must be every n-th column from the first: {columns:#x}"
+        )
+    return heads[0], step, len(heads)
+
+
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
 def engram_rows_gather_kernel(
     max_lookups: int,
@@ -168,6 +180,7 @@ def engram_rows_gather_kernel(
     vec: int = 4,
 ):
     assert threads * vec == ROW and 32 % vec == 0
+    first, step, count = column_span(columns)
     tokens = T.dynamic("tokens")
 
     @T.prim_func
@@ -176,30 +189,27 @@ def engram_rows_gather_kernel(
         num_tokens: T.Tensor((1,), T.int32),
         rows: T.Tensor((max_lookups, ROW), T.float8_e4m3fn),
         scales: T.Tensor((max_lookups, SCALES), T.uint8),
-        out: T.Tensor((tokens, HEADS * ROW), T.bfloat16),
+        out: T.Tensor((tokens, count * ROW), T.bfloat16),
     ):
-        with T.Kernel(HEADS, tokens, threads=threads) as (head, t):
+        with T.Kernel(count, tokens, threads=threads) as (column, t):
             tx = T.get_thread_binding()
+            head = first + column * step
             row = ids[t, head]
             lookup = t * HEADS + head
             owned = (t < num_tokens[0]) & (row >= shard_start) & (row < shard_end)
-            if columns != (1 << HEADS) - 1:
-                owned = owned & (
-                    T.bitwise_and(T.shift_right(T.int32(columns), head), 1) == 1
-                )
             if owned:
                 exponent = T.cast(scales[lookup, tx * vec // 32], T.uint32)
                 scale = T.reinterpret(T.shift_left(exponent, 23), T.float32)
                 scale = T.if_then_else(exponent == 0, T.float32(2.0**-127), scale)
                 scale = T.if_then_else(exponent == 255, T.float32(float("nan")), scale)
                 for i in T.vectorized(vec):
-                    out[t, head * ROW + tx * vec + i] = T.cast(
+                    out[t, column * ROW + tx * vec + i] = T.cast(
                         T.cast(rows[lookup, tx * vec + i], T.float32) * scale,
                         T.bfloat16,
                     )
             else:
                 for i in T.vectorized(vec):
-                    out[t, head * ROW + tx * vec + i] = T.bfloat16(0)
+                    out[t, column * ROW + tx * vec + i] = T.bfloat16(0)
 
     return engram_rows_gather
 
@@ -232,10 +242,11 @@ def engram_rows_gather(
     columns: int = (1 << HEADS) - 1,
 ) -> None:
     """Wait for the staged step's rows, dequantize the first ``num_tokens`` tokens'
-    rows into ``out`` ([tokens, 24 * 256] BF16), then release the buffers to the
-    reader. ``ids`` ([>= tokens, 24] int64) are the step's row IDs; ``rows``,
-    ``scales`` and ``control`` are the reader's mapped buffers; the rank owns the
-    rows in [shard_start, shard_end) of the hash columns in the mask ``columns``."""
+    rows into ``out`` ([tokens, columns * 256] BF16: the rank's hash columns side by
+    side), then release the buffers to the reader. ``ids`` ([>= tokens, 24] int64)
+    are the step's row IDs; ``rows``, ``scales`` and ``control`` are the reader's
+    mapped buffers; the rank owns the rows in [shard_start, shard_end) of the hash
+    columns in the mask ``columns``, every n-th from the first."""
     engram_rows_wait_kernel()(control)
     tokens = out.shape[0]
     if tokens:

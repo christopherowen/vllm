@@ -50,10 +50,11 @@ def _write_table(directory: str, seed: int = 0):
 
 
 def _reference(codes, scales, ids, live, start, end, columns=ALL_COLUMNS):
-    """b12x's lookup in torch: value times its E8M0 scale, rounded to BF16."""
-    rows = ids.cpu().long()
+    """b12x's lookup in torch: value times its E8M0 scale, rounded to BF16, of the
+    hash columns in the mask ``columns``, side by side."""
+    owned = [h for h in range(HEADS) if columns >> h & 1]
+    rows = ids.cpu().long()[:, owned]
     local = (rows >= start) & (rows < end)
-    local &= torch.tensor([bool(columns >> h & 1) for h in range(HEADS)])[None, :]
     local[live:] = False
     safe = rows.clamp(0, TABLE_ROWS - 1)
     values = codes[safe].view(torch.float8_e4m3fn).float()
@@ -77,7 +78,8 @@ def _rows(paths, start=0, end=TABLE_ROWS, tokens=16, **kwargs):
 def _step(rows, ids, live):
     stream = torch.cuda.current_stream()
     num_tokens = torch.tensor([live], dtype=torch.int32, device="cuda")
-    out = torch.full((ids.shape[0], HEADS * 256), 7, dtype=torch.bfloat16, device="cuda")
+    width = bin(rows.columns).count("1") * 256  # the rank's columns, side by side
+    out = torch.full((ids.shape[0], width), 7, dtype=torch.bfloat16, device="cuda")
     rows.stage(stream, ids, ids.numel())
     rows.gather(out, ids, num_tokens)
     return out, num_tokens
@@ -493,6 +495,19 @@ def test_timeline_records_each_step_and_the_gpu_wait():
         env=env, capture_output=True, text=True, timeout=600,
     )
     assert result.returncode == 0, result.stderr[-3000:]
+
+
+def test_the_gather_takes_every_nth_column():
+    """The gather writes a rank's columns side by side: every n-th from the first
+    (``column_shard``), or it refuses the mask."""
+    from vllm.models.deepseek_v4_1.tilelang.engram_rows import column_span
+
+    assert column_span(ALL_COLUMNS) == (0, 1, HEADS)
+    assert column_span(TP3_RANK1) == (1, 3, 8)
+    assert column_span(1 << 23) == (23, 1, 1)
+    for columns in (0, 0b1011, (1 << 2) | (1 << 5) | (1 << 9)):
+        with pytest.raises(ValueError, match="every n-th"):
+            column_span(columns)
 
 
 @pytest.mark.parametrize("columns", [0, 1 << HEADS])

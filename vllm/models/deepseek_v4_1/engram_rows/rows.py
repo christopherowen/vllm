@@ -182,8 +182,9 @@ class EngramDiskRows:
 
     def gather(self, out: torch.Tensor, ids: torch.Tensor, num_tokens: torch.Tensor) -> None:
         """Wait for the staged step's rows and dequantize the first ``num_tokens``
-        tokens' rows into ``out`` (``[tokens, 24 * 256]`` BF16), zero elsewhere and for
-        rows outside this rank's shard or columns. Capturable in a CUDA graph."""
+        tokens' rows into ``out`` (``[tokens, columns * 256]`` BF16, this rank's hash
+        columns side by side), zero elsewhere and for rows outside this rank's shard.
+        Capturable in a CUDA graph."""
         from vllm.models.deepseek_v4_1.tilelang.engram_rows import engram_rows_gather
 
         engram_rows_gather(ids, num_tokens, self.rows_e4m3, self.scales.device_view,

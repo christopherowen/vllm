@@ -1082,11 +1082,13 @@ def test_disk_rows_read_whole_table_sources(tmp_path, dist_init, tp_rank):
             embed.num_tokens.copy_(count)
             module.stage_rows(capacity, torch.cuda.current_stream())
             embed.gather_rows(output)
-            reference = weight.float()[ids.cpu() + shift].flatten(1).bfloat16()
-            owned = torch.tensor([bool(embed.column_mask >> h & 1) for h in range(24)])
-            reference[:, ~owned.repeat_interleave(256)] = 0
-            assert int(owned.sum()) == 24 // caps.tp_size
-            torch.testing.assert_close(output.cpu(), reference, rtol=0, atol=0)
+            # The rank's own columns, side by side.
+            owned = [h for h in range(24) if embed.column_mask >> h & 1]
+            assert len(owned) == 24 // caps.tp_size
+            reference = weight.float()[ids.cpu()[:, owned] + shift].flatten(1)
+            torch.testing.assert_close(
+                output.cpu(), reference.bfloat16(), rtol=0, atol=0
+            )
             assert output.data_ptr() == address
     finally:
         embed.close()
@@ -1113,7 +1115,8 @@ def test_disk_shards_interleave_hash_columns(tp_size):
 
 @pytest.mark.parametrize("tp_size", [1, 2, 3, 4, 6])
 def test_interleaved_rows_restore_column_order(tp_size, monkeypatch):
-    """Every rank's columns, all-gathered rank-major, go back to column order exactly."""
+    """Every rank's columns, all-gathered as 256-wide rows along the last dimension,
+    are the column order exactly, with no copy after the collective."""
     import vllm.models.deepseek_v4_1.common.engram as engram_module
 
     tokens = 5
@@ -1122,9 +1125,14 @@ def test_interleaved_rows_restore_column_order(tp_size, monkeypatch):
         full.view(tokens, 24 // tp_size, tp_size, 256)[:, :, r, :].reshape(tokens, -1)
         for r in range(tp_size)
     ]
-    monkeypatch.setattr(
-        engram_module, "tensor_model_parallel_all_gather",
-        lambda local, dim: torch.cat(locals_, dim=dim),
-    )
-    rows = engram_module.interleaved_rows(locals_[0], tp_size)
+    gathered = []
+
+    def all_gather(local, dim):
+        assert local.shape == (tokens * 24 // tp_size, 256) and dim == -1
+        gathered.append(torch.cat([part.view(-1, 256) for part in locals_], dim=dim))
+        return gathered[-1]
+
+    monkeypatch.setattr(engram_module, "tensor_model_parallel_all_gather", all_gather)
+    rows = engram_module.interleaved_rows(locals_[0])
     assert torch.equal(rows.view(torch.int16), full.view(torch.int16))
+    assert rows.data_ptr() == gathered[0].data_ptr()
