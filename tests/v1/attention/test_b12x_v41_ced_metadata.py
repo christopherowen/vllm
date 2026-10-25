@@ -255,8 +255,7 @@ def test_draft_window_starts_where_the_drafter_has_context(
     """The drafter's context rows are the CED decoder's kept rows, so a draft
     window starts at CED's replay start: before it, nothing of the request's draft
     window was written in its current blocks."""
-    from vllm.models.deepseek_v4_1.attention import _chunk
-    from vllm.triton_utils import triton
+    from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
 
     state, starts, seq = _state([chunk], [seq_len], prefix=[prefix])
     if limit is not None:
@@ -269,17 +268,19 @@ def test_draft_window_starts_where_the_drafter_has_context(
     )
     reqs = torch.zeros(drafts, dtype=torch.int32, device="cuda")
     table = torch.arange(1, 129, dtype=torch.int32, device="cuda").repeat(4, 1)
-    draft_starts = torch.tensor([0, drafts, drafts, drafts, drafts], device="cuda")
+    draft_starts = torch.tensor(
+        [0, drafts, drafts, drafts, drafts], dtype=torch.int32, device="cuda"
+    )
     request_positions = torch.tensor([draft_prefix, -1, -1, -1], device="cuda")
     for replay_start, start in ((state.replay_start, first), (None, None)):
         swa = torch.full((drafts, width), 7, dtype=torch.int32, device="cuda")
         lengths = torch.full((drafts,), 7, dtype=torch.int32, device="cuda")
         top = torch.full((drafts,), 7, dtype=torch.int32, device="cuda")
         visible = torch.zeros(drafts, dtype=torch.int32, device="cuda")
-        _chunk[(drafts,)](
+        tl_metadata.chunk(
             positions, reqs, table, swa, lengths, top, visible, draft_starts,
-            request_positions, 0, table.stride(0), page, window, width, True,
-            triton.next_power_of_2(width), swa_replay_start=replay_start,
+            request_positions, 0, drafts, page=page, window=window, draft=True,
+            replay_start=replay_start,
         )  # fmt: skip
         if start is None:
             # Unbounded, the window reaches back a whole window from the anchor.
