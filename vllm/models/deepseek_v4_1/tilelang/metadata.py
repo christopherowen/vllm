@@ -156,6 +156,12 @@ def _window_macro(page, window, width, draft, replay, threads, per_thread):
             end = T.if_then_else(valid, T.Cast(T.int64, starts[req + 1]), T.int64(0))
             prefix = T.if_then_else(valid, request_positions[req], T.int64(0))
             info[0] = T.max(prefix - window, T.int64(0))
+            if replay:
+                # The drafter's context rows are the CED decoder's kept rows:
+                # before the replay start its window holds nothing written.
+                info[0] = T.max(
+                    info[0], T.if_then_else(valid, replay_start[req], T.int64(0))
+                )
             length = prefix + end - first - info[0]
         else:
             info[0] = T.max(pos + 1 - window, T.int64(0))
@@ -357,7 +363,7 @@ def chunk(
 ) -> None:  # fmt: skip
     """``attention._chunk`` for ``rows`` rows from source row ``offset``."""
     width = swa.shape[1]
-    replay = replay_start is not None and not draft
+    replay = replay_start is not None
     chunk_kernel(page, window, width, draft, replay)(
         positions, reqs, table, swa[:rows], lengths[:rows], top_lengths[:rows],
         visible, starts, request_positions,
@@ -372,7 +378,7 @@ def decode_metadata(
 ) -> None:  # fmt: skip
     """``chunk`` then ``pages`` of the main cache for ``rows`` rows, one launch."""
     width, main_width = swa.shape[1], main_pages.shape[1]
-    replay = replay_start is not None and not draft
+    replay = replay_start is not None
     decode_metadata_kernel(page, window, width, draft, replay, main_width)(
         positions, reqs, table, swa[:rows], lengths[:rows], top_lengths[:rows],
         visible, starts, request_positions,

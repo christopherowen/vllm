@@ -8,7 +8,7 @@ import torch.nn as nn
 
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.models.deepseek_v4_1.ced import (
     CED_WINDOW,
@@ -173,6 +173,16 @@ class DeepseekV41ModelState(DefaultModelState):
                 pipeline=parallel.pipeline_parallel_size > 1,
                 sink_columns=model.get_sink_residual_columns() is not None,
             )
+            # The drafter (loaded before the model state) keeps context only for
+            # the decoder's kept rows: its windows start at the same replay bound,
+            # read from the buffer its captured graphs were recorded with.
+            from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention
+
+            for layer in get_layers_from_vllm_config(
+                vllm_config, DeepseekV4Attention
+            ).values():
+                if layer.is_draft:
+                    layer.bind_draft_replay_start(self.ced_state.replay_start)
             if (
                 is_breakable_cudagraph_enabled()
                 and self.max_num_tokens == 4096

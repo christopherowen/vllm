@@ -237,6 +237,62 @@ def test_prefix_hit_short_chunk_has_no_unwritten_decoder_history():
 
 
 @cuda
+@pytest.mark.parametrize(
+    "chunk, seq_len, prefix, limit, first",
+    [
+        # A 17-row first chunk after a prefix hit at 4096: [4096 - 111, 4096)
+        # precedes the hit, and the drafter's caches are not prefix-cached.
+        (17, 4096 + 17, 4096, None, 4096),
+        # A one-row nonfinal chunk: the decoder, and with it the drafter's
+        # context, kept the chunk's last row only.
+        (4096, 8192, 0, 1, 8191),
+    ],
+    ids=["prefix-hit-short-chunk", "one-row-nonfinal-chunk"],
+)
+def test_draft_window_starts_where_the_drafter_has_context(
+    chunk, seq_len, prefix, limit, first
+):
+    """The drafter's context rows are the CED decoder's kept rows, so a draft
+    window starts at CED's replay start: before it, nothing of the request's draft
+    window was written in its current blocks."""
+    from vllm.models.deepseek_v4_1.attention import _chunk
+    from vllm.triton_utils import triton
+
+    state, starts, seq = _state([chunk], [seq_len], prefix=[prefix])
+    if limit is not None:
+        state.stage(starts, seq, [chunk], [False], [prefix], [limit])
+    assert state.replay_start[0].item() == first
+    drafts, page, window, width = 6, 128, 128, 136
+    draft_prefix = seq_len  # the step's anchor: drafts follow its last row
+    positions = torch.arange(
+        draft_prefix, draft_prefix + drafts, device="cuda", dtype=torch.int64
+    )
+    reqs = torch.zeros(drafts, dtype=torch.int32, device="cuda")
+    table = torch.arange(1, 129, dtype=torch.int32, device="cuda").repeat(4, 1)
+    draft_starts = torch.tensor([0, drafts, drafts, drafts, drafts], device="cuda")
+    request_positions = torch.tensor([draft_prefix, -1, -1, -1], device="cuda")
+    for replay_start, start in ((state.replay_start, first), (None, None)):
+        swa = torch.full((drafts, width), 7, dtype=torch.int32, device="cuda")
+        lengths = torch.full((drafts,), 7, dtype=torch.int32, device="cuda")
+        top = torch.full((drafts,), 7, dtype=torch.int32, device="cuda")
+        visible = torch.zeros(drafts, dtype=torch.int32, device="cuda")
+        _chunk[(drafts,)](
+            positions, reqs, table, swa, lengths, top, visible, draft_starts,
+            request_positions, 0, table.stride(0), page, window, width, True,
+            triton.next_power_of_2(width), swa_replay_start=replay_start,
+        )  # fmt: skip
+        if start is None:
+            # Unbounded, the window reaches back a whole window from the anchor.
+            start = draft_prefix - window
+        length = draft_prefix + drafts - start
+        assert lengths.tolist() == [length] * drafts
+        logical = torch.arange(start, start + length, device="cuda")
+        expected = table[0, logical // page].long() * page + logical % page
+        assert torch.equal(swa[:, :length].long(), expected.expand(drafts, -1))
+        assert torch.all(swa[:, length:] == -1)
+
+
+@cuda
 def test_nonfinal_chunk_keeps_its_last_row():
     state, starts, seq = _state([7, 4096], [900, 4096])
     state.stage(starts, seq, [7, 4096], [False, False], [0, 0], [128, 1])

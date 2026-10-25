@@ -125,6 +125,9 @@ def _chunk(
         end = tl.load(Starts + req + 1, valid, other=0).to(tl.int64)
         prefix = tl.load(RequestPositions + req, valid, other=0).to(tl.int64)
         start = tl.maximum(prefix - WINDOW, 0)
+        if swa_replay_start is not None:
+            replay = tl.load(swa_replay_start + req, valid, other=0).to(tl.int64)
+            start = tl.maximum(start, replay)
         length = prefix + end - first - start
     else:
         start = tl.maximum(pos + 1 - WINDOW, 0)

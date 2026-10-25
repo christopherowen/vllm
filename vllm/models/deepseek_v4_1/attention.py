@@ -463,6 +463,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         self.is_ced_decoder = (
             not self.is_draft and boundary is not None and self.layer_id >= boundary
         )
+        # With a CED decoder the drafter's context rows are its kept rows, so a
+        # draft window starts at CED's replay start (bind_draft_replay_start).
+        self._draft_replays = self.is_draft and boundary is not None
+        self._draft_replay_start: torch.Tensor | None = None
         self.swa_width = self.window_size
         if self.is_draft:
             from vllm.v1.attention.backends.mla.compressor_utils import (
@@ -770,9 +774,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         calls = []
         # _write_decode_metadata: the window metadata, with the main page table in
         # the same launch on compressed layers. A CED decoder's rows start no
-        # earlier than their request's replay start when the step has one.
+        # earlier than their request's replay start when the step has one; a
+        # drafter's beside a CED decoder always do.
         replays = (
-            (False, True) if self.is_ced_decoder and not self.is_draft else (False,)
+            (True,)
+            if self._draft_replays
+            else (False, True)
+            if self.is_ced_decoder
+            else (False,)
         )
         for replay in replays:
             args = (
@@ -2003,6 +2012,21 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             cache_format="deepseek_v41",
         )
 
+    def bind_draft_replay_start(self, replay_start: torch.Tensor) -> None:
+        """A drafter layer's window bound: CED's per-request replay start (the
+        model state's persistent buffer, rewritten every step before the drafter
+        runs). Before it, the request's draft window was never written: the
+        decoder kept no rows there, or they precede a prefix hit."""
+        assert self._draft_replays
+        self._draft_replay_start = replay_start
+
+    def _replay_start(self, swa):
+        if self.is_ced_decoder:
+            return swa.swa_replay_start
+        if self._draft_replays:
+            return self._draft_replay_start
+        return None
+
     def _write_decode_metadata(self, buffers, swa, main, rows):
         swa_indices, swa_lengths, top_lengths = buffers[:3]
         visible = main.cache_lengths if main is not None else swa.cache_lengths
@@ -2013,7 +2037,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 page=self.swa_cache_layer.block_size,
                 window=self.window_size,
                 draft=self.is_draft,
-                replay_start=swa.swa_replay_start if self.is_ced_decoder else None,
+                replay_start=self._replay_start(swa),
             )
             common = (
                 swa.positions,
@@ -2058,7 +2082,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             self.swa_width,
             self.is_draft,
             triton.next_power_of_2(self.swa_width),
-            swa_replay_start=swa.swa_replay_start if self.is_ced_decoder else None,
+            swa_replay_start=self._replay_start(swa),
         )
         if main is not None:
             _pages[(rows, triton.cdiv(self._main_width, 128))](

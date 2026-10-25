@@ -107,7 +107,7 @@ def _token_metadata(s, nr, nt, page):
 
 @pytest.mark.parametrize("lengths", STEPS)
 @pytest.mark.parametrize(
-    "draft, replay", [(False, False), (False, True), (True, False)]
+    "draft, replay", [(False, False), (False, True), (True, False), (True, True)]
 )
 @pytest.mark.parametrize("width", [128, 136])
 def test_chunk(lengths, draft, replay, width):
@@ -163,7 +163,7 @@ def test_pages(lengths, width, read_width):
 
 @pytest.mark.parametrize("lengths", STEPS)
 @pytest.mark.parametrize(
-    "draft, replay", [(False, False), (False, True), (True, False)]
+    "draft, replay", [(False, False), (False, True), (True, False), (True, True)]
 )
 def test_decode_metadata_equals_chunk_and_pages(lengths, draft, replay):
     page, window, width, main_width = 64, 128, 128, 256
