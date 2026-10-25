@@ -401,6 +401,8 @@ def _run_tp_confidence_consistency(rank, port):
             )
             manager.add_request(0)
             manager.add_request(1)
+            # The runner applies the new requests' confidences after adding them.
+            manager.apply_staged_writes()
             batch = SimpleNamespace(
                 num_reqs=1,
                 idx_mapping=torch.tensor([0], dtype=torch.int32, device=device),

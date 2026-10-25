@@ -1557,6 +1557,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if scheduler_output.scheduled_new_reqs:
             self.req_states.apply_staged_writes()
             self.model_state.apply_staged_writes()
+            if self.adaptive_verification is not None:
+                self.adaptive_verification.apply_staged_writes()
         if self.sampler is not None:
             self.sampler.apply_staged_writes()
 
@@ -2146,6 +2148,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 + tilelang_inputs.scatter_rows_calls(
                     torch.int64, torch.float32, gather=False
                 )
+                # The new requests' confidences (apply_staged_writes).
+                + tilelang_inputs.fill_rows_calls(torch.int64, torch.float32)
             )
         self.req_states.register_warmups()
         if not samples:

@@ -758,6 +758,52 @@ def flatten_sampled_calls() -> list:
 
 _SCATTER_THREADS = 128
 
+_SCALARS = {"int32": T.int32, "int64": T.int64, "float32": T.float32}
+
+
+@tilelang.jit(pass_configs=_PASS)
+def fill_rows_kernel(idx_dtype: str, dtype: str):
+    """``state[rows] = value``, whole rows, a negative index wrapping as torch's
+    indexing does: the new requests' rows reset (the request state's drafts to 0,
+    adaptive verification's confidences to 1), where torch filled each request's
+    row as it was added. A thread an element."""
+    count, state_rows, state_cols, state_stride = T.dynamic(
+        "count, state_rows, state_cols, state_stride"
+    )
+    grid = T.ceildiv(count * state_cols, _SCATTER_THREADS)
+
+    @T.prim_func
+    def fill_rows(
+        rows: T.Tensor((count,), idx_dtype),
+        state: T.StridedTensor((state_rows, state_cols), (state_stride, 1), dtype),
+        value: _SCALARS[dtype],
+    ):
+        with T.Kernel(grid, threads=_SCATTER_THREADS) as b:
+            e = b * _SCATTER_THREADS + T.get_thread_binding()
+            r = T.min(e // state_cols, count - 1)
+            j = e % state_cols
+            index = T.alloc_var(T.int64, init=T.cast(rows[r], T.int64))
+            if e < count * state_cols:
+                state[T.if_then_else(index < 0, index + state_rows, index), j] = value
+
+    return fill_rows
+
+
+def fill_rows_key(idx_dtype: torch.dtype, dtype: torch.dtype) -> tuple:
+    return (_DTYPES[idx_dtype], _DTYPES[dtype])
+
+
+def fill_rows(rows: torch.Tensor, state: torch.Tensor, value: float) -> None:
+    """``state[rows] = value`` for a 2-D ``state`` of contiguous rows."""
+    if rows.numel() and state.shape[1]:
+        _kernel(fill_rows_kernel, *fill_rows_key(rows.dtype, state.dtype))(
+            rows, state, value
+        )
+
+
+def fill_rows_calls(idx_dtype: torch.dtype, dtype: torch.dtype) -> list:
+    return [_call(fill_rows_kernel, *fill_rows_key(idx_dtype, dtype))]
+
 
 @tilelang.jit(pass_configs=_PASS)
 def scatter_rows_kernel(idx_dtype: str, dtype: str, gather: bool):

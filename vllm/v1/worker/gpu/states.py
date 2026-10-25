@@ -3,6 +3,8 @@
 import numpy as np
 import torch
 
+from vllm.utils.torch_utils import async_tensor_h2d
+from vllm.v1.worker.gpu import tilelang_inputs
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
 
 
@@ -76,6 +78,8 @@ class RequestState:
             dtype=torch.int64,
             device=device,
         )
+        # The new requests' draft rows, zeroed together (apply_staged_writes).
+        self._new_draft_rows: list[int] = []
 
         self.next_prefill_tokens = torch.zeros(
             num_prefill_lookahead,
@@ -85,9 +89,16 @@ class RequestState:
         )
 
     def register_warmups(self) -> None:
-        """Register the staged writes of the request state."""
+        """Register the staged writes of the request state, and the new requests'
+        draft rows reset (apply_staged_writes)."""
         for tensor in (self.all_token_ids, self.total_len, self.num_computed_tokens):
             tensor.register_warmup()
+        if self.num_speculative_steps:
+            tilelang_inputs.declare(
+                lambda: tilelang_inputs.fill_rows_calls(
+                    torch.int64, self.draft_tokens.dtype
+                )
+            )
 
     @property
     def num_reqs(self) -> int:
@@ -119,9 +130,16 @@ class RequestState:
         self.num_computed_tokens_np[req_idx] = num_computed_tokens
         self.num_computed_tokens.stage_write_elem(req_idx, num_computed_tokens)
 
-        self.draft_tokens[req_idx].zero_()
+        self._new_draft_rows.append(req_idx)
 
     def apply_staged_writes(self) -> None:
+        if self._new_draft_rows:
+            # The new requests' draft rows zeroed in one launch.
+            rows = async_tensor_h2d(
+                self._new_draft_rows, dtype=torch.int64, device=self.device
+            )
+            tilelang_inputs.fill_rows(rows, self.draft_tokens, 0)
+            self._new_draft_rows.clear()
         self.prompt_len.copy_to_uva()
         self.prefill_len.copy_to_uva()
         self.total_len.apply_write()

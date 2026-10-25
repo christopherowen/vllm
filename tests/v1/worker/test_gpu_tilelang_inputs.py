@@ -1389,3 +1389,26 @@ def test_declared_calls_cover_the_call_sites(monkeypatch):
     )
     lookback.gather_lookback(window, idx, computed, history)
     assert used == [lookback.gather_lookback_key(3, tli.RUNNER_IDX_DTYPE)]
+
+
+@pytest.mark.parametrize("num_rows", [1, 3, 64])
+@pytest.mark.parametrize(
+    "dtype, width, value", [(torch.int64, 5, 0), (torch.float32, 5, 1.0)]
+)
+def test_fill_rows(num_rows, dtype, width, value):
+    """New requests' rows reset as torch's row fills did: the request state's
+    drafts to 0 and adaptive verification's confidences to 1, whole rows, a
+    repeated and a negative (wrapping) index included."""
+    gen = _gen(num_rows + width)
+    state = _randint(-(1 << 20), 1 << 20, (128, width), gen, torch.int64).to(dtype)
+    rows = _randint(0, state.shape[0], (num_rows,), gen, torch.int64)
+    if num_rows > 2:
+        rows[1] = rows[0]
+        rows[2] = -1
+    expected = state.clone()
+    expected[rows] = value
+    tli.fill_rows(rows, state, value)
+    torch.accelerator.synchronize()
+    assert torch.equal(state, expected)
+    ((_, declared, _),) = tli.fill_rows_calls(torch.int64, dtype)
+    assert declared == tli.fill_rows_key(torch.int64, dtype)
