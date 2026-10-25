@@ -1073,6 +1073,12 @@ class Engram(nn.Module):
         sequence_parallel = (
             0 < self.prefill_sp_min_rows <= self.embed_tokens.caps.max_tokens
         )
+        if sequence_parallel:
+            # SP's trailing pad rows pass through (forward).
+            from vllm.models.deepseek_v4_1.tilelang import columns
+
+            key = columns.copy_columns_key(self.hc_mult * self.dim, torch.bfloat16)
+            calls.append(prepare.call(columns.copy_columns_kernel, *key))
         if sequence_parallel and isinstance(self.wkv, _PaddedColumnParallelLinear):
             calls.append(
                 prepare.call(
@@ -1169,7 +1175,12 @@ class Engram(nn.Module):
             # Gate the real local rows; the trailing pad rows pass through.
             start, real = sp_rows.start, sp_rows.real_rows
             if real < state.shape[0]:
-                out[real:].copy_(state[real:])
+                if kernels.uses_tilelang():
+                    from vllm.models.deepseek_v4_1.tilelang import columns
+
+                    columns.copy_columns(state[real:], out[real:])
+                else:
+                    out[real:].copy_(state[real:])
             if real == 0:
                 return out.view_as(hidden_states)
             state, mix_out = state[:real], out[:real]
