@@ -147,6 +147,15 @@ def test_activate_logs_info():
     assert "Kernel JIT monitor activated" in m.call_args[0][0]
 
 
+def test_activate_off_installs_nothing():
+    fake = _make_fake_knobs()
+    with _patch_jit_modules(fake):
+        jit_monitor.activate(mode="off")
+    assert not jit_monitor.is_active()
+    assert fake.runtime.jit_post_compile_hook is None
+    assert not jit_monitor._tilelang_hook_installed
+
+
 def test_activate_rejects_unknown_mode():
     with pytest.raises(ValueError, match="Unsupported JIT monitor mode"):
         jit_monitor.activate(mode="panic")  # type: ignore[arg-type]

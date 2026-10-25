@@ -34,7 +34,7 @@ from vllm.platforms import current_platform
 from vllm.triton_utils.importing import HAS_TRITON
 
 logger = init_logger(__name__)
-JitMonitorMode = Literal["warn", "error"]
+JitMonitorMode = Literal["off", "warn", "error"]
 
 _active: bool = False
 _mode: JitMonitorMode = "warn"
@@ -58,14 +58,15 @@ def activate(*, mode: JitMonitorMode = "warn", verbose: bool = False) -> None:
     compilation or autotuning benchmark that happens during inference will be
     logged as a warning or raised as an error, depending on ``mode``.
 
-    Safe to call multiple times; subsequent calls are no-ops.
+    Safe to call multiple times; subsequent calls are no-ops. ``off`` installs
+    nothing.
 
     If the user has explicitly set ``TRITON_PRINT_AUTOTUNING=0`` in
     their environment, autotuning printing is left disabled; the JIT
     compilation hook is still registered regardless.
     """
     global _active, _mode, _verbose
-    if _active:
+    if _active or mode == "off":
         return
     if mode not in ("warn", "error"):
         raise ValueError(f"Unsupported JIT monitor mode: {mode!r}")
@@ -134,7 +135,9 @@ def _setup_dynamo_compile_hook() -> None:
     try:
         from torch._dynamo.callback import on_compile_start
     except Exception:
-        logger.debug("torch._dynamo callbacks are unavailable; skipping the Dynamo monitor.")
+        logger.debug(
+            "torch._dynamo callbacks are unavailable; skipping the Dynamo monitor."
+        )
         return
 
     def _on_compile_start(*args, **kwargs) -> None:

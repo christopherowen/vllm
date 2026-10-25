@@ -350,7 +350,7 @@ def test_jit_monitor_verbose_arg():
     assert EngineArgs(model="test", jit_monitor_verbose=True).jit_monitor_verbose
 
 
-@pytest.mark.parametrize("mode", ["warn", "error"])
+@pytest.mark.parametrize("mode", ["off", "warn", "error"])
 def test_jit_monitor_mode_arg(mode):
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
     args = parser.parse_args(["--jit-monitor-mode", mode])

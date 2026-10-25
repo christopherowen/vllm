@@ -770,7 +770,9 @@ class EngineArgs:
     enable_logging_iteration_details: bool = (
         ObservabilityConfig.enable_logging_iteration_details
     )
-    jit_monitor_mode: Literal["warn", "error"] = ObservabilityConfig.jit_monitor_mode
+    jit_monitor_mode: Literal["off", "warn", "error"] = (
+        ObservabilityConfig.jit_monitor_mode
+    )
     jit_monitor_verbose: bool = ObservabilityConfig.jit_monitor_verbose
     enable_mm_processor_stats: bool = ObservabilityConfig.enable_mm_processor_stats
     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy

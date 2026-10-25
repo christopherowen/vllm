@@ -88,8 +88,11 @@ class ObservabilityConfig:
     This includes number of context/generation requests and tokens
     and the elapsed cpu time for the iteration."""
 
-    jit_monitor_mode: Literal["warn", "error"] = "warn"
-    """How to handle post-warmup JIT compilation events."""
+    jit_monitor_mode: Literal["off", "warn", "error"] = "warn"
+    """How to handle post-warmup JIT compilation events. ``off`` installs no
+    hooks: where every kernel is prepared and the kernel caches are frozen, a
+    compile fails by name anyway, and the TileLang hook re-parses each eager
+    launch's cache key."""
 
     jit_monitor_verbose: bool = False
     """Log every monitored JIT compile with runtime details. This can emit many
