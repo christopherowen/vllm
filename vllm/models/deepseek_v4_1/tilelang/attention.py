@@ -92,7 +92,8 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
 
     def declare_kernels(self) -> None:
         """Also declare the sparse MLA, indexer and MXFP4 quantizer kernels; binding
-        builds the plans and reserves their scratch, before memory profiling."""
+        allocates the layer's staging, builds the plans and reserves their scratch,
+        before memory profiling."""
         super().declare_kernels()
         calls = self._plan_calls()
         prepare.declare(lambda: calls, bind=self._bind_plans)
@@ -152,6 +153,10 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
         return calls
 
     def _bind_plans(self) -> None:
+        # The staging is mutable serving state: ordinary tensors, not inference
+        # tensors of the worker's profiling scope.
+        with torch.inference_mode(False):
+            self._prepare(self.rotary_emb.cos_sin_cache.device)
         self._tilelang_plans = self._build_tilelang_plans()
 
     def _tilelang(self) -> SimpleNamespace:

@@ -394,3 +394,118 @@ def test_wo_prefill_remainders_reuse_declared_chunk_capacity():
     assert module._wo_plans == declarations
     assert not module._wo_plan(1).query.dynamic_tokens
     assert module._wo_plan(8).query.max_tokens == 8
+
+
+def _tilelang_layer(monkeypatch, layer_id):
+    """A TileLang attention layer with the geometry its bind reads (no weights)."""
+    from vllm.models.deepseek_v4_1 import attention
+    from vllm.models.deepseek_v4_1.tilelang.attention import (
+        DeepseekV41TileLangAttention,
+    )
+
+    monkeypatch.setattr(attention.kernels, "uses_tilelang", lambda: True)
+    module = DeepseekV41TileLangAttention.__new__(DeepseekV41TileLangAttention)
+    torch.nn.Module.__init__(module)
+    module.prefix = f"model.layers.{layer_id}.attn"
+    module.layer_id, module.candidate_source_layer = layer_id, 3
+    module.capacity, module.swa_width, module.compress_ratio = 300, 128, 1
+    module._main_page = module._index_page = 64
+    module._main_width = module._index_width = 16
+    module.is_ced_decoder, module.is_index_source = False, True
+    module.topk_indices_buffer = None
+    module.indexer = SimpleNamespace(heads=32)
+    module.compressor = None
+    module.config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+        speculative_config=None,
+        compilation_config=SimpleNamespace(max_cudagraph_capture_size=24),
+    )
+    module.rotary_emb = SimpleNamespace(cos_sin_cache=torch.zeros(16, 64))
+    module._helper_plans = {}
+    module._ready = False
+    return attention, module
+
+
+def test_tilelang_attention_declares_no_b12x_unit(monkeypatch):
+    attention, module = _tilelang_layer(monkeypatch, layer_id=3)
+    workload = SimpleNamespace(stage="weights")
+    helpers = attention._AttentionHelpers(module)
+    assert helpers.get_b12x_preparation_units(helpers, workload) == ()
+    assert module.get_b12x_preparation_units(module, workload) == ()
+    assert module._helper_plans == {} and not module._ready
+
+
+@pytest.mark.parametrize(
+    "layer_id,staging",
+    [
+        (2, ["topk_indices_buffer", "_index_pages", "_active", "_short_index_pages"]),
+        (
+            3,
+            [
+                "topk_indices_buffer",
+                "_index_pages",
+                "_active",
+                "_candidates",
+                "_candidate_lens",
+            ],
+        ),
+    ],
+)
+def test_tilelang_binding_prepares_the_attention_staging(
+    monkeypatch, layer_id, staging
+):
+    # B12X's kv helper plan used to allocate the staging while it was prepared;
+    # under TileLang the layer's kernel binding does, before memory profiling.
+    _, module = _tilelang_layer(monkeypatch, layer_id)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    module._build_tilelang_plans = lambda: "plans"
+    module._attention_geometry()  # declare_kernels() runs it before binding
+    with torch.inference_mode():  # the worker prepares kernels inside it
+        module._bind_plans()
+    assert module._ready and module._tilelang_plans == "plans"
+    assert [name for name, _, _ in module._staging_specs] == staging
+    for name, shape, dtype in module._staging_specs:
+        tensor = getattr(module, name)
+        assert tuple(tensor.shape) == shape and tensor.dtype == dtype
+        assert not tensor.is_inference()  # updated in place while serving
+    assert module._active.tolist() == [16 * 64]
+
+
+def test_tilelang_context_kv_write_needs_no_helper_plan(monkeypatch):
+    from vllm.models.deepseek_v4_1.tilelang import cache_writer, rope
+
+    _, module = _tilelang_layer(monkeypatch, layer_id=3)
+    writes = []
+    monkeypatch.setattr(rope, "rope_", lambda *args: None)
+    monkeypatch.setattr(
+        cache_writer, "write_cache", lambda *args, **kwargs: writes.append(kwargs)
+    )
+    module.swa_cache_layer = SimpleNamespace(
+        kv_cache=torch.empty(2, 8, dtype=torch.uint8), block_size=64
+    )
+    module._ready = True
+    kv = torch.zeros(1, 512, dtype=torch.bfloat16)
+    slots = torch.zeros(1, dtype=torch.int64)
+    module.insert_context_kv(kv, slots, slots)
+    assert writes == [dict(page_size=64, cache_kind="swa")]
+
+
+def test_b12x_cache_writes_use_the_helper_plan_of_their_kind(monkeypatch):
+    from vllm.models.deepseek_v4_1 import attention
+
+    monkeypatch.setattr(attention.kernels, "uses_tilelang", lambda: False)
+    plans = []
+    monkeypatch.setattr(
+        attention.mla, "write_cache", lambda *args, **kwargs: plans.append(kwargs)
+    )
+    module = attention.DeepseekV4Attention.__new__(attention.DeepseekV4Attention)
+    torch.nn.Module.__init__(module)
+    module.prefix = "model.layers.0.attn"
+    module._helper_plans = {"swa_cache_write": "swa", "indexed_cache_write": "main"}
+    x = torch.zeros(1, 512, dtype=torch.bfloat16)
+    cache = torch.empty(2, 8, dtype=torch.uint8)
+    slots = torch.zeros(1, dtype=torch.int64)
+    for kind in ("swa", "indexed"):
+        module._write_v41_cache(x, cache, slots, page_size=64, cache_kind=kind)
+    assert [kwargs["plan"] for kwargs in plans] == ["swa", "main"]
+    assert {kwargs["cache_format"] for kwargs in plans} == {"deepseek_v41"}

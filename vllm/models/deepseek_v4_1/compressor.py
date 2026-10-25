@@ -162,7 +162,14 @@ class DeepseekCompressor(nn.Module):
         self.fused_wkv_wgate.out_dtype = (
             torch.float32 if compress_ratio == 2 else torch.bfloat16
         )
-        self.norm = B12xRMSNorm(512, vllm_config.model_config.hf_config.rms_norm_eps)
+        if kernels.uses_tilelang():
+            # The TileLang compression applies the norm's weight itself: the
+            # module only holds the parameter, under its checkpoint name.
+            self.norm = nn.Module()
+        else:
+            self.norm = B12xRMSNorm(
+                512, vllm_config.model_config.hf_config.rms_norm_eps
+            )
         self.norm.weight = nn.Parameter(
             torch.ones(512, dtype=torch.float32), requires_grad=False
         )

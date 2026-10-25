@@ -72,6 +72,37 @@ def test_binding_allocates_the_serving_storage(monkeypatch):
     assert compressor._primer_starts is None
 
 
+@pytest.mark.parametrize("tilelang", [False, True])
+def test_norm_weight_loads_unchanged_and_only_b12x_builds_a_norm(monkeypatch, tilelang):
+    # The TileLang compression applies the norm's weight itself, so no B12X norm
+    # (and no preparation unit) is built; the checkpoint loads the same parameter.
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers import linear
+    from vllm.models.deepseek_v4_1 import b12x_layers
+
+    for module in (linear, parameter):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
+        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(compressor_module.kernels, "uses_tilelang", lambda: tilelang)
+    monkeypatch.setattr(b12x_layers, "_capacity", lambda: TOKENS)
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=TOKENS, max_num_seqs=REQUESTS
+        ),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(rms_norm_eps=1e-6)),
+    )
+    compressor = DeepseekCompressor(config, 1, 32, 512, prefix="layers.0.compressor")
+    weight = dict(compressor.named_parameters())["norm.weight"]
+    assert weight is compressor.norm.weight
+    assert weight.shape == (512,) and weight.dtype == torch.float32
+    assert not weight.requires_grad and not hasattr(weight, "weight_loader")
+    if tilelang:
+        assert type(compressor.norm) is torch.nn.Module
+        assert not hasattr(compressor.norm, "b12x_preparation_provider")
+    else:
+        assert isinstance(compressor.norm, b12x_layers.B12xRMSNorm)
+
+
 def test_forwarding_before_binding_fails_by_name(monkeypatch):
     compressor = _compressor(monkeypatch, 1)
     with pytest.raises(PreparationResourceUnavailableError, match="bound"):
