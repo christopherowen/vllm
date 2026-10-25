@@ -1158,6 +1158,16 @@ class MoeExpertsV41Plan:
     ``workspace_specs(rows)`` lists one call's scratch. Its owner calls
     ``declare_kernels()`` when preparing kernels; ``run`` launches the kernels it
     binds.
+
+    Each grouped-GEMM tile holds ``block_M`` routes of one expert and reads that
+    expert's weight slab again, so a call's tile height is chosen by its rows
+    (``tile_height``): decode keeps ``block_M``, whose partial tiles cost least
+    when an expert has a few routes; a prefill call, where the average expert has
+    at least one full ``block_M`` tile, uses ``prefill_block_M`` rows a tile and
+    reads the weights half as often a route (GB10, one layer's experts at TP3's
+    768 columns a rank: 11% faster at 8,192 tokens, 19% at 16,384; spark-ds41f
+    experiments/2026-10-26-tp3-budget-memory). A row's sum over K runs in the same
+    order at either height, so its output has the same bits.
     """
 
     def __init__(
@@ -1169,6 +1179,7 @@ class MoeExpertsV41Plan:
         *,
         swiglu_limit=None,
         block_M=32,
+        prefill_block_M=64,
         block_N=128,
         num_stages=3,
         out_dtype=torch.bfloat16,
@@ -1179,21 +1190,30 @@ class MoeExpertsV41Plan:
             hidden,
             intermediate,
         )
-        self.block_M, self.block_N = block_M, block_N
+        self.block_M, self.prefill_block_M, self.block_N = (
+            block_M,
+            prefill_block_M,
+            block_N,
+        )
         self.num_stages = num_stages
         self.swiglu_limit = swiglu_limit
         # Routers emit int32 or int64 expert ids. The combine writes ``out_dtype``.
         self.out_dtype = out_dtype
-        self.dispatch = {
-            dtype: MoeDispatchV41Plan(
-                num_experts, topk, block_M, hidden, dtype, out_dtype
-            )
-            for dtype in (torch.int32, torch.int64)
-        }
+        self.dispatch, self.prefill_dispatch = (
+            {
+                dtype: MoeDispatchV41Plan(
+                    num_experts, topk, height, hidden, dtype, out_dtype
+                )
+                for dtype in (torch.int32, torch.int64)
+            }
+            for height in (block_M, prefill_block_M)
+        )
         self.tk = _tile_kernels(block_M)
 
     def kernels(self) -> dict:
-        """The grouped GEMMs and the fused SwiGLU, as the calls ``bind`` makes."""
+        """The grouped GEMMs and the fused SwiGLU at both tile heights, as the calls
+        ``bind`` makes: ``gate_up``, ``down`` and ``swiglu`` at ``block_M``, and the
+        same with a ``prefill_`` prefix at ``prefill_block_M``."""
         config = dict(
             block_N=self.block_N, num_stages=self.num_stages, coded_scales=True
         )
@@ -1203,9 +1223,9 @@ class MoeExpertsV41Plan:
             self.hidden,
             self.intermediate,
         )
-        block_M = self.block_M
-        return {
-            "gate_up": prepare.call(
+        kernels = {}
+        for prefix, block_M in (("", self.block_M), ("prefill_", self.prefill_block_M)):
+            kernels[f"{prefix}gate_up"] = prepare.call(
                 grouped_fp8_fp4_gemm,
                 num_experts,
                 2 * inter,
@@ -1214,8 +1234,8 @@ class MoeExpertsV41Plan:
                 True,
                 block_M,
                 **config,
-            ),
-            "down": prepare.call(
+            )
+            kernels[f"{prefix}down"] = prepare.call(
                 grouped_fp8_fp4_gemm,
                 num_experts,
                 hidden,
@@ -1224,24 +1244,49 @@ class MoeExpertsV41Plan:
                 False,
                 block_M,
                 **config,
-            ),
-            "swiglu": prepare.call(moe_swiglu_cast, inter, block_M, self.swiglu_limit),
-        }
+            )
+            kernels[f"{prefix}swiglu"] = prepare.call(
+                moe_swiglu_cast, inter, block_M, self.swiglu_limit
+            )
+        return kernels
+
+    def tile_height(self, rows: int) -> int:
+        """The tile height of a call of ``rows`` tokens: ``prefill_block_M`` once the
+        average expert has a full ``block_M`` tile of routes (``rows * topk >=
+        block_M * num_experts``: 2,048 tokens for V4.1's 384 experts at top-6),
+        else ``block_M``. Decode steps and their CUDA graphs stay below it."""
+        if rows * self.topk >= self.block_M * self.num_experts:
+            return self.prefill_block_M
+        return self.block_M
+
+    def _dispatch_for(self, rows: int, idx_dtype):
+        """The dispatch plan of a call at its tile height."""
+        if self.tile_height(rows) == self.block_M:
+            return self.dispatch[idx_dtype]
+        return self.prefill_dispatch[idx_dtype]
+
+    def _kernels_for(self, rows: int):
+        """The (gate/up, SwiGLU, down) kernels of a call at its tile height."""
+        if self.tile_height(rows) == self.block_M:
+            return self.gate_up, self.swiglu, self.down
+        return self.prefill_gate_up, self.prefill_swiglu, self.prefill_down
 
     def declare_kernels(self) -> None:
         """Declare the grouped GEMMs, the fused SwiGLU and each dispatch plan's
         kernels, stored on the plans once prepared."""
 
+        dispatches = (*self.dispatch.values(), *self.prefill_dispatch.values())
+
         def calls() -> list[prepare.TileLangCall]:
             out = _calls(self.kernels())
-            for dispatch in self.dispatch.values():
+            for dispatch in dispatches:
                 out.extend(_calls(dispatch.kernels()))
             return out
 
         def bind() -> None:
             for name, kernel in _launch(self.kernels()).items():
                 setattr(self, name, kernel)
-            for dispatch in self.dispatch.values():
+            for dispatch in dispatches:
                 dispatch.bind()
 
         prepare.declare(calls, bind=bind)
@@ -1268,8 +1313,10 @@ class MoeExpertsV41Plan:
         return tuple(prepared)
 
     def workspace_specs(self, rows, idx_dtype=torch.int64):
-        dispatch = self.dispatch[idx_dtype]
-        layout_rows = dispatch.tiles(rows) * self.block_M
+        """One call's scratch, laid out for the call's tile height (``tile_height``):
+        ``prefill_block_M`` tiles pad each expert's routes to more rows."""
+        dispatch = self._dispatch_for(rows, idx_dtype)
+        layout_rows = dispatch.tiles(rows) * dispatch.block_M
         hidden, inter = self.hidden, self.intermediate
         return (
             *dispatch.workspace_specs(rows),
@@ -1307,7 +1354,8 @@ class MoeExpertsV41Plan:
         unchanged until its last call.
         """
         rows = topk_ids.shape[0]
-        dispatch = self.dispatch[topk_ids.dtype]
+        dispatch = self._dispatch_for(rows, topk_ids.dtype)
+        gate_up_kernel, swiglu_kernel, down_kernel = self._kernels_for(rows)
         specs = self.workspace_specs(rows, topk_ids.dtype)
         if workspace is None:
             workspace = torch.empty(
@@ -1321,9 +1369,9 @@ class MoeExpertsV41Plan:
         order, tile_expert = layout["order"], layout["tile_expert"]
         # The gather reads the live rows only; padding rows past them are not read.
         x_words, h_words = x.scales.view(torch.uint32), h_sf.view(torch.uint32)
-        self.gate_up(x.values, x_words, *_present(gate_up), order, tile_expert, h)
-        self.swiglu(h, hq, h_sf, order, layout["layout_weights"], tile_expert)
-        self.down(hq, h_words, *_present(down), order, tile_expert, y)
+        gate_up_kernel(x.values, x_words, *_present(gate_up), order, tile_expert, h)
+        swiglu_kernel(h, hq, h_sf, order, layout["layout_weights"], tile_expert)
+        down_kernel(hq, h_words, *_present(down), order, tile_expert, y)
         if callable(shared):
             shared = shared()
         if out is not None:

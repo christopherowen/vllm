@@ -522,6 +522,81 @@ def test_moe_swiglu_cast_equals_tile_kernels(
             assert a[first].float().isnan().any()
 
 
+def test_tile_height_follows_routes_per_expert():
+    """A call takes the prefill tiles once the average expert has a full decode tile
+    of routes; decode steps (at most 16 streams x 6 rows) and the drafter keep the
+    decode tiles, and each call's scratch is laid out at its own height."""
+    plan = MoeExpertsV41Plan(384, 6, 5120, 768, swiglu_limit=LIMIT)
+    assert plan.tile_height(96) == plan.tile_height(2047) == 32
+    assert plan.tile_height(2048) == plan.tile_height(24576) == 64
+    drafter = MoeExpertsV41Plan(128, 3, 5120, 768, swiglu_limit=LIMIT)
+    assert drafter.tile_height(96) == 32
+    for rows, height in ((2047, 32), (2048, 64), (16384, 64)):
+        layout_rows = (
+            plan.workspace_specs(rows, torch.int32)[-4][0][0]  # the gate/up output
+        )
+        tiles = min(rows * 6, -(-rows * 6 // height) + 384)
+        assert layout_rows == tiles * height, (rows, layout_rows)
+
+
+@pytest.mark.parametrize("hidden, intermediate", [(512, 256), (384, 576), (384, 768)])
+@pytest.mark.parametrize("rows", [170, 171, 1000])
+@pytest.mark.parametrize("idx_dtype", [torch.int32, torch.int64])
+def test_prefill_tiles_give_the_decode_tiles_bits(
+    rows, idx_dtype, hidden, intermediate, num_experts=32, topk=6
+):
+    """A call's output has the same bits at the prefill tile height as at the decode
+    one: every row's sum over K runs in the same order whatever the tile height
+    (171 rows is the first prefill call at 32 experts, top-6)."""
+    w13_packed, w13_sf, _ = _experts(num_experts, 2 * intermediate, hidden, 5)
+    w2_packed, w2_sf, _ = _experts(num_experts, hidden, intermediate, 6)
+    x = (torch.randn((rows, hidden), generator=_gen(7), device=DEVICE) * 0.5).bfloat16()
+    ids, route_weights = _routes(rows, num_experts, topk, 8, idx_dtype)
+    outs = {}
+    for prefill_block_M in (64, 32):  # 32: the decode tiles at every size
+        plan = _plan(
+            num_experts,
+            topk,
+            hidden,
+            intermediate,
+            swiglu_limit=LIMIT,
+            prefill_block_M=prefill_block_M,
+        )
+        weights = plan.prepare_weights(w13_packed, w13_sf, w2_packed, w2_sf)
+        outs[prefill_block_M] = torch.empty_like(x)
+        plan.run(cast_mxfp8(x), ids, route_weights, weights, outs[prefill_block_M])
+    assert _plan(
+        num_experts, topk, hidden, intermediate, swiglu_limit=LIMIT
+    ).tile_height(rows) == (64 if rows >= 171 else 32)
+    assert torch.equal(outs[64].view(torch.int16), outs[32].view(torch.int16))
+
+
+@pytest.mark.parametrize("intermediate", [576, 768])
+@pytest.mark.parametrize("rows", [2048, 4096])
+def test_moe_swiglu_cast_prefill_tiles_equal_tile_kernels(
+    rows, intermediate, num_experts=384, topk=6
+):
+    """At the prefill tile height (64 rows) the fused SwiGLU's bytes and scales still
+    equal TileKernels' kernel over the same layout."""
+    try:
+        layout, h = _swiglu_case(rows, intermediate, num_experts, topk, block_M=64)
+        live = layout["order"] >= 0
+        ours = moe_swiglu_cast(intermediate, 64, LIMIT)
+        theirs = _tile_kernels_swiglu(intermediate, num_experts, 64)
+        a, a_sf = _swiglu_outputs(h.shape[0], intermediate)
+        b, b_sf = _swiglu_outputs(h.shape[0], intermediate)
+        ours(
+            h, a, a_sf, layout["order"], layout["layout_weights"], layout["tile_expert"]
+        )
+        theirs(h, b, b_sf, layout["psum"], layout["layout_weights"], 1.0, None)
+        cols = intermediate // 32
+        assert torch.equal(a[live].view(torch.uint8), b[live].view(torch.uint8))
+        assert torch.equal(a_sf[live, :cols], b_sf[live, :cols])
+    finally:
+        # The plans' decode tiles: TileKernels' alignment is process-wide.
+        tile_kernels.config.set_token_alignment(32)
+
+
 @pytest.mark.parametrize("k", [5120, 576, 768, 256])
 def test_scale_codes_are_the_words_exactly(k):
     """A row base and 4-bit deltas give back every scale word byte for byte (padding
