@@ -671,6 +671,31 @@ def test_logits_rows(num_logits, index_dtype):
     assert torch.equal(pos, positions[indices])
 
 
+@pytest.mark.parametrize("num_reqs", REQUEST_COUNTS[1:])
+@pytest.mark.parametrize("tail", [0, 5])
+def test_flatten_sampled(num_reqs, tail):
+    """The verified tokens at their logits rows, against the Triton kernel and
+    the zeros it wrote into: requests with 1 to 1 + 5 rows, any number of them
+    sampled, rows past the last request (``tail``) zero."""
+    from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
+        _flatten_sampled_kernel,
+    )
+
+    gen = _gen(num_reqs * 3 + tail)
+    rows = _randint(1, DRAFTS + 2, (num_reqs,), gen)
+    cu = _starts(rows.tolist())
+    num_sampled = torch.minimum(_randint(0, DRAFTS + 2, (num_reqs,), gen), rows)
+    sampled = _randint(0, 1 << 17, (num_reqs + 2, DRAFTS + 3), gen, torch.int64)
+    num_logits = int(cu[-1]) + tail
+    expected = torch.zeros(num_logits, dtype=torch.int64, device=DEVICE)
+    _flatten_sampled_kernel[(num_reqs,)](
+        expected, sampled, sampled.stride(0), num_sampled, cu, num_warps=1
+    )
+    actual = tli.flatten_sampled(sampled, num_sampled, cu, num_logits)
+    torch.accelerator.synchronize()
+    assert torch.equal(actual, expected)
+
+
 @pytest.mark.parametrize(
     "live,rows", [(0, 0), (0, 8), (6, 8), (96, 96), (90, 128), (16000, MAX_TOKENS)]
 )
@@ -1111,8 +1136,13 @@ def test_step_glue_declarations_cover_their_launches(monkeypatch):
     for index_dtype in (torch.int64, torch.int32):
         tli.logits_rows(ids, positions, _randint(0, 64, (24,), gen, index_dtype))
     torch.accelerator.synchronize()
+    tli.flatten_sampled(
+        drafts[:4], _randint(0, DRAFTS, (4,), gen), _starts([3, 2, 6, 1]), 12
+    )
+    torch.accelerator.synchronize()
     declared = (
-        tli.scatter_rows_calls(torch.int64, torch.int64, gather=True)
+        tli.flatten_sampled_calls()
+        + tli.scatter_rows_calls(torch.int64, torch.int64, gather=True)
         + tli.scatter_rows_calls(torch.int64, torch.float32, gather=False)
         + tli.adaptive_offsets_calls()
         + tli.padding_rows_calls()

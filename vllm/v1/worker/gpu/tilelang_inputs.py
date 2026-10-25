@@ -664,6 +664,70 @@ def padding_rows_calls() -> list:
     return [_call(padding_rows_kernel)]
 
 
+# --- Verified tokens, one a logits row ----------------------------------------------
+
+_FLATTEN_THREADS = 128
+
+
+@tilelang.jit(pass_configs=_PASS)
+def flatten_sampled_kernel():
+    """``rejection_sampler._flatten_sampled_kernel`` and the zeros it wrote into:
+    logits row ``cu_num_logits[r] + i`` takes request ``r``'s ``i``-th sampled
+    token while ``i < num_sampled[r]``, every other row 0. A thread a row, its
+    request found by a search over the request starts."""
+    num_logits, num_reqs, cu_len, sampled_rows, width, sampled_stride = T.dynamic(
+        "num_logits, num_reqs, cu_len, sampled_rows, width, sampled_stride"
+    )
+
+    @T.prim_func
+    def flatten_sampled(
+        flat: T.Tensor((num_logits,), T.int64),
+        sampled: T.StridedTensor((sampled_rows, width), (sampled_stride, 1), T.int64),
+        num_sampled: T.Tensor((num_reqs,), T.int32),
+        cu_num_logits: T.Tensor((cu_len,), T.int32),
+    ):
+        with T.Kernel(
+            T.ceildiv(num_logits, _FLATTEN_THREADS), threads=_FLATTEN_THREADS
+        ) as b:
+            row = b * _FLATTEN_THREADS + T.get_thread_binding()
+            req = T.alloc_var(T.int32, init=-1)
+            for r in T.serial(num_reqs):
+                if (cu_num_logits[r] <= row) & (row < cu_num_logits[r + 1]):
+                    req = r
+            if row < num_logits:
+                if req >= 0:
+                    i = row - cu_num_logits[req]
+                    flat[row] = T.if_then_else(
+                        i < num_sampled[req],
+                        sampled[req, T.min(i, width - 1)],
+                        T.int64(0),
+                    )
+                else:
+                    flat[row] = T.int64(0)
+
+    return flatten_sampled
+
+
+def flatten_sampled(
+    sampled: torch.Tensor,
+    num_sampled: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    num_logits: int,
+) -> torch.Tensor:
+    """Each request's sampled tokens at its logits rows, 0 elsewhere ([num_logits]
+    int64)."""
+    flat = torch.empty(num_logits, dtype=sampled.dtype, device=sampled.device)
+    if num_logits:
+        _kernel(flatten_sampled_kernel)(
+            flat, sampled, num_sampled, _as(cu_num_logits, torch.int32)
+        )
+    return flat
+
+
+def flatten_sampled_calls() -> list:
+    return [_call(flatten_sampled_kernel)]
+
+
 # --- Per-request row scatters ---------------------------------------------------
 
 _SCATTER_THREADS = 128
