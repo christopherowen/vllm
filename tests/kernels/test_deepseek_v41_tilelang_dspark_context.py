@@ -95,8 +95,8 @@ def test_context_graph_norm_writes_the_context_buffer(monkeypatch, capacity):
     """The context graph's combine writes main_x straight into the speculator's
     context buffer (the norm's ``out``), which the context KV projections then read:
     no copy between the norm and their per-token casts, the buffer's bits the
-    combine's own (TileKernels' norm of a projection of the joined sources), the
-    rows past the capacity untouched."""
+    combine's own (TileKernels' norm of a stand-in projection of the joined
+    sources), the rows past the capacity untouched."""
     from types import SimpleNamespace
 
     from vllm.models.deepseek_v4_1.nvidia.dspark import (
@@ -109,9 +109,11 @@ def test_context_graph_norm_writes_the_context_buffer(monkeypatch, capacity):
     norm = TileLangRMSNorm(WIDTH, 1e-6).to(DEVICE)
     norm.weight.data.copy_(torch.rand(WIDTH, generator=gen, device=DEVICE) + 0.5)
     joined = dspark_context.NUM_SOURCES * WIDTH
-    projection = torch.randn(joined, WIDTH, generator=gen, device=DEVICE) / joined
-    projection = projection.to(torch.bfloat16)
-    model = SimpleNamespace(main_proj=lambda x: x @ projection, main_norm=norm)
+
+    def main_proj(x):  # a stand-in projection, elementwise, so deterministic
+        return x[:, :WIDTH] * 2 + x[:, WIDTH : 2 * WIDTH]
+
+    model = SimpleNamespace(main_proj=main_proj, main_norm=norm)
     aux = torch.randn(LIMIT, joined, generator=gen, device=DEVICE).to(torch.bfloat16)
     aux[0, :8] = float("nan")
     hidden_states = torch.randn(LIMIT + 4, WIDTH, generator=gen, device=DEVICE)
@@ -119,13 +121,16 @@ def test_context_graph_norm_writes_the_context_buffer(monkeypatch, capacity):
     before = hidden_states.clone()
     expected = DSparkDeepseekV4Model.combine_hidden_states(model, aux[:capacity])
     projected = []
+
+    def combine(x, out):
+        return DSparkDeepseekV4Model.combine_hidden_states(model, x, out)
+
+    def project(states, positions, slots):
+        projected.append((states, slots))
+
     graphs = DSparkContextCudaGraphs.__new__(DSparkContextCudaGraphs)
     graphs.model = SimpleNamespace(
-        combine_hidden_states=lambda x,
-        out: DSparkDeepseekV4Model.combine_hidden_states(model, x, out),
-        precompute_and_store_context_kv=lambda states, positions, slots: (
-            projected.append((states, slots))
-        ),
+        combine_hidden_states=combine, precompute_and_store_context_kv=project
     )
     graphs.aux = aux
     graphs.hidden_states = hidden_states
