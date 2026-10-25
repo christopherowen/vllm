@@ -217,6 +217,18 @@ class KVCacheSpec:
         """
         raise NotImplementedError
 
+    def max_capacity_blocks(self, vllm_config: VllmConfig) -> tuple[float, float]:
+        """Pool blocks behind the capacity figure: (per request, shared).
+
+        Every request at max_model_len holds the first; the second is held
+        once, however many requests run. By default a request holds its whole
+        maximum usage and nothing is shared.
+        """
+        return (
+            cdiv(self.max_memory_usage_bytes(vllm_config), self.page_size_bytes),
+            0.0,
+        )
+
     def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
         """
         The number of block table entries needed per request, i.e. the row
@@ -914,6 +926,38 @@ class SlidingWindowSpec(AttentionSpec):
         )
         return max_blocks * self.page_size_bytes
 
+    def max_capacity_blocks(self, vllm_config: VllmConfig) -> tuple[float, float]:
+        """The window per request; the unsettled tokens once for all requests.
+
+        A request holds the blocks covering one contiguous span: the
+        `sliding_window - 1 + extra_retained_tokens` tokens kept below its
+        processed boundary, its scheduled but unsettled tokens, and the
+        lookahead slots. A span of n tokens touches at most
+        (n - 2) / block_size + 2 blocks, so the kept tokens and the lookahead
+        cost each request (kept + lookahead - 2) / block_size + 2 blocks, and
+        its unsettled tokens one block per `block_size` of them. The unsettled
+        tokens of all requests together are at most `max_in_flight_tokens`
+        (one batch per concurrent step), so they are charged once, not per
+        request. That holds while every running request is allocated each
+        step: one the scheduler skips keeps its last allocation's blocks until
+        it is scheduled again. `max_admission_blocks_per_request` remains one
+        request's own peak, every unsettled token its own (startup check,
+        admission gate).
+        """
+        assert (
+            vllm_config.parallel_config.decode_context_parallel_size == 1
+            or self.dcp_replicated
+        ), "DCP only supports sliding-window KV when it is replicated."
+        whole = cdiv(vllm_config.model_config.max_model_len, self.block_size)
+        kept = self.sliding_window - 1 + self.extra_retained_tokens
+        per_request = (
+            kept + vllm_config.num_lookahead_tokens - 2
+        ) / self.block_size + 2
+        if per_request >= whole:
+            # The window covers the whole sequence: nothing is recycled.
+            return whole, 0.0
+        return per_request, vllm_config.max_in_flight_tokens / self.block_size
+
     def is_uniform_with_collection(
         self, kv_cache_specs: dict[str, KVCacheSpec]
     ) -> bool:
@@ -1074,6 +1118,10 @@ class KpoolTailSpec(SlidingWindowSpec):
         self, max_in_flight_tokens: int, max_model_len: int
     ) -> int:
         return 1
+
+    def max_capacity_blocks(self, vllm_config: VllmConfig) -> tuple[float, float]:
+        # One circular block per request, whatever is in flight.
+        return KVCacheSpec.max_capacity_blocks(self, vllm_config)
 
     def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
         return 1
@@ -1387,6 +1435,14 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
             for spec in self.kv_cache_specs.values()
         )
         return max_num_pages * self.page_size_bytes
+
+    def max_capacity_blocks(self, vllm_config: VllmConfig) -> tuple[float, float]:
+        # The layers share one block table, so the widest layer sets each part.
+        parts = [
+            spec.max_capacity_blocks(vllm_config)
+            for spec in self.kv_cache_specs.values()
+        ]
+        return max(part[0] for part in parts), max(part[1] for part in parts)
 
     def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
         # Metadata builders are constructed from the per-layer spec, so the base

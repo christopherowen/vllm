@@ -1127,9 +1127,17 @@ def get_max_concurrency_for_kv_cache_config(
     a representative per-layer spec (scheduler config), so both capacity
     call sites agree.
 
+    That charges every request its own peak, which for a sliding-window group
+    includes a whole batch per concurrent step. Those unsettled tokens fill at
+    most one batch per step across all requests, so the window can be charged
+    per request and their blocks once (`KVCacheSpec.max_capacity_blocks`).
+    Both accountings bound the pool's use, so the larger concurrency stands.
+
     Host groups use a separate pool; the smaller concurrency limit applies.
     """
-    num_blocks_per_request = 0
+    peak_blocks_per_request = 0
+    num_blocks_per_request = 0.0
+    shared_blocks = 0.0
     host_blocks_per_request = 0
     for group in kv_cache_config.kv_cache_groups:
         required = cdiv(
@@ -1138,12 +1146,21 @@ def get_max_concurrency_for_kv_cache_config(
         )
         if group.host_resident:
             host_blocks_per_request += required
-        else:
-            num_blocks_per_request += required
-    num_blocks_per_request += _request_boundary_reserve_blocks(
+            continue
+        per_request, shared = group.kv_cache_spec.max_capacity_blocks(vllm_config)
+        peak_blocks_per_request += required
+        num_blocks_per_request += per_request
+        shared_blocks += shared
+    reserve = _request_boundary_reserve_blocks(
         vllm_config, len(kv_cache_config.kv_cache_groups)
     )
-    limits = [kv_cache_config.num_blocks / num_blocks_per_request]
+    num_blocks = kv_cache_config.num_blocks
+    limits = [
+        max(
+            num_blocks / (peak_blocks_per_request + reserve),
+            (num_blocks - shared_blocks) / (num_blocks_per_request + reserve),
+        )
+    ]
     if host_blocks_per_request:
         assert kv_cache_config.hisparse_host_num_blocks is not None
         limits.append(

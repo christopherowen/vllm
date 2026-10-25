@@ -34,6 +34,7 @@ from vllm.multimodal.inputs import (
 )
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor, xxhash, xxhash_cbor
+from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
@@ -88,7 +89,10 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats
+from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request
+
+from .utils import create_requests, create_scheduler
 
 pytestmark = pytest.mark.cpu_test
 
@@ -1806,6 +1810,16 @@ def test_get_max_concurrency_for_kv_cache_config():
     )
     assert max_concurrency_full_attention == 1.5
 
+    # One request's own peak is its window and a whole batch: (1023 + 1024)
+    # tokens, 129 blocks. Only one batch is unsettled at a time, so the pool
+    # holds its 64 blocks once and each request (1023 - 2) / 16 + 2 for the
+    # window, not 129 each.
+    window_blocks = (1024 - 1 - 2) / 16 + 2
+    batch_blocks = 1024 / 16
+    assert sliding_window_spec.max_capacity_blocks(vllm_config) == (
+        window_blocks,
+        batch_blocks,
+    )
     kv_cache_config_sliding_window = KVCacheConfig(
         num_blocks=129 * 3,
         kv_cache_tensors=[],
@@ -1816,7 +1830,10 @@ def test_get_max_concurrency_for_kv_cache_config():
     max_concurrency_sliding_window = get_max_concurrency_for_kv_cache_config(
         vllm_config, kv_cache_config_sliding_window
     )
-    assert max_concurrency_sliding_window == 3
+    assert max_concurrency_sliding_window == pytest.approx(
+        (129 * 3 - batch_blocks) / window_blocks
+    )
+    assert max_concurrency_sliding_window > 3
 
     kv_cache_config_hybrid_model = KVCacheConfig(
         num_blocks=(1024 + 129) * 3,
@@ -1831,17 +1848,18 @@ def test_get_max_concurrency_for_kv_cache_config():
     max_concurrency_hybrid_model = get_max_concurrency_for_kv_cache_config(
         vllm_config, kv_cache_config_hybrid_model
     )
-    assert max_concurrency_hybrid_model == 3
+    hybrid_concurrency = ((1024 + 129) * 3 - batch_blocks) / (1024 + window_blocks)
+    assert max_concurrency_hybrid_model == pytest.approx(hybrid_concurrency)
     num_tokens, max_concurrency = get_kv_cache_capacity(
         vllm_config, kv_cache_config_hybrid_model
     )
-    assert num_tokens == max_concurrency_hybrid_model * max_model_len
+    assert num_tokens == int(max_concurrency_hybrid_model * max_model_len)
     assert max_concurrency == max_concurrency_hybrid_model
 
     # Unequal group sizes in the standard layout: each group's pages cost
-    # whole pool blocks, so a request needs 1024 + 129 = 1153 blocks — the
-    # same as the equal-hybrid case above, regardless of the second group
-    # holding only 2 layers.
+    # whole pool blocks, so a request needs the same blocks as in the
+    # equal-hybrid case above, regardless of the second group holding only 2
+    # layers.
     kv_cache_config_unequal_groups = KVCacheConfig(
         num_blocks=1153 * 3,
         kv_cache_tensors=[],
@@ -1850,19 +1868,16 @@ def test_get_max_concurrency_for_kv_cache_config():
             KVCacheGroupSpec(["layer_32", "layer_33"], sliding_window_spec),
         ],
     )
-    assert (
-        get_max_concurrency_for_kv_cache_config(
-            vllm_config, kv_cache_config_unequal_groups
-        )
-        == 3
-    )
+    assert get_max_concurrency_for_kv_cache_config(
+        vllm_config, kv_cache_config_unequal_groups
+    ) == pytest.approx(hybrid_concurrency)
 
     # UniformTypeKVCacheSpecs group (worker config shape): the aggregated
     # spec's memory/page ratio equals a single layer's page count, so the
-    # group needs 1024 blocks and the request 1153 in total. The previous
-    # formula normalized both groups' memory by the first group's page size,
-    # reporting 3459/1057 = 3.27 here instead of 3 — and a different value
-    # again for the scheduler-config shape below.
+    # group needs 1024 blocks, as in the hybrid case. The previous formula
+    # normalized both groups' memory by the first group's page size, reporting
+    # 3459/1057 = 3.27 for what was then 3 — and a different value again for
+    # the scheduler-config shape below.
     uniform_full_spec = UniformTypeKVCacheSpecs(
         block_size=full_attention_spec.block_size,
         kv_cache_specs={f"layer_{i}": full_attention_spec for i in range(4)},
@@ -1875,12 +1890,9 @@ def test_get_max_concurrency_for_kv_cache_config():
             KVCacheGroupSpec(["layer_4", "layer_5"], sliding_window_spec),
         ],
     )
-    assert (
-        get_max_concurrency_for_kv_cache_config(
-            vllm_config, kv_cache_config_uniform_group
-        )
-        == 3
-    )
+    assert get_max_concurrency_for_kv_cache_config(
+        vllm_config, kv_cache_config_uniform_group
+    ) == pytest.approx(hybrid_concurrency)
 
     # Scheduler-config shape: generate_scheduler_kv_cache_config replaces the
     # uniform-type group's spec with a representative per-layer spec.
@@ -1894,6 +1906,223 @@ def test_get_max_concurrency_for_kv_cache_config():
     ) == get_max_concurrency_for_kv_cache_config(
         vllm_config, kv_cache_config_uniform_group
     )
+
+
+def _ds41_ring_config(max_num_batched_tokens: int) -> SimpleNamespace:
+    """The DeepSeek V4.1 Flash TP4 ring's sizing: 1M tokens, async scheduling
+    (two batches in flight) and DSpark's five drafts as lookahead."""
+    return SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=1048576),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        attention_config=SimpleNamespace(hisparse_config=None),
+        max_in_flight_tokens=2 * max_num_batched_tokens,
+        num_lookahead_tokens=5,
+        use_request_boundary_checkpoints=False,
+    )
+
+
+def _ds41_cache_groups() -> list[KVCacheGroupSpec]:
+    """DeepSeek V4.1 Flash's cache groups, as packed for the worker.
+
+    One group holds the compressed MLA and indexer caches of the KV source
+    layers (ratio 2 for layers 2, 8 and 14, ratio 1 for layer 20) at 256
+    tokens a block; their pages make the pool's 227,840-byte block. The 43
+    sliding-window caches (40 target layers, three drafter layers) pack three
+    to a block in 15 groups of 128-token blocks, and the ratio-2 compressors'
+    states take one ring block per request.
+    """
+
+    def compressed(head_size: int, content: int, ratio: int) -> MLAAttentionSpec:
+        return MLAAttentionSpec(
+            block_size=256,
+            num_kv_heads=1,
+            head_size=head_size,
+            state_content_bytes=content,
+            dtype=torch.uint8,
+            tokens_per_state=ratio,
+            cache_dtype_str="b12x_dsv41",
+        )
+
+    full: dict[str, KVCacheSpec] = {}
+    for layer, ratio in {2: 2, 8: 2, 14: 2, 20: 1}.items():
+        full[f"layers.{layer}.attn"] = compressed(512, 288, ratio)
+        full[f"layers.{layer}.indexer"] = compressed(68, 68, ratio)
+    window = SlidingWindowMLASpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=512,
+        state_content_bytes=528,
+        dtype=torch.uint8,
+        cache_dtype_str="b12x_dsv41",
+        sliding_window=128,
+    )
+    ring = CircularBufferSpec(
+        block_size=8, num_kv_heads=1, head_size=1024, head_size_v=0, dtype=torch.float32
+    )
+    groups = [
+        KVCacheGroupSpec(
+            list(full), UniformTypeKVCacheSpecs(block_size=256, kv_cache_specs=full)
+        )
+    ]
+    groups += [
+        KVCacheGroupSpec([f"window.{group}.{i}" for i in range(3)], window)
+        for group in range(15)
+    ]
+    groups.append(KVCacheGroupSpec([f"ring.{layer}" for layer in (2, 8, 14)], ring))
+    return groups
+
+
+@pytest.mark.parametrize(
+    ("max_num_batched_tokens", "per_request_figure", "figure"),
+    [(8192, 8.18, 11.48), (16384, 6.21, 11.02)],
+)
+def test_ds41_ring_capacity_charges_unsettled_tokens_once(
+    max_num_batched_tokens, per_request_figure, figure
+):
+    """The ring's 10.5 GiB pool holds 11 full 1M contexts at either budget.
+
+    Charging every request its own peak (the window and two whole batches)
+    reported 8.18 at 8,192 batched tokens and 6.21 at 16,384, yet only two
+    batches are unsettled at a time across all requests.
+    """
+    config = _ds41_ring_config(max_num_batched_tokens)
+    groups = _ds41_cache_groups()
+    assert kv_cache_utils._pool_bytes_per_block(groups) == 227_840
+    num_blocks = 11_274_289_152 // 227_840
+    assert num_blocks == 49_483
+    pool = KVCacheConfig(
+        num_blocks=num_blocks, kv_cache_tensors=[], kv_cache_groups=groups
+    )
+
+    window = groups[1].kv_cache_spec
+    # One request's own peak is unchanged: the startup check still charges it.
+    peak = window.max_admission_blocks_per_request(config.max_in_flight_tokens, 1048576)
+    assert peak == 1 + cdiv(127 + 2 * max_num_batched_tokens, 128)
+    peak_blocks = 4096 + 15 * peak + 1
+    assert num_blocks / peak_blocks == pytest.approx(per_request_figure, abs=0.005)
+    assert (
+        kv_cache_utils._max_memory_usage_bytes_from_groups(config, groups)
+        == peak_blocks * 227_840
+    )
+
+    per_request, shared = window.max_capacity_blocks(config)
+    assert per_request == (127 + 5 - 2) / 128 + 2
+    assert shared == 2 * max_num_batched_tokens / 128
+    concurrency = get_max_concurrency_for_kv_cache_config(config, pool)
+    assert concurrency == pytest.approx(
+        (num_blocks - 15 * shared) / (4096 + 15 * per_request + 1)
+    )
+    assert concurrency == pytest.approx(figure, abs=0.005)
+    num_tokens, _ = get_kv_cache_capacity(config, pool)
+    assert num_tokens == int(concurrency * 1048576)
+    # The scheduler-config shape reports the same figure.
+    scheduler_pool = generate_scheduler_kv_cache_config([copy.deepcopy(pool)])
+    assert get_max_concurrency_for_kv_cache_config(
+        config, scheduler_pool
+    ) == pytest.approx(concurrency)
+
+
+def test_kpool_tail_capacity_stays_one_block():
+    """The kpool tail is a sliding-window spec of one circular block."""
+    tail = KpoolTailSpec(
+        block_size=64,
+        num_kv_heads=2,
+        head_size=128,
+        head_size_v=0,
+        dtype=torch.bfloat16,
+        sliding_window=64,
+    )
+    assert tail.max_capacity_blocks(_ds41_ring_config(16384)) == (1, 0.0)
+
+
+def test_swa_capacity_bounds_blocks_held_under_async_chunked_prefill():
+    """Every request's window plus the unsettled batches once bounds the pool's
+    real use through overlapping async prefill chunks and decodes, while a
+    request alone still reaches its own two-chunk peak."""
+    budget, block_size = 64, 16
+    spec = SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=32,
+    )
+    scheduler = create_scheduler(
+        max_num_seqs=4,
+        max_num_batched_tokens=budget,
+        block_size=block_size,
+        max_model_len=1024,
+        num_blocks=1000,
+        async_scheduling=True,
+        kv_cache_spec=spec,
+    )
+    # The loop below keeps two steps in flight, whatever the platform resolves
+    # for async scheduling.
+    per_request, shared = spec.max_capacity_blocks(
+        SimpleNamespace(
+            model_config=SimpleNamespace(max_model_len=1024),
+            parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+            max_in_flight_tokens=2 * budget,
+            num_lookahead_tokens=0,
+        )
+    )
+    peak = spec.max_admission_blocks_per_request(2 * budget, 1024)
+    for request in create_requests(
+        num_requests=4,
+        num_tokens=300,
+        max_tokens=64,
+        ignore_eos=True,
+        block_size=block_size,
+    ):
+        scheduler.add_request(request)
+    manager = scheduler.kv_cache_manager.coordinator.single_type_managers[0]
+    block_pool = scheduler.kv_cache_manager.block_pool
+    most_held = most_running = 0
+
+    def schedule():
+        nonlocal most_held, most_running
+        output = scheduler.schedule()
+        partial = {
+            req_id
+            for req_id in output.num_scheduled_tokens
+            if scheduler.requests[req_id].is_prefill_chunk
+        }
+        used = block_pool.num_gpu_blocks - 1 - block_pool.get_num_free_blocks()
+        assert used <= len(scheduler.running) * per_request + shared
+        for request in scheduler.running:
+            blocks = manager.req_to_blocks.get(request.request_id, ())
+            most_held = max(most_held, sum(not block.is_null for block in blocks))
+        most_running = max(most_running, len(scheduler.running))
+        return output, partial
+
+    def runner_output(output, partial) -> ModelRunnerOutput:
+        req_ids = list(output.num_scheduled_tokens)
+        return ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
+            # A partial prefill chunk samples nothing.
+            sampled_token_ids=[[] if r in partial else [0] for r in req_ids],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        )
+
+    # As the async engine: each step is scheduled before the previous one's
+    # output is processed.
+    in_flight = schedule()
+    for _ in range(400):
+        if not scheduler.has_unfinished_requests():
+            break
+        scheduled = schedule()
+        scheduler.update_from_output(in_flight[0], runner_output(*in_flight))
+        in_flight = scheduled
+    else:
+        pytest.fail("requests did not finish")
+
+    assert most_running == 4
+    # A lone prompt's window, its chunk in flight and its next chunk: its own peak.
+    assert most_held == peak
+    assert 4 * per_request + shared < 4 * peak
 
 
 def test_allocate_with_lookahead():
@@ -3834,6 +4063,7 @@ def test_kimi_parallel_draft_full_depth_cache_admission(
         pipeline_parallel_size=1,
     )
     config.max_in_flight_tokens = 8192
+    config.num_lookahead_tokens = 0
     config.use_request_boundary_checkpoints = False
     full_layers = set(range(3, 92, 4)) | {92}
     specs = {
