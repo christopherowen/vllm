@@ -66,6 +66,19 @@ def test_split_columns_like_torch(widths, rows):
         assert torch.equal(_bits(part), _bits(reference))
 
 
+@pytest.mark.parametrize("parts", [3, 2])
+@pytest.mark.parametrize("rows", [1, 5, 96, 8192])
+def test_join_columns_like_torch_cat(parts, rows):
+    """The DSpark drafter's eager context join: the target's auxiliary hidden
+    states side by side, as torch's cat."""
+    width = 5120  # DeepSeek-V4.1 Flash's hidden size, one a target layer
+    states = [_rows(rows, width, rows + 11 * i) for i in range(parts)]
+    out = _rows(rows, parts * width, rows + 99)
+    joined = columns.join_columns(states, out)
+    assert joined.data_ptr() == out.data_ptr()
+    assert torch.equal(_bits(out), _bits(torch.cat(states, dim=-1)))
+
+
 def test_float32_parts():
     gathered = _rows(9, 64 + 32 + 16, 5, torch.float32)
     expected = [p.contiguous() for p in gathered.split((64, 32, 16), dim=-1)]
@@ -81,3 +94,5 @@ def test_refuses_what_it_cannot_copy_in_vectors():
         columns.split_columns(_rows(4, 12, 8), (4, 8))
     with pytest.raises(ValueError, match="contiguous"):
         columns.split_columns(_rows(4, 128, 9)[:, :64], (32, 32))
+    with pytest.raises(ValueError, match="contiguous parts"):
+        columns.join_columns([x, _rows(5, 64, 10)], _rows(4, 128, 11))

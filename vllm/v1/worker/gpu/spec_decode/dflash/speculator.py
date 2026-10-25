@@ -623,16 +623,21 @@ class DFlashSpeculator(DraftModelSpeculator):
                     ]
                 else:
                     last_hidden_states = gather_rows(last_hidden_states, ced_indices)
+            combine_into = getattr(self.model, "combine_aux_hidden_states_into", None)
             if context_states_are_streamed:
                 assert aux_hidden_states is not None
                 context_states = aux_hidden_states[0]
-            elif aux_hidden_states:
-                hidden_states = self.model.combine_hidden_states(
-                    torch.cat(aux_hidden_states, dim=-1)
-                )
+            elif aux_hidden_states and combine_into is not None:
+                # The model joins the aux states and writes the combined rows
+                # into the context buffer itself.
+                combine_into(aux_hidden_states, context_states)
             else:
-                hidden_states = last_hidden_states
-            if not context_states_are_streamed:
+                if aux_hidden_states:
+                    hidden_states = self.model.combine_hidden_states(
+                        torch.cat(aux_hidden_states, dim=-1)
+                    )
+                else:
+                    hidden_states = last_hidden_states
                 context_states.copy_(hidden_states[:num_context_tokens])
 
         if dummy_run and skip_attn_for_dummy_run:

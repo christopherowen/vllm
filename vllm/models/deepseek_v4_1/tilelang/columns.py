@@ -7,8 +7,10 @@ normalized Q and KV halves of the fused projection and the indexer's head weight
 in one all-gather: the norms write their halves into the gather's buffer in place,
 ``copy_columns`` puts the head weights beside them, and ``split_columns`` cuts the
 gathered rows into one contiguous tensor a part. Torch's cat and three contiguous
-copies, as two TileLang launches. A thread copies 16 bytes; the block widths are
-whole vectors, so no vector straddles two parts.
+copies, as two TileLang launches. ``join_columns`` is the split reversed: the
+DSpark drafter's eager context step joins the target's auxiliary hidden states side
+by side (torch's cat). A thread copies 16 bytes; the block widths are whole vectors,
+so no vector straddles two parts.
 """
 
 # No `from __future__ import annotations`: TileLang reads the prim_func
@@ -74,11 +76,18 @@ def copy_columns_kernel(width: int, dtype: str):
     return copy_columns
 
 
+def _move(part, whole, join: bool):
+    """A 16-byte copy between a part's and the whole row's addresses, in the
+    direction ``join`` gives."""
+    destination, source = (whole, part) if join else (part, whole)
+    return T.call_extern("handle", "vllm_columns_b128", destination, source)
+
+
 @tilelang.jit(pass_configs=_PASS)
-def split_columns_kernel(widths: tuple[int, int, int], dtype: str):
+def split_columns_kernel(widths: tuple[int, int, int], dtype: str, join: bool = False):
     """Row ``r`` of ``src`` ([rows, sum(widths)], contiguous) cut into ``out0``,
     ``out1`` and ``out2`` (contiguous, ``widths[i]`` wide; a zero width has no
-    part)."""
+    part), or with ``join`` the parts' rows side by side into ``src``."""
     vector = _vector(dtype)
     if any(width % vector for width in widths) or not widths[0] or not widths[1]:
         raise ValueError(f"widths {widths} are not whole 16-byte vectors")
@@ -98,27 +107,13 @@ def split_columns_kernel(widths: tuple[int, int, int], dtype: str):
         with T.Kernel(T.ceildiv(total, span), rows, threads=_THREADS) as (bx, row):
             T.import_source(_HEADER)
             col = bx * span + T.get_thread_binding() * vector
+            whole = T.address_of(src[row, col])
             if col < w0:
-                T.call_extern(
-                    "handle",
-                    "vllm_columns_b128",
-                    T.address_of(out0[row, col]),
-                    T.address_of(src[row, col]),
-                )
+                _move(T.address_of(out0[row, col]), whole, join)
             elif col < w0 + w1:
-                T.call_extern(
-                    "handle",
-                    "vllm_columns_b128",
-                    T.address_of(out1[row, col - w0]),
-                    T.address_of(src[row, col]),
-                )
+                _move(T.address_of(out1[row, col - w0]), whole, join)
             elif col < total:
-                T.call_extern(
-                    "handle",
-                    "vllm_columns_b128",
-                    T.address_of(out2[row, col - w0 - w1]),
-                    T.address_of(src[row, col]),
-                )
+                _move(T.address_of(out2[row, col - w0 - w1]), whole, join)
 
     return split_columns
 
@@ -149,8 +144,10 @@ def copy_columns_key(width: int, dtype: torch.dtype) -> tuple:
     return (width, _DTYPES[dtype])
 
 
-def split_columns_key(widths: tuple[int, ...], dtype: torch.dtype) -> tuple:
-    return (tuple(widths) + (0,) * (3 - len(widths)), _DTYPES[dtype])
+def split_columns_key(
+    widths: tuple[int, ...], dtype: torch.dtype, join: bool = False
+) -> tuple:
+    return (tuple(widths) + (0,) * (3 - len(widths)), _DTYPES[dtype], join)
 
 
 def copy_columns(src: torch.Tensor, dst: torch.Tensor) -> None:
@@ -181,10 +178,30 @@ def split_columns(src: torch.Tensor, widths: tuple[int, ...]) -> list[torch.Tens
     return parts
 
 
+def join_columns(parts: list[torch.Tensor], out: torch.Tensor) -> torch.Tensor:
+    """``torch.cat(parts, -1, out=out)`` for two or three contiguous parts of the
+    same rows into contiguous ``out``."""
+    widths = tuple(part.shape[-1] for part in parts)
+    if len(parts) not in (2, 3) or out.shape != (parts[0].shape[0], sum(widths)):
+        raise ValueError(f"cannot join {widths} into {tuple(out.shape)}")
+    if not all(t.is_contiguous() for t in (out, *parts)) or any(
+        part.shape[0] != out.shape[0] for part in parts
+    ):
+        raise ValueError("join_columns joins contiguous parts of the same rows")
+    dtype = _check(out, *parts)
+    rows = out.shape[0]
+    if rows:
+        third = parts[2] if len(parts) == 3 else parts[0].view(-1, _vector(dtype))
+        key = split_columns_key(widths, out.dtype, join=True)
+        _bound(True, *key)(out, parts[0], parts[1], third, rows)
+    return out
+
+
 __all__ = [
     "copy_columns",
     "copy_columns_kernel",
     "copy_columns_key",
+    "join_columns",
     "split_columns",
     "split_columns_kernel",
     "split_columns_key",
