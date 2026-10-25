@@ -1757,11 +1757,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         query_start_loc = self.input_buffers.query_start_loc
         async_tensor_h2d(query_start_loc_np, out=query_start_loc)
         if adaptive_verification is not None:
-            cu_num_logits, query_start_loc, total_num_draft_tokens = (
-                adaptive_verification.reallocate_drafts(req_ids, idx_mapping)
-            )
+            (
+                cu_num_logits,
+                query_start_loc,
+                total_num_draft_tokens,
+                expanded_idx_mapping,
+                expanded_local_pos,
+            ) = adaptive_verification.reallocate_drafts(req_ids, idx_mapping)
             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
-        if draft_tokens:
+        elif draft_tokens:
             expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
                 idx_mapping, total_num_logits, cu_num_logits, self.decode_query_len
             )
@@ -2138,8 +2142,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # The target's padding rows (prepare_inputs).
             tilelang_inputs.declare(tilelang_inputs.padding_rows_calls)
         if self.adaptive_verification is not None:
+            steps = self.num_speculative_steps
+            width = steps + self.model_state.num_new_sampled_tokens_per_step
             tilelang_inputs.declare(
-                lambda: tilelang_inputs.adaptive_offsets_calls()
+                lambda: tilelang_inputs.adaptive_offsets_calls(width)
+                + tilelang_inputs.assign_draft_budget_calls(steps)
                 + tilelang_inputs.scatter_rows_calls(
                     torch.int64, torch.float32, gather=False
                 )
