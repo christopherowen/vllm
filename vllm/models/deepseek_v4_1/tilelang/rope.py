@@ -15,7 +15,7 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from . import prepare
+from . import pdl, prepare
 
 _PAIRS = 4  # pairs per thread: 8 BF16, one 16-byte access
 
@@ -46,6 +46,7 @@ def rope_kernel(heads: int, dim: int, rope_dim: int, ratio: int, inverse: bool):
             T.ceildiv(heads, heads_per_block),
             threads=threads,
         ) as (tb, hb):
+            pdl.chain()
             tx = T.get_thread_binding()
             t = tb * tokens_per_block + tx // per_token
             head = hb * heads_per_block + tx % per_token // lanes

@@ -30,7 +30,7 @@ from torch import nn
 
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.models.deepseek_v4_1.quant_config import Block32FP8LinearMethod
-from vllm.models.deepseek_v4_1.tilelang import prepare
+from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
 from vllm.v1.worker.workspace import (
     current_preallocated_workspace,
     current_workspace_manager,
@@ -69,9 +69,7 @@ _TORCH_TO_TL = {torch.bfloat16: "bfloat16", torch.float32: "float32"}
 
 
 def _tile_kernels():
-    import tile_kernels
-
-    return tile_kernels
+    return pdl.tile_kernels()
 
 
 def _activation_specs(rows: int, k: int, decode_rows: int = DECODE_ROWS):

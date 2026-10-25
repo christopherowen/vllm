@@ -32,6 +32,8 @@ import tilelang
 import tilelang.language as T
 import torch
 
+from . import pdl
+
 DIM = 512
 STATE = 2 * DIM  # a ring slot: the value, then the gate
 EPS = 1e-20
@@ -63,6 +65,7 @@ def gather_partial_state_kernel(max_requests: int, page: int):
         local_ids: T.Tensor((max_requests,), T.int64),
     ):
         with T.Kernel(max_requests, threads=128) as r:
+            pdl.chain()
             tx = T.get_thread_binding()
             buf = T.alloc_local((_VEC,), T.float32)
             nt = counts[0]
@@ -129,6 +132,7 @@ def compress_kernel(ratio: int, max_requests: int, page: int, warps: int = 4):
         emitted_slots: T.Tensor((rows,), T.int64),
     ):
         with T.Kernel(T.ceildiv(rows, warps), threads=warps * 32) as bx:
+            pdl.chain()
             tx = T.get_thread_binding()
             token = bx * warps + tx // 32
             lane = tx % 32

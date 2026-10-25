@@ -26,7 +26,7 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from . import prepare
+from . import pdl, prepare
 
 DIM = 512
 RECORD_BYTES = {"swa": 528, "indexed": 288}
@@ -101,6 +101,7 @@ def cache_writer_kernel(cache_kind: str, page_size: int, slot_dtype: str = "int6
     ):
         with T.Kernel(T.ceildiv(tokens, tokens_per_block), threads=threads) as bx:
             T.import_source(_CVT_HEADER)
+            pdl.chain()
             tx = T.get_thread_binding()
             token = bx * tokens_per_block + tx // per_token
             item = tx % per_token

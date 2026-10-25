@@ -20,6 +20,8 @@ import tilelang
 import tilelang.language as T
 import torch
 
+from . import pdl
+
 SF_BLOCK = 32  # K elements per UE8M0 scale
 SF_WORD_K = 4 * SF_BLOCK  # K elements per packed scale word
 
@@ -58,6 +60,7 @@ def _mxfp8_gemm(
     swizzle_panel: int = 0,
     groups: int = 1,
     shards: int = 1,
+    pdl_chain: bool = False,
 ):
     """``C[M, N] = (A * SFA) @ (B * SFB)^T`` for MXFP8 ``A[M, K]``, ``B[N, K]``.
 
@@ -87,6 +90,10 @@ def _mxfp8_gemm(
     zero and the shards are added in order: the arithmetic of
     ``mxfp8_gemm_partials`` plus ``splitk_reduce``, so a narrow projection's
     split-K decode rows give its prefill rows' bits.
+
+    ``pdl_chain`` starts the kernel with ``pdl.chain()``: the decode tiles
+    (``mxfp8_gemm_decode``), which compile without warp specialization, do; the
+    warp-specialized prefill tiles do not.
     """
     assert K % block_K == 0 and block_K % 64 == 0, (
         "block_K must divide K and be a multiple of 64"
@@ -119,6 +126,8 @@ def _mxfp8_gemm(
         ) as (bx, by):
             if swizzle_panel:
                 T.use_swizzle(panel_size=swizzle_panel)
+            if pdl_chain:
+                pdl.chain()
             # The group's activation columns and scale words.
             group = bx * block_N // N
             a_k = group * K if groups > 1 else 0
@@ -218,6 +227,7 @@ def _mxfp8_gemm_partials(
         with T.Kernel(
             T.ceildiv(N, block_N), shards, T.ceildiv(M, block_M), threads=threads
         ) as (bx, s, by):
+            pdl.chain()
             A_shared = T.alloc_shared((block_M, block_K), in_dtype)
             B_shared = T.alloc_shared((block_N, block_K), in_dtype)
             SFA_shared = T.alloc_shared((block_M, block_words), T.uint32)
@@ -255,10 +265,42 @@ def _mxfp8_gemm_partials(
     return gemm_mxfp8_partials
 
 
+def _mxfp8_gemm_decode(
+    N: int,
+    K: int,
+    block_M: int = 128,
+    block_N: int = 128,
+    block_K: int = 128,
+    num_stages: int = 2,
+    threads: int = 128,
+    out_dtype: T.dtype = T.bfloat16,
+    padded_rows: bool = False,
+    swizzle_panel: int = 0,
+    groups: int = 1,
+    shards: int = 1,
+):
+    """``_mxfp8_gemm``'s decode tiles: no warp specialization, on the PDL chain."""
+    return _mxfp8_gemm(
+        N,
+        K,
+        block_M,
+        block_N,
+        block_K,
+        num_stages,
+        threads,
+        out_dtype,
+        padded_rows,
+        swizzle_panel,
+        groups,
+        shards,
+        pdl_chain=True,
+    )
+
+
 mxfp8_gemm = tilelang.jit(_mxfp8_gemm)
 mxfp8_gemm_decode = tilelang.jit(
     pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
-)(_mxfp8_gemm)
+)(_mxfp8_gemm_decode)
 mxfp8_gemm_partials = tilelang.jit(
     pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
 )(_mxfp8_gemm_partials)
@@ -285,6 +327,7 @@ def splitk_reduce(
         P: T.Tensor((shards, M, N), T.float32), C: T.Tensor((M, N), out_dtype)
     ):
         with T.Kernel(T.ceildiv(N, block_N), M, threads=threads) as (bx, m):
+            pdl.chain()
             acc = T.alloc_fragment((block_N,), T.float32)
             # Columns past N (a narrow projection's last block) are skipped.
             for j in T.Parallel(block_N):
@@ -393,6 +436,7 @@ def splitk_reduce_cast(N: int, shards: int, block_M: int = 4, threads: int = 128
         S: T.Tensor((M, N // 32), T.uint8),
     ):
         with T.Kernel(N // 128, T.ceildiv(M, block_M), threads=threads) as (bx, by):
+            pdl.chain()
             X = T.alloc_fragment((block_M * blocks, 32), T.float32)
             amax = T.alloc_fragment((block_M * blocks,), T.float32)
             inv = T.alloc_fragment((block_M * blocks,), T.float32)
@@ -535,6 +579,7 @@ def fp8w_bf16_gemm(
             bx,
             by,
         ):
+            pdl.chain()
             g = bx // n_tiles
             n0 = g * N + (bx % n_tiles) * block_N
             A_shared = T.alloc_shared((block_M, block_K), T.bfloat16)
@@ -604,6 +649,7 @@ def fp8w_bf16_gemm_cast(
             bx,
             by,
         ):
+            pdl.chain()
             g = bx // n_tiles
             n0 = g * N + (bx % n_tiles) * block_N
             A_shared = T.alloc_shared((block_M, block_K), T.bfloat16)
@@ -707,6 +753,7 @@ def fp8w_bf16_gemm_partials(
         with T.Kernel(
             groups * n_tiles, shards, T.ceildiv(M, block_M), threads=threads
         ) as (bx, s, by):
+            pdl.chain()
             g = bx // n_tiles
             n0 = g * N + (bx % n_tiles) * block_N
             A_shared = T.alloc_shared((block_M, block_K), T.bfloat16)
@@ -748,6 +795,7 @@ def splitk_reduce_two(
         C1: T.Tensor((M, N), out_dtype),
     ):
         with T.Kernel(2 * tiles, M, threads=threads) as (bx, m):
+            pdl.chain()
             acc = T.alloc_fragment((block_N,), T.float32)
             for j in T.Parallel(block_N):
                 acc[j] = P[0, m, bx * block_N + j]
@@ -950,6 +998,7 @@ def bf16_gemm_splitk(
             by,
         ):
             T.import_source(_SPLITK_HEADER)
+            pdl.chain()
             tx = T.get_thread_binding()
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_N, block_K), dtype)

@@ -31,6 +31,8 @@ including which rows each launch writes:
 import tilelang
 import tilelang.language as T
 
+from . import pdl
+
 _PASS = {tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
 _BLOCK = 128
 _TOP = 512  # top-k length cap
@@ -75,6 +77,7 @@ def builder_kernel(max_requests: int, page: int, ratio: int, circular: bool):
         nt: T.int32,
     ):
         with T.Kernel(request_blocks + T.ceildiv(cover, _BLOCK), threads=_BLOCK) as bx:
+            pdl.chain()
             tx = T.get_thread_binding()
             bounds = T.alloc_local((2,), T.int32)
             if bx < request_blocks:
@@ -240,6 +243,7 @@ def chunk_kernel(page: int, window: int, width: int, draft: bool, replay: bool):
         offset: T.int32,
     ):
         with T.Kernel(rows, threads=threads) as row:
+            pdl.chain()
             tx = T.get_thread_binding()
             info = T.alloc_local((2,), T.int64)  # window start, clamped length
             window_row(
@@ -307,6 +311,7 @@ def decode_metadata_kernel(
     ):
         # Two blocks a row, one launch: the window metadata, then the page table.
         with T.Kernel(rows, 2, threads=threads) as (row, part):
+            pdl.chain()
             tx = T.get_thread_binding()
             info = T.alloc_local((2,), T.int64)  # window start, clamped length
             live = T.alloc_var(T.int32)  # the page part's columns
@@ -364,6 +369,7 @@ def pages_kernel(width: int, page: int):
         read_width: T.int32,
     ):
         with T.Kernel(rows, T.ceildiv(width, _BLOCK), threads=_BLOCK) as (row, cb):
+            pdl.chain()
             entry = T.alloc_var(T.int32)  # one load (decode_metadata_kernel's entry)
             col = cb * _BLOCK + T.get_thread_binding()
             req = reqs[offset + row]

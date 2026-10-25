@@ -53,7 +53,7 @@ from torch import nn
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.models.deepseek_v4_1 import sp_prefill
-from vllm.models.deepseek_v4_1.tilelang import prepare
+from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
 from vllm.models.deepseek_v4_1.tilelang.collectives import RankOrderParts
 from vllm.models.deepseek_v4_1.tilelang.gemm import cast_block_mxfp8, scale_words
 from vllm.models.deepseek_v4_1.tilelang.linear import (
@@ -153,6 +153,7 @@ def project_streams(
         Q: T.Tensor((splits, M), T.float32),
     ):
         with T.Kernel(splits, T.ceildiv(M, block_M), threads=threads) as (sp, by):
+            pdl.chain()
             h0 = sp * block_H
             A_shared = T.alloc_shared((block_M, block_H), T.float32)
             F_shared = T.alloc_shared((N, block_H), T.float32)
@@ -339,6 +340,7 @@ def finalize(
         ysf: T.Tensor((Mq, sf_width), T.uint8),
     ):
         with T.Kernel(M, threads=threads) as pid:
+            pdl.chain()
             tx = T.get_thread_binding()
             mixes_shared = T.alloc_shared((MIXES,), T.float32)
             xv = T.alloc_local((VEC,), T.bfloat16)
@@ -473,6 +475,7 @@ def post_streams(hidden_size: int, threads: int = 128):
         out: T.Tensor((M, MULT, hidden_size), T.bfloat16),
     ):
         with T.Kernel(M * blocks, threads=threads) as pid:
+            pdl.chain()
             token = pid // blocks
             col = (pid % blocks * threads + T.get_thread_binding()) * VEC
             xv = T.alloc_local((VEC,), T.bfloat16)
@@ -569,6 +572,7 @@ def collapse_streams(hidden_size: int, threads: int = 128, column: int = -1):
             out: T.Tensor((M, hidden_size), T.bfloat16),
         ):
             with T.Kernel(M * blocks, threads=threads) as pid:
+                pdl.chain()
                 tx = T.get_thread_binding()
                 sv = T.alloc_local((MULT * VEC,), T.bfloat16)
                 # Held, not used: the one write keeps the allocation, and with it
@@ -600,6 +604,7 @@ def collapse_streams(hidden_size: int, threads: int = 128, column: int = -1):
         columns: T.Tensor((M, MULT), T.float32),
     ):
         with T.Kernel(M * blocks, threads=threads) as pid:
+            pdl.chain()
             tx = T.get_thread_binding()
             sv = T.alloc_local((MULT * VEC,), T.bfloat16)
             reserve = T.alloc_shared((_COLLAPSE_RESERVE // 4,), T.float32)

@@ -18,7 +18,7 @@ import tilelang.language as T
 import torch
 from torch import nn
 
-from vllm.models.deepseek_v4_1.tilelang import prepare
+from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
 
 _VEC = 8
 
@@ -39,6 +39,7 @@ def swiglu_clamp_kernel(n: int, limit: float, threads: int = 128):
         Y: T.Tensor((M, n), T.bfloat16),
     ):
         with T.Kernel(T.ceildiv(n, per_block), M, threads=threads) as (bx, by):
+            pdl.chain()
             col = (bx * threads + T.get_thread_binding()) * _VEC
             gate = T.alloc_local((_VEC,), T.bfloat16)
             up = T.alloc_local((_VEC,), T.bfloat16)

@@ -39,7 +39,7 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     FusedTopKBiasRouter,
 )
-from vllm.models.deepseek_v4_1.tilelang import prepare
+from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
 
 _MASK_THREADS = 256
 
@@ -73,6 +73,7 @@ def routing_masks_kernel(image_ids: str | None, route: bool):
         rows: T.int32,
     ):
         with T.Kernel(T.ceildiv(rows, _MASK_THREADS), threads=_MASK_THREADS) as b:
+            pdl.chain()
             i = b * _MASK_THREADS + T.get_thread_binding()
             if image_ids is not None:  # noqa: SIM102
                 if i < ids_len:
@@ -262,9 +263,7 @@ def _topk_gate(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """TileKernels' top-k gate as V4.1 routes: sqrtsoftplus with a correction
     bias and no shared experts."""
-    from tile_kernels.moe import moe_topk_gate_forward
-
-    return moe_topk_gate_forward(
+    return pdl.tile_kernels().moe.moe_topk_gate_forward(
         logits,
         num_topk,
         use_shared_as_routed=False,
@@ -407,6 +406,7 @@ def route_partials(
         routed_scaling_factor: T.float32,
     ):
         with T.Kernel(T.ceildiv(rows, warps), threads=warps * _WARP) as pid:
+            pdl.chain()
             thread = T.get_thread_binding()
             token = thread // _WARP
             row = token + pid * warps

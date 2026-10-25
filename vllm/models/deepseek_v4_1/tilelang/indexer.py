@@ -46,7 +46,7 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from . import prepare
+from . import pdl, prepare
 from .gemm import SF_BLOCK
 
 INDEX_HEADS = 32
@@ -316,6 +316,7 @@ def indexer_score_v41(
             Scores: T.Tensor([rows, width], T.bfloat16),
         ):
             with T.Kernel(ctas, rows, threads=threads) as (cta, row):
+                pdl.chain()
                 extent = _row_extent(Lengths, Active, row, width)
                 score_row(
                     Q,
@@ -352,6 +353,7 @@ def indexer_score_v41(
         Scores: T.Tensor([rows, width], T.bfloat16),
     ):
         with T.Kernel(ctas, rows, threads=threads) as (cta, row):
+            pdl.chain()
             extent = _row_extent(CandidateLengths, None, row, width)
             score_row(
                 Q,
@@ -417,6 +419,7 @@ def mxfp4_quantize_v41(paged: bool = False, page_size: int = 64, threads: int = 
     @T.macro
     def body(X, Q, S, Slots, Pool):
         with T.Kernel(T.ceildiv(rows * groups, threads), threads=threads) as bx:
+            pdl.chain()
             tx = T.get_thread_binding()
             g = bx * threads + tx
             row, k = g // groups, g % groups
@@ -770,6 +773,7 @@ def indexer_topk_segment_v41(
         WorkEntries,
     ):
         with T.Kernel(segments, rows, threads=threads) as (seg, row):
+            pdl.chain()
             tx = T.get_thread_binding()
             keys = T.alloc_shared([segment], T.int32)
             hist = T.alloc_shared([257], T.int32)
@@ -931,6 +935,7 @@ def indexer_topk_merge_v41(
     @T.macro
     def body(WorkValues, WorkEntries, Lengths, Active, Gather, Indices, Values, Counts):
         with T.Kernel(groups, rows, threads=threads) as (g, row):
+            pdl.chain()
             tx = T.get_thread_binding()
             keys = T.alloc_shared([n_pad], T.int32)
             hist = T.alloc_shared([257], T.int32)

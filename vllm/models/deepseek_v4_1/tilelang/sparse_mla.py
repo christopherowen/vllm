@@ -72,7 +72,7 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from . import prepare
+from . import pdl, prepare
 from .gemm import _reference_roundtrip
 
 HEAD_DIM = 512
@@ -400,6 +400,7 @@ def sparse_mla_fwd_v41(
         Output,
     ):
         with T.Kernel(head_blocks, rows, threads=threads) as (hb, row):
+            pdl.chain()
             Q_shared = T.alloc_shared([block_H, D], dtype)
             KV_shared = T.alloc_shared([BI, D], dtype)
             P_shared = T.alloc_shared([block_H, BI], dtype)
@@ -522,6 +523,7 @@ def sparse_mla_fwd_v41(
         Output,
     ):
         with T.Kernel(segments, head_blocks, rows, threads=threads) as (seg, hb, row):
+            pdl.chain()
             Q_shared = T.alloc_shared([block_H, D], dtype)
             KV_shared = T.alloc_shared([BI, D], dtype)
             P_shared = T.alloc_shared([block_H, BI], dtype)
@@ -606,6 +608,7 @@ def sparse_mla_fwd_v41(
 
         # Fold the segment partials in order from the sink; store WO-A's input.
         with T.Kernel(heads, rows, threads=128) as (hc, rc):
+            pdl.chain()
             o = T.alloc_fragment([D], accum_dtype)
             O_shared = T.alloc_shared([1, D], dtype)
             X = T.alloc_fragment([D // 32, 32], accum_dtype)

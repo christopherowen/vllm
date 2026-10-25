@@ -7,16 +7,14 @@ import functools
 import torch
 from torch import nn
 
-from vllm.models.deepseek_v4_1.tilelang import prepare
+from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
 
 
 @torch.library.custom_op("vllm::dsv41_tilelang_rmsnorm", mutates_args=("out",))
 def _rmsnorm(
     x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor, eps: float
 ) -> None:
-    import tile_kernels
-
-    tile_kernels.quant.norm_forward(x, weight, eps, out=out)
+    pdl.tile_kernels().quant.norm_forward(x, weight, eps, out=out)
 
 
 @_rmsnorm.register_fake

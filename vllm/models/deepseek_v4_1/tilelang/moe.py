@@ -47,7 +47,7 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from vllm.models.deepseek_v4_1.tilelang import prepare
+from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
 
 from .gemm import (
     SF_BLOCK,
@@ -202,6 +202,7 @@ def moe_dispatch_v41(
             NumTiles: T.Tensor([1], T.int32),
         ):
             with T.Kernel(1, threads=threads):
+                pdl.chain()
                 warp_count = T.alloc_shared([warps + 1, num_experts], T.int32)
                 scan = T.alloc_shared([threads], T.int32)
                 count = T.alloc_var(T.int32)
@@ -250,6 +251,7 @@ def moe_dispatch_v41(
             Rank: T.Tensor([rows * topk], T.int32),
         ):
             with T.Kernel(chunks, threads=threads) as c:
+                pdl.chain()
                 warp_count = T.alloc_shared([warps + 1, num_experts], T.int32)
                 tx = T.get_thread_binding()
                 expert, rank = rank_routes(
@@ -276,6 +278,7 @@ def moe_dispatch_v41(
             NumTiles: T.Tensor([1], T.int32),
         ):
             with T.Kernel(1, threads=threads):
+                pdl.chain()
                 scan = T.alloc_shared([threads], T.int32)
                 count = T.alloc_var(T.int32)
                 tx = T.get_thread_binding()
@@ -318,6 +321,7 @@ def moe_dispatch_v41(
         RoutePos: T.Tensor([rows, topk], T.int32),
     ):
         with T.Kernel(chunks, threads=threads) as c:
+            pdl.chain()
             tx = T.get_thread_binding()
             expert = T.alloc_var(T.int32)
             r = c * threads + tx
@@ -364,6 +368,7 @@ def moe_combine_v41(
         Out: T.Tensor([rows, hidden], out_dtype),
     ):
         with T.Kernel(hidden // block_D, rows, threads=threads) as (bd, row):
+            pdl.chain()
             acc = T.alloc_fragment([block_D], T.float32)
             T.clear(acc)
             if shared:
@@ -727,6 +732,7 @@ def grouped_fp8_fp4_gemm(
     @T.macro
     def body(A, SFA, B, BT, SFB, SFBase, Order, TileExpert, C):
         with T.Kernel(T.ceildiv(N, block_N), tiles, threads=threads) as (bx, t):
+            pdl.chain()
             A_shared = T.alloc_shared((stages, block_M, block_K), T.float8_e4m3fn)
             B_shared = T.alloc_shared(
                 (stages, block_N, block_K), T.float4_e2m1_unpacked
@@ -999,6 +1005,7 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
         TileExpert: T.Tensor((tiles,), T.int32),
     ):
         with T.Kernel(block_M // rows_per_cta, tiles, threads=threads) as (slab, t):
+            pdl.chain()
             tid = T.get_thread_binding()
             col = (tid // warp) * chunk + (tid % warp) * vec
             orders = T.alloc_local((rows_per_cta,), T.int32)
@@ -1390,8 +1397,7 @@ def _present(weights):
 
 
 def _tile_kernels(block_M):
-    import tile_kernels
-
+    tile_kernels = pdl.tile_kernels()
     # Expert segments in the dispatch layout start on block_M rows.
     tile_kernels.config.set_token_alignment(block_M)
     return tile_kernels
