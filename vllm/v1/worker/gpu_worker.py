@@ -285,6 +285,8 @@ class Worker(WorkerBase):
         self._b12x_profile_batch: B12xPreparedBatch | None = None
         self._b12x_tuning_batch: B12xPreparedBatch | None = None
         self._b12x_tuning_cache = False
+        # Whether a preparation stage collected any unit (collect_b12x_units).
+        self._b12x_units_declared = False
         # Startup-plan key computed before profiling can rewrite the config.
         self.startup_plan_fingerprint: str | None = None
         # Resolved lazily on first sleep/wake; persists worker-process state.

@@ -296,6 +296,7 @@ def test_tuning_pool_preserves_final_group_layout_with_less_storage(
         model_runner=SimpleNamespace(
             initialize_kv_cache=lambda c, **kw: initialized.append((c, kw))
         ),
+        _b12x_units_declared=True,
     )
     monkeypatch.setattr(b12x_prepare, "b12x_native_supported", lambda _: True)
     assert b12x_prepare.initialize_b12x_tuning_cache(worker, final)
@@ -308,6 +309,40 @@ def test_tuning_pool_preserves_final_group_layout_with_less_storage(
     for before, after in zip(final.kv_cache_tensors, temporary.kv_cache_tensors):
         assert after.size * 32 == before.size
         assert after.block_stride == before.block_stride
+
+
+def test_tuning_pool_is_not_built_for_a_model_that_declared_no_unit(monkeypatch):
+    # A model whose kernels need no preparation (DeepSeek V4.1 under TileLang)
+    # builds no temporary KV cache, so the state stage has nothing to run.
+    initialized = []
+    cache = SimpleNamespace(num_gpu_blocks=None, num_gpu_blocks_override=None)
+    worker = SimpleNamespace(
+        use_v2_model_runner=True,
+        cache_config=cache,
+        model_runner=SimpleNamespace(
+            initialize_kv_cache=lambda c, **kw: initialized.append((c, kw))
+        ),
+    )
+    monkeypatch.setattr(b12x_prepare, "b12x_native_supported", lambda _: True)
+    assert not b12x_prepare.initialize_b12x_tuning_cache(worker, object())
+    assert initialized == []
+    assert cache.num_gpu_blocks is None and cache.num_gpu_blocks_override is None
+    assert not getattr(worker, "_b12x_tuning_cache", False)
+
+
+def test_collection_records_whether_any_unit_was_declared(monkeypatch) -> None:
+    monkeypatch.setattr(b12x_prepare, "b12x_unit_providers", lambda: [])
+    model = torch.nn.Module()
+    model.layer = torch.nn.Module()
+    worker = _worker(model)
+    assert b12x_prepare.collect_b12x_units(worker, _workload("weights")) == []
+    assert b12x_prepare.collect_b12x_units(worker, _workload("state")) == []
+    assert not getattr(worker, "_b12x_units_declared", False)
+
+    # A unit of the other stage counts: the state stage tunes it.
+    model.layer.b12x_preparation_provider = _Provider("state")
+    assert b12x_prepare.collect_b12x_units(worker, _workload("weights")) == []
+    assert worker._b12x_units_declared
 
 
 @pytest.mark.parametrize("failure", [False, True])

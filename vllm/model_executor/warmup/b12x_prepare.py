@@ -388,6 +388,10 @@ def collect_b12x_units(
                 replace(unit, workspace_lanes=tuple(sorted({0, lane})))
                 for unit in hook(provider, workload)
             )
+    if units:
+        # Only a model that declares units, of either stage, tunes its state
+        # against a temporary cache (initialize_b12x_tuning_cache).
+        worker._b12x_units_declared = True
     # The state stage also carries the weights-stage units: their prepared
     # plans are skipped by the session, and any plan a layer declared for a
     # count that only the state stage exposes is prepared before capture.
@@ -605,6 +609,10 @@ class B12xPreparedBatch:
 def initialize_b12x_tuning_cache(worker: Worker, kv_cache_config) -> bool:
     """Use final cache groups and layout with a small disposable block pool."""
     if not b12x_native_supported(worker) or not worker.use_v2_model_runner:
+        return False
+    # A model that declared no unit, in its weights stage or against the
+    # profiling pools, has nothing to tune.
+    if not getattr(worker, "_b12x_units_declared", False):
         return False
     # HiSparse has a separate shared host-pool lifecycle.
     if worker.vllm_config.attention_config.hisparse_config is not None:
