@@ -8,6 +8,12 @@ The sparse MLA stores WO-A's input: its output rotated back and through
 ``act_quant`` (``wo_input``), checked bit for bit on its own.
 """
 
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -405,6 +411,74 @@ def test_indexer_candidates(page_size=64, rows=3, context=8192):
         assert torch.equal(scores[r, : extent[r]], ref[r]), f"row {r} scores differ"
     expected, _ = _ref_topk(scores, extent, INDEX_TOPK, gather=candidates)
     assert torch.equal(out, expected)
+
+
+def _compute_sanitizer() -> str | None:
+    path = os.environ.get("COMPUTE_SANITIZER") or shutil.which("compute-sanitizer")
+    if path is None and os.path.exists("/usr/local/cuda/bin/compute-sanitizer"):
+        path = "/usr/local/cuda/bin/compute-sanitizer"
+    return path
+
+
+def test_indexer_reads_only_visible_rows():
+    """No key or scale past a row's visible positions is read, as DeepSeek's reference
+    reads ``index_k[:, : end_pos // ratio]``: compute-sanitizer's initcheck scores a
+    cache written only at the visible positions, dense and by candidates, and reports
+    any read of the rest (deepseek_v41_indexer_reads.py)."""
+    sanitizer = _compute_sanitizer()
+    if sanitizer is None:
+        pytest.skip("compute-sanitizer not found (COMPUTE_SANITIZER names it)")
+    script = Path(__file__).with_name("deepseek_v41_indexer_reads.py")
+    run = subprocess.run(
+        [sanitizer, "--tool", "initcheck", "--error-exitcode", "1",
+         sys.executable, str(script)],
+        env={**os.environ, "PYTORCH_NO_CUDA_MEMORY_CACHING": "1"},
+        capture_output=True,
+        text=True,
+        timeout=3600,
+    )  # fmt: skip
+    report = run.stdout + run.stderr
+    assert run.returncode == 0 and "ERROR SUMMARY: 0 errors" in report, report[-6000:]
+
+
+@pytest.mark.parametrize("page_size", [128, 256])
+def test_indexer_scores_ignore_rows_past_the_extent(page_size, rows=4, context=9000):
+    """NaN bytes in every slot past a row's extent (a UE8M0 scale of 0xFF) leave every
+    stored score bit-identical: no row past the extent reaches a result."""
+    inp = _index_inputs(rows, context, page_size)
+    inp["lengths"][:] = torch.tensor([37, 1061, 4133, 8999], device=DEVICE)
+    width = (context + page_size - 1) // page_size * page_size
+    # Disjoint pages, so one row's poisoned tail is no other row's visible key.
+    logical = width // page_size
+    inp["page_table"] = (
+        torch.randperm(inp["pool"].shape[0], generator=_gen(5), device=DEVICE)
+        [: rows * logical]
+        .view(rows, logical)
+        .to(torch.int32)
+    )
+    plan = IndexerV41Plan(width, page_size)
+    names = (
+        "q_packed",
+        "q_scales",
+        "weights",
+        "pool",
+        "page_table",
+        "lengths",
+        "active",
+    )
+    _, clean = plan.run(*(inp[k] for k in names))
+    clean = clean.clone()
+    extent = _dense_extent(inp, width)
+    for r in range(rows):
+        for position in range(extent[r], width):
+            page = int(inp["page_table"][r, position // page_size])
+            offset = position % page_size
+            inp["pool"][page, offset * 64 : offset * 64 + 64] = 0xFF
+            words = page_size * 64 + offset * 4
+            inp["pool"][page, words : words + 4] = 0xFF
+    _, poisoned = plan.run(*(inp[k] for k in names))
+    for r in range(rows):
+        assert torch.equal(poisoned[r, : extent[r]], clean[r, : extent[r]]), r
 
 
 def test_indexer_publishes_candidates(page_size=64, rows=2, context=20000):

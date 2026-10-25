@@ -109,13 +109,15 @@ def indexer_score_v41(
     - ``Lengths``: ``[rows]`` int32 positions per row;
     - ``Active``: ``[1]`` int32 width cap;
     - candidate mode: ``Candidates`` ``[rows, width]`` int32 positions and
-      ``CandidateLengths`` ``[rows]``.
+      ``CandidateLengths`` ``[rows]``; its source layer writes the list whole,
+      ``-1`` padded.
 
     Writes ``Scores`` (``[rows, width]`` BF16) up to each row's extent, ``-inf``
     for masked candidates; entries past the extent are left unwritten and the
-    top-k never reads them. Each row gets at most ``max_ctas`` CTAs, which loop
-    over its live tiles, so the launch scales with the context in use rather
-    than the planned width.
+    top-k never reads them. No key or scale is read past the visible positions
+    either.
+    Each row gets at most ``max_ctas`` CTAs, which loop over its live tiles, so
+    the launch scales with the context in use rather than the planned width.
     """
     assert page_size % block_P == 0 or candidates, (
         "dense tiles must not straddle a page"
@@ -143,6 +145,7 @@ def indexer_score_v41(
         extent,
         position,
         slot_valid,
+        loads,
         Scores,
     ):
         K_shared = T.alloc_shared([block_P, D], fp4)
@@ -161,21 +164,36 @@ def indexer_score_v41(
             W_shared[h] = T.cast(Weights[row, h], accum_dtype)
         for i in T.serial(T.ceildiv(T.max(T.ceildiv(extent, block_P) - cta, 0), ctas)):
             p0 = (cta + i * ctas) * block_P
-            # Invalid slots load a clamped, in-pool key and are masked at the end.
+            # No load reaches past the visible positions (DeepSeek's reference reads
+            # ``index_k[:, : end_pos // ratio]``). Tile rows that ``loads`` refuses
+            # (a dense row's rows past its extent) load no key or scale and score
+            # zeros, which the store drops. Only the key and scale loads are
+            # predicated: the page read stays unconditional, so a dense tile's
+            # addresses stay affine and its loads issue together. Every candidate
+            # row loads: a masked or padding candidate is position 0, which is
+            # visible, and its score is masked at the end.
             for p, d in T.Parallel(block_P, D):
                 pos = position(p0, p)
                 page = T.min(
                     T.max(PageTable[row, T.min(pos // page_size, table_width - 1)], 0),
                     pool_pages - 1,
                 )
-                K_shared[p, d] = KPool[page, (pos % page_size) * D + d]
+                K_shared[p, d] = T.if_then_else(
+                    loads(p0, p),
+                    KPool[page, (pos % page_size) * D + d],
+                    T.cast(0, fp4),
+                )
             for p in T.Parallel(block_P):
                 pos = position(p0, p)
                 page = T.min(
                     T.max(PageTable[row, T.min(pos // page_size, table_width - 1)], 0),
                     pool_pages - 1,
                 )
-                SFK_shared[p, 0] = KScale[page, scale_word0 + pos % page_size]
+                SFK_shared[p, 0] = T.if_then_else(
+                    loads(p0, p),
+                    KScale[page, scale_word0 + pos % page_size],
+                    T.cast(0, T.uint32),
+                )
             T.mma_gemm_blockscaled(
                 K_shared,
                 Q_shared,
@@ -236,6 +254,7 @@ def indexer_score_v41(
                     extent,
                     lambda p0, p: p0 + p,
                     lambda p0, p: True,
+                    lambda p0, p: p0 + p < extent,
                     Scores,
                 )
 
@@ -269,6 +288,7 @@ def indexer_score_v41(
                 extent,
                 lambda p0, p: T.max(Candidates[row, T.min(p0 + p, width - 1)], 0),
                 lambda p0, p: Candidates[row, T.min(p0 + p, width - 1)] >= 0,
+                lambda p0, p: True,
                 Scores,
             )
 
