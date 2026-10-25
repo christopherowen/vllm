@@ -234,6 +234,12 @@ def _prepare_global_kv_fake(hidden, positions, prefix):
 
 
 class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+    """The V4.1 attention layer: caches, metadata, projections and ownership. Its
+    kernels are the TileLang layer's (``DeepseekV41TileLangAttention``), which
+    defines ``_check_attention_rows``, ``_attention_scratch_specs``,
+    ``_quantize_index_query``, ``_write_index_keys``, ``_index_chunk`` and
+    ``_attend``."""
+
     backend_cls = DeepseekV41B12xBackend
     # Index scores need bounded row scratch; attention handles the whole batch.
     INDEX_CHUNK = 256
