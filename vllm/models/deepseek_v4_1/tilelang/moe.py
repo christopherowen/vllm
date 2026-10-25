@@ -1397,7 +1397,8 @@ def _present(weights):
 
 
 def _tile_kernels(block_M):
-    tile_kernels = pdl.tile_kernels()
+    import tile_kernels
+
     # Expert segments in the dispatch layout start on block_M rows.
     tile_kernels.config.set_token_alignment(block_M)
     return tile_kernels

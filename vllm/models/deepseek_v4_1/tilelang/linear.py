@@ -68,10 +68,6 @@ _LAYERS: WeakValueDictionary[int, nn.Module] = WeakValueDictionary()
 _TORCH_TO_TL = {torch.bfloat16: "bfloat16", torch.float32: "float32"}
 
 
-def _tile_kernels():
-    return pdl.tile_kernels()
-
-
 def _activation_specs(rows: int, k: int, decode_rows: int = DECODE_ROWS):
     """MXFP8 activations and packed scales; decode rows fill whole tiles.
 
@@ -136,7 +132,7 @@ def cast_mxfp8(rows: torch.Tensor) -> MXFP8Rows:
     out = empty_mxfp8(rows)
     m = rows.shape[0]
     if m:
-        _tile_kernels().quant.per_token_cast(
+        pdl.per_token_cast(
             rows,
             "e4m3",
             SF_BLOCK,
@@ -249,7 +245,7 @@ def _block32_linear(
         _block32_split(layer, x, out.view(rows, n), scratch)
         return
     xq, sf = _scratch(_activation_specs(rows, k, layer.tilelang_decode_rows), scratch)
-    _tile_kernels().quant.per_token_cast(
+    pdl.per_token_cast(
         x,
         "e4m3",
         SF_BLOCK,
@@ -294,7 +290,7 @@ def _split_specs(layer, rows: int):
 def _block32_split(layer, x: torch.Tensor, out: torch.Tensor, scratch) -> None:
     rows = x.shape[0]
     xq, sf, partials = _scratch(_split_specs(layer, rows), scratch)
-    _tile_kernels().quant.per_token_cast(
+    pdl.per_token_cast(
         x,
         "e4m3",
         SF_BLOCK,
@@ -417,7 +413,7 @@ def _warm_cast(k: int, rows: int) -> None:
         torch.empty(shape, dtype=dtype, device="cuda")
         for shape, dtype in _activation_specs(rows, k)
     )
-    _tile_kernels().quant.per_token_cast(
+    pdl.per_token_cast(
         x,
         "e4m3",
         SF_BLOCK,
