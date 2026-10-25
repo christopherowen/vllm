@@ -13,10 +13,19 @@ import numpy as np
 import pytest
 import torch
 
+from vllm.platforms import current_platform
+from vllm.utils.import_utils import has_tilelang
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="DraftTokensHandler copies on CUDA streams"
+)
+# The consumed drafts are gathered by a TileLang kernel.
+_TILELANG = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not current_platform.is_device_capability_family(120)
+    or not has_tilelang(),
+    reason="the consumed drafts' gather is a TileLang kernel for SM120/SM121",
 )
 
 
@@ -38,6 +47,7 @@ def _draft_slots():
     )
 
 
+@_TILELANG
 def test_consumed_drafts_include_requests_that_skipped_the_proposing_step():
     handler = DraftTokensHandler(torch.device("cuda"), track_consumed_drafts=True)
     drafts = _draft_slots()
@@ -54,6 +64,7 @@ def test_consumed_drafts_include_requests_that_skipped_the_proposing_step():
     assert draft_token_ids.draft_token_ids == [[1, 2, 3], [7, 8, 9]]
 
 
+@_TILELANG
 def test_step_without_drafts_clears_the_hand_off():
     handler = DraftTokensHandler(torch.device("cuda"), track_consumed_drafts=True)
     drafts = _draft_slots()
@@ -64,6 +75,28 @@ def test_step_without_drafts_clears_the_hand_off():
     draft_token_ids = handler.get_draft_tokens()
     assert draft_token_ids.req_ids == ["b"]
     assert draft_token_ids.draft_token_ids == [[]]
+
+
+@_TILELANG
+def test_consecutive_hand_offs_share_the_gather_buffer():
+    """Each step's hand-off is its own consumed drafts, though the gather reuses one
+    buffer: rows in any order, a narrower step after a wider one, and a draft count
+    past the buffer's columns clamped as the slice clamps it."""
+    handler = DraftTokensHandler(torch.device("cuda"), track_consumed_drafts=True)
+    drafts = _draft_slots()
+
+    handler.set_consumed_draft_tokens(
+        _batch(["a", "b", "c"], [2, 0, 1], [3] * 3), drafts
+    )
+    assert handler.get_draft_tokens().draft_token_ids == [
+        [7, 8, 9],
+        [1, 2, 3],
+        [4, 5, 6],
+    ]
+    handler.set_consumed_draft_tokens(_batch(["b", "c"], [0, 1], [1, 2]), drafts)
+    assert handler.get_draft_tokens().draft_token_ids == [[1, 2], [4, 5]]
+    handler.set_consumed_draft_tokens(_batch(["c"], [1], [5]), drafts)
+    assert handler.get_draft_tokens().draft_token_ids == [[4, 5, 6]]
 
 
 def test_synchronous_scheduling_hands_back_proposals():

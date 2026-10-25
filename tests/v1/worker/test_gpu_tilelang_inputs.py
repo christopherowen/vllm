@@ -764,6 +764,28 @@ def test_scatter_rows(num_reqs, width, dtype, gather):
         assert out is None
 
 
+@pytest.mark.parametrize("num_reqs", REQUEST_COUNTS)
+@pytest.mark.parametrize("width", [1, 3, DRAFTS])
+@pytest.mark.parametrize("idx_dtype", [torch.int64, torch.int32])
+def test_gather_rows(num_reqs, width, idx_dtype):
+    """The drafts a step's inputs consumed (``DraftTokensHandler``):
+    ``state[idx, :width]`` against torch's indexing, from a state of wider rows, a
+    repeated row and -1 (the last row) among the indices, into the front of a
+    larger buffer whose tail keeps its contents."""
+    gen = _gen(num_reqs * 5 + width)
+    idx = _idx(num_reqs, gen, idx_dtype)
+    if num_reqs > 2:
+        idx[1] = idx[0]
+        idx[2] = -1
+    state = _garbage((MAX_REQS, DRAFTS + 2), torch.int64, gen)[:, :DRAFTS]
+    flat = _garbage((MAX_REQS * DRAFTS,), torch.int64, gen)
+    expected = flat.clone()
+    expected[: num_reqs * width] = state[idx, :width].reshape(-1)
+    tli.gather_rows(idx, state, flat[: num_reqs * width].view(num_reqs, width))
+    torch.accelerator.synchronize()
+    assert torch.equal(flat, expected)
+
+
 def _adaptive_offsets_ref(capacities, non_draft, cu, starts, bonus, tokens, drafted):
     """reallocate_drafts' torch chain before the port."""
     num_reqs = capacities.shape[0]
@@ -1191,6 +1213,7 @@ def test_step_glue_declarations_cover_their_launches(monkeypatch):
     drafts = _randint(0, 1 << 17, (MAX_REQS, DRAFTS), gen, torch.int64)
     state = torch.zeros_like(drafts)
     tli.scatter_rows(idx, drafts[:4], state, gather=True)
+    tli.gather_rows(idx, state, torch.empty_like(drafts[:4]))
     confidences = torch.rand(MAX_REQS, DRAFTS, generator=gen, device=DEVICE)
     tli.scatter_rows(idx, confidences[:4], torch.zeros_like(confidences))
     capacities = _randint(0, DRAFTS + 1, (4,), gen)
@@ -1228,6 +1251,7 @@ def test_step_glue_declarations_cover_their_launches(monkeypatch):
         tli.flatten_sampled_calls()
         + tli.scatter_rows_calls(torch.int64, torch.int64, gather=True)
         + tli.scatter_rows_calls(torch.int64, torch.float32, gather=False)
+        + tli.gather_rows_calls(torch.int64, torch.int64)
         + tli.adaptive_offsets_calls(DRAFTS + 1)
         + tli.assign_draft_budget_calls(DRAFTS)
         + tli.padding_rows_calls()

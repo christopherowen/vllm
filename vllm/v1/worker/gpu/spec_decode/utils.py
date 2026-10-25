@@ -80,6 +80,9 @@ class DraftTokensHandler:
         self.req_ids: list[str] = []
         self.draft_tokens_np: np.ndarray | None = None
         self.num_draft_tokens: int = 0
+        # The consumed drafts' rows for the copy, flat; allocated on first use as
+        # large as the per-request draft buffer.
+        self._consumed: torch.Tensor | None = None
 
     def set_draft_tokens(
         self, input_batch: InputBatch, draft_tokens: torch.Tensor
@@ -107,11 +110,28 @@ class DraftTokensHandler:
         if num_drafts is None or not input_batch.has_structured_output_reqs:
             self._set(input_batch.req_ids, draft_tokens[:0, :0], False)
             return
-        self._set(
-            input_batch.req_ids,
-            draft_tokens[input_batch.idx_mapping, : int(num_drafts.max())],
-            True,
-        )
+        from vllm.v1.worker.gpu import tilelang_inputs
+
+        # draft_tokens[input_batch.idx_mapping, :max drafts], the slice's clamp
+        # included, gathered in TileLang into the persistent buffer.
+        num_reqs = input_batch.idx_mapping.shape[0]
+        width = min(int(num_drafts.max()), draft_tokens.shape[1])
+        consumed = self._consumed
+        if (
+            consumed is None
+            or consumed.dtype != draft_tokens.dtype
+            or consumed.numel() < num_reqs * width
+        ):
+            consumed = self._consumed = torch.empty(
+                max(draft_tokens.numel(), num_reqs * width),
+                dtype=draft_tokens.dtype,
+                device=draft_tokens.device,
+            )
+        rows = consumed[: num_reqs * width].view(num_reqs, width)
+        # The previous step's copy may still be reading the buffer.
+        torch.cuda.current_stream(self.device).wait_event(self.copy_event)
+        tilelang_inputs.gather_rows(input_batch.idx_mapping, draft_tokens, rows)
+        self._set(input_batch.req_ids, rows, True)
 
     def _set(self, req_ids: list[str], draft_tokens: torch.Tensor, copy: bool) -> None:
         self.req_ids = req_ids
@@ -128,9 +148,9 @@ class DraftTokensHandler:
         self.copy_stream.wait_stream(current_stream)
         with torch.cuda.stream(self.copy_stream):
             self.draft_tokens_np = async_copy_to_np(draft_tokens)
-            # draft_tokens is a temporary allocation on the main stream and read here on
-            # copy_stream; without record_stream, the caching allocator may reuse its
-            # memory before the async copy executes.
+            # draft_tokens may be a temporary allocation on the main stream (the
+            # proposals), read here on copy_stream; without record_stream, the caching
+            # allocator may reuse its memory before the async copy executes.
             draft_tokens.record_stream(self.copy_stream)
             self.copy_event.record()
 

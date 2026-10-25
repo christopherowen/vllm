@@ -847,6 +847,57 @@ def scatter_rows_calls(
     return [_call(scatter_rows_kernel, *scatter_rows_key(idx_dtype, dtype, gather))]
 
 
+@tilelang.jit(pass_configs=_PASS)
+def gather_rows_kernel(idx_dtype: str, dtype: str):
+    """``out = state[idx_mapping, :width]`` for the batch's ``[num_reqs, width]``
+    rows, a negative index wrapping as torch's indexing does: the drafts a step's
+    inputs consumed, which the async-scheduling hand-off copies to the host. A
+    thread an element, its index load clamped into the batch and its store
+    guarded."""
+    num_reqs, width = T.dynamic("num_reqs, width")
+    state_rows, state_cols, state_stride = T.dynamic(
+        "state_rows, state_cols, state_stride"
+    )
+    grid = T.ceildiv(num_reqs * width, _SCATTER_THREADS)
+
+    @T.prim_func
+    def gather_rows(
+        idx_mapping: T.Tensor((num_reqs,), idx_dtype),
+        state: T.StridedTensor((state_rows, state_cols), (state_stride, 1), dtype),
+        out: T.Tensor((num_reqs, width), dtype),
+    ):
+        with T.Kernel(grid, threads=_SCATTER_THREADS) as b:
+            e = b * _SCATTER_THREADS + T.get_thread_binding()
+            r = T.min(e // width, num_reqs - 1)
+            j = e % width
+            index = T.alloc_var(T.int64, init=T.cast(idx_mapping[r], T.int64))
+            if e < num_reqs * width:
+                out[r, j] = state[
+                    T.if_then_else(index < 0, index + state_rows, index), j
+                ]
+
+    return gather_rows
+
+
+def gather_rows_key(idx_dtype: torch.dtype, dtype: torch.dtype) -> tuple:
+    return (_DTYPES[idx_dtype], _DTYPES[dtype])
+
+
+def gather_rows(
+    idx_mapping: torch.Tensor, state: torch.Tensor, out: torch.Tensor
+) -> None:
+    """``out[:] = state[idx_mapping, :out.shape[1]]``, into a contiguous ``out`` of
+    ``[num_reqs, width]``."""
+    if out.numel():
+        _kernel(gather_rows_kernel, *gather_rows_key(idx_mapping.dtype, state.dtype))(
+            idx_mapping, state, out
+        )
+
+
+def gather_rows_calls(idx_dtype: torch.dtype, dtype: torch.dtype) -> list:
+    return [_call(gather_rows_kernel, *gather_rows_key(idx_dtype, dtype))]
+
+
 # --- Adaptive verification's draft budget -----------------------------------------
 
 _BUDGET_THREADS = 256

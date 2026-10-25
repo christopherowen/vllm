@@ -2128,6 +2128,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     else []
                 )
             )
+            if self.draft_tokens_handler.track_consumed_drafts:
+                # The drafts a step's inputs consumed, handed back to the
+                # scheduler for grammar validation (set_consumed_draft_tokens).
+                tilelang_inputs.declare(
+                    lambda: tilelang_inputs.gather_rows_calls(torch.int64, draft_dtype)
+                )
         if envs.VLLM_MOE_SKIP_PADDING:
             # The target's padding rows (prepare_inputs).
             tilelang_inputs.declare(tilelang_inputs.padding_rows_calls)
@@ -2238,6 +2244,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     if dtype is not None
                 ),
                 cache_dtype=draft_logits.dtype,
+                vocab_size=draft_logits.shape[-1],
                 use_fp64=self.model_config.use_fp64_gumbel,
             )
 

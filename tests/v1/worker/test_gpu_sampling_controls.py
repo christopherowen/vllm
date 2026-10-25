@@ -6,13 +6,21 @@ import pytest
 import torch
 
 pytest.importorskip("triton")
+pytest.importorskip("tilelang")
 if not torch.cuda.is_available():
     pytest.skip("CUDA required for sampling controls", allow_module_level=True)
 
+from vllm.platforms import current_platform
+from vllm.v1.worker.gpu.sample import penalties
 from vllm.v1.worker.gpu.sample import tilelang_auxiliary as auxiliary
 from vllm.v1.worker.gpu.sample import tilelang_controls as candidate
 from vllm.v1.worker.gpu.sample.min_p import _min_p_kernel
 from vllm.v1.worker.gpu.sample.penalties import _bincount_kernel, _penalties_kernel
+
+_SM12X = pytest.mark.skipif(
+    not current_platform.is_device_capability_family(120),
+    reason="TileLang sampling controls target SM120/SM121",
+)
 
 
 def assert_bits(actual, expected):
@@ -185,6 +193,79 @@ def test_bincount_distinguishes_prompt_bits_and_output_counts(
     candidate.accumulate_bincount(
         mapping, tokens, prompt, prefill, mask, counts, length
     )
+    assert_bits(mask, expected_mask)
+    assert_bits(counts, expected_counts)
+
+
+def _bin_buffers(states, vocab, padded):
+    """Prompt bits and output counts of garbage, rows padded past the vocabulary
+    or not."""
+    pad = 13 if padded else 0
+    mask = torch.randint(
+        -(2**31), 2**31 - 1, (states, (vocab + 31) // 32 + pad), device="cuda"
+    ).int()[:, : (vocab + 31) // 32]
+    counts = torch.randint(0, 1 << 20, (states, vocab + pad), device="cuda").int()
+    return mask, counts[:, :vocab]
+
+
+@_SM12X
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("vocab", [1, 33, 1023, 1025, 129280])
+@pytest.mark.parametrize(
+    "rows", [[0], [8], [-1], [3, 7, 3], [-9, 2, -1, 0], list(range(9))]
+)
+@pytest.mark.parametrize("padded", [False, True])
+def test_bincount_rows_cleared_as_index_fill(index_dtype, vocab, rows, padded):
+    """The rows the bincount accumulates into, cleared as the int64 cast and two
+    index_fill_ calls cleared them: repeated rows, the last, a negative index
+    wrapping (-9 is the first of nine); every other element kept."""
+    torch.manual_seed(len(rows) + vocab)
+    mask, counts = _bin_buffers(9, vocab, padded)
+    mapping = torch.tensor(rows, dtype=index_dtype, device="cuda")
+    expected_mask, expected_counts = mask.clone(), counts.clone()
+    idx_long = mapping.long()
+    expected_mask.index_fill_(0, idx_long, 0)
+    expected_counts.index_fill_(0, idx_long, 0)
+    candidate.clear_bincount_rows(mapping, mask, counts)
+    assert_bits(mask, expected_mask)
+    assert_bits(counts, expected_counts)
+
+
+@_SM12X
+@pytest.mark.parametrize("length", [0, 1, 1025, 8192])
+@pytest.mark.parametrize("num_rows", [1, 4])
+def test_bincount_clears_then_accumulates(length, num_rows):
+    """``penalties.bincount`` (the clear, then the accumulation) against the torch
+    clear it replaced followed by the Triton kernel, from garbage rows, at the
+    runner's int32 request indices (a request with no prefill tokens cleared)."""
+    torch.manual_seed(length + num_rows)
+    states, vocab = 9, 129280
+    tokens = torch.randint(
+        vocab, (states, length + 11), dtype=torch.int32, device="cuda"
+    )
+    tokens[:, ::3] = 31
+    mapping = torch.tensor([8, 1, 5, 2][:num_rows], dtype=torch.int32, device="cuda")
+    prompt = torch.full((states,), length // 2, dtype=torch.int32, device="cuda")
+    prefill = torch.full((states,), length, dtype=torch.int32, device="cuda")
+    mask, counts = _bin_buffers(states, vocab, False)
+    expected_mask, expected_counts = mask.clone(), counts.clone()
+    idx_long = mapping.long()
+    expected_mask.index_fill_(0, idx_long, 0)
+    expected_counts.index_fill_(0, idx_long, 0)
+    if length:
+        _bincount_kernel[(num_rows, (length + 1023) // 1024)](
+            mapping,
+            tokens,
+            tokens.stride(0),
+            prompt,
+            prefill,
+            expected_mask,
+            mask.stride(0),
+            expected_counts,
+            counts.stride(0),
+            BLOCK_SIZE=1024,
+        )
+    penalties.bincount(mapping, tokens, prompt, prefill, mask, counts, length)
     assert_bits(mask, expected_mask)
     assert_bits(counts, expected_counts)
 
