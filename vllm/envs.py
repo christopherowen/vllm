@@ -328,6 +328,7 @@ if TYPE_CHECKING:
     VLLM_SSM_CONV_STATE_LAYOUT: Literal["SD", "DS"] | None = None
     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
     VLLM_RAISE_ON_LOGIT_NANS: bool = False
+    VLLM_KV_CACHE_POISON: bool = False
     VLLM_SINK_DETECTOR_COLUMN: int | None = None
     VLLM_SINK_DETECTOR_THRESHOLD: float | None = None
     VLLM_SINK_REJECTION: bool | None = None
@@ -2202,6 +2203,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_RAISE_ON_LOGIT_NANS": lambda: bool(
         int(os.getenv("VLLM_RAISE_ON_LOGIT_NANS", "0"))
     ),
+    # Debug only, never in serving: fill newly allocated KV cache blocks with
+    # all-ones bytes (NaN in FP32, BF16, FP16, FP8 E4M3/E5M2 and UE8M0) instead
+    # of zeros, compressor rings included, so a kernel that reads a slot it has
+    # not written, or masks one arithmetically, turns its output NaN. Forces the
+    # fill on for caches that skip zeroing.
+    "VLLM_KV_CACHE_POISON": lambda: bool(int(os.getenv("VLLM_KV_CACHE_POISON", "0"))),
     # Attention-sink detector and rejection (vllm.v1.sample.sink). On by
     # default for the models in its SINK_CHANNELS table, which holds each
     # one's watched residual column and threshold; off for every other model.

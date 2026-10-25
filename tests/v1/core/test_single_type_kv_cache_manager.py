@@ -244,6 +244,35 @@ def get_chunked_local_attention_manager(
     )
 
 
+@pytest.mark.parametrize("poison", [False, True])
+def test_kv_cache_poison_records_the_circular_buffer_block(monkeypatch, poison):
+    """A ring's block is never zeroed; under ``VLLM_KV_CACHE_POISON`` its new
+    block goes to the worker's fill with the other groups' blocks."""
+    if poison:
+        monkeypatch.setenv("VLLM_KV_CACHE_POISON", "1")
+    else:
+        monkeypatch.delenv("VLLM_KV_CACHE_POISON", raising=False)
+    spec = CircularBufferSpec(
+        block_size=4, num_kv_heads=1, head_size=8, dtype=torch.float32
+    )
+    block_pool = BlockPool(num_gpu_blocks=10, enable_caching=True, hash_block_size=4)
+    manager = CircularBufferManager(
+        spec,
+        block_pool=block_pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=4,
+        needs_kv_cache_zeroing=True,
+        max_admission_blocks_per_request=1,
+    )
+    blocks = manager.allocate_new_blocks("r", num_tokens=128, num_tokens_main_model=128)
+    assert manager.records_new_block_ids == poison
+    assert manager.take_new_block_ids() == ([blocks[0].block_id] if poison else [])
+    # The ring's one block lasts the request: later steps allocate nothing.
+    assert manager.allocate_new_blocks("r", 256, 256) == []
+    assert manager.take_new_block_ids() == []
+
+
 def test_circular_buffer_allocates_one_block_for_the_request_lifetime():
     block_size = 4
     spec = CircularBufferSpec(

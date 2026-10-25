@@ -44,7 +44,11 @@ from vllm.v1.worker.gpu.buffer_utils import (  # noqa: E402
     _apply_write_kernel,
 )
 from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash  # noqa: E402
-from vllm.v1.worker.utils import KVBlockZeroer, _zero_kv_blocks_kernel  # noqa: E402
+from vllm.v1.worker.utils import (  # noqa: E402
+    KV_POISON_WORD,
+    KVBlockZeroer,
+    _zero_kv_blocks_kernel,
+)
 
 DEVICE = torch.device("cuda")
 MAX_REQS = 16
@@ -404,6 +408,71 @@ def test_zero_kv_blocks(num_ids):
     torch.accelerator.synchronize()
     for r, s in zip(ref, storages):
         assert torch.equal(r, s)
+
+
+@pytest.mark.parametrize("num_ids", [1, 5, 32])
+def test_poison_fills_what_zeroing_clears(monkeypatch, num_ids):
+    """``VLLM_KV_CACHE_POISON``: the fill writes the poison word to exactly the
+    elements the Triton zeroing clears (``test_zero_kv_blocks``' segments), and
+    launches only the call it declares."""
+    gen = _gen(100 + num_ids)
+    num_blocks = 40
+    layouts = [  # (block stride, page, element offset)
+        (33792, 33792, 0),
+        (1100, 1027, 0),
+        (12, 4, 3),
+        (2048, 2048, 1),
+        (5, 5, 0),
+    ]
+    storages = [
+        _garbage((num_blocks * stride + offset + 8,), torch.int32, gen)
+        for stride, _, offset in layouts
+    ]
+    addrs = [s.data_ptr() + offset * 4 for s, (_, _, offset) in zip(storages, layouts)]
+    strides = torch.tensor([s for s, _, _ in layouts], device=DEVICE)
+    pages = torch.tensor([p for _, p, _ in layouts], device=DEVICE)
+    max_page = max(p for _, p, _ in layouts)
+    blk = min(1 << (max_page - 1).bit_length(), 1024)
+    ids = torch.randperm(num_blocks, generator=gen, device=DEVICE)[:num_ids].tolist()
+    # What zeroing clears: the Triton reference over all-ones copies.
+    cleared = [torch.ones_like(s) for s in storages]
+    cleared_addrs = [
+        c.data_ptr() + (a - s.data_ptr()) for c, s, a in zip(cleared, storages, addrs)
+    ]
+    _zero_kv_blocks_kernel[(num_ids, len(layouts), math.ceil(max_page / blk))](
+        torch.tensor(cleared_addrs, dtype=torch.uint64, device=DEVICE),
+        strides,
+        pages,
+        torch.tensor(ids, dtype=torch.int64, device=DEVICE),
+        BLOCK_SIZE=blk,
+    )
+    expected = [
+        torch.where(c == 0, KV_POISON_WORD, s) for c, s in zip(cleared, storages)
+    ]
+    launched = set()
+    kernel = tli._kernel
+
+    def record(factory, *key):
+        launched.add((id(factory), key))
+        return kernel(factory, *key)
+
+    monkeypatch.setattr(tli, "_kernel", record)
+    zeroer = KVBlockZeroer.__new__(KVBlockZeroer)
+    zeroer.device = DEVICE
+    zeroer._fill_word = KV_POISON_WORD
+    zeroer._meta = (
+        torch.tensor(addrs, dtype=torch.uint64, device=DEVICE),
+        strides,
+        pages,
+        math.ceil(max_page / blk),
+        blk,
+        len(layouts),
+    )
+    zeroer.zero_block_ids(ids)
+    torch.accelerator.synchronize()
+    for e, s in zip(expected, storages):
+        assert torch.equal(e, s)
+    assert launched == {(id(f), key) for f, key, _ in tli.fill_kv_blocks_calls()}
 
 
 # --- Step inputs --------------------------------------------------------------

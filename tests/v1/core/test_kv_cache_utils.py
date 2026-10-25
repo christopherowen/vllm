@@ -5110,6 +5110,51 @@ def test_wrapped_mamba_group_requires_block_zeroing():
     assert config.needs_kv_cache_zeroing
 
 
+def _zeroing_config(**specs: KVCacheSpec) -> KVCacheConfig:
+    return KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                [name],
+                UniformTypeKVCacheSpecs(block_size=4, kv_cache_specs={name: spec}),
+            )
+            for name, spec in specs.items()
+        ],
+    )
+
+
+def test_ds41_shaped_cache_zeroing_comes_from_the_fp32_compressor_ring():
+    """DeepSeek V4.1's window and compressed pages are bytes and its compressors'
+    open groups FP32 (``CircularBufferSpec``, whose blocks are not zeroed): the
+    ring alone makes the cache mixed-precision, and so zeroed."""
+    common = dict(num_kv_heads=1, head_size=1)
+    window = SlidingWindowMLASpec(
+        block_size=4, sliding_window=8, dtype=torch.uint8, **common
+    )
+    compressed = MLAAttentionSpec(block_size=4, dtype=torch.uint8, **common)
+    ring = CircularBufferSpec(block_size=4, dtype=torch.float32, **common)
+
+    assert not _zeroing_config(
+        window=window, compressed=compressed
+    ).needs_kv_cache_zeroing
+    assert _zeroing_config(
+        window=window, compressed=compressed, ring=ring
+    ).needs_kv_cache_zeroing
+
+
+def test_kv_cache_poison_forces_the_fill(monkeypatch):
+    """``VLLM_KV_CACHE_POISON`` runs the new-block fill for a cache that skips
+    zeroing (it fills with NaN bytes, never zeros)."""
+    spec = FullAttentionSpec(
+        block_size=4, num_kv_heads=1, head_size=1, dtype=torch.bfloat16
+    )
+    monkeypatch.delenv("VLLM_KV_CACHE_POISON", raising=False)
+    assert not _zeroing_config(full=spec).needs_kv_cache_zeroing
+    monkeypatch.setenv("VLLM_KV_CACHE_POISON", "1")
+    assert _zeroing_config(full=spec).needs_kv_cache_zeroing
+
+
 def _spec_decode_grouping_config(method="dspark", model_type=None):
     """Grouping config with an EAGLE-family speculative method enabled."""
     return SimpleNamespace(

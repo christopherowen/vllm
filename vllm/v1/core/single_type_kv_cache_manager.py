@@ -6,6 +6,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, ClassVar
 
+import vllm.envs as envs
 from vllm.distributed.kv_events import MEDIUM_CPU
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
@@ -193,10 +194,15 @@ class SingleTypeKVCacheManager(ABC):
         self._max_admission_blocks_per_request = max_admission_blocks_per_request
         # Record newly allocated block ids only when worker-side zeroing will
         # consume them and this manager holds a spec type that gets zeroed.
+        # A ring's block is not zeroed; under VLLM_KV_CACHE_POISON it is
+        # poisoned too, so a read of a ring slot before its write shows.
         self._record_new_block_ids = (
             needs_kv_cache_zeroing
             and isinstance(kv_cache_spec, AttentionSpec)
-            and not isinstance(kv_cache_spec, CircularBufferSpec)
+            and (
+                not isinstance(kv_cache_spec, CircularBufferSpec)
+                or envs.VLLM_KV_CACHE_POISON
+            )
         )
         self.new_block_ids: list[int] = []
 

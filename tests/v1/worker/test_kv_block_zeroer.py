@@ -394,3 +394,131 @@ def test_zeroes_exactly_one_block_per_layer(layout: KVCacheLayout):
             assert (view[b].view(torch.int8) == 1).all(), layout
     zero_bytes = int((raw == 0).sum().item())
     assert zero_bytes == num_layers * spec.page_size_bytes, layout
+
+
+# --- VLLM_KV_CACHE_POISON -----------------------------------------------------
+
+
+def _cpu_zeroer(monkeypatch, poison: bool, num_blocks: int = 4) -> KVBlockZeroer:
+    """A zeroer over two CPU layers, its launches recorded instead of run."""
+    if poison:
+        monkeypatch.setenv("VLLM_KV_CACHE_POISON", "1")
+    else:
+        monkeypatch.delenv("VLLM_KV_CACHE_POISON", raising=False)
+    spec = SlidingWindowSpec(
+        block_size=1, num_kv_heads=1, head_size=1, dtype=torch.int32, sliding_window=1
+    )
+    storages = {
+        name: torch.ones((num_blocks, 8), dtype=torch.int32) for name in ("a", "b")
+    }
+    zeroer = KVBlockZeroer(
+        torch.device("cpu"),
+        attn_groups_iter=[AttentionGroup(None, list(storages), spec, 0)],
+        kernel_block_sizes=[1],
+        static_forward_context={
+            name: SimpleNamespace(kv_cache=storage)
+            for name, storage in storages.items()
+        },
+        num_blocks=num_blocks,
+    )
+    monkeypatch.setattr(
+        worker_utils,
+        "async_tensor_h2d",
+        lambda values, **kwargs: torch.tensor(values, dtype=torch.int64),
+    )
+    zeroer.launches = []
+    monkeypatch.setattr(
+        worker_utils,
+        "_zero_kv_blocks",
+        lambda addrs, strides, pages, ids, max_el: zeroer.launches.append(
+            ("zero", ids.tolist(), addrs.numel(), max_el)
+        ),
+    )
+    monkeypatch.setattr(
+        worker_utils,
+        "_fill_kv_blocks",
+        lambda addrs, strides, pages, ids, max_el, word: zeroer.launches.append(
+            ("fill", ids.tolist(), addrs.numel(), max_el, word)
+        ),
+    )
+    return zeroer
+
+
+def test_poison_fills_new_blocks_where_zeroing_would_zero(monkeypatch):
+    """The poison check fills the segments and pages zeroing clears, with
+    ``KV_POISON_WORD``; off, the zeroing kernel runs as before."""
+    zeroer = _cpu_zeroer(monkeypatch, poison=False)
+    zeroer.zero_block_ids([1, 3])
+    zeroer.zero_block_ids([])
+    assert zeroer.launches == [("zero", [1, 3], 2, 8)]
+
+    zeroer = _cpu_zeroer(monkeypatch, poison=True)
+    zeroer.zero_block_ids([1, 3])
+    zeroer.zero_block_ids([])
+    assert zeroer.launches == [("fill", [1, 3], 2, 8, worker_utils.KV_POISON_WORD)]
+    assert worker_utils.KV_POISON_WORD & 0xFFFFFFFF == 0xFFFFFFFF
+
+
+def test_poison_warmup_compiles_the_fill_on_a_zero_null_block(monkeypatch):
+    """Warmup compiles the kernel the steps launch; under the poison check it fills
+    the null block (no request's) with zeros, as zeroing leaves it."""
+    zeroer = _cpu_zeroer(monkeypatch, poison=False)
+    zeroer.warmup(4)
+    assert zeroer.launches == [("zero", [0], 2, 8)]
+
+    zeroer = _cpu_zeroer(monkeypatch, poison=True)
+    zeroer.warmup(4)
+    zeroer.warmup(0)
+    assert zeroer.launches == [("fill", [0], 2, 8, 0)]
+
+
+@pytest.mark.parametrize("poison", [False, True])
+def test_poison_declares_the_kernel_it_launches(monkeypatch, poison):
+    """The frozen kernel cache accepts only declared calls: the poison check
+    declares the fill in place of zeroing, and serving declares no fill."""
+    if poison:
+        monkeypatch.setenv("VLLM_KV_CACHE_POISON", "1")
+    else:
+        monkeypatch.delenv("VLLM_KV_CACHE_POISON", raising=False)
+    declared = []
+    fake = SimpleNamespace(
+        declare=declared.append,
+        zero_kv_blocks_calls=object(),
+        fill_kv_blocks_calls=object(),
+    )
+    import sys
+
+    monkeypatch.setitem(sys.modules, "vllm.v1.worker.gpu.tilelang_inputs", fake)
+    import vllm.v1.worker.gpu as gpu_package
+
+    monkeypatch.setattr(gpu_package, "tilelang_inputs", fake, raising=False)
+    worker_utils.declare_zero_kv_blocks_kernel()
+    expected = fake.fill_kv_blocks_calls if poison else fake.zero_kv_blocks_calls
+    assert declared == [expected]
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float32,
+        torch.bfloat16,
+        torch.float16,
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+        torch.float8_e8m0fnu,
+    ],
+)
+def test_poison_bytes_are_nan_in_every_cache_float_format(dtype):
+    """All-ones bytes are NaN in each float format a KV page may hold. Every byte
+    is the same, so a field at any offset of a record reads this pattern: the
+    record's layout cannot turn the poison into a number."""
+    word = torch.tensor([worker_utils.KV_POISON_WORD] * 4, dtype=torch.int32)
+    assert torch.isnan(word.view(dtype).float()).all()
+
+
+def test_poison_nibbles_are_the_largest_e2m1_magnitude():
+    """E2M1 (FP4) has no NaN or Inf: the all-ones nibble is -6.0, its largest
+    magnitude (the poison check relies on the UE8M0 scale beside it)."""
+    # E2M1: sign, two exponent bits (bias 1), one mantissa bit.
+    sign, exponent, mantissa = 1, 0b11, 1
+    assert (-1) ** sign * 2 ** (exponent - 1) * (1 + mantissa / 2) == -6.0

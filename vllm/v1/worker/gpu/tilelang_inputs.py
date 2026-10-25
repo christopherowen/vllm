@@ -11,6 +11,8 @@ reference):
 - ``compute_slot_mappings``: ``block_table._compute_slot_mappings_kernel``
 - ``apply_staged_writes``: ``buffer_utils._apply_write_kernel``
 - ``zero_kv_blocks``: ``worker.utils._zero_kv_blocks_kernel``
+- ``fill_kv_blocks``: ``zero_kv_blocks`` storing a given word (the debug-only
+  ``VLLM_KV_CACHE_POISON`` check; it has no Triton original)
 - ``prepare_prefill_inputs``: ``input_batch._prepare_prefill_inputs_kernel``
 - ``prepare_pos_seq_lens``: ``input_batch._prepare_pos_seq_lens_kernel``
 - ``combine_sampled_and_draft_tokens``:
@@ -562,6 +564,62 @@ def zero_kv_blocks(
         return
     _kernel(zero_kv_blocks_kernel)(
         seg_addrs, seg_block_strides, seg_page_sizes, block_ids, chunks
+    )
+
+
+@tilelang.jit(pass_configs=_PASS)
+def fill_kv_blocks_kernel():
+    """``zero_kv_blocks_kernel`` storing ``word`` in place of zero: the same
+    segments, pages and predicated int32 stores, so a fill covers exactly what
+    zeroing covers."""
+    segments = T.dynamic("segments")
+    stride_len = T.dynamic("stride_len")
+    page_len = T.dynamic("page_len")
+    num_ids = T.dynamic("num_ids")
+
+    @T.prim_func
+    def fill_kv_blocks(
+        seg_addrs: T.Tensor((segments,), T.ptr),
+        seg_block_strides: T.Tensor((stride_len,), T.int64),
+        seg_page_sizes: T.Tensor((page_len,), T.int64),
+        block_ids: T.Tensor((num_ids,), T.int64),
+        chunks: T.int32,
+        word: T.int32,
+    ):
+        with T.Kernel(num_ids, segments, chunks, threads=_ZERO_THREADS) as (b, s, cx):
+            T.import_source(_STORE_IF)
+            tx = T.get_thread_binding()
+            page = T.alloc_var(T.int64, init=seg_page_sizes[s])
+            first = T.cast(cx, T.int64) * _ZERO_CHUNK
+            if first < page:
+                stride = T.alloc_var(T.int64, init=seg_block_strides[s])
+                block_id = T.alloc_var(T.int64, init=block_ids[b])
+                segment = T.make_tensor(seg_addrs[s], (_SPAN,), T.int32)
+                base = block_id * stride
+                for k in T.unroll(_ZERO_PER_THREAD):
+                    col = first + k * _ZERO_THREADS + tx
+                    T.call_extern(
+                        "handle", "vllm_store_if_b32",
+                        T.address_of(segment[base + col]), word, col < page,
+                    )  # fmt: skip
+
+    return fill_kv_blocks
+
+
+def fill_kv_blocks(
+    seg_addrs: torch.Tensor,
+    seg_block_strides: torch.Tensor,
+    seg_page_sizes: torch.Tensor,
+    block_ids: torch.Tensor,
+    max_page_size: int,
+    word: int,
+) -> None:
+    """``KVBlockZeroer``'s fill under ``VLLM_KV_CACHE_POISON``: ``word`` an int32."""
+    chunks = _ceil(max_page_size, _ZERO_CHUNK)
+    if chunks == 0 or seg_addrs.shape[0] == 0 or block_ids.shape[0] == 0:
+        return
+    _kernel(fill_kv_blocks_kernel)(
+        seg_addrs, seg_block_strides, seg_page_sizes, block_ids, chunks, word
     )
 
 
@@ -2490,6 +2548,10 @@ def staged_write_calls(
 
 def zero_kv_blocks_calls() -> list:
     return [_call(zero_kv_blocks_kernel)]
+
+
+def fill_kv_blocks_calls() -> list:
+    return [_call(fill_kv_blocks_kernel)]
 
 
 def input_batch_calls(

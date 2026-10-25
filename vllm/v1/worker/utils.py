@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.config import CacheConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
@@ -109,11 +110,22 @@ def zero_kv_blocks_block_size(max_page_size_el: int) -> int:
     return min(1 << (max_page_size_el - 1).bit_length(), 1024)
 
 
+# ``VLLM_KV_CACHE_POISON``'s fill: every byte 0xFF, a NaN in FP32, BF16, FP16, FP8
+# E4M3 and E5M2 and UE8M0, whatever the record's layout or the byte's offset in it.
+# E2M1 (FP4) has neither NaN nor Inf: its nibble reads -6, its largest magnitude,
+# and the UE8M0 scale beside it is NaN.
+KV_POISON_WORD = -1
+
+
 def declare_zero_kv_blocks_kernel() -> None:
-    """Declare KV block zeroing (one kernel for every page size and block count)."""
+    """Declare KV block zeroing (one kernel for every page size and block count), or
+    under ``VLLM_KV_CACHE_POISON`` the fill that replaces it."""
     from vllm.v1.worker.gpu import tilelang_inputs
 
-    tilelang_inputs.declare(tilelang_inputs.zero_kv_blocks_calls)
+    if envs.VLLM_KV_CACHE_POISON:
+        tilelang_inputs.declare(tilelang_inputs.fill_kv_blocks_calls)
+    else:
+        tilelang_inputs.declare(tilelang_inputs.zero_kv_blocks_calls)
 
 
 def _zero_kv_blocks(
@@ -131,13 +143,33 @@ def _zero_kv_blocks(
     )
 
 
+def _fill_kv_blocks(
+    seg_addrs: torch.Tensor,
+    seg_block_strides: torch.Tensor,
+    seg_page_sizes: torch.Tensor,
+    block_ids: torch.Tensor,
+    max_page_size_el: int,
+    word: int,
+) -> None:
+    """``_zero_kv_blocks`` storing ``word`` (an int32) in place of zero."""
+    from vllm.v1.worker.gpu import tilelang_inputs
+
+    tilelang_inputs.fill_kv_blocks(
+        seg_addrs, seg_block_strides, seg_page_sizes, block_ids, max_page_size_el, word
+    )
+
+
 class KVBlockZeroer:
     """Manages efficient zeroing of KV cache blocks via a TileLang kernel.
 
     Construct once after KV caches are allocated to precompute segment
     addresses, then call :meth:`zero_block_ids` each step to zero
-    newly-allocated blocks.
+    newly-allocated blocks. Under ``VLLM_KV_CACHE_POISON`` the same pages are
+    filled with ``KV_POISON_WORD`` instead.
     """
+
+    # The word new blocks are filled with in place of zeros (the poison check).
+    _fill_word: int | None = None
 
     def __init__(
         self,
@@ -167,6 +199,7 @@ class KVBlockZeroer:
         Only AttentionSpec layers are processed; Mamba layers are skipped.
         """
         self.device = device
+        self._fill_word = KV_POISON_WORD if envs.VLLM_KV_CACHE_POISON else None
         self._meta: (
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int] | None
         ) = None
@@ -256,7 +289,11 @@ class KVBlockZeroer:
         )
 
     def zero_block_ids(self, block_ids: list[int]) -> None:
-        """Zero the KV cache memory for the given block IDs."""
+        """Zero the KV cache memory for the given block IDs (poison it under
+        ``VLLM_KV_CACHE_POISON``)."""
+        if self._fill_word is not None:
+            self._fill_block_ids(block_ids, self._fill_word)
+            return
         if not block_ids or self._meta is None:
             return
         seg_addrs, seg_block_strides, seg_page_sizes, max_chunks, blk_size, _ = (
@@ -273,9 +310,31 @@ class KVBlockZeroer:
             max_chunks * blk_size,
         )
 
+    def _fill_block_ids(self, block_ids: list[int], word: int) -> None:
+        if not block_ids or self._meta is None:
+            return
+        seg_addrs, seg_block_strides, seg_page_sizes, max_chunks, blk_size, _ = (
+            self._meta
+        )
+        idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
+        _fill_kv_blocks(
+            seg_addrs.view(torch.int64),
+            seg_block_strides,
+            seg_page_sizes,
+            idx,
+            max_chunks * blk_size,
+            word,
+        )
+
     def warmup(self, num_kv_blocks: int) -> None:
         """JIT-compile the zeroing kernel before the first real request."""
-        if num_kv_blocks > 0:
+        if num_kv_blocks <= 0:
+            return
+        if self._fill_word is not None:
+            # The poison fill compiles on the null block, which no request is
+            # given: it stays zero, as without the check.
+            self._fill_block_ids([0], 0)
+        else:
             self.zero_block_ids([0])
 
 

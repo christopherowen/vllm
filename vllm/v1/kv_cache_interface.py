@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, TypeVar
 import torch
 from typing_extensions import Self
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.torch_utils import get_dtype_size
@@ -1704,5 +1705,11 @@ class KVCacheConfig:
         (#35219), and for mixed-precision caches, where a block reused across
         groups can be reinterpreted under a different precision and decode stale
         bytes to NaN/Inf. Uniform-precision caches skip zeroing.
+        ``VLLM_KV_CACHE_POISON`` (debug) runs the fill for every cache, with
+        NaN bytes in place of zeros.
         """
-        return self.has_mamba_layers or self.has_mixed_precision_kv_cache
+        return (
+            self.has_mamba_layers
+            or self.has_mixed_precision_kv_cache
+            or envs.VLLM_KV_CACHE_POISON
+        )
