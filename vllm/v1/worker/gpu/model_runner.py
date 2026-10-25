@@ -2098,11 +2098,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kv_cache_groups, self.vllm_config
         )
         self._register_kv_cache_warmups(kv_cache_groups, kernel_block_sizes)
-        dead_rows = bool(
-            getattr(self.speculator, "enable_adaptive_verification", False)
-            and dead_rows_enabled()
-            and self.batch_sharder is None
-        )
+        # The manager is built with the KV cache, after preparation; the
+        # speculator's flag is what decides it exists.
+        adaptive = bool(getattr(self.speculator, "enable_adaptive_verification", False))
+        dead_rows = adaptive and dead_rows_enabled() and self.batch_sharder is None
         samples = self.is_last_pp_rank and not self.is_pooling_model
         if not samples:
             # A stage before the last commits what the last stage sampled.
@@ -2147,7 +2146,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if envs.VLLM_MOE_SKIP_PADDING:
             # The target's padding rows (prepare_inputs).
             tilelang_inputs.declare(tilelang_inputs.padding_rows_calls)
-        if self.adaptive_verification is not None:
+        if adaptive:
             steps = self.num_speculative_steps
             width = steps + self.model_state.num_new_sampled_tokens_per_step
             tilelang_inputs.declare(

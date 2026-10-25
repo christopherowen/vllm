@@ -106,3 +106,54 @@ def test_tilelang_kernels_compile_and_freeze_before_binding(monkeypatch):
         "collect", "step kernels", "collected", "compile",
         "release", "freeze", "bind", "monitor",
     ]  # fmt: skip
+
+
+def test_adaptive_verification_kernels_are_declared_before_the_manager_exists(
+    monkeypatch,
+):
+    """Preparation runs inside memory profiling, before ``initialize_kv_cache``
+    builds the adaptive verification manager: the speculator's flag, not the
+    manager, decides that its kernels (the draft budget among them) are declared."""
+    import torch
+
+    import vllm.v1.core.kv_cache_utils as kv_cache_utils
+    import vllm.v1.worker.gpu.model_runner as runner_module
+    from vllm.v1.worker.gpu import tilelang_inputs
+
+    declared: list = []
+    monkeypatch.setattr(kv_cache_utils, "get_kv_cache_groups", lambda *_: [])
+    for name in (
+        "add_kv_sharing_layers_to_kv_cache_groups",
+        "get_shared_kv_cache_layers",
+        "select_kernel_block_sizes",
+        "declare_input_batch_kernels",
+    ):
+        monkeypatch.setattr(runner_module, name, lambda *_, **__: None)
+    monkeypatch.setattr(runner_module, "dead_rows_enabled", lambda: False)
+    monkeypatch.setattr(runner_module.envs, "VLLM_MOE_SKIP_PADDING", False)
+    monkeypatch.setattr(tilelang_inputs, "declare", declared.append)
+    monkeypatch.setattr(tilelang_inputs, "_call", lambda factory, *key: (factory, key))
+    steps = 5
+    runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(use_request_boundary_checkpoints=False),
+        get_kv_cache_spec=dict,
+        _register_kv_cache_warmups=lambda *_: None,
+        speculator=SimpleNamespace(enable_adaptive_verification=True),
+        adaptive_verification=None,
+        batch_sharder=None,
+        num_speculative_steps=steps,
+        draft_tokens_handler=SimpleNamespace(track_consumed_drafts=False),
+        req_states=SimpleNamespace(
+            next_prefill_tokens=torch.zeros(4, dtype=torch.int32),
+            draft_tokens=torch.zeros(16, steps, dtype=torch.int32),
+            register_warmups=lambda: None,
+        ),
+        model_state=SimpleNamespace(num_new_sampled_tokens_per_step=1),
+        is_last_pp_rank=False,
+        is_pooling_model=False,
+    )
+    runner_module.GPUModelRunner.declare_step_kernels(runner)
+    calls = [call for calls in declared for call in calls()]
+    budget = (tilelang_inputs.assign_draft_budget_kernel, (steps, "int64"))
+    assert budget in calls
+    assert (tilelang_inputs.fill_rows_kernel, ("int64", "float32")) in calls
