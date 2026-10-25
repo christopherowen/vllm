@@ -196,15 +196,29 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
         mla_args, index_args, chunks = self._plan_args()
         mla = _mla_plan(*mla_args)
         index = {mode: _index_plan(*args) for mode, args in index_args.items()}
-        # Reserve the largest scratch each phase borrows: indexing, then the
-        # attention metadata arena with the decode route's segment workspace.
-        workspace = current_workspace_manager()
-        for mode, plan in index.items():
-            workspace.reserve_all(*plan.scratch_specs(chunks[mode]))
+        # The largest scratch each phase borrows: indexing, then the attention
+        # metadata arena with the decode route's segment workspace. They are
+        # reserved in the workspace lane this layer runs in, before profiling
+        # (``reserve_profile_scratch``), so the drafter's lane does not hold the
+        # target's indexing scratch.
         split_rows = min(mla.decode_max_rows, self.capacity)
-        for metadata_specs in self._attention_workspace_specs.values():
-            workspace.reserve_all(*metadata_specs, *mla.scratch_specs(split_rows))
+        self._scratch_reservations = (
+            *(plan.scratch_specs(chunks[mode]) for mode, plan in index.items()),
+            *(
+                (*metadata_specs, *mla.scratch_specs(split_rows))
+                for metadata_specs in self._attention_workspace_specs.values()
+            ),
+        )
         return SimpleNamespace(mla=mla, index=index)
+
+    def reserve_profile_scratch(self) -> None:
+        """Reserve this layer's largest borrows (``_build_tilelang_plans``) in the
+        current workspace lane: the model runner calls this in the lane of each
+        model that holds the layer, before memory profiling, and then evens every
+        lane's microbatch slots out (``reserve_by_lane``)."""
+        workspace = current_workspace_manager()
+        for specs in self.__dict__.get("_scratch_reservations", ()):
+            workspace.get_simultaneous(*specs)
 
     def _check_attention_rows(self, mode: str, rows: int) -> None:
         capacity = self._tilelang().mla.max_rows

@@ -470,3 +470,65 @@ def test_dsv4_profile_retains_padded_query_reservation() -> None:
     assert reserved == [
         (4096, 32, 512, torch.bfloat16, device, ubatch) for ubatch in range(2)
     ]
+
+
+def test_v41_tilelang_attention_reserves_scratch_in_its_model_lane(monkeypatch):
+    """A V4.1 TileLang attention layer's indexing scratch and metadata arena are
+    reserved in the lane of the model holding the layer, before profiling: binding
+    the plans reserves nothing, so the drafter's lane does not take the target's
+    indexing scratch."""
+    pytest.importorskip("tilelang")
+    from vllm.models.deepseek_v4_1.tilelang import attention as tl_attention
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+    manager = workspace.WorkspaceManager(
+        torch.device("cpu"), num_ubatches=1, num_lanes=2
+    )
+    monkeypatch.setattr(workspace, "_manager", manager)
+    monkeypatch.setattr(tl_attention, "current_workspace_manager", lambda: manager)
+
+    class IndexPlan:
+        def __init__(self, width):
+            self.width = width
+
+        def scratch_specs(self, rows):
+            return (((rows, self.width), torch.bfloat16),)
+
+    mla = SimpleNamespace(
+        decode_max_rows=64, scratch_specs=lambda rows: (((rows, 4), torch.uint8),)
+    )
+    monkeypatch.setattr(tl_attention, "_mla_plan", lambda *args: mla)
+    monkeypatch.setattr(tl_attention, "_index_plan", IndexPlan)
+
+    def layer(index_width, metadata_rows):
+        module = tl_attention.DeepseekV41TileLangAttention.__new__(
+            tl_attention.DeepseekV41TileLangAttention
+        )
+        torch.nn.Module.__init__(module)
+        module.capacity = 1024
+        index = {"prefill": (index_width,)} if index_width else {}
+        module._plan_args = lambda: ((), index, {"prefill": 256})
+        module._attention_workspace_specs = {
+            "extend": (((metadata_rows, 4), torch.int32),)
+        }
+        module._build_tilelang_plans()
+        return module
+
+    target = layer(4096, 512)  # an index layer: 256 rows x 4,096 BF16 scores
+    draft = layer(0, 128)  # window-only
+    assert all(slot is None for slot in manager._current_workspaces)
+    runner = SimpleNamespace(
+        get_model=lambda: target,
+        get_draft_model=lambda: draft,
+        _draft_workspace_lane=1,
+        compilation_config=SimpleNamespace(
+            static_forward_context={"layers.20.attn": target, "layers.40.attn": draft}
+        ),
+    )
+    GPUModelRunner._reserve_profile_scratch(runner)
+
+    sizes = [manager._workspace_size_bytes(s) for s in manager._current_workspaces]
+    # Target: the scores (2 MiB) outgrow its arena; the drafter: its arena (2 KiB)
+    # and the attention scratch of 64 rows, each 256-byte aligned.
+    assert sizes == [256 * 4096 * 2, 128 * 4 * 4 + 256]
