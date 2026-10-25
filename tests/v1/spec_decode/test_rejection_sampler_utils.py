@@ -1437,8 +1437,8 @@ def test_rejection_sample_with_dead_row_cut_is_the_minimum(temperature):
     assert torch.equal(capped_sampled, sampled)
 
 
-@pytest.mark.parametrize("draft_logits", [False, True])
-def test_dead_rows_declare_the_capped_insertion(monkeypatch, draft_logits):
+@pytest.mark.parametrize("draft_logits,watermark", [(True, None), (False, 42)])
+def test_dead_rows_declare_the_capped_insertion(monkeypatch, draft_logits, watermark):
     """A step that can have dead rows declares the capped insertion beside the
     uncapped one, for every index dtype, before the cache freezes."""
     from types import SimpleNamespace
@@ -1458,7 +1458,7 @@ def test_dead_rows_declare_the_capped_insertion(monkeypatch, draft_logits):
     owner = module.RejectionSampler.__new__(module.RejectionSampler)
     owner.sampler = SimpleNamespace(use_fp64_gumbel=False)
     owner.num_speculative_steps = 5
-    owner.watermark_key = None
+    owner.watermark_key = watermark
     registry = JitWarmupRegistry(None)
     with registry.activate():
         owner.register_warmups(
