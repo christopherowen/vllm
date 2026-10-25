@@ -258,3 +258,46 @@ def _assert_same_bits(got, want):
     nan = want.isnan()
     assert torch.equal(got.isnan(), nan)
     assert torch.equal(got.view(torch.int16)[~nan], want.view(torch.int16)[~nan])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+@pytest.mark.parametrize("world", [2, 3, 4])
+@pytest.mark.parametrize(
+    "shard, dtype",
+    [
+        ((8192 * 6, 256), torch.bfloat16),  # TP4 disk Engram columns, 8K prefill
+        ((17, 3, 2048), torch.bfloat16),
+        ((5, 32320), torch.float32),  # vocab-parallel logits
+        ((9, 20), torch.int64),
+        ((1, 8), torch.bfloat16),
+    ],
+)
+def test_rank_shards_concatenate_like_movedim(world, shard, dtype):
+    """NCCL's rank-major all-gather output as the shards side by side along their
+    last dimension, as the communicator's movedim and reshape gave it, any dtype
+    (16-byte packs moved as bits)."""
+    from vllm.models.deepseek_v4_1.tilelang.collectives import concat_rank_shards
+
+    torch.manual_seed(world)
+    # Random bits of the dtype's width: NaN and infinity patterns included.
+    bits = {2: torch.int16, 4: torch.int32, 8: torch.int64}[dtype.itemsize]
+    gathered = torch.randint(
+        -(2**15), 2**15, (world * shard[0], *shard[1:]), device="cuda"
+    )
+    gathered = (gathered * 40503).to(bits).view(dtype)
+    want = (
+        gathered.reshape((world, *shard))
+        .movedim(0, len(shard) - 1)
+        .reshape(*shard[:-1], world * shard[-1])
+    )
+    got = concat_rank_shards(gathered, world, shard)
+    assert got is not None and got.shape == want.shape and got.is_contiguous()
+    assert torch.equal(got.view(torch.uint8), want.contiguous().view(torch.uint8))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_rank_shards_of_partial_packs_are_left_to_torch():
+    from vllm.models.deepseek_v4_1.tilelang.collectives import concat_rank_shards
+
+    gathered = torch.zeros(8, 5, dtype=torch.bfloat16, device="cuda")
+    assert concat_rank_shards(gathered, 2, (4, 5)) is None

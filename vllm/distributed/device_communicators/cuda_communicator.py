@@ -685,6 +685,22 @@ class CudaCommunicator(DeviceCommunicatorBase):
             output_size, dtype=input_.dtype, device=input_.device
         )
         pynccl_comm.all_gather(output_tensor, input_.contiguous())
+        if (
+            dim > 0
+            and dim == input_.dim() - 1
+            and envs.VLLM_DS41_KERNEL_BACKEND == "tilelang"
+        ):
+            # DS4.1's TileLang family: the rank-major shards side by side in one
+            # TileLang launch, not torch's movedim and reshape copy.
+            from vllm.models.deepseek_v4_1.tilelang.collectives import (
+                concat_rank_shards,
+            )
+
+            concatenated = concat_rank_shards(
+                output_tensor, self.world_size, tuple(input_size)
+            )
+            if concatenated is not None:
+                return concatenated
         output_tensor = output_tensor.reshape((self.world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
         return output_tensor.reshape(

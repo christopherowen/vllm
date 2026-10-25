@@ -18,6 +18,7 @@ neighbour, so the four links carry equal bytes. Fewer ranks exchange directly.
 
 # No `from __future__ import annotations`: TileLang reads the prim_func
 # annotations eagerly, and the symbolic shape must resolve.
+import math
 from dataclasses import dataclass
 
 import tilelang
@@ -126,6 +127,88 @@ def rank_order_sum_calls() -> list[prepare.TileLangCall]:
     if not 2 <= world <= 4 or not getattr(comm, "rank_order_reduce_scatter", False):
         return []
     return [prepare.call(rank_order_sum_kernel, world)]
+
+
+_RANK_ROWS_THREADS = 128
+
+_RANK_ROWS_HEADER = r"""
+__device__ __forceinline__ void vllm_rank_rows_b128(void* d, const void* s) {
+  *reinterpret_cast<uint4*>(d) = *reinterpret_cast<const uint4*>(s);
+}
+"""
+
+
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
+    }
+)
+def rank_rows_kernel():
+    """An all-gather's rank-major shards (``world`` blocks of ``rows`` rows) as their
+    rows side by side: ``out[r, w * packs + p] = src[w * rows + r, p]`` in 16-byte
+    packs, ``packs`` a shard row. Any dtype: both sides are viewed as int32 words,
+    four a pack."""
+    src_rows, src_words, out_rows, out_words = T.dynamic(
+        "src_rows, src_words, out_rows, out_words"
+    )
+    threads = _RANK_ROWS_THREADS
+
+    @T.prim_func
+    def collectives_rank_rows(
+        src: T.Tensor((src_rows, src_words), T.int32),
+        out: T.Tensor((out_rows, out_words), T.int32),
+        world: T.int32,
+        rows: T.int32,
+        packs: T.int32,
+    ):
+        with T.Kernel(T.ceildiv(world * packs, threads), rows, threads=threads) as (
+            bx,
+            r,
+        ):
+            T.import_source(_RANK_ROWS_HEADER)
+            p = bx * threads + T.get_thread_binding()
+            if p < world * packs:
+                T.call_extern(
+                    "handle",
+                    "vllm_rank_rows_b128",
+                    T.address_of(out[r, p * 4]),
+                    T.address_of(src[(p // packs) * rows + r, (p % packs) * 4]),
+                )
+
+    return collectives_rank_rows
+
+
+def rank_rows_calls() -> list[prepare.TileLangCall]:
+    """The rank-major-to-concatenated launch of the TP group's last-dimension
+    all-gathers that NCCL carries (``concat_rank_shards``)."""
+    from vllm.distributed import get_tp_group
+
+    return [] if get_tp_group().world_size < 2 else [prepare.call(rank_rows_kernel)]
+
+
+def concat_rank_shards(
+    gathered: torch.Tensor, world: int, shard_shape: tuple[int, ...]
+) -> torch.Tensor | None:
+    """An all-gather's rank-major output (``[world * rows, ...]``, each rank's shard
+    of ``shard_shape``) as the shards concatenated along their last dimension, in
+    one launch, or None when a shard row is not whole 16-byte packs (torch's
+    movedim and reshape copy then)."""
+    width = shard_shape[-1]
+    row_bytes = width * gathered.element_size()
+    if len(shard_shape) < 2 or row_bytes % 16 or gathered.data_ptr() % 16:
+        return None
+    rows = math.prod(shard_shape[:-1])
+    out = gathered.new_empty(*shard_shape[:-1], world * width)
+    if rows and width:
+        rank_rows_kernel()(
+            gathered.view(world * rows, width).view(torch.int32),
+            out.view(rows, world * width).view(torch.int32),
+            world,
+            rows,
+            row_bytes // 16,
+        )
+    return out
 
 
 def rank_order_sum(

@@ -691,8 +691,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
     def declare_kernels(self) -> None:
         """Declare the TileLang kernels the forward reaches outside its modules: the
-        rank-order sum of the TP group's collectives, the L2 prefetch and the last
-        collapse's sink-column variant."""
+        rank-order sum and the NCCL all-gathers' concatenation of the TP group's
+        collectives, the L2 prefetch and the last collapse's sink-column variant."""
         from ..tilelang import collectives, prepare
         from ..tilelang.mhc import TileKernelsMHC
 
@@ -707,6 +707,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         prepare.declare(
             lambda: [
                 *collectives.rank_order_sum_calls(),
+                *collectives.rank_rows_calls(),
                 *l2_prefetch.kernel_calls(),
                 *collapse,
             ]
