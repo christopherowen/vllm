@@ -22,6 +22,7 @@ from vllm.v1.worker.gpu import tilelang_inputs
 from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
     get_num_sampled_and_rejected,
+    logits_rows,
 )
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
 from vllm.v1.worker.gpu.sample.logprob import (
@@ -440,7 +441,7 @@ class RejectionSampler:
         # that num_nans is computed before applying penalties and temperature.
         num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
 
-        draft_sampled, pos = input_batch.logits_rows()
+        draft_sampled, pos = logits_rows(input_batch)
 
         max_num_logprobs = self.sampler.sampling_states.max_num_logprobs(
             input_batch.idx_mapping_np

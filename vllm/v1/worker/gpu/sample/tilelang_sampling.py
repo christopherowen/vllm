@@ -965,6 +965,8 @@ def sink_merge_kernel(packed: bool, k: int, num_alternates: int):
         "index_rows, index_width, index_stride"
     )
     threads = _SINK_MERGE_THREADS
+    # A packed row holds each rank's k values, then its k indices.
+    candidates = width // 2 if packed else width
 
     @T.prim_func
     def sink_merge(
@@ -993,9 +995,9 @@ def sink_merge_kernel(packed: bool, k: int, num_alternates: int):
             for rank in T.unroll(num_alternates):
                 best[0] = -T.infinity(T.float32)
                 best_index[0] = _NO_INDEX
-                for step in T.serial(T.ceildiv(width, threads)):
+                for step in T.serial(T.ceildiv(candidates, threads)):
                     j = step * threads + tx
-                    if j < width:
+                    if j < candidates:
                         if packed:
                             value = values[req, (j // k) * 2 * k + j % k]
                             index = T.cast(

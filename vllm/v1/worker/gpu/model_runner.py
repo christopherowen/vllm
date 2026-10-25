@@ -155,6 +155,7 @@ from vllm.v1.worker.gpu.input_batch import (
     declare_input_batch_kernels,
     expand_idx_mapping,
     get_num_sampled_and_rejected,
+    logits_rows,
     post_update,
     post_update_num_computed_tokens,
     prepare_pos_seq_lens,
@@ -2344,7 +2345,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         shard = self._language_model().lm_head.shard_indices
         tp_size = get_tensor_model_parallel_world_size()
         local_logits = self.model.compute_logits_local(sample_hidden_states)
-        drafts = input_batch.logits_rows()[0]
+        drafts = logits_rows(input_batch)[0]
         rejection = self.sink is not None and self.sink.rejection
         if rejection:
             assert self.sink is not None and sink_flags is not None
@@ -2553,7 +2554,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.idx_mapping,
             self._sink_decoding[:num_reqs],
             sink_flags,
-            input_batch.logits_rows()[0],
+            logits_rows(input_batch)[0],
             sampler_output.sink_alternates,
             self.req_states.total_len.gpu,
             self.sampler.penalties_state.output_bin_counts,
