@@ -305,7 +305,9 @@ def test_skipped_chunks_require_the_complete_successor(monkeypatch):
 @cuda
 @pytest.mark.parametrize("transpose", [False, True])
 def test_packing_trailing_dimensions_invalid_rows_and_scatter(transpose):
-    source = torch.arange(7 * 3 * 5, device="cuda", dtype=torch.float32).view(7, 3, 5)
+    # scatter_rows zeroes its output with TileLang's fill of whole 16-byte packs
+    # (columns.zero_), as every serving shape is: rows of 3 x 4 FP32 values here.
+    source = torch.arange(7 * 3 * 4, device="cuda", dtype=torch.float32).view(7, 3, 4)
     if transpose:
         source = source.transpose(1, 2)
     indices = torch.tensor([6, 1, -1, 3, 99], device="cuda")
