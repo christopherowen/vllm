@@ -176,15 +176,18 @@ def _masked(value, column, vocab, guarded: bool, other):
 
 
 @tilelang.jit(pass_configs=tilelang_sampling._PASS)
-def topk_log_softmax_kernel(logits_dtype: str, run: int):
+def topk_log_softmax_kernel(logits_dtype: str, run: int, masked: bool = False):
     """``_topk_log_softmax_kernel`` (BLOCK_SIZE and TOPK_BLOCK_SIZE 1024, four
     warps): one block of 128 threads a row, whose ``topk`` selected tokens' log
-    probabilities it writes. A thread holds its eight columns of each 1024-column
+    probabilities it writes; with ``masked``, -inf where ``valid`` is false (the
+    custom-ids path's ``masked_fill``, in the same store; unmasked, ``valid`` is
+    not read). A thread holds its eight columns of each 1024-column
     block in runs of ``run`` (``_triton_run``); chunks of eight whole blocks load
     their runs as vectors (the launch checked the alignment), and the row's last
     chunk loads each column clamped to the row, the columns past it masked."""
     rows, vocab, topk = T.dynamic("rows, vocab, topk")
     logits_stride = T.dynamic("logits_stride", "int64")
+    valid_rows, valid_cols = T.dynamic("valid_rows, valid_cols")
     per = _SOFTMAX_PER_THREAD
     unroll = _SOFTMAX_UNROLL
 
@@ -285,6 +288,7 @@ def topk_log_softmax_kernel(logits_dtype: str, run: int):
         output: T.Tensor((rows, topk), T.float32),
         logits: T.StridedTensor((rows, vocab), (logits_stride, 1), logits_dtype),
         token_ids: T.Tensor((rows, topk), T.int64),
+        valid: T.Tensor((valid_rows, valid_cols), T.bool),
     ):
         with T.Kernel(rows, threads=_THREADS) as row:
             T.import_source(_HEADER)
@@ -351,31 +355,36 @@ def topk_log_softmax_kernel(logits_dtype: str, run: int):
                     picked[u] = T.cast(logits[row, tokens[u]], T.float32)
                 for u in tuple(range(per)):
                     if c * SOFTMAX_BLOCK + u * _THREADS + tx < topk:
-                        output[row64, c * SOFTMAX_BLOCK + u * _THREADS + tx] = (
-                            T.call_extern(
-                                "float32",
-                                "vllm_sub",
-                                T.call_extern(
-                                    "float32", "vllm_sub", picked[u], maximum
-                                ),
-                                lse,
-                            )
+                        col = c * SOFTMAX_BLOCK + u * _THREADS + tx
+                        value = T.call_extern(
+                            "float32",
+                            "vllm_sub",
+                            T.call_extern("float32", "vllm_sub", picked[u], maximum),
+                            lse,
                         )
+                        if masked:
+                            value = T.if_then_else(
+                                valid[row64, col], value, -T.infinity(T.float32)
+                            )
+                        output[row64, col] = value
 
     return topk_log_softmax
 
 
-def topk_log_softmax_key(logits_dtype: torch.dtype, run: int = 1) -> tuple:
-    return (_DTYPES[logits_dtype], run)
+def topk_log_softmax_key(
+    logits_dtype: torch.dtype, run: int = 1, masked: bool = False
+) -> tuple:
+    return (_DTYPES[logits_dtype], run, masked)
 
 
 def log_softmax_calls(logits_dtypes: Sequence[torch.dtype]) -> list:
     """``topk_log_softmax``'s calls for logits of each of ``logits_dtypes``, in both
-    layouts a launch may take (``_runs``)."""
+    layouts a launch may take (``_runs``), unmasked and masked (custom ids)."""
     return [
-        _call(topk_log_softmax_kernel, *topk_log_softmax_key(dtype, run))
+        _call(topk_log_softmax_kernel, *topk_log_softmax_key(dtype, run, masked))
         for dtype in dict.fromkeys(logits_dtypes)
         for run in _runs(dtype)
+        for masked in (False, True)
     ]
 
 
@@ -391,6 +400,7 @@ def topk_log_softmax(
     logits: torch.Tensor,  # [rows, vocab_size]
     token_ids: torch.Tensor,  # [rows, topk], int64, contiguous
     output: torch.Tensor,  # [rows, topk], FP32, contiguous
+    valid: torch.Tensor | None = None,  # [rows, topk], bool, contiguous
 ) -> None:
     """``_topk_log_softmax_kernel``'s launch: each row's log-softmax at its
     ``token_ids``, into ``output``."""
@@ -398,6 +408,12 @@ def topk_log_softmax(
         return
     kernel = _kernel(
         topk_log_softmax_kernel,
-        *topk_log_softmax_key(logits.dtype, _triton_run(logits)),
+        *topk_log_softmax_key(logits.dtype, _triton_run(logits), valid is not None),
     )
-    kernel(output, logits, token_ids)
+    # Unmasked, the kernel does not read ``valid``: the ids' first row stands in.
+    kernel(
+        output,
+        logits,
+        token_ids,
+        token_ids[:1].view(torch.bool) if valid is None else valid,
+    )

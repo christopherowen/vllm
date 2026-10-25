@@ -246,8 +246,25 @@ def test_layout_decides_the_bits(dtype, vocab):
     tls._kernel(
         tilelang_logprob.topk_log_softmax_kernel,
         *tilelang_logprob.topk_log_softmax_key(dtype, 1),
-    )(other, logits, ids)
+    )(other, logits, ids, ids[:1].view(torch.bool))
     assert not torch.equal(_bits(other), _bits(theirs))
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=str)
+@pytest.mark.parametrize("layout", ["aligned", "odd_stride"])
+def test_masked_columns_are_minus_inf(dtype, layout):
+    """The custom-ids path's mask in the same store: the unmasked kernel's bits
+    where ``valid``, -inf elsewhere (torch's ``masked_fill`` after it before)."""
+    values = _values(37, VOCAB, "special", seed=13)
+    logits = _logits(values, dtype, layout)
+    ids = _ids(values, 21, 13)
+    g = torch.Generator(device=DEVICE).manual_seed(14)
+    valid = torch.rand(ids.shape, generator=g, device=DEVICE) < 0.6
+    valid[:, 0] = True
+    expected = _tilelang(logits, ids).masked_fill(~valid, float("-inf"))
+    ours = torch.full_like(expected, SENTINEL)
+    tilelang_logprob.topk_log_softmax(logits, ids, ours, valid)
+    _assert_same(ours, expected, "masked")
 
 
 # --- Call sites ------------------------------------------------------------------
@@ -350,10 +367,11 @@ def test_runner_declares_the_launched_calls(logits_mode):
     expected = {
         (
             id(tilelang_logprob.topk_log_softmax_kernel),
-            tilelang_logprob.topk_log_softmax_key(dtype, run),
+            tilelang_logprob.topk_log_softmax_key(dtype, run, masked),
         )
         for dtype in (torch.bfloat16, torch.float32)
         for run in tls._runs(dtype)
+        for masked in (False, True)
     }
     declared = _declared(registry)
     softmax = {

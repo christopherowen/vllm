@@ -25,7 +25,13 @@ from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
 from vllm.sampling_params import SamplingParams
 from vllm.v1.worker.gpu import tilelang_inputs
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
-from vllm.v1.worker.gpu.sample import logprob, states, tilelang_logprob
+from vllm.v1.worker.gpu.sample import (
+    logprob,
+    states,
+    tilelang_auxiliary,
+    tilelang_logprob,
+    tilelang_topk_ids,
+)
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.sink import SinkAlternates
 from vllm.v1.worker.gpu.spec_decode import rejection_sampler
@@ -100,6 +106,35 @@ def _fill_logprob_token_ids(
         valid[row, : 1 + len(tokens)] = True
 
 
+def _fill_token_ids(
+    out_ids, valid, sampled, topk, expanded_idx_mapping, num_per_req, per_req_ids, k
+):
+    """``tilelang_auxiliary.fill_token_ids``: every column written, 0 and invalid
+    where unused."""
+    out_ids.zero_()
+    valid.zero_()
+    _fill_logprob_token_ids(
+        out_ids,
+        None,
+        valid,
+        None,
+        sampled,
+        topk,
+        None,
+        expanded_idx_mapping,
+        num_per_req,
+        per_req_ids,
+        None,
+        k,
+        None,
+    )
+
+
+def _compute_token_logprobs(logits, ids, valid=None):
+    scores = torch.log_softmax(logits.float(), -1).gather(1, ids.long())
+    return scores if valid is None else scores.masked_fill(~valid, float("-inf"))
+
+
 def _token_ranks(logits, token_ids, out):
     chosen = logits.gather(1, token_ids.view(-1, 1).long())
     out.copy_((logits >= chosen).sum(1))
@@ -123,15 +158,21 @@ def host_runner(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(states, "UvaBackedTensor", HostTensor)
     monkeypatch.setattr(logprob, "UvaBackedTensor", HostTensor)
     monkeypatch.setattr(logprob, "StagedWriteTensor", HostStagedTensor)
+    monkeypatch.setattr(tilelang_auxiliary, "fill_token_ids", _fill_token_ids)
     monkeypatch.setattr(
-        logprob, "_fill_logprob_token_ids_kernel", HostKernel(_fill_logprob_token_ids)
+        tilelang_topk_ids,
+        "topk_token_ids",
+        lambda logits, k: torch.topk(logits, k, dim=-1).indices.int(),
+    )
+    monkeypatch.setattr(
+        tilelang_topk_ids,
+        "logprob_token_ids",
+        lambda logits, k, sampled: torch.cat(
+            (sampled.unsqueeze(-1), torch.topk(logits, k, dim=-1).indices), dim=1
+        ),
     )
     monkeypatch.setattr(tilelang_logprob, "token_ranks", _token_ranks)
-    monkeypatch.setattr(
-        logprob,
-        "compute_token_logprobs",
-        lambda logits, ids: torch.log_softmax(logits.float(), -1).gather(1, ids.long()),
-    )
+    monkeypatch.setattr(logprob, "compute_token_logprobs", _compute_token_logprobs)
     monkeypatch.setattr(
         logprob.triton,
         "next_power_of_2",
