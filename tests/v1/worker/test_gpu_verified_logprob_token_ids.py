@@ -23,6 +23,7 @@ import torch
 
 from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
 from vllm.sampling_params import SamplingParams
+from vllm.v1.worker.gpu import tilelang_inputs
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.sample import logprob, states
 from vllm.v1.worker.gpu.sample.sampler import Sampler
@@ -111,6 +112,12 @@ def _flatten_sampled(flat, sampled, _, num_sampled, cu_num_logits, num_warps):
         flat[start : start + n] = sampled[req, :n]
 
 
+def _flatten_sampled_rows(sampled, num_sampled, cu_num_logits, num_logits):
+    flat = torch.zeros(num_logits, dtype=sampled.dtype)
+    _flatten_sampled(flat, sampled, None, num_sampled, cu_num_logits, 1)
+    return flat
+
+
 @pytest.fixture(autouse=True)
 def host_runner(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(states, "UvaBackedTensor", HostTensor)
@@ -133,6 +140,11 @@ def host_runner(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     monkeypatch.setattr(
         rejection_sampler, "_flatten_sampled_launcher", HostKernel(_flatten_sampled)
+    )
+    # The TileLang launches the samplers reach, as torch on the host.
+    monkeypatch.setattr(tilelang_inputs, "flatten_sampled", _flatten_sampled_rows)
+    monkeypatch.setattr(
+        tilelang_inputs, "logits_rows", lambda ids, pos, rows: (ids[rows], pos[rows])
     )
     monkeypatch.setattr(
         rejection_sampler,
