@@ -13,7 +13,13 @@ including which rows each launch writes:
   their contents).
 - ``chunk``: per row its sliding-window page indices (-1 holes), window length and
   top-k length.
-- ``pages``: per row its request's page table, block 0 and holes as -1.
+- ``pages``: per row its request's page table, block 0 and holes as -1, over the
+  pages of the row's visible entries only. The Triton kernel it replaced wrote every
+  column; at a 1M-token context that is 4,096 a row, where a row reads
+  ``ceil(visible / page)``: the sparse MLA's indexed lanes and the indexer's tiles
+  look up only positions below the row's visible length, and a masked lane's lookup
+  is discarded (``test_sparse_mla_reads_only_live_pages``,
+  ``test_indexer_reads_only_live_pages``). Columns past them keep their contents.
 """
 
 # No `from __future__ import annotations`: TileLang reads the prim_func
@@ -197,6 +203,12 @@ def _window_macro(page, window, width, draft, replay, threads, per_thread):
     return window_row
 
 
+def _live_pages(visible, page: int, read_width):
+    """The page-table columns a row's readers reach: the pages holding its
+    ``visible`` entries (``page`` a page), at most ``read_width``."""
+    return T.min((T.max(visible, 0) + page - 1) // page, read_width)
+
+
 def _threads(width: int) -> tuple[int, int]:
     threads = min(256, max(32, (width + 31) // 32 * 32))
     return threads, (width + threads - 1) // threads
@@ -242,11 +254,17 @@ def chunk_kernel(page: int, window: int, width: int, draft: bool, replay: bool):
 
 @tilelang.jit(pass_configs=_PASS)
 def decode_metadata_kernel(
-    page: int, window: int, width: int, draft: bool, replay: bool, main_width: int
+    page: int,
+    window: int,
+    width: int,
+    draft: bool,
+    replay: bool,
+    main_width: int,
+    main_page: int,
 ):
     """``chunk`` and ``pages`` of the main cache in one launch, a block for each part
     of each row: the window metadata and the main page table (block 0 and holes as
-    -1)."""
+    -1) over the pages of the row's ``visible`` entries (``main_page`` a page)."""
     rows = T.dynamic("rows")
     src_rows = T.dynamic("src_rows")
     table_rows = T.dynamic("table_rows")
@@ -259,11 +277,10 @@ def decode_metadata_kernel(
     req_count = T.dynamic("req_count")
     starts_len = T.dynamic("starts_len")
     replay_len = T.dynamic("replay_len")
-    # Blocks as wide as the window part; the page part loops (idle threads cost the
-    # prefill rows' blocks).
+    # Blocks as wide as the window part; the page part loops over the row's live
+    # pages (idle threads cost the prefill rows' blocks).
     threads, per_thread = _threads(width)
     window_row = _window_macro(page, window, width, draft, replay, threads, per_thread)
-    main_per_thread = (main_width + threads - 1) // threads
 
     @T.prim_func
     def metadata_decode(
@@ -287,6 +304,7 @@ def decode_metadata_kernel(
         with T.Kernel(rows, 2, threads=threads) as (row, part):
             tx = T.get_thread_binding()
             info = T.alloc_local((2,), T.int64)  # window start, clamped length
+            live = T.alloc_var(T.int32)  # the page part's columns
             if part == 0:
                 window_row(
                     row, tx, info, positions, reqs, table, swa, lengths, top_lengths,
@@ -294,21 +312,24 @@ def decode_metadata_kernel(
                 )  # fmt: skip
             else:
                 req = main_reqs[offset + row]
-                for k in T.serial(main_per_thread):
+                live = _live_pages(
+                    visible[offset + row], main_page, T.min(main_read_width, main_width)
+                )
+                if req < 0:
+                    live = 0
+                for k in T.serial(T.ceildiv(live, threads)):
                     col = k * threads + tx
-                    if col < main_width:
-                        page_id = T.if_then_else(
-                            (req >= 0) & (col < main_read_width),
-                            main_table[req, col],
-                            -1,
-                        )
+                    if col < live:
+                        page_id = main_table[req, col]
                         main_pages[row, col] = T.if_then_else(page_id > 0, page_id, -1)
 
     return metadata_decode
 
 
 @tilelang.jit(pass_configs=_PASS)
-def pages_kernel(width: int):
+def pages_kernel(width: int, page: int):
+    """Each row's page table over the pages of its ``lengths`` entries (``page`` a
+    page)."""
     rows = T.dynamic("rows")
     src_rows = T.dynamic("src_rows")
     table_rows = T.dynamic("table_rows")
@@ -318,6 +339,7 @@ def pages_kernel(width: int):
     @T.prim_func
     def metadata_pages(
         reqs: T.Tensor((src_rows,), T.int32),
+        lengths: T.Tensor((src_rows,), T.int32),
         table: T.StridedTensor((table_rows, table_cols), (table_stride, 1), T.int32),
         out: T.Tensor((rows, width), T.int32),
         offset: T.int32,
@@ -325,12 +347,11 @@ def pages_kernel(width: int):
     ):
         with T.Kernel(rows, T.ceildiv(width, _BLOCK), threads=_BLOCK) as (row, cb):
             col = cb * _BLOCK + T.get_thread_binding()
-            if col < width:
-                req = reqs[offset + row]
-                page_id = T.if_then_else(
-                    (req >= 0) & (col < read_width), table[req, col], -1
-                )
+            req = reqs[offset + row]
+            live = _live_pages(lengths[offset + row], page, T.min(read_width, width))
+            if (req >= 0) & (col < live):
                 # vLLM reserves physical block zero; page tables use -1 for holes.
+                page_id = table[req, col]
                 out[row, col] = T.if_then_else(page_id > 0, page_id, -1)
 
     return metadata_pages
@@ -374,12 +395,15 @@ def chunk(
 def decode_metadata(
     positions, reqs, table, swa, lengths, top_lengths, visible, starts,
     request_positions, main_reqs, main_table, main_pages, offset: int, rows: int,
-    main_read_width: int, *, page: int, window: int, draft: bool, replay_start=None,
+    main_read_width: int, *, page: int, window: int, draft: bool, main_page: int,
+    replay_start=None,
 ) -> None:  # fmt: skip
-    """``chunk`` then ``pages`` of the main cache for ``rows`` rows, one launch."""
+    """``chunk`` then ``pages`` of the main cache for ``rows`` rows, one launch; a row's
+    main page table covers the pages of its ``visible`` entries, ``main_page`` a page
+    (its other columns keep their contents)."""
     width, main_width = swa.shape[1], main_pages.shape[1]
     replay = replay_start is not None
-    decode_metadata_kernel(page, window, width, draft, replay, main_width)(
+    decode_metadata_kernel(page, window, width, draft, replay, main_width, main_page)(
         positions, reqs, table, swa[:rows], lengths[:rows], top_lengths[:rows],
         visible, starts, request_positions,
         replay_start if replay_start is not None else request_positions, main_reqs,
@@ -387,10 +411,15 @@ def decode_metadata(
     )  # fmt: skip
 
 
-def pages(reqs, table, out, offset: int, rows: int, read_width: int) -> None:
-    """Page tables for ``rows`` rows from source row ``offset``; ``out`` is
-    ``[*, width]`` and columns at or past ``read_width`` are -1."""
-    pages_kernel(out.shape[1])(reqs, table, out[:rows], offset, read_width)
+def pages(
+    reqs, lengths, table, out, offset: int, rows: int, read_width: int, *, page: int
+) -> None:
+    """Page tables for ``rows`` rows from source row ``offset``, over the pages of
+    each row's ``lengths`` entries (``page`` a page; ``out`` is ``[*, width]``, its
+    other columns keep their contents)."""
+    pages_kernel(out.shape[1], page)(
+        reqs, lengths, table, out[:rows], offset, read_width
+    )
 
 
 __all__ = [

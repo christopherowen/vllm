@@ -592,7 +592,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             if self.compress_ratio:
                 calls.append(
                     prepare.call(
-                        tl_metadata.decode_metadata_kernel, *args, self._main_width
+                        tl_metadata.decode_metadata_kernel,
+                        *args,
+                        self._main_width,
+                        self._main_page,
                     )
                 )
             else:
@@ -603,7 +606,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             if self._short_index_shape is not None:
                 widths.add(self._short_index_shape[1])
             calls.extend(
-                prepare.call(tl_metadata.pages_kernel, width) for width in widths
+                prepare.call(tl_metadata.pages_kernel, width, self._index_page)
+                for width in widths
             )
         # Each group's metadata builder: its spec as the KV-cache spec code makes
         # it, for the scheduler's requests.
@@ -1005,11 +1009,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
 
                     tl_metadata.pages(
                         im.req_id_per_token,
+                        im.cache_lengths,
                         im.block_table,
                         index_pages,
                         row,
                         count,
                         min(im.block_table.shape[1], index_width),
+                        page=self._index_page,
                     )
                     candidate_args = {}
                     if self.layer_id == self.candidate_source_layer:
@@ -1225,6 +1231,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 0,
                 rows,
                 main.block_table.shape[1],
+                main_page=self._main_page,
                 **window,
             )
 

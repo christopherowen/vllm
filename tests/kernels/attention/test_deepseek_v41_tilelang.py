@@ -512,6 +512,75 @@ def test_indexer_publishes_candidates(page_size=64, rows=2, context=20000):
     assert torch.equal(counts, block_counts)
 
 
+def _poison_past_live(page_table, lengths, page_size, seed=11):
+    """``page_table`` with every column past each row's live pages (those holding its
+    first ``lengths`` positions, all the TileLang metadata writes) set to page ids no
+    pool holds, negative ones among them."""
+    live = (lengths.long().clamp_min(0) + page_size - 1) // page_size
+    cols = torch.arange(page_table.shape[1], device=DEVICE)
+    past = cols[None, :] >= live[:, None]
+    assert past.any(), "no column to poison"
+    garbage = torch.randint(
+        -(2**31),
+        2**31 - 1,
+        page_table.shape,
+        generator=_gen(seed),
+        device=DEVICE,
+        dtype=torch.int32,
+    )
+    return torch.where(past, garbage, page_table)
+
+
+@pytest.mark.parametrize("candidates", [False, True])
+def test_indexer_reads_only_live_pages(candidates, page_size=64, rows=4, context=9000):
+    """The TileLang metadata writes a row's index page table only over the pages of
+    its first ``lengths`` positions (``tilelang.metadata.pages``). The indexer looks
+    up no other column: with every other column poisoned, the scores and the
+    selections keep their bits."""
+    inp = _index_inputs(rows, context, page_size)
+    inp["lengths"] = torch.tensor(
+        [1, 700, 3001, context], dtype=torch.int32, device=DEVICE
+    )
+    keys = (
+        "q_packed",
+        "q_scales",
+        "weights",
+        "pool",
+        "page_table",
+        "lengths",
+        "active",
+    )
+    extra: tuple = ()
+    if candidates:
+        width = CANDIDATE_BLOCKS * CANDIDATE_BLOCK
+        gen = _gen(7)
+        candidate_lengths = torch.tensor(
+            [1, 600, 2048, 4096], dtype=torch.int32, device=DEVICE
+        )
+        candidates_in = torch.full((rows, width), -1, dtype=torch.int32, device=DEVICE)
+        for r in range(rows):
+            n = int(candidate_lengths[r])
+            chosen = torch.randperm(
+                int(inp["lengths"][r]), generator=gen, device=DEVICE
+            )[:n]
+            candidates_in[r, :n] = chosen.sort().values.to(torch.int32)
+        candidates_in[2, 5] = -1  # a masked candidate looks up column 0
+        extra = (candidates_in, candidate_lengths)
+        extent = candidate_lengths.clamp(0, width).tolist()
+    else:
+        width = (context + page_size - 1) // page_size * page_size
+        extent = _dense_extent(inp, width)
+    plan = IndexerV41Plan(width, page_size, candidates=candidates)
+    clean_out, clean_scores = plan.run(*(inp[k] for k in keys), *extra)
+    inp["page_table"] = _poison_past_live(inp["page_table"], inp["lengths"], page_size)
+    out, scores = plan.run(*(inp[k] for k in keys), *extra)
+    for r in range(rows):
+        assert torch.equal(scores[r, : extent[r]], clean_scores[r, : extent[r]]), (
+            f"row {r} looked up a page past its live pages"
+        )
+    assert torch.equal(out, clean_out)
+
+
 def _tie_scores(rows, width, seed=3):
     # Few distinct values force large ties at every selection threshold.
     gen = _gen(seed)
@@ -813,6 +882,42 @@ def test_sparse_mla_reads_only_selected_records(idx_width, heads=16, rows=6):
         )
     for kernel, out in _mla_run(case, **kwargs).items():
         assert torch.equal(out, clean[kernel]), f"{kernel} read an unselected record"
+
+
+@pytest.mark.parametrize("heads", [16, 24])
+def test_sparse_mla_reads_only_live_pages(heads, rows=6):
+    """The TileLang metadata writes a row's indexed page table only over the pages of
+    its visible entries (``tilelang.metadata.decode_metadata``), which hold every
+    position the row selects. The sparse MLA looks up no other column for a lane it
+    keeps: with every other column poisoned and each list pointing past its length
+    into them, every route keeps the clean bits."""
+    case = _mla_case(512, heads, rows)
+    page, width = case["idx_page"], case["idx_logical"].shape[1]
+    gen = _gen(13)
+    visible = [1, 130, 700, 1500, 2600, 4096][:rows]
+    logical = torch.full_like(case["idx_logical"], -1)
+    lengths = torch.zeros_like(case["idx_len"])
+    for r, seen in enumerate(visible):
+        n = min(seen, width, 1 + r * 97)
+        logical[r, :n] = torch.randperm(seen, generator=gen, device=DEVICE)[:n].to(
+            torch.int32
+        )
+        lengths[r] = n
+    case.update(idx_logical=logical, idx_len=lengths)
+    clean = _mla_run(case)
+    seen = torch.tensor(visible, dtype=torch.int32, device=DEVICE)
+    case["table"] = _poison_past_live(case["table"], seen, page)
+    # Lanes past each list's length look up the first poisoned column (a row whose
+    # pages are all live keeps its -1 lanes).
+    live = (seen.long() + page - 1) // page
+    lanes = torch.arange(width, device=DEVICE)[None, :]
+    past = lanes >= lengths[:, None]
+    dead = (live[:, None] * page + lanes % page).to(torch.int32)
+    poisoned = torch.where(
+        past & (live[:, None] < case["table"].shape[1]), dead, logical
+    )
+    for kernel, out in _mla_run(case, idx_logical=poisoned).items():
+        assert torch.equal(out, clean[kernel]), f"{kernel} looked up a dead page"
 
 
 def test_sparse_mla_selected_nan_reaches_its_rows(heads=16, rows=6):

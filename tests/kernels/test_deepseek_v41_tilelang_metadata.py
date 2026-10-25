@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek-V4.1 TileLang sparse-MLA metadata against torch references of its
-contracts, exactly: every row a launch writes, and the rows it must leave alone."""
+contracts, exactly: every row a launch writes, and the rows it must leave alone.
+
+The page tables equal the references over each row's live pages (those of its
+visible entries); their other columns keep what the buffer held."""
 
 from types import SimpleNamespace
 
@@ -156,6 +159,26 @@ def _rows_equal(actual, expected, rows, sentinel=7):
     assert bool((actual[rows:] == sentinel).all())
 
 
+def _live_columns(reqs, visible, offset, rows, page, read_width, width):
+    """Each of ``rows`` rows' live page-table columns: the pages of its visible
+    entries, at most the table's width, none for a row without a request."""
+    reqs, visible = _host(reqs, visible)
+    row = torch.arange(rows) + offset
+    live = (visible[row].clamp(min=0) + page - 1) // page
+    live = live.clamp(max=min(read_width, width))
+    return torch.where(reqs[row] >= 0, live, 0)
+
+
+def _live_equal(actual, expected, live, rows, sentinel=7):
+    """``actual`` equals the reference on each of its first rows' ``live``
+    columns, and every other element is untouched."""
+    actual = actual.cpu().long()
+    inside = torch.zeros_like(actual, dtype=torch.bool)
+    inside[:rows] = torch.arange(actual.shape[1])[None, :] < live[:, None]
+    assert torch.equal(actual[:rows][inside[:rows]], expected[inside[:rows]])
+    assert bool((actual[~inside] == sentinel).all())
+
+
 @pytest.mark.parametrize("lengths", STEPS)
 def test_requests(lengths):
     s, nr, nt = _step(lengths, seed=len(lengths))
@@ -231,26 +254,32 @@ def test_chunk(lengths, draft, replay, width):
 
 @pytest.mark.parametrize("lengths", STEPS)
 @pytest.mark.parametrize("width, read_width", [(128, COLS), (256, 30), (40, 40)])
-def test_pages(lengths, width, read_width):
+@pytest.mark.parametrize("page", [64, 128])
+def test_pages(lengths, width, read_width, page):
     s, nr, nt = _step(lengths, seed=width + read_width)
-    _, reqs, _ = _token_metadata(s, nr, nt, 64)
+    _, reqs, visible = _token_metadata(s, nr, nt, 64)
     rows, offset = min(nt, 500), 2 if nt > 4 else 0
     rows = min(rows, nt - offset)
     out = torch.full((CAP, width), 7, dtype=torch.int32, device=DEVICE)
-    metadata.pages(reqs, s["table"], out, offset, rows, read_width)
+    metadata.pages(reqs, visible, s["table"], out, offset, rows, read_width, page=page)
     expected = _ref_pages(reqs, s["table"], offset, rows, width, read_width)
-    _rows_equal(out, expected, rows)
+    live = _live_columns(reqs, visible, offset, rows, page, read_width, width)
+    _live_equal(out, expected, live, rows)
 
 
 @pytest.mark.parametrize("lengths", STEPS)
 @pytest.mark.parametrize(
     "draft, replay", [(False, False), (False, True), (True, False), (True, True)]
 )
-def test_decode_metadata_equals_chunk_and_pages(lengths, draft, replay):
+@pytest.mark.parametrize("main_page", [64, 128])
+def test_decode_metadata_equals_chunk_and_pages(lengths, draft, replay, main_page):
     page, window, width, main_width = 64, 128, 128, 256
     s, nr, nt = _step(lengths, seed=7 + 3 * draft + replay)
     pos, reqs, visible = _token_metadata(s, nr, nt, page)
-    main_reqs = torch.flip(reqs, (0,)).contiguous()
+    # The main rows' requests differ from the window rows' (the step's rows in
+    # reverse); every row has a written request or -1, as a builder leaves them.
+    main_reqs = torch.full_like(reqs, -1)
+    main_reqs[:nt] = torch.flip(reqs[:nt], (0,))
     request_positions = torch.randint(-5, 900, (R,), device=DEVICE)
     replay_start = torch.randint(0, 900, (R,), device=DEVICE) if replay else None
     rows, offset = min(nt, 600), 3 if nt > 10 else 0
@@ -263,18 +292,20 @@ def test_decode_metadata_equals_chunk_and_pages(lengths, draft, replay):
         pos, reqs, s["table"], swa, lengths_out, top, visible, s["qsl"],
         request_positions, main_reqs, s["table"], main_pages, offset, rows,
         s["table"].shape[1], page=page, window=window, draft=draft,
-        replay_start=replay_start,
+        main_page=main_page, replay_start=replay_start,
     )  # fmt: skip
     expected = _ref_chunk(
         pos, reqs, s["table"], visible, s["qsl"], request_positions, offset, rows,
         width, page, window, draft, replay_start,
-    ) + (
-        _ref_pages(
-            main_reqs, s["table"], offset, rows, main_width, s["table"].shape[1]
-        ),
     )  # fmt: skip
-    for actual, reference in zip((swa, lengths_out, top, main_pages), expected):
+    for actual, reference in zip((swa, lengths_out, top), expected):
         _rows_equal(actual, reference, rows)
+    read_width = s["table"].shape[1]
+    pages = _ref_pages(main_reqs, s["table"], offset, rows, main_width, read_width)
+    live = _live_columns(
+        main_reqs, visible, offset, rows, main_page, read_width, main_width
+    )
+    _live_equal(main_pages, pages, live, rows)
 
 
 @torch.inference_mode()
