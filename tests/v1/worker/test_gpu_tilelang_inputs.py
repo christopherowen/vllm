@@ -26,9 +26,6 @@ if not (
 
 pytest.importorskip("tilelang")
 
-from vllm.models.deepseek_v4_1.nvidia.model_state import (  # noqa: E402
-    _gather_lookback_kernel,
-)
 from vllm.models.deepseek_v4_1.tilelang import lookback  # noqa: E402
 from vllm.triton_utils import triton  # noqa: E402
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID  # noqa: E402
@@ -1246,20 +1243,17 @@ def test_gather_lookback(num_reqs, depth):
     computed = _randint(0, 12, (MAX_REQS,), gen)  # windows before the history
     history = _history(gen, 64)
     window = _garbage((MAX_REQS, depth), torch.int32, gen)
-    ref = window.clone()
-    _gather_lookback_kernel[(MAX_REQS,)](
-        ref,
-        idx,
-        computed,
-        history,
-        history.stride(0),
-        num_reqs,
-        DEPTH=depth,
-        BLOCK_DEPTH=triton.next_power_of_2(depth),
-    )
     lookback.gather_lookback(window, idx, computed, history)
-    torch.accelerator.synchronize()
-    assert torch.equal(ref, window)
+    # The window's contract: each batch row's request's last ``depth`` tokens
+    # before its computed tokens, -1 before its history starts; every row past the
+    # batch -1.
+    idx, computed, history = (t.cpu().long() for t in (idx, computed, history))
+    ref = torch.full((MAX_REQS, depth), -1, dtype=torch.long)
+    for row in range(num_reqs):
+        req = int(idx[row])
+        pos = torch.arange(int(computed[req]) - depth, int(computed[req]))
+        ref[row] = torch.where(pos >= 0, history[req, pos.clamp(min=0)], -1)
+    assert torch.equal(window.cpu().long(), ref)
 
 
 # --- Preparation --------------------------------------------------------------

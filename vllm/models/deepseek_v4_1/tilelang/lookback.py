@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The Engram lookback window, ``model_state._gather_lookback_kernel``'s contract.
+"""The Engram lookback window.
 
 Each row of ``lookback`` ([rows, depth], int32) holds the ids of the ``depth``
 tokens before its request's computed tokens, oldest first, from the runner's token

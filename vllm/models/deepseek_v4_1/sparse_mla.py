@@ -8,7 +8,6 @@ from typing import ClassVar
 import torch
 
 from vllm.config import CacheConfig
-from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -18,140 +17,6 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheLayout
-
-
-@triton.jit(do_not_specialize=["nr", "nt"])
-def _requests(
-    Starts, Seq, OutStarts, Pos, Counts, nr, nt, R: tl.constexpr, B: tl.constexpr
-):
-    r = tl.program_id(0) * B + tl.arange(0, B)
-    start = tl.load(Starts + r, r <= nr, other=nt)
-    end = tl.load(Starts + r + 1, r < nr, other=nt)
-    seq = tl.load(Seq + r, r < nr, other=0)
-    tl.store(OutStarts + r, start, r <= R)
-    tl.store(Pos + r, tl.where(r < nr, seq - (end - start), -1), r < R)
-    if tl.program_id(0) == 0:
-        tl.store(Counts, nt)
-        tl.store(Counts + 1, nr)
-
-
-@triton.jit(do_not_specialize=["nr", "nt", "stride", "table_width"])
-def _tokens(
-    Starts,
-    Seq,
-    Table,
-    InputSlots,
-    Positions,
-    Reqs,
-    Slots,
-    Visible,
-    nr,
-    nt,
-    stride,
-    table_width,
-    T: tl.constexpr,
-    PAGE: tl.constexpr,
-    RATIO: tl.constexpr,
-    B: tl.constexpr,
-    CIRCULAR: tl.constexpr = False,
-):
-    t = tl.program_id(0) * B + tl.arange(0, B)
-    lo = tl.full((B,), 0, tl.int32)
-    hi = tl.full((B,), nr, tl.int32)
-    while tl.sum((lo < hi).to(tl.int32), 0) > 0:
-        mid = (lo + hi) // 2
-        end = tl.load(Starts + mid + 1, mid < nr, other=nt)
-        right = end <= t
-        active = lo < hi
-        lo = tl.where(active & right, mid + 1, lo)
-        hi = tl.where(active & ~right, mid, hi)
-    valid = (t < nt) & (lo < nr)
-    start = tl.load(Starts + lo, valid, other=0)
-    end = tl.load(Starts + lo + 1, valid, other=0)
-    seq = tl.load(Seq + lo, valid, other=0)
-    pos = seq.to(tl.int64) - (end - start) + t - start
-    input_slot = tl.load(InputSlots + t, t < nt, other=-1)
-    # A ring group takes no slot-mapping row (its spec opts out, so every entry
-    # is padding); its slot comes from the ring block below, and padded rows
-    # are excluded by the request range and block checks.
-    valid = valid & (pos >= 0) if CIRCULAR else valid & (pos >= 0) & (input_slot >= 0)
-    logical = pos // RATIO
-    page_col = tl.full((B,), 0, tl.int64) if CIRCULAR else logical // PAGE
-    valid = valid & (page_col < table_width)
-    block = tl.load(Table + lo.to(tl.int64) * stride + page_col, valid, other=0).to(
-        tl.int64
-    )
-    valid = valid & (block > 0)
-    slot = block * PAGE + logical % PAGE
-    emit = valid & ((pos + 1) % RATIO == 0)
-    if CIRCULAR:
-        # Only the final capacity rows may write: earlier rows would race
-        # later writers to the same ring slots during a long prefill.
-        emit = emit & (t >= end - PAGE)
-    tl.store(Positions + t, tl.where(valid, pos, -1), t < T)
-    tl.store(Reqs + t, tl.where(valid, lo, -1), t < T)
-    tl.store(Slots + t, tl.where(emit, slot, -1), t < T)
-    tl.store(Visible + t, tl.where(valid, (pos + 1) // RATIO, 0), t < T)
-
-
-@triton.jit(do_not_specialize=["offset", "table_stride"])
-def _chunk(
-    Positions,
-    Reqs,
-    Table,
-    Swa,
-    Lengths,
-    TopLengths,
-    Visible,
-    Starts,
-    RequestPositions,
-    offset,
-    table_stride,
-    PAGE: tl.constexpr,
-    WINDOW: tl.constexpr,
-    WIDTH: tl.constexpr,
-    DRAFT: tl.constexpr,
-    BLOCK: tl.constexpr,
-    swa_replay_start=None,
-):
-    row = tl.program_id(0).to(tl.int64)
-    col = tl.arange(0, BLOCK)
-    req = tl.load(Reqs + offset + row)
-    pos = tl.load(Positions + offset + row).to(tl.int64)
-    valid = (req >= 0) & (pos >= 0)
-    if DRAFT:
-        first = tl.load(Starts + req, valid, other=0).to(tl.int64)
-        end = tl.load(Starts + req + 1, valid, other=0).to(tl.int64)
-        prefix = tl.load(RequestPositions + req, valid, other=0).to(tl.int64)
-        start = tl.maximum(prefix - WINDOW, 0)
-        if swa_replay_start is not None:
-            replay = tl.load(swa_replay_start + req, valid, other=0).to(tl.int64)
-            start = tl.maximum(start, replay)
-        length = prefix + end - first - start
-    else:
-        start = tl.maximum(pos + 1 - WINDOW, 0)
-        if swa_replay_start is not None:
-            replay = tl.load(swa_replay_start + req, valid, other=0).to(tl.int64)
-            start = tl.maximum(start, replay)
-        length = pos + 1 - start
-    length = tl.where(valid, tl.minimum(tl.maximum(length, 0), WIDTH), 0)
-    logical = start + col
-    page = tl.load(
-        Table + req.to(tl.int64) * table_stride + logical // PAGE,
-        valid & (logical >= 0) & (col < length),
-        other=-1,
-    ).to(tl.int64)
-    physical = page * PAGE + logical % PAGE
-    tl.store(
-        Swa + row * WIDTH + col,
-        tl.where((page > 0) & (logical >= 0) & (col < length), physical, -1),
-        col < WIDTH,
-    )
-    tl.store(Lengths + row, tl.maximum(length, 0))
-    visible = tl.load(Visible + offset + row)
-    tl.store(
-        TopLengths + row, tl.where(valid, tl.minimum(tl.maximum(visible, 0), 512), 0)
-    )
 
 
 @dataclass
@@ -246,7 +111,8 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
         return self._metadata(cm, table)
 
     def _build_tilelang(self, cm, table) -> None:
-        """``_requests`` and ``_tokens`` as the TileLang metadata kernels."""
+        """The step's request starts and positions, then each token's request,
+        position, slot and visible length."""
         from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
 
         tl_metadata.requests(

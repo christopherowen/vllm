@@ -2,9 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """TileLang sparse-MLA metadata for DeepSeek-V4.1: integer kernels, exact.
 
-The same contracts as the Triton kernels they replace (``sparse_mla._requests``,
-``_tokens``, ``attention._chunk`` and ``_pages``), element for element, including
-which rows each launch writes:
+Each keeps the contract of the Triton kernel it replaced, element for element,
+including which rows each launch writes:
 
 - ``requests``: request starts (``nt`` past the live requests), each request's first
   position (``seq - query``, -1 past them) and the live counts ``[nt, nr]``.
@@ -140,8 +139,8 @@ def tokens_kernel(max_requests: int, page: int, ratio: int, circular: bool):
 
 
 def _window_macro(page, window, width, draft, replay, threads, per_thread):
-    """One row's sliding-window metadata (``attention._chunk``), for a block of
-    ``threads`` threads."""
+    """One row's sliding-window metadata (``chunk``), for a block of ``threads``
+    threads."""
 
     @T.macro
     def window_row(
@@ -338,7 +337,7 @@ def pages_kernel(width: int):
 
 
 def requests(starts, seq, out_starts, positions, counts, nr: int, nt: int) -> None:
-    """``sparse_mla._requests``."""
+    """Request starts, first positions and live counts (module docstring)."""
     requests_kernel(positions.shape[0])(
         starts, seq, out_starts, positions, counts, nr, nt
     )
@@ -348,7 +347,8 @@ def tokens(
     starts, seq, table, input_slots, positions, reqs, slots, visible, nr: int,
     nt: int, *, max_requests: int, page: int, ratio: int, circular: bool,
 ) -> None:  # fmt: skip
-    """``sparse_mla._tokens``: rows of the first ``max(1, ceil(nt / 128))`` blocks."""
+    """Per-token metadata, for the rows of the first ``max(1, ceil(nt / 128))``
+    blocks."""
     cover = min(positions.shape[0], max(1, -(-nt // _BLOCK)) * _BLOCK)
     tokens_kernel(max_requests, page, ratio, circular)(
         starts, seq, table, input_slots, positions[:cover], reqs[:cover],
@@ -361,7 +361,7 @@ def chunk(
     request_positions, offset: int, rows: int, *, page: int, window: int,
     draft: bool, replay_start=None,
 ) -> None:  # fmt: skip
-    """``attention._chunk`` for ``rows`` rows from source row ``offset``."""
+    """Window metadata for ``rows`` rows from source row ``offset``."""
     width = swa.shape[1]
     replay = replay_start is not None
     chunk_kernel(page, window, width, draft, replay)(
@@ -388,7 +388,7 @@ def decode_metadata(
 
 
 def pages(reqs, table, out, offset: int, rows: int, read_width: int) -> None:
-    """``attention._pages`` for ``rows`` rows from source row ``offset``; ``out`` is
+    """Page tables for ``rows`` rows from source row ``offset``; ``out`` is
     ``[*, width]`` and columns at or past ``read_width`` are -1."""
     pages_kernel(out.shape[1])(reqs, table, out[:rows], offset, read_width)
 

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DeepSeek-V4.1 TileLang sparse-MLA metadata against the Triton kernels, exactly."""
+"""DeepSeek-V4.1 TileLang sparse-MLA metadata against torch references of its
+contracts, exactly: every row a launch writes, and the rows it must leave alone."""
 
 from types import SimpleNamespace
 
@@ -16,13 +17,11 @@ if not (
 
 pytest.importorskip("tilelang")
 
-from vllm.models.deepseek_v4_1.attention import _chunk, _pages  # noqa: E402
-from vllm.models.deepseek_v4_1.sparse_mla import _requests, _tokens  # noqa: E402
 from vllm.models.deepseek_v4_1.tilelang import metadata  # noqa: E402
-from vllm.triton_utils import triton  # noqa: E402
 
 DEVICE = "cuda"
 R, CAP, COLS = 16, 1024, 40
+BLOCK = 128  # tokens' rows a program covers
 
 
 def _step(lengths, seed, padding=5):
@@ -47,23 +46,125 @@ def _step(lengths, seed, padding=5):
 STEPS = [[1], [6] * 16, [3, 0, 5, 1, 2, 6], [700], [200, 1, 300]]
 
 
+# --- Torch references of the contracts, in int64 on the host -----------------
+
+
+def _host(*tensors):
+    return [t.cpu().long() for t in tensors]
+
+
+def _ref_requests(s, nr, nt):
+    """Each of the R + 1 request starts (``nt`` past the last request), each
+    request's first position (-1 past the last), and (tokens, requests)."""
+    qsl, seq = _host(s["qsl"], s["seq"])
+    starts = torch.where(torch.arange(R + 1) <= nr, qsl, nt)
+    live = torch.arange(R) < nr
+    ends = torch.where(live, qsl[1:], nt)
+    positions = torch.where(live, seq - (ends - starts[:R]), -1)
+    return starts, positions, torch.tensor([nt, nr])
+
+
+def _ref_tokens(s, nr, nt, page, ratio, circular):
+    """Each token row of the first ``max(1, ceil(nt / BLOCK))`` blocks: its position
+    and request (-1 when it belongs to none, its position is negative or, outside
+    a ring, the worker gave it no slot), the cache slot it writes (-1 when it
+    emits nothing: the page is a hole or past the table, the ratio's group is not
+    complete, or, in a ring, an earlier row of a long prefill would race later
+    writers) and its visible length ((position + 1) / ratio, 0 when invalid). Rows
+    past those blocks are left alone (None)."""
+    qsl, seq, table, input_slots = _host(s["qsl"], s["seq"], s["table"], s["slots"])
+    cover = min(CAP, max(1, -(-nt // BLOCK)) * BLOCK)
+    t = torch.arange(cover)
+    # The first request whose rows end past t: as many as end at or before it.
+    req = torch.searchsorted(qsl[1 : nr + 1].contiguous(), t, right=True)
+    valid = (t < nt) & (req < nr)
+    r = req.clamp(max=R - 1)
+    start, end = qsl[r], qsl[r + 1]
+    pos = seq[r] - (end - start) + t - start
+    valid &= pos >= 0
+    if not circular:
+        valid &= torch.where(t < nt, input_slots[t], -1) >= 0
+    logical = torch.where(valid, pos, 0) // ratio
+    column = torch.zeros_like(logical) if circular else logical // page
+    valid &= column < table.shape[1]
+    block = torch.where(valid, table[r, column.clamp(max=table.shape[1] - 1)], 0)
+    valid &= block > 0
+    emit = valid & ((torch.where(valid, pos, 0) + 1) % ratio == 0)
+    if circular:
+        emit &= t >= end - page
+    return (
+        torch.where(valid, pos, -1),
+        torch.where(valid, req, -1),
+        torch.where(emit, block * page + logical % page, -1),
+        torch.where(valid, (pos + 1) // ratio, 0),
+    )
+
+
+def _ref_chunk(pos, reqs, table, visible, qsl, request_positions, offset, rows,
+               width, page, window, draft, replay_start):  # fmt: skip
+    """Rows ``offset:offset + rows``: each row's window of physical SWA slots (-1 in
+    holes and past its length), its length (clamped to ``width``; 0 when its
+    request or position is invalid) and its indexed length (visible, at most 512).
+    A draft row's window is its request's: prefix plus the request's rows."""
+    pos, reqs, table, visible, qsl, request_positions = _host(
+        pos, reqs, table, visible, qsl, request_positions
+    )
+    row = torch.arange(rows) + offset
+    req, p = reqs[row], pos[row]
+    valid = (req >= 0) & (p >= 0)
+    r = torch.where(valid, req, 0)
+    if draft:
+        first, end = qsl[r] * valid, qsl[r + 1] * valid
+        prefix = request_positions[r] * valid
+        start = (prefix - window).clamp(min=0)
+        length = prefix + end - first - start
+    else:
+        start = (p + 1 - window).clamp(min=0)
+        if replay_start is not None:
+            start = torch.maximum(start, replay_start.cpu().long()[r] * valid)
+        length = p + 1 - start
+    length = torch.where(valid, length.clamp(0, width), 0)
+    col = torch.arange(width)
+    logical = start[:, None] + col
+    live = valid[:, None] & (logical >= 0) & (col < length[:, None])
+    column = torch.where(live, logical // page, 0)
+    assert int(column.max()) < table.shape[1]  # no read past a table row
+    page_id = torch.where(live, table[r[:, None], column], -1)
+    swa = torch.where(live & (page_id > 0), page_id * page + logical % page, -1)
+    top = torch.where(valid, visible[row].clamp(0, 512), 0)
+    return swa, length, top
+
+
+def _ref_pages(reqs, table, offset, rows, width, read_width):
+    """Rows ``offset:offset + rows``: each row's request's page table, ``width``
+    columns, -1 in holes (vLLM's block zero), past ``read_width`` and for rows
+    without a request."""
+    reqs, table = _host(reqs, table)
+    req = reqs[torch.arange(rows) + offset]
+    col = torch.arange(width)
+    live = (req >= 0)[:, None] & (col < read_width)
+    page = torch.where(
+        live, table[req.clamp(min=0)[:, None], col.clamp(max=table.shape[1] - 1)], -1
+    )
+    return torch.where(page > 0, page, -1)
+
+
+def _rows_equal(actual, expected, rows, sentinel=7):
+    """``actual``'s first rows equal the reference, and the rest are untouched."""
+    actual = actual.cpu().long()
+    assert torch.equal(actual[:rows], expected)
+    assert bool((actual[rows:] == sentinel).all())
+
+
 @pytest.mark.parametrize("lengths", STEPS)
 def test_requests(lengths):
     s, nr, nt = _step(lengths, seed=len(lengths))
-    outs = []
-    for impl in ("triton", "tilelang"):
-        out_starts = torch.full((R + 1,), 7, dtype=torch.int32, device=DEVICE)
-        pos = torch.full((R,), 7, dtype=torch.int64, device=DEVICE)
-        counts = torch.full((2,), 7, dtype=torch.int32, device=DEVICE)
-        if impl == "triton":
-            _requests[(triton.cdiv(R + 1, 128),)](
-                s["qsl"], s["seq"], out_starts, pos, counts, nr, nt, R, 128
-            )
-        else:
-            metadata.requests(s["qsl"], s["seq"], out_starts, pos, counts, nr, nt)
-        outs.append((out_starts, pos, counts))
-    for a, b in zip(*outs):
-        assert torch.equal(a, b)
+    out_starts = torch.full((R + 1,), 7, dtype=torch.int32, device=DEVICE)
+    pos = torch.full((R,), 7, dtype=torch.int64, device=DEVICE)
+    counts = torch.full((2,), 7, dtype=torch.int32, device=DEVICE)
+    metadata.requests(s["qsl"], s["seq"], out_starts, pos, counts, nr, nt)
+    for actual, expected in zip((out_starts, pos, counts), _ref_requests(s, nr, nt)):
+        assert torch.equal(actual.cpu().long(), expected)
 
 
 TOKEN_CASES = [(64, 1, False), (64, 4, False), (32, 2, False), (8, 2, True)]
@@ -73,26 +174,18 @@ TOKEN_CASES = [(64, 1, False), (64, 4, False), (32, 2, False), (8, 2, True)]
 @pytest.mark.parametrize("page, ratio, circular", TOKEN_CASES)
 def test_tokens(lengths, page, ratio, circular):
     s, nr, nt = _step(lengths, seed=page + ratio + len(lengths))
-    outs = []
-    for impl in ("triton", "tilelang"):
-        pos = torch.full((CAP,), 7, dtype=torch.int64, device=DEVICE)
-        reqs = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
-        slots = torch.full((CAP,), 7, dtype=torch.int64, device=DEVICE)
-        visible = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
-        if impl == "triton":
-            _tokens[(max(1, triton.cdiv(nt, 128)),)](
-                s["qsl"], s["seq"], s["table"], s["slots"], pos, reqs, slots, visible,
-                nr, nt, s["table"].stride(0), s["table"].shape[1], CAP, page, ratio,
-                128, circular,
-            )  # fmt: skip
-        else:
-            metadata.tokens(
-                s["qsl"], s["seq"], s["table"], s["slots"], pos, reqs, slots, visible,
-                nr, nt, max_requests=R, page=page, ratio=ratio, circular=circular,
-            )  # fmt: skip
-        outs.append((pos, reqs, slots, visible))
-    for a, b in zip(*outs):
-        assert torch.equal(a, b)
+    pos = torch.full((CAP,), 7, dtype=torch.int64, device=DEVICE)
+    reqs = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
+    slots = torch.full((CAP,), 7, dtype=torch.int64, device=DEVICE)
+    visible = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
+    metadata.tokens(
+        s["qsl"], s["seq"], s["table"], s["slots"], pos, reqs, slots, visible,
+        nr, nt, max_requests=R, page=page, ratio=ratio, circular=circular,
+    )  # fmt: skip
+    expected = _ref_tokens(s, nr, nt, page, ratio, circular)
+    cover = expected[0].shape[0]
+    for actual, reference in zip((pos, reqs, slots, visible), expected):
+        _rows_equal(actual, reference, cover)
 
 
 def _token_metadata(s, nr, nt, page):
@@ -120,26 +213,20 @@ def test_chunk(lengths, draft, replay, width):
     replay_start = torch.randint(0, 900, (R,), device=DEVICE) if replay else None
     rows, offset = min(nt, 600), 3 if nt > 10 else 0
     rows = min(rows, nt - offset)
-    outs = []
-    for impl in ("triton", "tilelang"):
-        swa = torch.full((CAP, width), 7, dtype=torch.int32, device=DEVICE)
-        lengths_out = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
-        top = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
-        if impl == "triton":
-            _chunk[(rows,)](
-                pos, reqs, s["table"], swa, lengths_out, top, visible, s["qsl"],
-                request_positions, offset, s["table"].stride(0), page, window, width,
-                draft, triton.next_power_of_2(width), swa_replay_start=replay_start,
-            )  # fmt: skip
-        else:
-            metadata.chunk(
-                pos, reqs, s["table"], swa, lengths_out, top, visible, s["qsl"],
-                request_positions, offset, rows, page=page, window=window, draft=draft,
-                replay_start=replay_start,
-            )  # fmt: skip
-        outs.append((swa, lengths_out, top))
-    for a, b in zip(*outs):
-        assert torch.equal(a, b)
+    swa = torch.full((CAP, width), 7, dtype=torch.int32, device=DEVICE)
+    lengths_out = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
+    top = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
+    metadata.chunk(
+        pos, reqs, s["table"], swa, lengths_out, top, visible, s["qsl"],
+        request_positions, offset, rows, page=page, window=window, draft=draft,
+        replay_start=replay_start,
+    )  # fmt: skip
+    expected = _ref_chunk(
+        pos, reqs, s["table"], visible, s["qsl"], request_positions, offset, rows,
+        width, page, window, draft, replay_start,
+    )  # fmt: skip
+    for actual, reference in zip((swa, lengths_out, top), expected):
+        _rows_equal(actual, reference, rows)
 
 
 @pytest.mark.parametrize("lengths", STEPS)
@@ -149,18 +236,10 @@ def test_pages(lengths, width, read_width):
     _, reqs, _ = _token_metadata(s, nr, nt, 64)
     rows, offset = min(nt, 500), 2 if nt > 4 else 0
     rows = min(rows, nt - offset)
-    outs = []
-    for impl in ("triton", "tilelang"):
-        out = torch.full((CAP, width), 7, dtype=torch.int32, device=DEVICE)
-        if impl == "triton":
-            _pages[(rows, triton.cdiv(width, 128))](
-                reqs, s["table"], out, offset, s["table"].stride(0), read_width,
-                width, 128,
-            )  # fmt: skip
-        else:
-            metadata.pages(reqs, s["table"], out, offset, rows, read_width)
-        outs.append(out)
-    assert torch.equal(outs[0], outs[1])
+    out = torch.full((CAP, width), 7, dtype=torch.int32, device=DEVICE)
+    metadata.pages(reqs, s["table"], out, offset, rows, read_width)
+    expected = _ref_pages(reqs, s["table"], offset, rows, width, read_width)
+    _rows_equal(out, expected, rows)
 
 
 @pytest.mark.parametrize("lengths", STEPS)
@@ -176,32 +255,26 @@ def test_decode_metadata_equals_chunk_and_pages(lengths, draft, replay):
     replay_start = torch.randint(0, 900, (R,), device=DEVICE) if replay else None
     rows, offset = min(nt, 600), 3 if nt > 10 else 0
     rows = min(rows, nt - offset)
-    outs = []
-    for impl in ("triton", "tilelang"):
-        swa = torch.full((CAP, width), 7, dtype=torch.int32, device=DEVICE)
-        lengths_out = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
-        top = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
-        main_pages = torch.full((CAP, main_width), 7, dtype=torch.int32, device=DEVICE)
-        if impl == "triton":
-            _chunk[(rows,)](
-                pos, reqs, s["table"], swa, lengths_out, top, visible, s["qsl"],
-                request_positions, offset, s["table"].stride(0), page, window, width,
-                draft, triton.next_power_of_2(width), swa_replay_start=replay_start,
-            )  # fmt: skip
-            _pages[(rows, triton.cdiv(main_width, 128))](
-                main_reqs, s["table"], main_pages, offset, s["table"].stride(0),
-                s["table"].shape[1], main_width, 128,
-            )  # fmt: skip
-        else:
-            metadata.decode_metadata(
-                pos, reqs, s["table"], swa, lengths_out, top, visible, s["qsl"],
-                request_positions, main_reqs, s["table"], main_pages, offset, rows,
-                s["table"].shape[1], page=page, window=window, draft=draft,
-                replay_start=replay_start,
-            )  # fmt: skip
-        outs.append((swa, lengths_out, top, main_pages))
-    for a, b in zip(*outs):
-        assert torch.equal(a, b)
+    swa = torch.full((CAP, width), 7, dtype=torch.int32, device=DEVICE)
+    lengths_out = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
+    top = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
+    main_pages = torch.full((CAP, main_width), 7, dtype=torch.int32, device=DEVICE)
+    metadata.decode_metadata(
+        pos, reqs, s["table"], swa, lengths_out, top, visible, s["qsl"],
+        request_positions, main_reqs, s["table"], main_pages, offset, rows,
+        s["table"].shape[1], page=page, window=window, draft=draft,
+        replay_start=replay_start,
+    )  # fmt: skip
+    expected = _ref_chunk(
+        pos, reqs, s["table"], visible, s["qsl"], request_positions, offset, rows,
+        width, page, window, draft, replay_start,
+    ) + (
+        _ref_pages(
+            main_reqs, s["table"], offset, rows, main_width, s["table"].shape[1]
+        ),
+    )  # fmt: skip
+    for actual, reference in zip((swa, lengths_out, top, main_pages), expected):
+        _rows_equal(actual, reference, rows)
 
 
 @torch.inference_mode()

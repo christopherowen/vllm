@@ -24,8 +24,7 @@ from collections.abc import Callable
 
 import torch
 
-from vllm.models.deepseek_v4_1.nvidia.model_state import _gather_lookback_kernel
-from vllm.models.deepseek_v4_1.tilelang import dspark_context, lookback
+from vllm.models.deepseek_v4_1.tilelang import dspark_context
 from vllm.triton_utils import triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu import input_batch as ib
@@ -538,26 +537,6 @@ def case_prepare_dflash_inputs(gen, num_reqs, prefill, widths):
     return triton_call, tilelang_call
 
 
-def case_gather_lookback(gen, num_reqs, prefill, widths):
-    """The Engram window of every row (the batch's, then -1) at depth 3."""
-    reqs = 1 if prefill else num_reqs
-    idx = torch.randperm(MAX_REQS, generator=gen, device=DEVICE)[:reqs]
-    computed = _randint(3, HISTORY, (MAX_REQS,), gen)
-    history = _history(gen)
-    window = torch.empty(MAX_REQS, 3, dtype=torch.int32, device=DEVICE)
-
-    def triton_call():
-        _gather_lookback_kernel[(MAX_REQS,)](
-            window, idx, computed, history, history.stride(0), reqs, DEPTH=3,
-            BLOCK_DEPTH=4,
-        )  # fmt: skip
-
-    def tilelang_call():
-        lookback.gather_lookback(window, idx, computed, history)
-
-    return triton_call, tilelang_call
-
-
 def case_gather_consumed_drafts(gen, num_reqs, prefill, widths):
     """The drafts a step's inputs consumed, which the async-scheduling hand-off
     copies to the host for structured-output requests: before the port, torch's
@@ -591,7 +570,6 @@ CASES = {
     "dspark_context": case_dspark_context,
     "post_update": case_post_update,
     "prepare_dflash_inputs": case_prepare_dflash_inputs,
-    "gather_lookback": case_gather_lookback,
     "gather_consumed_drafts": case_gather_consumed_drafts,
 }
 

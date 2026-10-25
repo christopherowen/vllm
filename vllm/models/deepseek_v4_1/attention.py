@@ -37,7 +37,7 @@ from vllm.models.deepseek_v4_1.sparse_mla import (
 )
 from vllm.models.deepseek_v4_1.tilelang import prepare
 from vllm.models.deepseek_v41.common.rope import build_deepseek_v4_rope
-from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
@@ -63,21 +63,6 @@ def _native_linear(layer):
         layer.quant_method = kernels.linear_method()
         return
     raise ValueError("V4.1 attention only supports native linear methods")
-
-
-@triton.jit(do_not_specialize=["offset", "stride", "width"])
-def _pages(
-    Reqs, Table, Out, offset, stride, width, WIDTH: tl.constexpr, B: tl.constexpr
-):
-    row = tl.program_id(0).to(tl.int64)
-    col = tl.program_id(1) * B + tl.arange(0, B)
-    req = tl.load(Reqs + offset + row)
-    page = tl.load(
-        Table + req.to(tl.int64) * stride + col, (req >= 0) & (col < width), other=-1
-    )
-    # vLLM reserves physical block zero; b12x page tables use -1 for holes.
-    page = tl.where(page > 0, page, -1)
-    tl.store(Out + row * WIDTH + col, page, col < WIDTH)
 
 
 class _Cache(nn.Module, AttentionLayerBase):
@@ -542,7 +527,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             and self.layer_id < self.candidate_source_layer
         ):
             short_rows = min(1024, self.capacity)
-            short_width = min(self._index_width, triton.cdiv(16384, self._index_page))
+            short_width = min(self._index_width, cdiv(16384, self._index_page))
             self._short_index_shape = (short_rows, short_width)
             specs.append(("_short_index_pages", self._short_index_shape, torch.int32))
         self._staging_specs = tuple(specs)
@@ -965,7 +950,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             ):
                 score_width = min(
                     self._index_width * self._index_page,
-                    max(1, triton.cdiv(im.max_seq_len, self.compress_ratio)),
+                    max(1, cdiv(im.max_seq_len, self.compress_ratio)),
                 )
             chunk_rows = self.DECODE_CHUNK if mode == "decode" else self.INDEX_CHUNK
             index_pages = self._index_pages

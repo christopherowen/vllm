@@ -17,7 +17,6 @@ from vllm.models.deepseek_v4_1.ced import (
 )
 from vllm.models.deepseek_v4_1.tilelang import ced as ced_kernels
 from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadata
-from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.mla.compressor_utils import get_dspark_swa_index_width
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -26,40 +25,6 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
-
-
-# The reference ``tilelang.lookback.gather_lookback_kernel`` is tested against;
-# the model state no longer launches it.
-@triton.jit(do_not_specialize=["num_reqs"])
-def _gather_lookback_kernel(
-    lookback_ptr,
-    idx_mapping_ptr,
-    num_computed_tokens_ptr,
-    all_token_ids_ptr,
-    all_token_ids_stride,
-    num_reqs,
-    DEPTH: tl.constexpr,
-    BLOCK_DEPTH: tl.constexpr,
-):
-    # One program per lookback row; rows past the batch are filled with -1.
-    batch_idx = tl.program_id(0)
-    in_batch = batch_idx < num_reqs
-    req_state_idx = tl.load(idx_mapping_ptr + batch_idx, mask=in_batch, other=0)
-    num_computed = tl.load(
-        num_computed_tokens_ptr + req_state_idx, mask=in_batch, other=0
-    )
-
-    offs = tl.arange(0, BLOCK_DEPTH)
-    pos = num_computed - DEPTH + offs
-    valid = in_batch & (offs < DEPTH) & (pos >= 0)
-    ids = tl.load(
-        all_token_ids_ptr
-        + req_state_idx.to(tl.int64) * all_token_ids_stride
-        + pos.to(tl.int64),
-        mask=valid,
-        other=-1,
-    )
-    tl.store(lookback_ptr + batch_idx * DEPTH + offs, ids, mask=offs < DEPTH)
 
 
 def _nonfinal_skip_policy(vllm_config: VllmConfig) -> tuple[int, int]:

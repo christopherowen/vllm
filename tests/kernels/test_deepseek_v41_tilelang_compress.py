@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DeepSeek-V4.1 TileLang CSA compression against DeepSeek's arithmetic and vLLM's
-Triton state-ring kernels."""
+"""DeepSeek-V4.1 TileLang CSA compression against DeepSeek's arithmetic and torch
+references of the state ring."""
 
 import pytest
 import torch
@@ -15,10 +15,6 @@ if not (
 
 pytest.importorskip("tilelang")
 
-from vllm.models.deepseek_v4_1.compressor import (  # noqa: E402
-    _load_partial_state,
-    _save_partial_states,
-)
 from vllm.models.deepseek_v4_1.tilelang.compress import (  # noqa: E402
     DIM,
     STATE,
@@ -75,34 +71,49 @@ def _step(lengths, ratio, seed, padding=3):
 
 
 def _ring(step):
-    """Each request's carry, by the Triton kernel and the TileLang one."""
-    out = []
-    for fn in ("triton", "tilelang"):
-        pv = torch.full((REQUESTS, DIM), 9.0, device=DEVICE)
-        pg = torch.full_like(pv, 9.0)
-        tags = torch.full((REQUESTS,), 7, dtype=torch.int64, device=DEVICE)
-        ids = torch.full_like(tags, 7)
-        if fn == "triton":
-            pool = step["pool"]
-            _load_partial_state[(REQUESTS,)](
-                pool, step["table"], step["starts"], step["positions"], pv, pg, tags,
-                ids, step["counts"], pool.stride(0), step["table"].stride(0), PAGE,
-            )  # fmt: skip
-        else:
-            gather_partial_state(
-                step["pool"], step["table"], step["starts"], step["positions"],
-                step["counts"], pv, pg, tags, ids, page=PAGE,
-            )  # fmt: skip
-        out.append((pv, pg, tags, ids))
-    return out
+    """Each request's carry, by the TileLang kernel."""
+    pv = torch.full((REQUESTS, DIM), 9.0, device=DEVICE)
+    pg = torch.full_like(pv, 9.0)
+    tags = torch.full((REQUESTS,), 7, dtype=torch.int64, device=DEVICE)
+    ids = torch.full_like(tags, 7)
+    gather_partial_state(
+        step["pool"], step["table"], step["starts"], step["positions"],
+        step["counts"], pv, pg, tags, ids, page=PAGE,
+    )  # fmt: skip
+    return pv, pg, tags, ids
+
+
+def _ref_ring(step):
+    """The carry's contract: a live request (one of the step's, rows within the
+    step's tokens, a position) at an odd position reads its predecessor's value
+    and gate from its ring block (in the first column of its block table), tagged
+    with the predecessor's position; every other request carries zeros, tag -1. A
+    live request keeps its index as its state id, others -1."""
+    starts, positions, table, counts = (
+        step[name].cpu().long() for name in ("starts", "positions", "table", "counts")
+    )
+    pool = step["pool"].cpu()
+    nt, nr = int(counts[0]), int(counts[1])
+    r = torch.arange(REQUESTS)
+    first, end = starts[:REQUESTS], starts[1 : REQUESTS + 1]
+    live = (r < nr) & (first >= 0) & (first < end) & (end <= nt) & (positions >= 0)
+    needed = live & (positions > 0) & (positions % 2 == 1)
+    page = torch.where(needed, table[:, 0], 0)
+    valid = needed & (page > 0)
+    predecessor = positions - 1
+    base = (torch.where(valid, predecessor, 0) % PAGE) * STATE
+    column = base[:, None] + torch.arange(DIM)
+    rows = pool[page]
+    value = torch.where(valid[:, None], rows.gather(1, column), 0.0)
+    gate = torch.where(valid[:, None], rows.gather(1, column + DIM), 0.0)
+    return value, gate, torch.where(valid, predecessor, -1), torch.where(live, r, -1)
 
 
 @pytest.mark.parametrize("seed", [1, 2, 3])
-def test_gather_equals_triton(seed):
+def test_gather_matches_the_reference(seed):
     step, _, _ = _step([3, 0, 5, 1, 2, 6], 2, seed)
-    triton_ring, tilelang_ring = _ring(step)
-    for a, b in zip(tilelang_ring, triton_ring):
-        assert torch.equal(a, b)
+    for actual, expected in zip(_ring(step), _ref_ring(step)):
+        assert torch.equal(actual.cpu(), expected.to(actual.dtype))
 
 
 def normalized_latent(values, weight, gates=None):
@@ -177,7 +188,7 @@ def _bf16_ulps(a, b):
 @pytest.mark.parametrize("lengths", [[1], [6] * 16, [3, 0, 5, 1, 2, 6], [300]])
 def test_compress_matches_reference(ratio, lengths):
     step, rows, starts = _step(lengths, ratio, seed=len(lengths) * 10 + ratio)
-    carry = _ring(step)[1]
+    carry = _ring(step)
     want = _reference(step, rows, starts, ratio, carry)
     pool_before = step["pool"].clone()
     out, emitted, eslots = _run(step, rows, ratio, carry)
@@ -200,21 +211,13 @@ def test_compress_matches_reference(ratio, lengths):
                 latest[slot // PAGE, base : base + DIM] = step["values"][token]
                 latest[slot // PAGE, base + DIM : base + STATE] = step["gates"][token]
         assert torch.equal(step["pool"], latest)
-        if max(lengths) <= PAGE:
-            # No slot collides: vLLM's Triton save writes the same.
-            triton_pool = pool_before.clone()
-            _save_partial_states[(CAPACITY,)](
-                triton_pool, step["state_slots"], step["values"], step["gates"],
-                step["counts"], triton_pool.stride(0), PAGE,
-            )  # fmt: skip
-            assert torch.equal(step["pool"], triton_pool)
 
 
 @pytest.mark.parametrize("ratio", [1, 2])
 def test_token_independent_of_batch_and_graphs(ratio):
     lengths = [4, 6, 2]
     step, rows, starts = _step(lengths, ratio, seed=40 + ratio)
-    carry = _ring(step)[1]
+    carry = _ring(step)
     together = _run(step, rows, ratio, carry)[0][:rows].clone()
     # The middle request alone: its rows packed first, the same positions.
     alone_step = {k: v.clone() for k, v in step.items()}

@@ -8,62 +8,8 @@ import torch.nn as nn
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.models.deepseek_v4_1.sparse_mla import SLOT_DTYPE, DeepseekV41B12xBackend
-from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.kv_cache_interface import CircularBufferSpec
-
-
-@triton.jit(do_not_specialize=["stride", "table_stride"])
-def _load_partial_state(
-    Pool,
-    Table,
-    Starts,
-    Positions,
-    Values,
-    Gates,
-    Tags,
-    LocalIds,
-    Counts,
-    stride,
-    table_stride,
-    PAGE: tl.constexpr,
-):
-    r = tl.program_id(0).to(tl.int64)
-    col = tl.arange(0, 512)
-    nr = tl.load(Counts + 1)
-    nt = tl.load(Counts)
-    first = tl.load(Starts + r)
-    end = tl.load(Starts + r + 1)
-    pos = tl.load(Positions + r)
-    live = (r < nr) & (first >= 0) & (first < end) & (end <= nt)
-    live = live & (pos >= 0)
-    predecessor = pos - 1
-    needed = live & (pos > 0) & (pos % 2 == 1)
-    page = tl.load(Table + r * table_stride, needed, other=0).to(tl.int64)
-    valid = needed & (page > 0)
-    base = Pool + page * stride + (predecessor % PAGE) * 1024
-    value = tl.load(base + col, valid, other=0)
-    gate = tl.load(base + 512 + col, valid, other=0)
-    tl.store(Values + r * 512 + col, value)
-    tl.store(Gates + r * 512 + col, gate)
-    tl.store(Tags + r, tl.where(valid, predecessor, -1))
-    tl.store(LocalIds + r, tl.where(live, r, -1))
-
-
-@triton.jit(do_not_specialize=["stride"])
-def _save_partial_states(
-    Pool, Slots, Values, Gates, Counts, stride, PAGE: tl.constexpr
-):
-    token = tl.program_id(0).to(tl.int64)
-    col = tl.arange(0, 512)
-    nt = tl.load(Counts)
-    slot = tl.load(Slots + token).to(tl.int64)
-    valid = (token < nt) & (slot >= PAGE)
-    base = Pool + (slot // PAGE) * stride + (slot % PAGE) * 1024
-    value = tl.load(Values + token * 512 + col, valid, other=0)
-    gate = tl.load(Gates + token * 512 + col, valid, other=0)
-    tl.store(base + col, value, valid)
-    tl.store(base + 512 + col, gate, valid)
 
 
 class CompressorBackend(DeepseekV41B12xBackend):
