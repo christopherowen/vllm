@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Accepted-prefix ownership through the real native compressor and metadata."""
+"""Accepted-prefix ownership through the real compressor and metadata."""
 
 from types import SimpleNamespace
 
@@ -163,13 +163,14 @@ def test_compressor_ring_writes_follow_the_worker_slot_mapping():
 
 
 @pytest.fixture
-def native_compressor_runners(monkeypatch):
+def compressor_runners(monkeypatch):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
-        pytest.skip("native b12x compression requires SM12x")
+        pytest.skip("DeepSeek-V4.1 compression requires SM12x")
+    pytest.importorskip("tilelang")
 
+    import vllm.v1.worker.workspace as workspace
     from vllm.model_executor import parameter
     from vllm.model_executor.layers import linear
-    from vllm.models.deepseek_v4_1 import b12x_layers
     from vllm.models.deepseek_v4_1.compressor import DeepseekCompressor
     from vllm.models.deepseek_v4_1.sparse_mla import (
         DeepseekV41B12xMetadataBuilder,
@@ -181,14 +182,15 @@ def native_compressor_runners(monkeypatch):
         monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 1)
 
     device = torch.device("cuda", torch.cuda.current_device())
+    # The split projection borrows its decode partials from vLLM's workspace.
+    monkeypatch.setattr(workspace, "_manager", workspace.WorkspaceManager(device))
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
     capacity, requests, width = 96, 3, 16
-    monkeypatch.setattr(b12x_layers, "_capacity", lambda: capacity)
     config = SimpleNamespace(
         scheduler_config=SimpleNamespace(
             max_num_batched_tokens=capacity, max_num_seqs=requests
         ),
         compilation_config=SimpleNamespace(static_forward_context={}),
-        model_config=SimpleNamespace(hf_config=SimpleNamespace(rms_norm_eps=1e-20)),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
         speculative_config=None,
     )
@@ -240,9 +242,13 @@ def native_compressor_runners(monkeypatch):
             for length in lengths:
                 starts.append(starts[-1] + length)
             n = starts[-1]
+            # With ``pad`` the last request's rows are graph padding, as the runner
+            # pads a captured step: past every request's range, without slots,
+            # while its block table row still names its pages.
+            live = len(identities) - pad
             self.starts.copy_(
                 torch.tensor(
-                    starts + [n] * (requests + 1 - len(starts)),
+                    starts[: live + 1] + [starts[live]] * (requests - live),
                     device=device,
                     dtype=torch.int32,
                 )
@@ -266,14 +272,15 @@ def native_compressor_runners(monkeypatch):
                 self.table[:, null] = 0
             cm = SimpleNamespace(
                 query_start_loc=self.starts,
+                query_start_loc_cpu=self.starts[: live + 1].cpu(),
                 seq_lens=self.seq,
                 block_table_tensor=self.table,
                 slot_mapping=self.input_slots,
-                num_reqs=len(identities),
+                num_reqs=live,
                 num_actual_tokens=n,
-                max_query_len=max(lengths, default=0),
+                max_query_len=max(lengths[:live], default=0),
                 max_seq_len=max(
-                    (pos + length for pos, length in zip(positions, lengths)),
+                    (pos + length for pos, length in zip(positions, lengths[:live])),
                     default=0,
                 ),
             )
@@ -291,53 +298,34 @@ def native_compressor_runners(monkeypatch):
             n = self.main.num_actual_tokens
             return self.module._latent[:n].clone(), self.module._slots[:n].clone()
 
-    with torch.no_grad():
+    with torch.no_grad(), workspace.use_workspace_lane(0):
         candidate, reference = Runner("candidate"), Runner("reference")
         candidate.module.fused_wkv_wgate.weight.normal_(0, 0.1)
         candidate.module.norm.weight.uniform_(0.5, 1.5)
         reference.module.load_state_dict(candidate.module.state_dict())
-        from b12x.preparation import PreparationSession
-
-        from vllm.utils.b12x import B12xWorkload
-
-        workload = B12xWorkload(
-            stage="state",
-            token_counts=(capacity,),
-            fixed_token_counts=(),
-            output_dtype=torch.bfloat16,
-            max_tokens=capacity,
-            max_seqs=requests,
-            max_model_len=64,
-        )
-        with PreparationSession(
-            device=device, autotune=False, compile_workers=2
-        ) as session:
+        for runner in (candidate, reference):
+            # The worker declares the projection's and the compression's kernels
+            # after loading; outside its registry they compile and bind at once.
+            projection = runner.module.fused_wkv_wgate
+            projection.quant_method.declare_layer_kernels(projection)
+            runner.module.declare_kernels()
+            runner.stage([0, 1], [0, 0], [10, 10], original)
+            runner.run()
+        try:
+            yield candidate, reference, original, replacement
+        finally:
             for runner in (candidate, reference):
-                units = runner.module.get_b12x_preparation_units(
-                    runner.module, workload
-                )
-                session.prepare(
-                    tuple(request for unit in units for request in unit.requests)
-                )
-                runner.stage([0, 1], [0, 0], [10, 10], original)
-                runner.run()
-            session.freeze()
-            try:
-                yield candidate, reference, original, replacement
-            finally:
-                for runner in (candidate, reference):
-                    if runner.graph is not None:
-                        runner.graph.reset()
-                        runner.graph = None
+                if runner.graph is not None:
+                    runner.graph.reset()
+                    runner.graph = None
 
 
-def test_native_compressor_rejection_reorder_padding_and_page_boundaries(
-    native_compressor_runners,
+def test_compressor_rejection_reorder_padding_and_page_boundaries(
+    compressor_runners,
 ):
-    from vllm.models.deepseek_v4_1.attention import _pages
-    from vllm.models.deepseek_v4_1.sparse_mla import _chunk
+    from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
 
-    candidate, reference, original, replacement = native_compressor_runners
+    candidate, reference, original, replacement = compressor_runners
     device = original.device
     width = candidate.table.shape[1]
     with torch.no_grad():
@@ -369,14 +357,17 @@ def test_native_compressor_rejection_reorder_padding_and_page_boundaries(
                 assert (candidate.backing[0] == 123).all()
                 assert (candidate.backing[:, candidate.state_width :] == 123).all()
 
-        # A rejected/PAD request must not be resurrected by a real block table.
+        # Graph padding must not be resurrected by a real block table: the padded
+        # rows write neither latents nor the ring of the pages its table row names.
+        # Serving gives every row a request owns a slot; only rows past the step's
+        # requests are padding (the ring-writes test above).
         before = candidate.pool[33:49].clone()
         candidate.stage([0, 1, 2], [20, 20, 20], [2, 2, 2], replacement, pad=True)
         _, slots = candidate.run()
         assert slots[-2:].tolist() == [-1, -1]
         torch.testing.assert_close(candidate.pool[33:49], before, atol=0, rtol=0)
-        assert candidate.state.slot_mapping[6:].eq(-1).all()
-        assert candidate.state.req_id_per_token[-1].item() == -1
+        assert candidate.state.slot_mapping[4:].eq(-1).all()
+        assert candidate.state.req_id_per_token[4:].eq(-1).all()
 
         # An absent request-state block must neither supply carry nor receive
         # partials, even if incoming token slots claim it is writable.
@@ -388,11 +379,11 @@ def test_native_compressor_rejection_reorder_padding_and_page_boundaries(
 
         # Sparse reads must also preserve holes rather than attending null page0.
         candidate.stage([0], [8], [1], replacement, null=1)
-        sparse = torch.empty(1, 16, device=device, dtype=torch.int64)
+        sparse = torch.empty(1, 16, device=device, dtype=torch.int32)
         lengths = torch.empty(1, device=device, dtype=torch.int32)
         top_lengths = torch.empty_like(lengths)
         for draft in (False, True):
-            _chunk[(1,)](
+            tl_metadata.chunk(
                 candidate.state.positions,
                 candidate.state.req_id_per_token,
                 candidate.table,
@@ -403,12 +394,10 @@ def test_native_compressor_rejection_reorder_padding_and_page_boundaries(
                 candidate.state.query_start_loc,
                 candidate.state.request_positions,
                 0,
-                candidate.table.stride(0),
-                4,
-                8,
-                16,
-                draft,
-                16,
+                1,
+                page=4,
+                window=8,
+                draft=draft,
             )
             logical = list(range(0 if draft else 1, 9))
             expected = [
@@ -419,15 +408,8 @@ def test_native_compressor_rejection_reorder_padding_and_page_boundaries(
 
         # Compressed/index page tables use the same null-block convention.
         pages = torch.empty((1, width), device=device, dtype=torch.int32)
-        _pages[(1, 1)](
-            candidate.state.req_id_per_token,
-            candidate.table,
-            pages,
-            0,
-            candidate.table.stride(0),
-            width,
-            width,
-            16,
+        tl_metadata.pages(
+            candidate.state.req_id_per_token, candidate.table, pages, 0, 1, width
         )
         expected_pages = list(range(1, width + 1))
         expected_pages[1] = -1
@@ -440,8 +422,8 @@ def test_native_compressor_rejection_reorder_padding_and_page_boundaries(
         torch.testing.assert_close(candidate.backing, before, atol=0, rtol=0)
 
 
-def test_native_compressor_high_page_offsets(native_compressor_runners):
-    candidate, reference, original, replacement = native_compressor_runners
+def test_compressor_high_page_offsets(compressor_runners):
+    candidate, reference, original, replacement = compressor_runners
     device = original.device
     with torch.no_grad():
         # Recycled state pages can exceed Int32 element offsets even though

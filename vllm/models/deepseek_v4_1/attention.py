@@ -1,21 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""V4.1 Full/Reindex/Reuse topology with native b12x compute only."""
+"""V4.1 Full/Reindex/Reuse topology: caches, metadata and ownership. The TileLang
+layer (``tilelang/attention.py``) runs the indexer and sparse MLA kernels."""
 
-import math
 import os
-from dataclasses import replace
 from typing import cast
 
 import regex as re
 import torch
-from b12x.attention import compressed_sparse_mla as mla
-from b12x.attention import dsa_indexer
-from b12x.attention.compressed_sparse_mla import rotary, weight_scale
-from b12x.gemm import wo_projection
 from torch import nn
 
-from vllm import envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
@@ -32,27 +26,18 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.deepseek_v4_1 import kernels, l2_prefetch, sp_prefill
-from vllm.models.deepseek_v4_1.ced import CED_WINDOW, ced_decoder_start
+from vllm.models.deepseek_v4_1.ced import ced_decoder_start
 from vllm.models.deepseek_v4_1.compressor import DeepseekCompressor
 from vllm.models.deepseek_v4_1.quant_config import Block32FP8LinearMethod
 from vllm.models.deepseek_v4_1.sparse_mla import (
     SLOT_DTYPE,
     DeepseekV41B12xBackend,
     DeepseekV41B12xMetadata,
-    _chunk,
     tilelang_builder_kernels,
 )
 from vllm.models.deepseek_v4_1.tilelang import prepare
 from vllm.models.deepseek_v41.common.rope import build_deepseek_v4_rope
 from vllm.triton_utils import tl, triton
-from vllm.utils.b12x import (
-    B12xPreparationUnit,
-    B12xWorkload,
-    PreparationResourceUnavailableError,
-    register_b12x_unit_provider,
-    set_b12x_preparation_provider,
-)
-from vllm.utils.torch_utils import current_stream
 from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
@@ -78,167 +63,6 @@ def _native_linear(layer):
         layer.quant_method = kernels.linear_method()
         return
     raise ValueError("V4.1 attention only supports native linear methods")
-
-
-def _scratch(plan):
-    return current_workspace_manager().get_simultaneous(
-        *((s.shape, s.dtype) for s in plan.scratch_specs())
-    )
-
-
-def _rotated(x, positions, cos_sin_cache, **kwargs):
-    # This result can span nested GEMMs, which reuse the workspace arena.
-    out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
-    rotary.rotate(x, positions, cos_sin_cache, out=out, **kwargs)
-    return out
-
-
-class _AttentionHelpers:
-    """Loaded-resource owner, independent of unpublished attention caches."""
-
-    def __init__(self, attention):
-        self.attention = attention
-
-    def get_b12x_preparation_units(
-        self, layer: object, workload: B12xWorkload
-    ) -> tuple[B12xPreparationUnit, ...]:
-        # The TileLang kernels launch no helper plan; binding them prepares the
-        # attention staging (DeepseekV41TileLangAttention._bind_plans).
-        if kernels.uses_tilelang():
-            return ()
-        from b12x.preparation import FrozenMapping, MemoryRequirements, PreparedCall
-
-        attn = self.attention
-        table = attn.rotary_emb.cos_sin_cache
-        device = table.device
-        attn._declare_attention(device)
-        roles = [("kv", 1, 512, 1), ("q", attn.n_local_heads, 512, 1)]
-        if attn.indexer is not None:
-            roles.append(("index_query", attn.indexer.heads, 128, 1))
-        if attn.compressor is not None:
-            roles.extend(
-                (
-                    ("index_key", 1, 128, attn.compress_ratio),
-                    ("latent", 1, 512, attn.compress_ratio),
-                )
-            )
-        plans: dict[str, object] = {}
-        requests = []
-        for role, heads, dim, ratio in roles:
-            query = rotary.Query(
-                max_rows=attn.capacity,
-                heads=heads,
-                dim=dim,
-                ratio=ratio,
-                cos_sin_dtype=str(table.dtype).removeprefix("torch."),
-            )
-            declaration = rotary.plan(query, device=device)
-            if role == "kv":
-                native_memory = declaration._memory_requirements
-
-                def memory(config, detected, native_memory=native_memory):
-                    return MemoryRequirements.sequential(
-                        (
-                            native_memory(config, detected),
-                            attn._staging_memory(),
-                        )
-                    )
-
-                declaration = replace(
-                    declaration,
-                    _memory_requirements=memory,
-                    invocation=FrozenMapping(
-                        {
-                            "vllm_staging": tuple(
-                                (name, shape, str(dtype))
-                                for name, shape, dtype in attn._staging_specs
-                            )
-                        }
-                    ),
-                )
-            plans[role] = declaration
-
-            def prepare(state, heads=heads, dim=dim):
-                attn._prepare(device)
-                source = torch.ones(
-                    (1, heads, dim), dtype=torch.bfloat16, device=device
-                )
-                output = torch.empty_like(source)
-                positions = torch.zeros(1, dtype=torch.int64, device=device)
-                return PreparedCall(
-                    run=lambda: state.run(source, positions, table, out=output)
-                )
-
-            requests.append(
-                declaration.request(
-                    name=f"{attn.prefix}.helper.{role}",
-                    prepare_call=prepare,
-                )
-            )
-        if attn.indexer is not None:
-            declaration = weight_scale.plan(
-                weight_scale.Query(max_elements=attn.capacity * attn.indexer.heads),
-                device=device,
-            )
-            plans["index_weights"] = declaration
-
-            def prepare_weights(state):
-                source = torch.ones(
-                    (1, attn.indexer.heads), dtype=torch.bfloat16, device=device
-                )
-                output = torch.empty_like(source)
-                return PreparedCall(run=lambda: state.run(source, out=output))
-
-            requests.append(
-                declaration.request(
-                    name=f"{attn.prefix}.helper.index_weights",
-                    prepare_call=prepare_weights,
-                )
-            )
-        cache_roles = [("swa_cache_write", attn.swa_cache_layer.block_size, "swa")]
-        if attn.compressor is not None:
-            cache_roles.append(("indexed_cache_write", attn._main_page, "indexed"))
-        for role, page_size, kind in cache_roles:
-            declaration = mla.plan_cache_writer(
-                mla.CacheWriterQuery(
-                    max_rows=attn.capacity,
-                    page_size=page_size,
-                    cache_kind=kind,
-                    slot_dtype="int64",
-                ),
-                device=device,
-            )
-            plans[role] = declaration
-
-            def prepare_writer(state, page_size=page_size, kind=kind):
-                source = torch.ones((1, 512), dtype=torch.bfloat16, device=device)
-                cache = torch.empty(
-                    (
-                        1,
-                        mla.page_nbytes(
-                            page_size, cache_kind=kind, cache_format="deepseek_v41"
-                        ),
-                    ),
-                    dtype=torch.uint8,
-                    device=device,
-                )
-                slots = torch.zeros(1, dtype=torch.int64, device=device)
-                return PreparedCall(run=lambda: state.run(source, cache, slots))
-
-            requests.append(
-                declaration.request(
-                    name=f"{attn.prefix}.helper.{role}",
-                    prepare_call=prepare_writer,
-                )
-            )
-        attn._helper_plans = plans
-        helpers = B12xPreparationUnit(
-            name="V41AttentionHelpers",
-            key=(attn.prefix, attn.capacity),
-            requests=tuple(requests),
-            stage="weights",
-        )
-        return (helpers, attn._wo_preparation_unit(workload))
 
 
 @triton.jit(do_not_specialize=["offset", "stride", "width"])
@@ -364,17 +188,15 @@ class DeepseekV4Indexer(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.weights_proj",
         )
-        self.weights_proj.quant_method = kernels.linear_method()
-        if kernels.uses_tilelang():
-            from vllm.models.deepseek_v4_1.tilelang.linear import (
-                TileLangScaledLinearMethod,
-            )
+        from vllm.models.deepseek_v4_1.tilelang.linear import (
+            TileLangScaledLinearMethod,
+        )
 
-            # DeepSeek scales the head weights by (heads * head_dim) ** -0.5, a
-            # power of two folded exactly into the projection.
-            self.weights_proj.quant_method = TileLangScaledLinearMethod(
-                (hf.index_n_heads * 128) ** -0.5
-            )
+        # DeepSeek scales the head weights by (heads * head_dim) ** -0.5, a
+        # power of two folded exactly into the projection.
+        self.weights_proj.quant_method = TileLangScaledLinearMethod(
+            (hf.index_n_heads * 128) ** -0.5
+        )
         if owns_k:
             self.wk = ReplicatedLinear(
                 512,
@@ -576,7 +398,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 for param in linear.parameters():
                     set_weight_attrs(param, {"allow_tp_padding": True})
         self._wo_projection_weights = None
-        self._wo_plans = {}
         self._l2pf_wo = None
         self._l2pf_ffn = None
         for linear in (self.fused_wqa_wkv, self.wq_b):
@@ -627,12 +448,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 ratio=self.compress_ratio,
             )
         self.topk_indices_buffer = topk_indices_buffer
-        self._index_plans: dict[tuple[str, int], object] = {}
-        self._attention_plans: dict[str, object] = {}
-        self._helper_plans: dict[str, object] = {}
-        self._helpers = _AttentionHelpers(self)
-        register_b12x_unit_provider(self._helpers)
-        set_b12x_preparation_provider(self, self)
         self._ready = False
 
     def get_attn_backend(self):
@@ -658,20 +473,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
 
     def _owner(self):
         return self._context[_source(self.prefix, self.kv_source_layer_id)]
-
-    def _declare_attention(self, device):
-        """Describe native code and simultaneous metadata without allocating."""
-        self._attention_geometry()
-        self._attention_declarations = {}
-        for mode, capacity in (
-            ("decode", self._decode_capacity),
-            ("extend", self.capacity),
-        ):
-            declaration = self._declare_mla(
-                mode, capacity, self._attention_workspace_specs[mode], device
-            )
-            if declaration is not None:
-                self._attention_declarations[mode] = declaration
 
     def _attention_geometry(self) -> None:
         """The metadata arena of each attention mode and the staging this layer
@@ -751,9 +552,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         included (the worker calls this after loading, before any distributed
         work)."""
         self._attention_geometry()
-        if kernels.uses_tilelang():
-            calls = self._tilelang_calls()
-            prepare.declare(lambda: calls)
+        calls = self._tilelang_calls()
+        prepare.declare(lambda: calls)
         declare_wo = getattr(self._wo_projection_weights, "declare_kernels", None)
         if declare_wo is not None:
             declare_wo()
@@ -856,138 +656,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             calls.append(prepare.call(columns.split_columns_kernel, *key))
         return calls
 
-    def _declare_mla(self, mode: str, capacity: int, metadata_specs, device):
-        """Declare the native sparse-MLA plan for one mode, beside its metadata."""
-        from b12x._lib.scratch import ScratchBufferSpec
-        from b12x.preparation import MemoryRequirements
-
-        def descriptor(tensor, *, page_size, kind):
-            if tensor is None or tensor.numel() == 0:
-                width = mla.page_nbytes(
-                    page_size,
-                    cache_kind=kind,
-                    cache_format="deepseek_v41",
-                )
-                return {
-                    "shape": (1, width),
-                    "stride": (width, 1),
-                    "alignment": 16,
-                    "dtype": "uint8",
-                }
-            return {
-                "shape": tuple(tensor.shape),
-                "stride": tuple(tensor.stride()),
-                "alignment": min(16, tensor.data_ptr() & -tensor.data_ptr()),
-                "dtype": str(tensor.dtype).removeprefix("torch."),
-            }
-
-        compute = envs.VLLM_DS41_ATTENTION_COMPUTE
-        # "reference" gives decode rows the single-pass kernel as well.
-        kernel_mode = "extend" if compute == "reference" else mode
-        caps = mla.Caps(
-            device=device,
-            num_q_heads=self.n_local_heads,
-            max_q_rows=capacity,
-            max_width=self.swa_width + (512 if self.compress_ratio else 0),
-            swa_width=self.swa_width,
-            indexed_width=512 if self.compress_ratio else 0,
-            swa_page_size=self.swa_cache_layer.block_size,
-            indexed_page_size=self._main_page,
-            max_page_table_width=self._main_width,
-            mode=kernel_mode,
-            # DSpark's two-span reservation can exceed the generic
-            # 256-row cutoff even when replaying a six-row C1 graph.
-            # Keep the entire reserved decode capacity on its decode
-            # split contract; prefill retains its separate plan.
-            decode_row_capacity=capacity if kernel_mode == "decode" else None,
-            cache_format="deepseek_v41",
-            use_cuda_graph=True,
-        )
-        swa_cache = getattr(self.swa_cache_layer, "kv_cache", None)
-        indexed_cache = (
-            getattr(self._owner(), "kv_cache", None) if self.compress_ratio else None
-        )
-        invocation = mla.invocation_from_descriptors(
-            q={
-                "shape": (capacity, self.n_local_heads, 512),
-                "stride": (self.n_local_heads * 512, 512, 1),
-                "alignment": 16,
-                "dtype": "bfloat16",
-            },
-            swa_cache=descriptor(
-                swa_cache, page_size=self.swa_cache_layer.block_size, kind="swa"
-            ),
-            indexed_cache=(
-                descriptor(indexed_cache, page_size=self._main_page, kind="indexed")
-                if self.compress_ratio
-                else None
-            ),
-            attn_sink_present=True,
-            output_mode="provided",
-        )
-        declaration = mla.plan(caps, invocation=invocation)
-        if compute != "auto":
-            # Pin BF16 arithmetic; the split/single-pass lowering stays the
-            # plan's own default for this query.
-            default = declaration.contract.default_config(declaration.query, None)
-            declaration = mla.plan(
-                caps,
-                invocation=invocation,
-                override=replace(
-                    default, v41_compute_mode="bf16", v41_heads_per_block=16
-                ),
-            )
-
-        # These metadata views coexist with native scratch in one arena.
-        # Only integration-owned storage is added; launch policy stays native.
-        def memory(config, detected, native=declaration._memory_requirements):
-            requirement = native(config, detected)
-            metadata = tuple(
-                ScratchBufferSpec(
-                    name=f"{mode}_metadata_{index}",
-                    shape=shape,
-                    dtype=dtype,
-                    device=torch.device("cuda", detected.ordinal),
-                )
-                for index, (shape, dtype) in enumerate(metadata_specs)
-            )
-            return MemoryRequirements(
-                scratch=(*metadata, *requirement.scratch),
-                persistent=requirement.persistent,
-            )
-
-        return replace(declaration, _memory_requirements=memory)
-
-    def _staging_memory(self):
-        from b12x.preparation import MemoryRequirements, PersistentMemory
-
-        required = resident = 0
-        for name, shape, dtype in self._staging_specs:
-            nbytes = math.prod(shape) * dtype.itemsize
-            required += nbytes
-            tensor = getattr(self, name, None)
-            if (
-                tensor is not None
-                and tuple(tensor.shape) == shape
-                and tensor.dtype == dtype
-            ):
-                resident += nbytes
-        return MemoryRequirements(
-            persistent=(
-                PersistentMemory(
-                    key=(self, "attention_metadata"),
-                    required_nbytes=required,
-                    resident_nbytes=resident,
-                ),
-            )
-        )
-
     def _prepare(self, device):
         """Materialize admitted integration-owned metadata, never launch choices."""
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("V4.1 metadata must be prepared before graph capture")
         if not hasattr(self, "_staging_specs"):
-            self._declare_attention(device)
+            self._attention_geometry()
         for name, shape, dtype in self._staging_specs:
             tensor = getattr(self, name, None)
             if tensor is None or tuple(tensor.shape) != shape or tensor.dtype != dtype:
@@ -996,407 +670,24 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             self._active.fill_(self._index_width * self._index_page)
         self._ready = True
 
-    def _preparation_token_counts(self, workload):
-        counts = set(workload.token_counts)
-        if self.is_ced_decoder:
-            compact_max = min(self.capacity, workload.max_seqs * CED_WINDOW)
-            counts.add(compact_max)
-            counts.update(range(CED_WINDOW, compact_max + 1, CED_WINDOW))
-        return tuple(sorted(counts))
-
-    def _index_request_name(self, mode: str, rows: int) -> str:
-        return f"{self.prefix}.mxfp4_index.{mode}.m{rows}"
-
-    def get_b12x_preparation_units(
-        self, layer: object, workload: B12xWorkload
-    ) -> tuple[B12xPreparationUnit, ...]:
-        device = self.rotary_emb.cos_sin_cache.device
-        self._declare_attention(device)
-        index_declarations = {}
-        token_counts = self._preparation_token_counts(workload)
-        if self.indexer is not None:
-            regimes = [
-                ("decode", self.DECODE_CHUNK, self._index_width),
-                ("prefill", self.INDEX_CHUNK, self._index_width),
-            ]
-            if self._short_index_shape is not None:
-                regimes.append(("prefill_short", *self._short_index_shape))
-            for mode, chunk, width in regimes:
-                counts: set[int] = set()
-                counts.update(min(rows, chunk) for rows in token_counts)
-                counts.update(rows % chunk for rows in token_counts if rows % chunk)
-                for rows in sorted(counts):
-                    index_declarations[mode, rows] = self._declare_index_plan(
-                        mode, rows
-                    )
-
-        caches = [getattr(self.swa_cache_layer, "kv_cache", None)]
-        if self.compress_ratio:
-            caches.append(getattr(self._owner(), "kv_cache", None))
-        if self.indexer is not None:
-            caches.append(getattr(self.indexer.k_cache, "kv_cache", None))
-        if any(cache is None or cache.numel() == 0 for cache in caches):
-            return ()
-        self._index_plans = dict(index_declarations)
-        requests = [
-            declaration.request(
-                name=self._index_request_name(mode, rows),
-                prepare_call=self._index_call(mode, rows),
-                benchmark_call=self._index_call(mode, rows, benchmark=True),
-            )
-            for (mode, rows), declaration in index_declarations.items()
-        ]
-        self._attention_plans = dict(self._attention_declarations)
-        for mode, declaration in self._attention_declarations.items():
-            capacity = declaration.query.query_rows
-            requests.append(
-                declaration.request(
-                    name=f"{self.prefix}.mla.{mode}.m{capacity}",
-                    prepare_call=self._attention_call(mode, capacity),
-                    benchmark_call=self._attention_call(mode, capacity),
-                )
-            )
-        return (
-            B12xPreparationUnit(
-                name="V41Attention",
-                key=(self.prefix, token_counts),
-                requests=tuple(requests),
-                stage="state",
-            ),
-        )
-
-    def _attention_call(self, mode: str, rows: int):
-        def prepare(state):
-            from b12x.preparation import PreparedCall
-
-            device = self.swa_cache_layer.kv_cache.device
-            source = torch.randn(
-                (rows, self.n_local_heads, 512), dtype=torch.bfloat16, device=device
-            )
-            q = torch.empty_like(source)
-            out = torch.empty_like(source)
-            # Trial scratch belongs to the trial; the serving workspace is
-            # never drawn from while candidates are timed.
-            scratch = [
-                torch.empty(spec.shape, dtype=spec.dtype, device=device)
-                for spec in state.scratch_plan.scratch_specs()
-            ]
-            snapshots = []
-            initializers = []
-
-            def cache_inputs(cache, page_size, width, kind):
-                pages = min(
-                    cache.shape[0],
-                    self._main_width
-                    if kind == "indexed"
-                    else triton.cdiv(width, page_size),
-                )
-                if pages < 1:
-                    raise PreparationResourceUnavailableError(
-                        "attention primer needs a live cache page"
-                    )
-                live = cache[:pages]
-                snapshots.append((live, live.clone()))
-                records = live.view(pages, page_size, -1)
-                if kind == "swa":
-                    payload = torch.randn((pages, page_size, 512), device=device).mul_(
-                        0.25
-                    )
-                    initializers.append(
-                        (
-                            records,
-                            payload.to(torch.float8_e4m3fn).view(torch.uint8),
-                            512,
-                            127,
-                        )
-                    )
-                else:
-                    payload = torch.randint(
-                        0,
-                        256,
-                        (pages, page_size, 256),
-                        dtype=torch.uint8,
-                        device=device,
-                    )
-                    initializers.append((records, payload, 256, 56))
-                count = min(width, pages * page_size)
-                indices = torch.full(
-                    (rows, width), -1, dtype=torch.int32, device=device
-                )
-                indices[:, :count] = torch.arange(
-                    count, dtype=torch.int32, device=device
-                )
-                lengths = torch.full((rows,), count, dtype=torch.int32, device=device)
-                return indices, lengths, pages
-
-            swa_indices, swa_lengths, _ = cache_inputs(
-                self.swa_cache_layer.kv_cache,
-                self.swa_cache_layer.block_size,
-                self.swa_width,
-                "swa",
-            )
-            kwargs = {}
-            if self.compress_ratio:
-                indices, lengths, pages = cache_inputs(
-                    self._owner().kv_cache,
-                    self._main_page,
-                    512,
-                    "indexed",
-                )
-                table = torch.full(
-                    (rows, self._main_width), -1, dtype=torch.int32, device=device
-                )
-                table[:, :pages] = torch.arange(pages, dtype=torch.int32, device=device)
-                kwargs = dict(
-                    indexed_indices=indices,
-                    indexed_lengths=lengths,
-                    indexed_page_table=table,
-                )
-            binding = state.bind_for_preparation(
-                scratch=scratch,
-                q=q,
-                swa_indices=swa_indices,
-                swa_lengths=swa_lengths,
-                **kwargs,
-            )
-
-            def reset():
-                for target, payload, width, scale in initializers:
-                    target[..., :width].copy_(payload)
-                    target[..., width:].fill_(scale)
-                out.fill_(float("nan"))
-
-            def restore():
-                from b12x.preparation.types import _close_all
-
-                _close_all(
-                    (lambda target=target, saved=saved: target.copy_(saved))
-                    for target, saved in snapshots
-                )
-
-            return PreparedCall(
-                run=lambda: state.run(
-                    binding,
-                    swa_k_cache=self.swa_cache_layer.kv_cache,
-                    indexed_k_cache=self._owner().kv_cache
-                    if self.compress_ratio
-                    else None,
-                    swa_page_size=self.swa_cache_layer.block_size,
-                    indexed_page_size=self._main_page,
-                    sm_scale=512**-0.5,
-                    attn_sink=self.attn_sink,
-                    out=out,
-                    cache_format="deepseek_v41",
-                ),
-                output=out,
-                produce=lambda: q.copy_(source),
-                reset=reset,
-                restore=restore,
-            )
-
-        return prepare
-
-    def _index_call(self, mode: str, rows: int, *, benchmark: bool = False):
-        def prepare(state):
-            from b12x.attention.dsa_indexer.mxfp4 import score_mxfp4, select_mxfp4
-            from b12x.preparation import PreparedCall
-
-            assert self.indexer is not None
-            cache = self.indexer.k_cache.kv_cache
-            device, heads = cache.device, self.indexer.heads
-            width = state.caps.max_page_table_width
-            live_pages = min(cache.shape[0], width)
-            if live_pages < 1:
-                raise PreparationResourceUnavailableError(
-                    "indexer primer needs a live cache page"
-                )
-            live_tokens = live_pages * self._index_page
-            saved_cache = cache[:live_pages].clone()
-            keys = torch.randn((live_tokens, 128), dtype=torch.bfloat16, device=device)
-            slots = torch.arange(live_tokens, dtype=torch.int64, device=device)
-            source = torch.randn(
-                (rows, heads, 128), dtype=torch.bfloat16, device=device
-            )
-            q = torch.empty((rows, heads, 64), dtype=torch.uint8, device=device)
-            scales = torch.empty((rows, heads, 4), dtype=torch.uint8, device=device)
-            weights = torch.full(
-                (rows, heads), 1 / 64, dtype=torch.bfloat16, device=device
-            )
-            pages = torch.full((rows, width), -1, dtype=torch.int32, device=device)
-            pages[:, :live_pages] = torch.arange(
-                live_pages, dtype=torch.int32, device=device
-            )
-            lengths = torch.full((rows,), live_tokens, dtype=torch.int32, device=device)
-            active = torch.full((1,), live_tokens, dtype=torch.int32, device=device)
-            indices = torch.empty((rows, 512), dtype=torch.int32, device=device)
-            kwargs = {}
-            if self.layer_id == self.candidate_source_layer:
-                kwargs = dict(
-                    candidate_output=torch.empty(
-                        (rows, 16384), dtype=torch.int32, device=device
-                    ),
-                    candidate_output_lengths=torch.empty(
-                        (rows,), dtype=torch.int32, device=device
-                    ),
-                )
-            elif self.layer_id > self.candidate_source_layer:
-                count = min(16384, live_tokens)
-                candidates = torch.full(
-                    (rows, 16384), -1, dtype=torch.int32, device=device
-                )
-                candidates[:, :count] = torch.arange(
-                    count, dtype=torch.int32, device=device
-                )
-                kwargs = dict(
-                    candidate_indices=candidates,
-                    candidate_lengths=torch.full(
-                        (rows,), count, dtype=torch.int32, device=device
-                    ),
-                )
-            # Retained tuning trials need independent scratch; priming is serial.
-            scratch = (
-                [
-                    torch.empty(spec.shape, dtype=spec.dtype, device=device)
-                    for spec in state.layout.scratch_specs()
-                ]
-                if benchmark
-                else _scratch(state.layout)
-            )
-            binding = state.bind(
-                scratch=scratch,
-                q_mxfp4=q,
-                q_scales=scales,
-                query_weights=weights,
-                index_k_cache=cache,
-                page_table=pages,
-                cache_lengths=lengths,
-                active_width=active,
-                output_indices=indices,
-                **kwargs,
-            )
-
-            def run():
-                score_mxfp4(binding, launchers=state._launchers)
-                return select_mxfp4(binding, launchers=state._launchers)
-
-            return PreparedCall(
-                run=run,
-                output=indices,
-                produce=lambda: state.quantize_query(
-                    source, q_mxfp4=q, q_scales=scales
-                ),
-                reset=lambda: state.write_index_keys(
-                    keys, index_k_cache=cache, slot_mapping=slots
-                ),
-                restore=lambda: cache[:live_pages].copy_(saved_cache),
-            )
-
-        return prepare
-
     def _rope(self, x, positions, role: str):
-        """``x`` rotated at ``positions``; in place under the TileLang kernels."""
-        table = self.rotary_emb.cos_sin_cache
-        if kernels.uses_tilelang():
-            from vllm.models.deepseek_v4_1.tilelang.rope import rope_
+        """``x`` rotated at ``positions``, in place."""
+        from vllm.models.deepseek_v4_1.tilelang.rope import rope_
 
-            compressed = role in ("index_key", "latent")
-            rope_(x, positions, table, self.compress_ratio if compressed else 1, False)
-            return x
-        return _rotated(x, positions, table, plan=self._helper_plan(role))
+        table = self.rotary_emb.cos_sin_cache
+        compressed = role in ("index_key", "latent")
+        rope_(x, positions, table, self.compress_ratio if compressed else 1, False)
+        return x
 
     def _write_v41_cache(self, x, cache, slots, *, page_size, cache_kind):
         """Write ``x``'s V4.1 records (``cache_kind`` swa or indexed) at ``slots``."""
-        if kernels.uses_tilelang():
-            # The same bytes as B12X's writer.
-            from .tilelang.cache_writer import write_cache
+        from .tilelang.cache_writer import write_cache
 
-            write_cache(x, cache, slots, page_size=page_size, cache_kind=cache_kind)
-            return
-        mla.write_cache(
-            x,
-            cache,
-            slots,
-            page_size=page_size,
-            cache_kind=cache_kind,
-            cache_format="deepseek_v41",
-            plan=self._helper_plan(f"{cache_kind}_cache_write"),
-        )
-
-    def _helper_plan(self, role: str):
-        try:
-            return self._helper_plans[role]
-        except KeyError:
-            raise PreparationResourceUnavailableError(
-                f"{self.prefix} lacks a declared {role} attention helper plan"
-            ) from None
-
-    def _attention_plan(self, mode: str):
-        try:
-            return self._attention_plans[mode]
-        except KeyError:
-            raise PreparationResourceUnavailableError(
-                f"{self.prefix} lacks a declared {mode} MLA attention plan"
-            ) from None
-
-    def _declare_index_plan(self, mode: str, rows: int):
-        if mode == "decode":
-            chunk, width = self.DECODE_CHUNK, self._index_width
-        elif mode == "prefill":
-            chunk, width = self.INDEX_CHUNK, self._index_width
-        elif mode == "prefill_short" and self._short_index_shape is not None:
-            chunk, width = self._short_index_shape
-        else:
-            raise ValueError(f"unsupported V4.1 indexer mode {mode!r}")
-        if not 0 < rows <= chunk:
-            raise ValueError(
-                f"V4.1 {mode} indexer rows {rows} exceed chunk capacity {chunk}"
-            )
-        assert self.indexer is not None
-        return dsa_indexer.plan(
-            dsa_indexer.Caps(
-                device=self.rotary_emb.cos_sin_cache.device,
-                num_q_heads=self.indexer.heads,
-                max_q_rows=rows,
-                max_page_table_width=width,
-                topk=512,
-                mode="decode" if mode == "decode" else "prefill",
-                cache_format="mxfp4",
-                page_size=self._index_page,
-                max_candidates=16384
-                if self.layer_id > self.candidate_source_layer
-                else 0,
-                candidate_topk_blocks=2048
-                if self.layer_id == self.candidate_source_layer
-                else 0,
-            )
-        )
-
-    def _index_plan(self, mode: str, rows: int):
-        key = (mode, rows)
-        if key in self._index_plans:
-            return self._index_plans[key]
-        if mode == "decode":
-            capacity = self.DECODE_CHUNK
-        elif mode == "prefill":
-            capacity = self.INDEX_CHUNK
-        elif mode == "prefill_short" and self._short_index_shape is not None:
-            capacity = self._short_index_shape[0]
-        else:
-            raise ValueError(f"unsupported V4.1 indexer mode {mode!r}")
-        if not 0 < rows <= capacity:
-            raise ValueError(
-                f"V4.1 {mode} indexer rows {rows} exceed chunk capacity {capacity}"
-            )
-        key = (mode, capacity)
-        if key not in self._index_plans:
-            self._index_plans[key] = self._declare_index_plan(mode, capacity)
-        return self._index_plans[key]
+        write_cache(x, cache, slots, page_size=page_size, cache_kind=cache_kind)
 
     def insert_context_kv(self, kv, positions, slot_mapping):
         if not self._ready:
-            raise PreparationResourceUnavailableError(
-                "V4.1 attention metadata is not prepared"
-            )
+            raise RuntimeError("V4.1 attention metadata is not prepared")
         rotated = self._rope(kv, positions, "kv")
         self._write_v41_cache(
             rotated,
@@ -1428,9 +719,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
     @eager_break_during_capture
     def _prepare_global_kv(self, positions, hidden_states):
         if not self._ready:
-            raise PreparationResourceUnavailableError(
-                "V4.1 attention metadata is not prepared"
-            )
+            raise RuntimeError("V4.1 attention metadata is not prepared")
         metadata = get_forward_context().attn_metadata
         if not isinstance(metadata, dict) or self.compressor is None:
             return
@@ -1487,9 +776,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
 
     def _forward(self, positions, hidden_states):
         if not self._ready:
-            raise PreparationResourceUnavailableError(
-                "V4.1 attention metadata is not prepared"
-            )
+            raise RuntimeError("V4.1 attention metadata is not prepared")
         sp_rows = sp_prefill.current()
         index_weights = None
         if sp_rows is not None and self.compressor is None:
@@ -1498,20 +785,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             # its product, narrower than the hidden state, is gathered.
             qr_kv, _ = self.fused_wqa_wkv(hidden_states)
             qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
-            if kernels.uses_tilelang():
-                parts = self._gather_front(sp_rows, hidden_states, qr, kv)
-            else:
-                parts = [self.q_norm(qr), self.kv_norm(kv)]
-                if self.indexer is not None:
-                    parts.append(self.indexer.weights_proj(hidden_states))
-                if len({part.dtype for part in parts}) == 1:
-                    widths = [part.shape[-1] for part in parts]
-                    parts = sp_rows.gather(torch.cat(parts, dim=-1)).split(
-                        widths, dim=-1
-                    )
-                else:
-                    parts = [sp_rows.gather(part) for part in parts]
-                parts = [part.contiguous() for part in parts]
+            parts = self._gather_front(sp_rows, hidden_states, qr, kv)
             qr, kv = parts[0], parts[1]
             if self.indexer is not None:
                 index_weights = parts[2]
@@ -1533,14 +807,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             dict[str, DeepseekV41B12xMetadata] | None,
             get_forward_context().attn_metadata,
         )
-        is_prefill = True
         if not isinstance(metadata, dict):
             # Memory profiling has no cache pages; serving does not use this branch.
             output.zero_()
         else:
             original_swa = metadata[self.swa_cache_layer.prefix]
             swa = self._query_metadata(original_swa)
-            is_prefill = not swa.is_decode
             self._cache_context_kv(kv, positions)
             if swa is original_swa and hidden_states is not None:
                 self._prepare_global_kv(positions, hidden_states)
@@ -1562,7 +834,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     )
                 index_query = (*query, split, reference)
             self.forward_mqa(q, kv, positions, output, index_query=index_query)
-        return self._o_proj(output, positions, is_prefill=is_prefill, sp_rows=sp_rows)
+        return self._o_proj(output, sp_rows=sp_rows)
 
     def _index_query(
         self, qr, positions, hidden_states, index_weights, first, last, swa
@@ -1585,15 +857,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             if index_weights is not None
             else self.indexer.weights_proj(hidden_states)[first:last]
         )
-        if kernels.uses_tilelang():
-            return iq_data, iq_scale, weights  # the projection applied the scale
-        iw = torch.empty_like(weights)
-        weight_scale.scale_index_weights(
-            weights,
-            out=iw,
-            plan=self._helper_plan("index_weights"),
-        )
-        return iq_data, iq_scale, iw
+        return iq_data, iq_scale, weights  # the projection applied the scale
 
     @staticmethod
     def _selection_spread(actual, expected):
@@ -1740,30 +1004,18 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     end = min(offset + chunk_rows, index_rows)
                     count = end - offset
                     row, row_end = first + offset, first + end
-                    if kernels.uses_tilelang():
-                        from vllm.models.deepseek_v4_1.tilelang import (
-                            metadata as tl_metadata,
-                        )
+                    from vllm.models.deepseek_v4_1.tilelang import (
+                        metadata as tl_metadata,
+                    )
 
-                        tl_metadata.pages(
-                            im.req_id_per_token,
-                            im.block_table,
-                            index_pages,
-                            row,
-                            count,
-                            min(im.block_table.shape[1], index_width),
-                        )
-                    else:
-                        _pages[(count, triton.cdiv(index_width, 128))](
-                            im.req_id_per_token,
-                            im.block_table,
-                            index_pages,
-                            row,
-                            im.block_table.stride(0),
-                            min(im.block_table.shape[1], index_width),
-                            index_width,
-                            128,
-                        )
+                    tl_metadata.pages(
+                        im.req_id_per_token,
+                        im.block_table,
+                        index_pages,
+                        row,
+                        count,
+                        min(im.block_table.shape[1], index_width),
+                    )
                     candidate_args = {}
                     if self.layer_id == self.candidate_source_layer:
                         candidate_args = dict(
@@ -1929,96 +1181,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 **kwargs,
             )
 
-    def _quantize_index_query(self, mode: str, iq, iq_data, iq_scale) -> None:
-        """MXFP4-quantize ``[rows, heads, 128]`` index queries into the outputs."""
-        chunk_rows = self.DECODE_CHUNK if mode == "decode" else self.INDEX_CHUNK
-        for offset in range(0, iq.shape[0], chunk_rows):
-            end = min(offset + chunk_rows, iq.shape[0])
-            dsa_indexer.quantize_q_mxfp4(
-                self._index_plan(mode, end - offset),
-                iq[offset:end],
-                q_mxfp4=iq_data[offset:end],
-                q_scales=iq_scale[offset:end],
-            )
-
-    def _write_index_keys(self, key, slot_mapping) -> None:
-        """MXFP4-quantize ``[rows, 128]`` index keys into the index K cache."""
-        for offset in range(0, key.shape[0], self.INDEX_CHUNK):
-            end = min(offset + self.INDEX_CHUNK, key.shape[0])
-            dsa_indexer.quantize_write_index_k_mxfp4(
-                self._index_plan("prefill", end - offset),
-                key[offset:end],
-                index_k_cache=self.indexer.k_cache.kv_cache,
-                slot_mapping=slot_mapping[offset:end],
-            )
-
-    def _check_attention_rows(self, mode: str, rows: int) -> None:
-        """Reject a batch beyond the prepared attention capacity."""
-        from b12x.preparation import require_prepared
-
-        state = require_prepared(
-            self._attention_plan(mode), "attention.compressed_sparse_mla"
-        )
-        if rows > state.query.query_rows:
-            raise ValueError(
-                f"V4.1 {mode} rows {rows} exceed prepared capacity "
-                f"{state.query.query_rows}"
-            )
-
-    def _attention_scratch_specs(self, mode: str, rows: int):
-        """Native attention scratch, borrowed beside the metadata arena."""
-        from b12x.preparation import require_prepared
-
-        state = require_prepared(
-            self._attention_plan(mode), "attention.compressed_sparse_mla"
-        )
-        return tuple(
-            (spec.shape, spec.dtype) for spec in state.scratch_plan.scratch_specs()
-        )
-
-    def _index_chunk(self, mode: str, rows: int, *, output_indices, **tensors):
-        """Score and select one chunk of index rows into `output_indices`."""
-        index_plan = self._index_plan(mode, rows)
-        scratch = current_workspace_manager().get_simultaneous(
-            *(
-                (spec.shape, spec.dtype)
-                for spec in dsa_indexer.scratch_specs(
-                    index_plan, device=tensors["q_mxfp4"].device
-                )
-            )
-        )
-        binding = dsa_indexer.bind(
-            index_plan,
-            scratch=scratch,
-            index_k_cache=self.indexer.k_cache.kv_cache,
-            active_width=self._active,
-            output_indices=output_indices,
-            **tensors,
-        )
-        retain_cuda_graph_capture_resource(scratch)
-        dsa_indexer.score(binding)
-        dsa_indexer.select(binding)
-
-    def _attend(self, mode: str, q, output, *, scratch, positions, **indices):
-        """Sparse MLA over the SWA and (compressed layers) indexed caches. B12X's WO
-        projection rotates its input back itself, so ``positions`` is unused here; the
-        TileLang layer's kernels prepare WO-A's input in their output store."""
-        del positions
-        binding = mla.bind(self._attention_plan(mode), scratch=scratch, q=q, **indices)
-        mla.run(
-            binding=binding,
-            swa_k_cache=self.swa_cache_layer.kv_cache,
-            indexed_k_cache=self._owner().kv_cache
-            if "indexed_indices" in indices
-            else None,
-            swa_page_size=self.swa_cache_layer.block_size,
-            indexed_page_size=self._main_page,
-            sm_scale=512**-0.5,
-            attn_sink=self.attn_sink,
-            out=output,
-            cache_format="deepseek_v41",
-        )
-
     def bind_draft_replay_start(self, replay_start: torch.Tensor) -> None:
         """A drafter layer's window bound: CED's per-request replay start (the
         model state's persistent buffer, rewritten every step before the drafter
@@ -2035,44 +1197,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         return None
 
     def _write_decode_metadata(self, buffers, swa, main, rows):
+        from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
+
         swa_indices, swa_lengths, top_lengths = buffers[:3]
         visible = main.cache_lengths if main is not None else swa.cache_lengths
-        if kernels.uses_tilelang():
-            from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
-
-            window = dict(
-                page=self.swa_cache_layer.block_size,
-                window=self.window_size,
-                draft=self.is_draft,
-                replay_start=self._replay_start(swa),
-            )
-            common = (
-                swa.positions,
-                swa.req_id_per_token,
-                swa.block_table,
-                swa_indices,
-                swa_lengths,
-                top_lengths,
-                visible,
-                swa.query_start_loc,
-                swa.request_positions,
-            )
-            if main is None:
-                tl_metadata.chunk(*common, 0, rows, **window)
-            else:
-                # The window metadata and the main page table in one launch.
-                tl_metadata.decode_metadata(
-                    *common,
-                    main.req_id_per_token,
-                    main.block_table,
-                    buffers[3],
-                    0,
-                    rows,
-                    main.block_table.shape[1],
-                    **window,
-                )
-            return
-        _chunk[(rows,)](
+        window = dict(
+            page=self.swa_cache_layer.block_size,
+            window=self.window_size,
+            draft=self.is_draft,
+            replay_start=self._replay_start(swa),
+        )
+        common = (
             swa.positions,
             swa.req_id_per_token,
             swa.block_table,
@@ -2082,25 +1217,20 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             visible,
             swa.query_start_loc,
             swa.request_positions,
-            0,
-            swa.block_table.stride(0),
-            self.swa_cache_layer.block_size,
-            self.window_size,
-            self.swa_width,
-            self.is_draft,
-            triton.next_power_of_2(self.swa_width),
-            swa_replay_start=self._replay_start(swa),
         )
-        if main is not None:
-            _pages[(rows, triton.cdiv(self._main_width, 128))](
+        if main is None:
+            tl_metadata.chunk(*common, 0, rows, **window)
+        else:
+            # The window metadata and the main page table in one launch.
+            tl_metadata.decode_metadata(
+                *common,
                 main.req_id_per_token,
                 main.block_table,
                 buffers[3],
                 0,
-                main.block_table.stride(0),
+                rows,
                 main.block_table.shape[1],
-                self._main_width,
-                128,
+                **window,
             )
 
     def setup_wo_projection(self):
@@ -2129,142 +1259,20 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     f"V4.1 {name} shape mismatch: expected {shape}, "
                     f"got {tuple(tensor.shape)}"
                 )
-        if kernels.uses_tilelang():
-            from vllm.models.deepseek_v4_1.tilelang.wo import TileLangWOProjection
+        from vllm.models.deepseek_v4_1.tilelang.wo import TileLangWOProjection
 
-            # The checkpoint tensors in place, no packing.
-            self._wo_projection_weights = TileLangWOProjection(
-                self.wo_a, self.wo_b, groups=groups
-            )
-            return
-        self._wo_projection_weights = wo_projection.pack_weights(
-            self.wo_a.weight.detach(),
-            self.wo_a.weight_scale_inv.detach(),
-            self.wo_b.weight.detach(),
-            self.wo_b.weight_scale_inv.detach(),
-            groups=groups,
-            group_width=group_width,
-            rank=rank,
-            hidden=hidden,
-            block_size=(32, 32),
+        # The checkpoint tensors in place, no packing.
+        self._wo_projection_weights = TileLangWOProjection(
+            self.wo_a, self.wo_b, groups=groups
         )
 
-    def _wo_preparation_unit(self, workload):
-        from b12x.preparation import PreparedCall
-
-        weights = self._wo_projection_weights
-        if weights is None:
-            raise PreparationResourceUnavailableError("V4.1 WO weights are not packed")
-        table = self.rotary_emb.cos_sin_cache
-        device = table.device
-        invocation = dict(
-            operation="inv_rope",
-            heads_per_group=self.n_local_heads // self.n_local_groups,
-            nope_dim=self.head_dim - self.rope_head_dim,
-            rope_dim=self.rope_head_dim,
-            positions_dtype="int64",
-            cos_sin_dtype=str(table.dtype).removeprefix("torch."),
-        )
-
-        def prepare(state):
-            rows = state.query.max_tokens
-            source = torch.empty(
-                (rows, self.n_local_heads, self.head_dim),
-                dtype=torch.bfloat16,
-                device=device,
-            )
-            positions = torch.arange(rows, dtype=torch.int64, device=device)
-            positions.remainder_(table.shape[0])
-            scratch = tuple(
-                torch.empty(spec.shape, dtype=spec.dtype, device=device)
-                for spec in state._scratch_state.scratch_specs()
-            )
-            binding = state.bind_inv_rope(
-                scratch=scratch,
-                o=source,
-                positions=positions,
-                cos_sin_cache=table,
-                weights=weights,
-                heads_per_group=invocation["heads_per_group"],
-                nope_dim=invocation["nope_dim"],
-                rope_dim=invocation["rope_dim"],
-            )
-            return PreparedCall(
-                run=lambda: state.run_inv_rope(binding),
-                produce=lambda: source.normal_(std=0.25),
-                owners=(weights, table),
-            )
-
-        requests = []
-        decode_rows = self._decode_capacity
-        token_counts = tuple(
-            sorted(
-                {
-                    *self._preparation_token_counts(workload),
-                    *range(1, decode_rows + 1),
-                }
-            )
-        )
-        for rows in token_counts:
-            requests.append(
-                self._wo_plan(rows).request(
-                    name=f"{self.prefix}.wo.m{rows}",
-                    prepare_call=prepare,
-                    benchmark_call=prepare,
-                )
-            )
-        requests.append(
-            self._wo_plan(self.capacity, is_prefill=True).request(
-                name=f"{self.prefix}.wo.prefill",
-                prepare_call=prepare,
-                benchmark_call=prepare,
-            )
-        )
-        return B12xPreparationUnit(
-            name="V41WOProjection",
-            key=(self.prefix, token_counts),
-            requests=tuple(requests),
-            stage="weights",
-        )
-
-    def _wo_plan(self, rows: int, *, is_prefill: bool = False):
-        key = "prefill" if is_prefill else rows
-        planned_rows = self.capacity if is_prefill else rows
-        if key not in self._wo_plans:
-            weights = self._wo_projection_weights
-            if weights is None:
-                raise PreparationResourceUnavailableError(
-                    "V4.1 WO weights are not packed"
-                )
-            table = self.rotary_emb.cos_sin_cache
-            self._wo_plans[key] = wo_projection.plan(
-                wo_projection.Caps(
-                    device=table.device,
-                    max_tokens=planned_rows,
-                    groups=weights.groups,
-                    group_width=weights.group_width,
-                    rank=weights.rank,
-                    hidden=weights.hidden,
-                ),
-                invocation=dict(
-                    operation="inv_rope",
-                    dynamic_tokens=is_prefill,
-                    heads_per_group=self.n_local_heads // self.n_local_groups,
-                    nope_dim=self.head_dim - self.rope_head_dim,
-                    rope_dim=self.rope_head_dim,
-                    positions_dtype="int64",
-                    cos_sin_dtype=str(table.dtype).removeprefix("torch."),
-                ),
-            )
-        return self._wo_plans[key]
-
-    def _o_proj_tilelang(self, o, sp_rows):
+    def _o_proj(self, o, sp_rows=None):
         """The TileLang WO projection of WO-A's input ``o``, which the attention
         kernels store already rotated back and through ``act_quant``.
 
-        A sequence-parallel step projects through ``project_reduce_scatter`` as the
-        B12X path does: in slices, and as unreduced rank-order parts when the step
-        keeps them, so a row's sum over ranks is the non-SP step's all-reduce."""
+        A sequence-parallel step projects through ``project_reduce_scatter``: in
+        slices, and as unreduced rank-order parts when the step keeps them, so a
+        row's sum over ranks is the non-SP step's all-reduce."""
         rows, hidden = o.shape[0], self.hidden_size
         if sp_rows is not None:
             if rows != sp_rows.num_tokens:
@@ -2284,107 +1292,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         local = torch.empty((rows, hidden), dtype=torch.bfloat16, device=o.device)
         self._wo_projection_weights(o, local)
         l2_prefetch.issue(self._l2pf_ffn, rows)
-        if get_tensor_model_parallel_world_size() > 1:
-            local = get_tp_group().all_reduce(local)
-        return local
-
-    def _o_proj(self, o, positions, *, is_prefill=False, sp_rows=None):
-        if kernels.uses_tilelang():
-            return self._o_proj_tilelang(o, sp_rows)
-        from b12x.preparation import require_prepared
-
-        rows = o.shape[0]
-        plan = self._wo_plans.get("prefill" if is_prefill else rows)
-        if plan is None or plan.prepared is None:
-            raise PreparationResourceUnavailableError(
-                f"V4.1 WO projection is not prepared for {rows} rows "
-                f"with is_prefill={is_prefill}"
-            )
-        require_prepared(plan, "gemm.wo_projection", o.device)
-        weights = self._wo_projection_weights
-        assert weights is not None
-        scratch = _scratch(plan)
-        binding = wo_projection.bind_inv_rope(
-            plan,
-            scratch=scratch,
-            o=o,
-            positions=positions,
-            cos_sin_cache=self.rotary_emb.cos_sin_cache,
-            weights=weights,
-            heads_per_group=self.n_local_heads // self.n_local_groups,
-            nope_dim=self.head_dim - self.rope_head_dim,
-            rope_dim=self.rope_head_dim,
-        )
-        if sp_rows is not None:
-            if rows != sp_rows.num_tokens:
-                raise ValueError(f"V4.1 SP WO expects {sp_rows.num_tokens} rows")
-            hidden = weights.hidden
-
-            def project(start, stop, out):
-                part = replace(
-                    wo_projection.bind_inv_rope(
-                        plan,
-                        scratch=scratch,
-                        o=o[start:stop],
-                        positions=positions[start:stop],
-                        cos_sin_cache=self.rotary_emb.cos_sin_cache,
-                        weights=weights,
-                        heads_per_group=self.n_local_heads // self.n_local_groups,
-                        nope_dim=self.head_dim - self.rope_head_dim,
-                        rope_dim=self.rope_head_dim,
-                    ),
-                    output=out.as_strided(
-                        (stop - start, hidden, 1), (hidden, 1, (stop - start) * hidden)
-                    ),
-                )
-                done = wo_projection.run_inv_rope(
-                    binding=part, plan=plan, stream=current_stream().cuda_stream
-                )
-                if done.data_ptr() != out.data_ptr():
-                    raise RuntimeError("V4.1 WO projection ignored its output")
-
-            retain_cuda_graph_capture_resource(scratch)
-            return sp_rows.project_reduce_scatter(
-                project,
-                (hidden,),
-                torch.bfloat16,
-                o.device,
-                # Slicing keeps the bits only with the rank-order reduce-scatter.
-                slices=sp_prefill.wo_slices(rows) if kernels.uses_tilelang() else 1,
-                then=lambda: l2_prefetch.issue(self._l2pf_ffn, rows),
-            )
-        # The custom attention result must outlive reuse of the workspace arena.
-        if sp_rows is None:
-            output = torch.empty_strided(
-                (rows, weights.hidden, 1),
-                (weights.hidden, 1, rows * weights.hidden),
-                dtype=torch.bfloat16,
-                device=o.device,
-            )
-        else:
-            if rows != sp_rows.num_tokens:
-                raise ValueError(f"V4.1 SP WO expects {sp_rows.num_tokens} rows")
-            # Leading rows of the zero-padded buffer the reduce-scatter reads.
-            padded = sp_rows.empty_padded((weights.hidden,), torch.bfloat16, o.device)
-            output = padded.as_strided(
-                (rows, weights.hidden, 1), (weights.hidden, 1, rows * weights.hidden)
-            )
-        binding = replace(binding, output=output)
-        # The model owns the plan and weights; graph pools manage activation
-        # lifetimes. Keep only the borrowed workspace, not layer activations.
-        retain_cuda_graph_capture_resource(scratch)
-        local = wo_projection.run_inv_rope(
-            binding=binding,
-            plan=plan,
-            stream=current_stream().cuda_stream,
-        )
-        if local.dtype != torch.bfloat16:
-            raise TypeError("V4.1 WO projection must return BF16")
-        l2_prefetch.issue(self._l2pf_ffn, rows)
-        if sp_rows is not None:
-            if local.data_ptr() != padded.data_ptr():
-                raise RuntimeError("V4.1 WO projection ignored its padded output")
-            return sp_rows.reduce_scatter(padded)
         if get_tensor_model_parallel_world_size() > 1:
             local = get_tp_group().all_reduce(local)
         return local

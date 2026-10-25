@@ -38,10 +38,13 @@ from vllm.models.deepseek_v4_1.nvidia.vl_model import (
     DeepseekV41ForCausalLM,
     _make_deepseek_v4_vl_weights_mapper,
 )
-from vllm.models.deepseek_v41.common.mm_preprocess import image_sentinel_mask
 from vllm.utils.b12x import B12xWorkload
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.workspace import collect_cuda_graph_capture_resources
+
+# The smallest width the TileLang gate takes: a multiple of its 256 threads' 4-wide
+# vectors (the model's is 4096).
+HIDDEN = 1024
 
 
 @pytest.fixture
@@ -63,7 +66,7 @@ def tiny_engram_checkpoint(tmp_path, dist_init):
         for layer_id in geometry.layer_ids
     )
     config = SimpleNamespace(
-        hidden_size=64,
+        hidden_size=HIDDEN,
         hc_mult=4,
         rms_norm_eps=1e-6,
         num_attention_heads=1,
@@ -80,10 +83,10 @@ def tiny_engram_checkpoint(tmp_path, dist_init):
             .expand(geometry.num_embeddings[index], -1)
             .contiguous()
             .view(torch.float8_e8m0fnu),
-            prefix + "q_weight": torch.full((4, 64), 0.5, dtype=torch.bfloat16),
-            prefix + "k_weight": torch.full((4, 64), 0.25, dtype=torch.bfloat16),
+            prefix + "q_weight": torch.full((4, HIDDEN), 0.5, dtype=torch.bfloat16),
+            prefix + "k_weight": torch.full((4, HIDDEN), 0.25, dtype=torch.bfloat16),
             prefix + "wkv.weight": torch.full(
-                (320, 6144), (index + 1) / 8192, dtype=torch.bfloat16
+                (5 * HIDDEN, 6144), (index + 1) / 8192, dtype=torch.bfloat16
             ),
         }
         path = tmp_path / f"layer-{index}.safetensors"
@@ -98,10 +101,6 @@ def tiny_engram_checkpoint(tmp_path, dist_init):
         )
         layout = SimpleNamespace(
             caps=local_caps,
-            hash_plans=tuple(
-                native.plan(caps, token_map=list(range(32)), geometry=geometry)
-                for caps in local_caps
-            ),
             lookup_plans=tuple(
                 None
                 if memory == "disk"
@@ -204,11 +203,11 @@ def _prepare_engram(session, target):
         max_seqs=2,
         max_model_len=8,
     )
-    providers = (target.engram_hash, *_engrams(target))
+    # Only resident tables prepare a B12X lookup; the hash and gate are TileLang's.
     units = [
         unit
-        for provider in providers
-        for unit in provider.get_b12x_preparation_units(provider, workload)
+        for engram in _engrams(target)
+        for unit in engram.get_b12x_preparation_units(engram, workload)
     ]
     requests = tuple(request for unit in units for request in unit.requests)
     result = session.prepare(requests, autotune=False)
@@ -477,12 +476,12 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
             )
         ),
     )
-    hidden = torch.ones(4, 4, 64, dtype=torch.bfloat16, device="cuda")
+    hidden = torch.ones(4, 4, HIDDEN, dtype=torch.bfloat16, device="cuda")
 
     def consume():
-        mask = ~image_sentinel_mask(batch.input_ids)
+        # The gate takes the token ids: the image sentinel's rows pass.
         return tuple(
-            engram(hidden, target.prepared_engram_hashes[:4, index], mask)
+            engram(hidden, target.prepared_engram_hashes[:4, index], batch.input_ids)
             for index, engram in enumerate(_engrams(target))
         )
 
@@ -528,11 +527,7 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
                 request, accepted - width : accepted
             ]
             hashes = resident.engram_hash(
-                batch.input_ids,
-                None,
-                batch.query_start_loc,
-                image_sentinel_mask(batch.input_ids),
-                history,
+                batch.input_ids, None, batch.query_start_loc, history
             )
             for index, engram in enumerate(_engrams(resident)):
                 engram.prepare_embeddings(hashes[:, index])
@@ -540,9 +535,7 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
             graph.replay()
             assert stats == _settled_reader_stats(target)
             for index, engram in enumerate(_engrams(resident)):
-                expected = engram(
-                    hidden, hashes[:, index], ~image_sentinel_mask(batch.input_ids)
-                )
+                expected = engram(hidden, hashes[:, index], batch.input_ids)
                 torch.testing.assert_close(immediate[index], expected, rtol=0, atol=0)
                 torch.testing.assert_close(actual[index], expected, rtol=0, atol=0)
                 torch.testing.assert_close(
@@ -628,7 +621,7 @@ def test_disk_engram_rows_the_host_hashed_equal_the_gpu_rows(
         [prompt, [4, 129264, 6, 8, 10, 12]], dtype=torch.int32, device="cuda"
     )
     slots = {"a": 0, "b": 1}
-    hidden = torch.ones(4, 4, 64, dtype=torch.bfloat16, device="cuda")
+    hidden = torch.ones(4, 4, HIDDEN, dtype=torch.bfloat16, device="cuda")
     # (input ids, [(request, computed tokens, rows, prefilling)], early lookups)
     steps = (
         ([13, 17, 19, 31], [("a", 2, 3, True)], 4 * 24),
@@ -671,9 +664,9 @@ def test_disk_engram_rows_the_host_hashed_equal_the_gpu_rows(
             )
             before = [s["early_lookups"] for s in _settled_reader_stats(target)]
             state.prepare_inputs(batch, req_states)
-            mask = ~image_sentinel_mask(batch.input_ids)
+            ids = batch.input_ids
             actual = tuple(
-                engram(hidden, target.prepared_engram_hashes[:4, index], mask)
+                engram(hidden, target.prepared_engram_hashes[:4, index], ids)
                 for index, engram in enumerate(_engrams(target))
             )
             stats = _settled_reader_stats(target)
@@ -690,15 +683,11 @@ def test_disk_engram_rows_the_host_hashed_equal_the_gpu_rows(
                     slots[name], done - width : done
                 ]
             hashes = resident.engram_hash(
-                batch.input_ids,
-                None,
-                batch.query_start_loc,
-                image_sentinel_mask(batch.input_ids),
-                history,
+                batch.input_ids, None, batch.query_start_loc, history
             )
             for index, engram in enumerate(_engrams(resident)):
                 engram.prepare_embeddings(hashes[:, index])
-                expected = engram(hidden, hashes[:, index], mask)
+                expected = engram(hidden, hashes[:, index], ids)
                 torch.testing.assert_close(actual[index], expected, rtol=0, atol=0)
     session.close()
     resident_session.close()
@@ -817,9 +806,11 @@ def test_ram_engram_budget_reserves_memory_and_survives_worker_serialization(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @torch.inference_mode()
-def test_engram_preparation_covers_masked_and_unmasked_graphs(dist_init):
+def test_engram_graphs_gate_text_rows_and_pass_the_image_sentinel_rows(dist_init):
+    from vllm.models.deepseek_v4_1.tilelang.engram_hash import IMAGE_SENTINEL
+
     device = torch.device("cuda", torch.cuda.current_device())
-    capacity, hidden, streams = 7, 64, 4
+    capacity, hidden, streams = 7, HIDDEN, 4
     geometry = native.build_geometry(base_table_size=19, compressed_vocab_size=32)
     caps = native.Caps(
         device=device,
@@ -878,8 +869,14 @@ def test_engram_preparation_covers_masked_and_unmasked_graphs(dist_init):
         device=device,
         dtype=torch.bfloat16,
     ).mul_(0.1)
+    # The gate takes the step's token ids; rows of the image sentinel pass through.
     mask = torch.ones(capacity, dtype=torch.bool, device=device)
     mask[::2] = False
+    token_ids = torch.empty(capacity, dtype=torch.int32, device=device)
+
+    def fill_ids(with_images):
+        sentinel = torch.full_like(token_ids, IMAGE_SENTINEL)
+        token_ids.copy_(torch.where(mask, 7, sentinel) if with_images else 7)
 
     def reference(rows, token_mask):
         source = residual[:rows].float()
@@ -903,18 +900,20 @@ def test_engram_preparation_covers_masked_and_unmasked_graphs(dist_init):
         module.prepare_embeddings(ids)
         launch = torch.compile(module.forward, fullgraph=True)
         for rows in (1, capacity):
-            for with_mask in (False, True):
-                token_mask = mask[:rows] if with_mask else None
-                launch(residual[:rows], ids[:rows], token_mask)
+            for with_images in (False, True):
+                token_mask = mask[:rows] if with_images else None
+                fill_ids(with_images)
+                launch(residual[:rows], ids[:rows], token_ids[:rows])
                 graph = torch.cuda.CUDAGraph()
                 try:
                     with session.capture(), torch.cuda.graph(graph):
-                        actual = launch(residual[:rows], ids[:rows], token_mask)
+                        actual = launch(residual[:rows], ids[:rows], token_ids[:rows])
                     pointer = actual.data_ptr()
                     allocated = torch.cuda.memory_allocated(device)
                     residual.mul_(-0.5)
                     module.staged_rows.mul_(0.75)
                     mask.logical_not_()
+                    fill_ids(with_images)
                     actual.fill_(float("nan"))
                     graph.replay()
                     torch.cuda.synchronize(device)
@@ -945,25 +944,21 @@ def test_engram_preparation_covers_masked_and_unmasked_graphs(dist_init):
 def test_engram_hash_first_forward_uses_declared_geometry(
     monkeypatch, num_layers, num_tokens
 ):
-    """Lazy native bindings must not make the first output have zero layers."""
+    """The first output has a plane for every declared Engram layer."""
     module = NgramHashState.__new__(NgramHashState)
     nn.Module.__init__(module)
-    module.layout = SimpleNamespace(hash_plans=(None,) * num_layers)
-    module.bindings = []
+    module.layout = SimpleNamespace(layer_ids=tuple(range(num_layers)))
 
-    def run_native(ids, mask, starts, history, out):
-        if not module.bindings:
-            module.bindings = list(range(num_layers))
-        for layer in module.bindings:
+    def run_native(ids, starts, history, out):
+        for layer in range(num_layers):
             out[:, layer].copy_(ids[:, None].expand(-1, 24) + layer)
 
     monkeypatch.setattr(module, "run_native", run_native)
     ids = torch.arange(num_tokens, dtype=torch.int64)
     starts = torch.tensor([0, num_tokens], dtype=torch.int32)
-    dead_mask = torch.zeros(num_tokens, dtype=torch.bool)
     history = torch.full((1, 3), -1, dtype=torch.int64)
     for offset in (0, 7):
-        actual = module(ids + offset, ids, starts, dead_mask, history)
+        actual = module(ids + offset, ids, starts, history)
         expected = (
             ids[:, None, None] + offset + torch.arange(num_layers)[None, :, None]
         ).expand(-1, -1, 24)

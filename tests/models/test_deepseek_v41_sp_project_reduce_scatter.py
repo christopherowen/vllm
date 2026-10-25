@@ -139,11 +139,9 @@ def test_unreduced_parts_hold_every_block(monkeypatch, tokens, rank, slices, per
 def test_row_exchange_gives_each_rank_its_rows_of_every_block(
     monkeypatch, tokens, world
 ):
-    """Every rank receives every rank's column block of its own real rows, and the
-    blocks packed side by side equal its rows of the gathered product cut to the
-    logical width (the other ranks' all-to-all blocks simulated, each sending only
-    real rows)."""
-    width, block = 50, 17  # logical width over world * block padded columns
+    """Every rank receives every rank's column block of its own real rows (the other
+    ranks' all-to-all blocks simulated, each sending only real rows)."""
+    block = 17
     product = torch.randn(tokens, world * block, device="cuda")
     ranks = [
         sp_prefill.SPRows(num_tokens=tokens, world_size=world, rank=r)
@@ -170,11 +168,6 @@ def test_row_exchange_gives_each_rank_its_rows_of_every_block(
                 blocks[s, :real],
                 product[rows.start : rows.start + real, s * block : (s + 1) * block],
             )
-        packed = rows.pack_columns(blocks, width)
-        assert packed.shape == (own, width) and packed.is_contiguous()
-        assert torch.equal(
-            packed[:real], product[rows.start : rows.start + real, :width]
-        )
 
 
 class _Fabric:

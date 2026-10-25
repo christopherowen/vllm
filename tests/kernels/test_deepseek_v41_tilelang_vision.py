@@ -1,26 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DeepSeek-V4.1's TileLang vision tower against B12X's arithmetic and DeepSeek's
+"""DeepSeek-V4.1's TileLang vision tower against its arithmetic and DeepSeek's
 reference.
 
 Bit for bit (compared as bits): the patch padding and the spatial merge (copies),
 the residual add with RMSNorm, the 2-D RoPE and the bias epilogue's single
-rounding, against torch models of B12X's arithmetic (``_b12x_*``, read from its
-CuTe kernels: the same reduction tree, FMAs where libNVVM contracts, the same FP32
-constants); the GELU epilogue against DeepSeek's reference GELU (torch's
-``F.gelu``), on every BF16 input. Where b12x is importable, the same operations,
-the SwiGLU epilogue and the few-row GEMVs (B12X's SIMT projection) against B12X's
-own kernels, bit for bit (GELU's difference from B12X's, which uses CuTe's ``erf``,
-measured and bounded to one BF16 step); a mismatch names the arithmetic B12X's
-kernel matched instead.
+rounding, against torch models of the tower's arithmetic (``_b12x_*``, read from
+the CuTe kernels the port replaced: the same reduction tree, FMAs where libNVVM
+contracts, the same FP32 constants); the GELU and SwiGLU epilogues against
+DeepSeek's reference activations (torch's ``F.gelu``), on every BF16 input.
 
-Against FP64 references, with tolerances no looser than B12X's own error on the
-same inputs (both measured and reported): the projections, attention, and the whole
-tower and aligner (DeepSeek's ``deepseek_v4/common/vision.py`` math in FP64, rounded
-to BF16 where its modules return BF16) at grids from 1x1 to the capacity, odd sizes
-included for the merge padding. Then non-finite values (the reference's positions),
-stale capacity rows, CUDA graph replay, the data-parallel runner and declaration
-coverage.
+Against FP64 references (DeepSeek's ``deepseek_v4/common/vision.py`` math in FP64,
+rounded to BF16 where its modules return BF16), with tolerances no looser than fixed
+ones nor than B12X's own error on the same inputs (``B12X_ERROR``, measured on the
+tower this one replaced): the projections, attention, and the whole tower and aligner
+at grids from 1x1 to the capacity, odd sizes included for the merge padding. Then
+non-finite values (the reference's positions), stale capacity rows, CUDA graph replay,
+the data-parallel runner and declaration coverage.
 """
 
 import math
@@ -84,6 +80,52 @@ REAL = _config(
 SMALL_GRIDS = [(1, 1), (1, 7), (4, 7), (5, 5), (7, 11), (12, 12), (3, 48), (1, 144)]
 REAL_GRIDS = [(1, 1), (5, 7), (13, 17), (24, 24), (1, 576)]
 
+# B12X's error at each FP64 comparison below, on the same inputs: candidate 6's vision
+# test on its image (spark-ds41f experiments/2026-10-25-retire-conditionals,
+# bundles/vision-b12x-error; dgx4, 2026-10-25), which measured both towers. Projections:
+# (worst BF16 steps, values off the correctly rounded); attention: (relative RMS, worst
+# BF16 steps); towers, by width and grid: (ViT, aligner) relative RMS.
+B12X_ERROR = {
+    "qkv at 1 rows": (0.49664192447845906, 0),
+    "wo at 1 rows": (0.49470068153396846, 0),
+    "mlp gate/up at 1 rows": (0.49794636391807, 0),
+    "mlp down at 1 rows": (0.4959321068274381, 0),
+    "aligner w1 at 1 rows": (0.48621282933571575, 0),
+    "aligner w2 at 1 rows": (0.4934345848745577, 2),
+    "qkv at 77 rows": (0.49866283029179753, 130),
+    "wo at 77 rows": (0.49879117582709537, 37),
+    "mlp gate/up at 77 rows": (0.49880283280869087, 198),
+    "mlp down at 77 rows": (0.49676895476923505, 63),
+    "aligner w1 at 77 rows": (0.49089014453706376, 2006),
+    "aligner w2 at 77 rows": (0.4945250258583259, 1170),
+    "qkv at 192 rows": (0.498748932429561, 333),
+    "wo at 192 rows": (121.80086993074598, 80684),
+    "mlp gate/up at 192 rows": (0.4989614576498799, 572),
+    "mlp down at 192 rows": (0.49701668764484325, 291),
+    "aligner w1 at 192 rows": (0.4913324818187672, 5229),
+    "aligner w2 at 192 rows": (0.49501480496989436, 2878),
+    "patch embedding at 1 rows": (0.49650757680379937, 0),
+    "patch embedding at 77 rows": (0.49868921946481376, 29),
+    "patch embedding at 300 rows": (0.4992916210657623, 92),
+    "attention at 1 rows": (0.0, 0.0),
+    "attention at 77 rows": (0.001767753885921865, 10.741378149878534),
+    "attention at 300 rows": (0.0017426768323724874, 14.752147869508457),
+    "attention at 576 rows": (0.0017363360945632515, 12.480541974387345),
+    "tower 128 1x1": (0.0, 0.0),
+    "tower 128 1x7": (0.006624815042978595, 0.0),
+    "tower 128 4x7": (0.005986462518016249, 0.0),
+    "tower 128 5x5": (0.006280779640718641, 0.0),
+    "tower 128 7x11": (0.006553608157130729, 0.004384625869705573),
+    "tower 128 12x12": (0.0063686162131065495, 0.004168449837265123),
+    "tower 128 3x48": (0.006261522709414092, 0.00446008286592595),
+    "tower 128 1x144": (0.006070036114104239, 0.0002476796899654311),
+    "tower 1024 1x1": (0.0, 0.0),
+    "tower 1024 5x7": (0.004482965789398322, 0.00067090285939057),
+    "tower 1024 13x17": (0.003496343115106573, 0.0050644118823980925),
+    "tower 1024 24x24": (0.0030264071165440115, 0.0009215817182229654),
+    "tower 1024 1x576": (0.0030055770167633227, 0.0007788215984908864),
+}
+
 
 # --- Construction ---------------------------------------------------------------
 
@@ -127,56 +169,6 @@ def small():
 @pytest.fixture(scope="module")
 def real():
     return _towers(REAL)
-
-
-def _b12x_towers(config, vit, aligner):
-    """B12X's tower and aligner with the same weights, prepared as the existing
-    native-vision test prepares them (plans for one row and the capacity)."""
-    pytest.importorskip("b12x")
-    from b12x.preparation import PreparationSession
-
-    from vllm.model_executor.warmup.b12x_prepare import _units_from_modules
-    from vllm.models.deepseek_v4_1.nvidia import b12x_vision
-    from vllm.utils.b12x import B12xWorkload
-
-    with torch.device(DEVICE):
-        b12x_vit = b12x_vision.DeepseekV4ViT(config)
-        b12x_aligner = b12x_vision.DeepseekV4Aligner(config)
-    b12x_vit.load_state_dict(vit.state_dict())
-    b12x_aligner.load_state_dict(aligner.state_dict())
-    workload = B12xWorkload(
-        stage="weights",
-        token_counts=(1,),
-        fixed_token_counts=(),
-        output_dtype=torch.bfloat16,
-        max_tokens=vit.capacity,
-        max_seqs=1,
-        max_model_len=vit.capacity,
-    )
-    session = PreparationSession(
-        device=torch.device(DEVICE), autotune=False, compile_workers=2
-    )
-    units = [
-        unit
-        for provider in (b12x_vit, b12x_aligner)
-        for unit in _units_from_modules(provider, workload)
-    ]
-    session.prepare(tuple(request for unit in units for request in unit.requests))
-    return SimpleNamespace(vit=b12x_vit, aligner=b12x_aligner, session=session)
-
-
-@pytest.fixture(scope="module")
-def b12x_small(small):
-    towers = _b12x_towers(SMALL, *small)
-    yield towers
-    towers.session.close()
-
-
-@pytest.fixture(scope="module")
-def b12x_real(real):
-    towers = _b12x_towers(REAL, *real)
-    yield towers
-    towers.session.close()
 
 
 def _kernel(module, role: str):
@@ -452,29 +444,6 @@ def test_spatial_merge_matches_unfold(channels, height, width):
     assert bool(out[rows:].isnan().all())
 
 
-def test_spatial_merge_matches_b12x(real, b12x_real):
-    from b12x.norm.vision import run_spatial_merge
-
-    _, aligner = real
-    for height, width in REAL_GRIDS:
-        x = _randn(height * width, REAL.vision_dim, seed=height * 31 + width)
-        rows = -(-height // 3) * -(-width // 3)
-        ours = torch.empty(
-            rows, REAL.vision_dim * 9, dtype=torch.bfloat16, device=DEVICE
-        )
-        theirs = torch.empty_like(ours)
-        _kernel(aligner, "merge")(x, ours, height, width)
-        run_spatial_merge(
-            x,
-            height,
-            width,
-            ratio=3,
-            out=theirs,
-            plan=b12x_real.aligner._merge_plan,
-        )
-        _assert_bits(ours, theirs, f"merge {height}x{width} against B12X")
-
-
 # --- The residual add and RMSNorm -----------------------------------------------
 
 
@@ -506,36 +475,6 @@ def test_add_norm_is_b12x_arithmetic(config, rows, add):
     # DeepSeek's FP64 norm of the same rounded sum: within one BF16 step.
     ref = _norm64(total, weight)
     assert _max_ulps(out, ref, 0.0) <= 1.0
-
-
-def test_add_norm_matches_b12x(real, b12x_real):
-    from b12x.norm import hyperconnection
-
-    vit, _ = real
-    b12x_vit = b12x_real.vit
-    plans = b12x_vit._workspace
-    width = REAL.vision_dim
-    for rows in (1, 77, vit.capacity):
-        x = _randn(rows, width, seed=rows, scale=3.0)
-        branch = _randn(rows, width, seed=rows + 1, scale=2.0)
-        weight = b12x_vit.norm.weight
-        summed, out = _add_norm(width, x, branch, weight)
-        theirs_sum = torch.empty_like(x)
-        hyperconnection.run_add(x, branch, out=theirs_sum, plan=plans.add_plan)
-        _assert_bits(summed, theirs_sum, f"residual add, {rows} rows, against B12X")
-        theirs = torch.empty_like(x)
-        b12x_vit.norm(theirs_sum, out=theirs, plan=plans.norm_plan)
-        message = _differing(out, theirs)
-        if message is not None:
-            unfused = _differing(_b12x_rmsnorm(theirs_sum, weight, fused=False), theirs)
-            raise AssertionError(
-                f"RMSNorm of {rows} rows against B12X: {message}; B12X "
-                + (
-                    "adds rounded squares (no FMA)"
-                    if unfused is None
-                    else "matches neither summation"
-                )
-            )
 
 
 def test_add_norm_nonfinite_like_the_reference():
@@ -602,48 +541,6 @@ def test_rope_is_b12x_arithmetic(config, height, width):
         assert _max_ulps(got, ref, 2.0**-12) <= 1.0
 
 
-def test_rope_matches_b12x(real, b12x_real):
-    from b12x.norm.vision import run_rope_qkv
-
-    vit, _ = real
-    ws = b12x_real.vit._workspace
-    heads, hidden = REAL.vision_n_heads, REAL.vision_dim
-    inv = _inv_freq(REAL)
-    _assert_bits(inv, ws.inv_freq, "inverse frequencies")
-    kernel = _kernel(vit, "rope")
-    for height, width in REAL_GRIDS:
-        rows = height * width
-        qkv = _randn(rows, 3 * hidden, seed=rows, scale=4.0)
-        ours = qkv.clone()
-        kernel(ours, inv, width)
-        run_rope_qkv(
-            qkv,
-            height,
-            width,
-            ws.inv_freq,
-            q=ws.q,
-            k=ws.k,
-            v=ws.v,
-            cu_seqlens=ws.cu,
-            plan=ws.rope_plan,
-        )
-        theirs = torch.cat(
-            [t[:rows].reshape(rows, hidden) for t in (ws.q, ws.k, ws.v)], -1
-        )
-        message = _differing(ours, theirs)
-        if message is not None:
-            forms = [
-                form
-                for form in ("right", "unfused")
-                if _differing(_b12x_rope(qkv, height, width, inv, heads, form), theirs)
-                is None
-            ]
-            raise AssertionError(
-                f"RoPE {height}x{width} against B12X: {message}; B12X matches "
-                f"{forms or 'no modelled form'}"
-            )
-
-
 def test_rope_nonfinite_like_the_reference():
     heads, hidden, height, width = 16, 1024, 3, 4
     rows = height * width
@@ -678,26 +575,25 @@ def _projection_error(out, a, weight, bias):
     return error, int((out != ref.bfloat16()).sum()), out.numel()
 
 
-def _check_projection(name, ours, theirs):
-    """Ours within one BF16 step of the reference (plus accumulation noise), or at
-    most B12X's worst; and off the correctly rounded value no more often than
-    B12X (1.5x, plus four values for sampling noise)."""
+def _check_projection(name, ours):
+    """Ours within one BF16 step of the reference (plus accumulation noise), and off
+    the correctly rounded value no more often than for 1% of the outputs nor than
+    B12X (1.5x), plus four values for sampling noise."""
     error, off, total = ours
-    message = f"{name}: ours {error:.3f} steps, {off} of {total} off; "
-    if theirs is None:
-        assert error <= 1.0 and off <= 0.01 * total + 4, message + "B12X unavailable"
-        return
-    b12x_error, b12x_off, _ = theirs
-    message += f"B12X {b12x_error:.3f} steps, {b12x_off} off"
-    assert error <= max(1.0, b12x_error), message
-    assert off <= 1.5 * b12x_off + 4, message
+    b12x_error, b12x_off = B12X_ERROR[name]
+    message = (
+        f"{name}: ours {error:.3f} steps, {off} of {total} off; "
+        f"B12X {b12x_error:.3f} steps, {b12x_off} off"
+    )
+    assert error <= 1.0, message
+    assert off <= min(0.01 * total, 1.5 * b12x_off) + 4, message
 
 
 def _projection_cases(vit, aligner, rows: int):
     """Each projection at ``rows`` rows: the TileLang kernel the tower launches (the
     GEMV up to GEMV_ROWS rows, else the GEMM; for the two with an epilogue, the
     plain projection their epilogues start from), its layer, and its module path
-    (the same in B12X's tower)."""
+    """
     block, out_dim = vit.blocks[0], aligner.out_dim
     small = rows <= vision.GEMV_ROWS
 
@@ -738,30 +634,15 @@ def _project(kernel, layer, a: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def _optional(request, name: str):
-    """A B12X fixture, or None where b12x is not importable."""
-    try:
-        return request.getfixturevalue(name)
-    except pytest.skip.Exception:
-        return None
-
-
-# B12X plans its aligner projections for the merged capacity (192 rows here).
+# The aligner's merged capacity is 192 rows here.
 @pytest.mark.parametrize("rows", [1, 77, 192])
-def test_projections_against_fp64(real, rows, request):
+def test_projections_against_fp64(real, rows):
     vit, aligner = real
-    b12x = _optional(request, "b12x_real")
-    for name, (kernel, layer, path) in _projection_cases(vit, aligner, rows).items():
+    for name, (kernel, layer, _) in _projection_cases(vit, aligner, rows).items():
         a = _randn(rows, layer.weight.shape[1], seed=rows + layer.weight.shape[0])
         out = _project(kernel, layer, a)
         ours = _projection_error(out, a, layer.weight, layer.bias)
-        theirs = None
-        if b12x is not None:
-            root = b12x.aligner if name.startswith("aligner") else b12x.vit
-            b12x_out = torch.empty_like(out)
-            root.get_submodule(path)(a, out=b12x_out)
-            theirs = _projection_error(b12x_out, a, layer.weight, layer.bias)
-        _check_projection(f"{name} at {rows} rows", ours, theirs)
+        _check_projection(f"{name} at {rows} rows", ours)
 
 
 def _patch_embedding(vit, patches: torch.Tensor) -> torch.Tensor:
@@ -781,22 +662,16 @@ def _patch_embedding(vit, patches: torch.Tensor) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("rows", [1, 77, 300])
-def test_patch_embedding_against_fp64(real, rows, request):
+def test_patch_embedding_against_fp64(real, rows):
     """The patch embedding: the GEMV on the 588-wide rows for one row, the GEMM on
     rows and weight padded to 640 (zero tails) for more."""
     vit, _ = real
-    b12x = _optional(request, "b12x_real")
     proj = vit.patch_embed.proj
     patches = _patches(REAL, rows + 1, seed=rows)[1:]
     flat = patches.reshape(rows, -1)
     out = _patch_embedding(vit, patches)
     ours = _projection_error(out, flat, proj.weight, proj.bias)
-    theirs = None
-    if b12x is not None:
-        b12x_out = torch.empty_like(out)
-        b12x.vit.patch_embed(patches, out=b12x_out)
-        theirs = _projection_error(b12x_out, flat, proj.weight, proj.bias)
-    _check_projection(f"patch embedding at {rows} rows", ours, theirs)
+    _check_projection(f"patch embedding at {rows} rows", ours)
 
 
 @pytest.mark.parametrize("role, k", [("patch", 64), ("patch_rows", 12)])
@@ -827,25 +702,6 @@ def test_projection_nonfinite_rows(small, rows):
     out = _project(kernel, layer, a)
     assert bool(out[4].isnan().all())
     assert_other_rows_equal(out, clean, [4])
-
-
-def test_gemv_is_b12x_simt_projection(real, b12x_real):
-    """At one row B12X runs its SIMT projection (its plan below nine rows); the GEMVs
-    reproduce it bit for bit: 8-wide vectors, and single elements for the 588-wide
-    patch rows."""
-    vit, aligner = real
-    for name, (kernel, layer, path) in _projection_cases(vit, aligner, 1).items():
-        a = _randn(1, layer.weight.shape[1], seed=layer.weight.shape[0])
-        root = b12x_real.aligner if name.startswith("aligner") else b12x_real.vit
-        theirs = torch.empty(
-            1, layer.weight.shape[0], dtype=torch.bfloat16, device=DEVICE
-        )
-        root.get_submodule(path)(a, out=theirs)
-        _assert_bits(_project(kernel, layer, a), theirs, f"{name} against B12X")
-    patches = _patches(REAL, 2, seed=3)[1:]
-    theirs = torch.empty(1, REAL.vision_dim, dtype=torch.bfloat16, device=DEVICE)
-    b12x_real.vit.patch_embed(patches, out=theirs)
-    _assert_bits(_patch_embedding(vit, patches), theirs, "patch embedding vs B12X")
 
 
 # --- Epilogues: GELU and SwiGLU ---------------------------------------------------
@@ -936,31 +792,6 @@ def test_gelu_epilogue_is_the_reference_everywhere(real, gemv):
     _assert_bits(got, _reference_gelu(table), "GELU on every BF16 input")
 
 
-def test_gelu_differs_from_b12x_only_in_erf(real, b12x_real):
-    """B12X's GELU (the same FP32 formula with CuTe's ``erf``) on every BF16 input
-    against ours (the reference, CUDA's ``erff``): where they differ, it is by what
-    an ``erf`` ulp moves ``0.5 * x * (1 + erf(x))`` (in the negative tail, where
-    ``1 + erf`` cancels, that is many output ulps of a tiny value) plus the BF16
-    rounding of the result. The count is printed: DeepSeek's reference semantics
-    over production's bits, measured."""
-    from b12x.norm.vision import run_gelu
-
-    _, aligner = real
-    table = _gelu_table(aligner, _every_bf16())
-    ours = _gelu_through_epilogue(aligner, table, gemv=False)
-    theirs = torch.empty_like(table)
-    run_gelu(table, out=theirs, plan=b12x_real.aligner._gelu_plan)
-    _assert_bits(ours, _reference_gelu(table), "GELU on every BF16 input")
-    differ = _bits(ours) != _bits(theirs)
-    print(f"ours differs from B12X's GELU on {int(differ.sum())} of {table.numel()}")
-    # Two FP32 ulps of erf near +-1 (2**-23 each) through 0.5 * x, plus one BF16
-    # step of the output, and only where both are finite.
-    step = (ours.float() - theirs.float()).abs()
-    ulp = torch.maximum(ours.float().abs(), theirs.float().abs()) * 2.0**-7
-    erf_ulps = 0.5 * table.float().abs() * 2.0**-22
-    assert bool((step[differ] <= (ulp + erf_ulps)[differ]).all())
-
-
 def _mlp_in(vit, rows: int, seed: int):
     """The MLP's fused gate/up projection with SwiGLU, and the unfused projection's
     BF16 gate/up of the same rows (the GEMVs up to GEMV_ROWS rows, else the GEMMs:
@@ -1003,26 +834,6 @@ def test_swiglu_epilogue_against_the_reference(small, rows):
     assert (activated != ref).float().mean().item() <= 2e-3
 
 
-def test_swiglu_epilogue_matches_b12x(real, b12x_real):
-    """The fused epilogue equals B12X's vision SwiGLU of the same BF16 gate/up (our
-    unfused projection's; both projections accumulate in the same order)."""
-    from b12x.norm import hyperconnection
-
-    vit, _ = real
-    ws = b12x_real.vit._workspace
-    for rows in (1, 77, 300):
-        _, activated, gate_up = _mlp_in(vit, rows, rows)
-        theirs = torch.empty_like(activated)
-        hyperconnection.run_swiglu(
-            gate_up,
-            limit=float("inf"),
-            round_silu=True,
-            out=theirs,
-            plan=ws.swiglu_plan,
-        )
-        _assert_bits(activated, theirs, f"SwiGLU of {rows} rows against B12X")
-
-
 @pytest.mark.parametrize("rows", [5, 9])
 def test_swiglu_epilogue_nonfinite_rows(small, rows):
     vit, _ = small
@@ -1050,39 +861,24 @@ def _split64(qkv: torch.Tensor, heads: int):
     ]
 
 
-def _b12x_attention(b12x, qkv: torch.Tensor) -> torch.Tensor:
-    from b12x.attention import varlen
-
-    ws = b12x.vit._workspace
-    rows, hidden = qkv.shape[0], qkv.shape[1] // 3
-    for buffer, part in zip((ws.q, ws.k, ws.v), qkv.split(hidden, -1)):
-        buffer[:rows].copy_(part.reshape(rows, *buffer.shape[1:]))
-    ws.cu.copy_(torch.tensor([0, rows], dtype=torch.int32))
-    attended, _ = varlen.run(binding=ws.attention_binding)
-    return attended[:rows].reshape(rows, hidden).clone()
-
-
 @pytest.mark.parametrize("rows", [1, 77, 300, 576])
-def test_attention_against_fp64(real, rows, request):
-    """Relative RMS error at most 1.25x B12X's, and the worst element at most one
-    BF16 step past B12X's worst (FP64 softmax attention, in BF16 steps of the
+def test_attention_against_fp64(real, rows):
+    """Relative RMS error at most 2^-8 and 1.25x B12X's, and the worst element at most
+    one BF16 step past B12X's worst (FP64 softmax attention, in BF16 steps of the
     reference plus 2^-12 of its RMS)."""
     vit, _ = real
-    b12x = _optional(request, "b12x_real")
     heads = REAL.vision_n_heads
     qkv = _randn(rows, 3 * REAL.vision_dim, seed=rows, scale=2.0)
     ref = _attention64(*_split64(qkv, heads)).reshape(rows, -1)
     floor = 2.0**-12 * ref.square().mean().sqrt()
     out = _attention(vit, qkv)
     ours = (_relative(out, ref), _max_ulps(out, ref, floor))
-    message = f"{rows} rows: ours {ours[0]:.3e} relative, {ours[1]:.2f} steps"
-    if b12x is None:
-        assert ours[0] <= 2.0**-8 and ours[1] <= 4.0, message + "; B12X unavailable"
-        return
-    theirs_out = _b12x_attention(b12x, qkv)
-    theirs = (_relative(theirs_out, ref), _max_ulps(theirs_out, ref, floor))
-    message += f"; B12X {theirs[0]:.3e} relative, {theirs[1]:.2f} steps"
-    assert ours[0] <= 1.25 * theirs[0], message
+    theirs = B12X_ERROR[f"attention at {rows} rows"]
+    message = (
+        f"{rows} rows: ours {ours[0]:.3e} relative, {ours[1]:.2f} steps; "
+        f"B12X {theirs[0]:.3e} relative, {theirs[1]:.2f} steps"
+    )
+    assert ours[0] <= min(2.0**-8, 1.25 * theirs[0]), message
     assert ours[1] <= theirs[1] + 1.0, message
 
 
@@ -1118,7 +914,7 @@ def test_attention_nonfinite_like_the_reference(real):
 # --- The tower and aligner ----------------------------------------------------------
 
 
-def _tower_case(vit, aligner, b12x, height, width, seed):
+def _tower_case(vit, aligner, height, width, seed):
     rows = height * width
     patches = _patches(vit.config, rows, seed)
     encoded = vit(patches, height, width)
@@ -1126,36 +922,25 @@ def _tower_case(vit, aligner, b12x, height, width, seed):
     vit_ref = _vit_reference(vit, patches, height, width)
     aligner_ref = _aligner_reference(aligner, encoded, height, width)
     ours = (_relative(encoded, vit_ref), _relative(aligned, aligner_ref))
+    theirs = B12X_ERROR[f"tower {vit.config.vision_dim} {height}x{width}"]
     message = (
-        f"{height}x{width}: ViT {ours[0]:.3e}, aligner {ours[1]:.3e} relative to FP64"
+        f"{height}x{width}: ViT {ours[0]:.3e}, aligner {ours[1]:.3e} relative to FP64; "
+        f"B12X {theirs[0]:.3e}, {theirs[1]:.3e}"
     )
-    if b12x is None:
-        assert ours[0] <= 2.0**-7 and ours[1] <= 2.0**-7, message + " (no B12X)"
-        return
-    b12x_encoded = b12x.vit(patches, height, width)
-    # The aligner on our ViT's output: each stage's error on the same input.
-    b12x_aligned = b12x.aligner(encoded, height, width)
-    theirs = (
-        _relative(b12x_encoded, vit_ref),
-        _relative(b12x_aligned, aligner_ref),
-    )
-    message += f"; B12X {theirs[0]:.3e}, {theirs[1]:.3e}"
     # Both round the same activations to BF16; their errors come from FP32
     # accumulation orders and attention, so ours may differ by sampling noise.
-    assert ours[0] <= 1.5 * theirs[0] + 2.0**-14, message
-    assert ours[1] <= 1.5 * theirs[1] + 2.0**-14, message
+    for stage in (0, 1):
+        assert ours[stage] <= min(2.0**-7, 1.5 * theirs[stage] + 2.0**-14), message
 
 
 @pytest.mark.parametrize("height, width", SMALL_GRIDS)
-def test_small_tower_against_reference(small, height, width, request):
-    b12x = _optional(request, "b12x_small")
-    _tower_case(*small, b12x, height, width, seed=height * 1000 + width)
+def test_small_tower_against_reference(small, height, width):
+    _tower_case(*small, height, width, seed=height * 1000 + width)
 
 
 @pytest.mark.parametrize("height, width", REAL_GRIDS)
-def test_v41_tower_against_reference(real, height, width, request):
-    b12x = _optional(request, "b12x_real")
-    _tower_case(*real, b12x, height, width, seed=height * 1000 + width)
+def test_v41_tower_against_reference(real, height, width):
+    _tower_case(*real, height, width, seed=height * 1000 + width)
 
 
 def test_images_do_not_contaminate_each_other(small):

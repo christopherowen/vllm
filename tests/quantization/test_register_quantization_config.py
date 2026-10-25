@@ -119,7 +119,7 @@ def test_quantization_discovery_does_not_require_optional_model_kernels():
 
         class RejectOptionalKernels(importlib.abc.MetaPathFinder):
             def find_spec(self, fullname, path=None, target=None):
-                if fullname == "vllm.models.deepseek_v4_1.b12x_layers":
+                if fullname.startswith("vllm.models.deepseek_v4_1.tilelang"):
                     raise ModuleNotFoundError("optional model kernels unavailable")
                 return None
 

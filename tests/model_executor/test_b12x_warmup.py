@@ -24,6 +24,7 @@ from vllm.utils.b12x import (
     register_b12x_layer,
     register_b12x_unit_provider,
     scope_b12x_unit_calls,
+    set_b12x_preparation_provider,
 )
 from vllm.v1.worker.workspace import _workspace_lane
 
@@ -925,20 +926,62 @@ def test_b12x_batches_with_autotune_disabled_time_nothing():
     ]
 
 
+class _EmbeddingProvider:
+    """A provider discovered on an embedding layer: one B12X plan per id dtype for
+    the layer's table, as a vocabulary embedding declares them."""
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.b12x_embedding_plans = {}
+        set_b12x_preparation_provider(layer, self)
+
+    def get_b12x_preparation_units(self, layer, workload):
+        from b12x.sequence import embedding
+
+        weight = layer.weight
+        requests = []
+        for id_dtype in (torch.int32, torch.int64):
+            plan = layer.b12x_embedding_plans.get(id_dtype)
+            if plan is None:
+                query = embedding.EmbeddingQuery(
+                    max_rows=workload.max_tokens,
+                    table_rows=weight.shape[0],
+                    width=weight.shape[1],
+                    row_stride=weight.stride(0),
+                    weight_dtype=str(weight.dtype).removeprefix("torch."),
+                    id_dtype=str(id_dtype).removeprefix("torch."),
+                )
+                plan = layer.b12x_embedding_plans[id_dtype] = embedding.plan(
+                    query, device=weight.device
+                )
+            requests.append(
+                plan.request(
+                    name=f"embedding.{id(layer):x}.{id_dtype}",
+                    prepare_call=lambda state: None,
+                )
+            )
+        return (
+            B12xPreparationUnit(
+                name="Embedding",
+                key=(id(layer), workload.max_tokens),
+                requests=tuple(requests),
+                stage="weights",
+            ),
+        )
+
+
 @pytest.mark.parametrize("shared_module", [True, False])
 @pytest.mark.parametrize("draft_lane", [0, 1])
 def test_collect_units_handles_target_and_draft_embedding_aliases(
     shared_module, draft_lane
 ):
-    from vllm.models.deepseek_v4_1.b12x_layers import B12xEmbeddingMethod
-
+    pytest.importorskip("b12x")
     target = torch.nn.Module()
     target.embed_tokens = torch.nn.Module()
     target.embed_tokens.weight = torch.nn.Parameter(
         torch.ones(32, 64, dtype=torch.bfloat16),
         requires_grad=False,
     )
-    method = B12xEmbeddingMethod()
+    method = _EmbeddingProvider()
     method.process_weights_after_loading(target.embed_tokens)
     draft = torch.nn.Module()
     if shared_module:

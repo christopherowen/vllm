@@ -9,7 +9,7 @@ candidate list) and the sparse MLA with this package's kernels.
 
 The kernels hold no buffers. Their scratch comes from vLLM's workspace,
 reserved for the worst case before memory profiling, beside the attention
-metadata arena exactly as B12X's scratch is.
+metadata arena.
 """
 
 import functools
@@ -81,14 +81,6 @@ def _index_calls(width, page_size, candidates, candidate_blocks) -> list:
 
 class DeepseekV41TileLangAttention(DeepseekV4Attention):
     backend_cls = DeepseekV41TileLangBackend
-
-    def _declare_mla(self, mode, capacity, metadata_specs, device):
-        return None
-
-    def get_b12x_preparation_units(self, layer, workload):
-        # B12X's state unit prepares its own sparse MLA and indexer plans,
-        # which this layer never launches.
-        return ()
 
     def declare_kernels(self) -> None:
         """Also declare the sparse MLA, indexer and MXFP4 quantizer kernels; binding

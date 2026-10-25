@@ -827,7 +827,7 @@ def _constant_mixes(
 
 
 class TileKernelsMHC(nn.Module):
-    """V4.1 lagged mHC for a decoder layer, with ``B12xMHC``'s interface."""
+    """V4.1 lagged mHC for a decoder layer: pre, post_pre, post and collapse."""
 
     def __init__(self, config):
         super().__init__()

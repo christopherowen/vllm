@@ -215,20 +215,6 @@ class SPRows:
             )
         return tensor_model_parallel_all_to_all_rows(local, self.local_rows)
 
-    @staticmethod
-    def pack_columns(blocks: torch.Tensor, width: int) -> torch.Tensor:
-        """``exchange_rows``'s blocks side by side, cut to ``width``, as packed rows
-        (one copy; a block wholly past ``width`` is padding and is dropped)."""
-        block = blocks.shape[-1]
-        return torch.cat(
-            [
-                blocks[rank, :, : width - rank * block]
-                for rank in range(blocks.shape[0])
-                if rank * block < width
-            ],
-            dim=1,
-        )
-
     def empty_padded(
         self, row_shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
     ) -> torch.Tensor:

@@ -106,8 +106,7 @@ _ELEMENTWISE = {
 # Tiles by kernel. A GEMM's tile changes its speed only (each output adds the same
 # 64-wide K blocks in the same order, whatever the tile; K tiles stay 64); the
 # attention's tiles change the grouping of its online softmax, so its bits (within
-# the reference tolerance).
-# ``benchmarks/kernels/benchmark_tilelang_vision.py --sweep`` times alternatives.
+# the reference tolerance). A tile sweep of the port against B12X chose them.
 LINEAR_TILE = dict(block_M=128, block_N=128, num_stages=2, threads=256)
 SWIGLU_TILE = dict(block_M=128, block_N=64, num_stages=2, threads=256)
 ATTENTION_TILE = dict(block_M=128, block_N=64, num_stages=2, threads=128)

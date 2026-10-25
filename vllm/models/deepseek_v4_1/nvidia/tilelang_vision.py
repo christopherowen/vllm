@@ -2,9 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Replicated V4.1 ViT and aligner on DeepSeek-V4.1's TileLang kernels.
 
-The TileLang family's (``VLLM_DS41_KERNEL_BACKEND=tilelang``) vision tower:
-``b12x_vision``'s classes, forward signatures and checkpoint parameter tree, with
-every launch a kernel of ``tilelang/vision.py``. One image is evaluated per call.
+The vision tower, over the checkpoint's parameter tree, with every launch a
+kernel of ``tilelang/vision.py``. One image is evaluated per call.
 Each module declares its kernels (``declare_kernels``, which the worker calls after
 loading); binding them provisions a workspace for the tower's capacity
 (``_capacity``), so a forward allocates nothing but an output the caller did not
@@ -17,8 +16,8 @@ the residual add with the second norm, the gate/up projection with the SwiGLU in
 its epilogue, the down projection, and the residual add with the next block's (or
 the final) norm. The aligner merges each window, projects with the bias and GELU
 in one launch, and projects again. Images of at most ``GEMV_ROWS`` rows (merged
-rows, for the aligner) project through the GEMVs (B12X's SIMT projection, as B12X
-plans for so few rows), larger ones through the tensor-core GEMMs.
+rows, for the aligner) project through the SIMT GEMVs, larger ones through the
+tensor-core GEMMs.
 """
 
 import itertools
@@ -31,7 +30,7 @@ from vllm.models.deepseek_v4_1.tilelang import vision as kernels
 
 
 def _capacity(config) -> int:
-    """Rows of the largest image the tower serves (``b12x_vision``'s)."""
+    """Rows of the largest image the tower serves."""
     capacity = getattr(config, "vision_max_tokens", None)
     if capacity is None:
         capacity = config.vision_max_n_token * config.vision_downsample_ratio**2

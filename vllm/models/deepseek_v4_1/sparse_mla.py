@@ -8,7 +8,6 @@ from typing import ClassVar
 import torch
 
 from vllm.config import CacheConfig
-from vllm.models.deepseek_v4_1 import kernels
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -228,13 +227,12 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
         self.reqs = alloc((self.tokens,), torch.int32)
         self.slots = alloc((self.tokens,), SLOT_DTYPE)
         self.lengths = alloc((self.tokens,), torch.int32)
-        if kernels.uses_tilelang():
-            # The attention layers owning this group's caches declare these
-            # kernels; here, and at every rebuild, they are cache hits.
-            for function, args, kwargs in tilelang_builder_kernels(
-                kv_cache_spec, self.requests
-            ):
-                function(*args, **kwargs)
+        # The attention layers owning this group's caches declare these kernels;
+        # here, and at every rebuild, they are cache hits.
+        for function, args, kwargs in tilelang_builder_kernels(
+            kv_cache_spec, self.requests
+        ):
+            function(*args, **kwargs)
 
     def build(
         self,
@@ -244,41 +242,7 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
     ):
         cm = common_attn_metadata
         table = cm.block_table_tensor
-        if kernels.uses_tilelang():
-            self._build_tilelang(cm, table)
-            return self._metadata(cm, table)
-        _requests[(triton.cdiv(self.requests + 1, 128),)](
-            cm.query_start_loc,
-            cm.seq_lens,
-            self.starts,
-            self.request_positions,
-            self.counts,
-            cm.num_reqs,
-            cm.num_actual_tokens,
-            self.requests,
-            128,
-        )
-        # num_actual_tokens already includes the selected graph's padding.
-        # Retain capacity-sized storage, but refresh only that readable domain.
-        _tokens[(max(1, triton.cdiv(cm.num_actual_tokens, 128)),)](
-            cm.query_start_loc,
-            cm.seq_lens,
-            table,
-            cm.slot_mapping,
-            self.positions,
-            self.reqs,
-            self.slots,
-            self.lengths,
-            cm.num_reqs,
-            cm.num_actual_tokens,
-            table.stride(0),
-            table.shape[1],
-            self.tokens,
-            self.page,
-            self.ratio,
-            128,
-            self.circular,
-        )
+        self._build_tilelang(cm, table)
         return self._metadata(cm, table)
 
     def _build_tilelang(self, cm, table) -> None:

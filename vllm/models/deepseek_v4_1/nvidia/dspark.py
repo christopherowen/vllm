@@ -12,13 +12,11 @@ include the future query tokens in the top-k indices for each query token.
 
 import copy
 import os
-from bisect import bisect_left
 from collections.abc import Iterable
 
 import regex as re
 import torch
 import torch.nn as nn
-from b12x.gemm import block_fp8_linear
 
 from vllm import envs
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -48,25 +46,10 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_shard,
 )
 from vllm.models.deepseek_v4_1.common.engram import _PaddedColumnParallelLinear
-from vllm.utils.b12x import (
-    B12xPreparationUnit,
-    B12xWorkload,
-    b12x_layer_prefix,
-    register_b12x_layer,
-    register_b12x_unit_provider,
-    set_b12x_preparation_provider,
-)
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
-from vllm.v1.worker.workspace import (
-    current_workspace_manager,
-    retain_cuda_graph_capture_resource,
-)
 
 from .. import kernels, l2_prefetch
-from ..b12x_layers import (
-    _execution_capacities,
-)
 from ..tilelang import columns, dspark_context, prepare
 from .model import (
     DeepseekV4DecoderLayer,
@@ -92,127 +75,11 @@ def _vocab_parallel_greedy() -> bool:
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
 
 
-def _context_kv_projection(attn: nn.Module, capacity: int):
+def _context_kv_projection(attn: nn.Module):
     """The KV rows of ``attn``'s fused Q-A/KV weight as one projection."""
-    if kernels.uses_tilelang():
-        from ..tilelang.linear import TileLangBlock32Rows
+    from ..tilelang.linear import TileLangBlock32Rows
 
-        return TileLangBlock32Rows(attn.fused_wqa_wkv, attn.q_lora_rank)
-    return _ContextKVProjection(attn, capacity)
-
-
-class _ContextKVProjection:
-    """KV-only view of checkpoint block32 weights, packed once after loading."""
-
-    def __init__(self, attn: nn.Module, capacity: int) -> None:
-        fused = attn.fused_wqa_wkv
-        start = attn.q_lora_rank
-        if start % 32:
-            raise ValueError("DSpark context KV must start on a checkpoint scale block")
-        self.weight = block_fp8_linear.pack_weight(
-            fused.weight[start:],
-            fused.weight_scale_inv[start // 32 :],
-            block_size=(32, 32),
-        )
-        self.capacities = tuple(
-            sorted(
-                {
-                    capacity,
-                    *(bound for bound in _execution_capacities() if bound <= capacity),
-                }
-            )
-        )
-        self.plans = tuple(
-            block_fp8_linear.plan(
-                block_fp8_linear.Caps(
-                    device=fused.weight.device,
-                    max_tokens=bound,
-                    in_features=fused.weight.shape[1],
-                    out_features=fused.weight.shape[0] - start,
-                    block_size=(32, 32),
-                    output_mode="provided",
-                )
-            )
-            for bound in self.capacities
-        )
-        register_b12x_unit_provider(self)
-
-    def get_b12x_preparation_units(
-        self, layer: object, workload: B12xWorkload
-    ) -> tuple[B12xPreparationUnit, ...]:
-        if self.weight.weight.values.is_meta:
-            return ()
-
-        def make_call(state, *, bound: int):
-            from b12x.preparation import PreparedCall
-
-            source = torch.zeros(
-                (bound, self.weight.in_features),
-                dtype=torch.bfloat16,
-                device=state.device,
-            )
-            output = torch.empty(
-                (bound, self.weight.out_features, 1),
-                dtype=torch.bfloat16,
-                device=source.device,
-            )
-            scratch = [
-                torch.empty(spec.shape, dtype=spec.dtype, device=source.device)
-                for spec in state.scratch.scratch_specs()
-            ]
-            binding = state.bind(
-                scratch=scratch,
-                source=source,
-                packed_weight=self.weight,
-                output=output,
-            )
-            return PreparedCall(
-                run=lambda: state.run_binding(binding),
-                produce=lambda: source.normal_(std=0.25),
-                owners=(self.weight,),
-            )
-
-        requests = tuple(
-            plan.request(
-                name=f"dspark.context_kv.{id(self):x}.m{bound}",
-                prepare_call=lambda state, bound=bound: make_call(state, bound=bound),
-                benchmark_call=lambda state, bound=bound: make_call(state, bound=bound),
-            )
-            for bound, plan in zip(self.capacities, self.plans)
-        )
-        return (
-            B12xPreparationUnit(
-                name="DSparkContextKV",
-                key=(id(self), self.capacities),
-                requests=requests,
-                stage="weights",
-            ),
-        )
-
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        index = bisect_left(self.capacities, x.shape[0])
-        if index == len(self.capacities):
-            raise ValueError("DSpark context rows exceed prepared capacity")
-        rows = x.shape[0]
-        plan = self.plans[index]
-        out = torch.empty(
-            (rows, self.weight.out_features),
-            dtype=torch.bfloat16,
-            device=x.device,
-        )
-        scratch = current_workspace_manager().get_simultaneous(
-            *((spec.shape, spec.dtype) for spec in plan.scratch_specs())
-        )
-        binding = block_fp8_linear.bind(
-            plan,
-            scratch=scratch,
-            source=x,
-            packed_weight=self.weight,
-            output=out.view(rows, self.weight.out_features, 1),
-        )
-        retain_cuda_graph_capture_resource(scratch)
-        block_fp8_linear.run(binding=binding)
-        return out
+    return TileLangBlock32Rows(attn.fused_wqa_wkv, attn.q_lora_rank)
 
 
 class DSparkContextCudaGraphs:
@@ -368,7 +235,6 @@ class DSparkDeepseekV4Model(nn.Module):
             ]
         )
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
-        self.context_capacity = vllm_config.scheduler_config.max_num_batched_tokens
         self._context_kv_projections: list = []
 
         self.num_dspark_layers = (
@@ -920,8 +786,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         for layer in self.model.layers:
             layer.attn.setup_wo_projection()
         self.model._context_kv_projections = [
-            _context_kv_projection(layer.attn, self.model.context_capacity)
-            for layer in self.model.layers
+            _context_kv_projection(layer.attn) for layer in self.model.layers
         ]
         first_layer = self.model.layers[0]
         broadcast = (
@@ -933,14 +798,6 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             first_layer.hc_attn_fn_broadcast = broadcast
         else:
             first_layer.hc_attn_fn_broadcast.copy_(broadcast)
-        for layer in self.model.layers:
-            mhc = getattr(layer, "mhc", None)
-            if mhc is not None:
-                name = b12x_layer_prefix(layer)
-                register_b12x_layer(name, layer)
-                if not kernels.uses_tilelang():
-                    set_b12x_preparation_provider(layer, mhc)
-                    mhc.bind_layer_name(name)
 
     def _remap_dspark_name(self, name: str) -> str | None:
         """Map a checkpoint ``mtp.{i}.*`` name to this model's parameter path.

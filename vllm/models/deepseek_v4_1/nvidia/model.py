@@ -43,7 +43,6 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_shard,
 )
 from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MoE
-from vllm.models.deepseek_v41.common.mm_preprocess import image_sentinel_mask
 from vllm.models.deepseek_v41.nvidia.model import (
     DeepseekV4MixtureOfExperts as DeepseekV4MixtureOfExperts,
 )
@@ -54,11 +53,6 @@ from vllm.models.deepseek_v41.nvidia.model import (
     _make_deepseek_v4_weights_mapper as _make_deepseek_v4_weights_mapper,
 )
 from vllm.sequence import IntermediateTensors
-from vllm.utils.b12x import (
-    b12x_layer_prefix,
-    register_b12x_layer,
-    set_b12x_preparation_provider,
-)
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.sample.sink import SinkConfig
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
@@ -68,7 +62,6 @@ from ..attention import DeepseekV4Attention
 from ..ced import ced_decoder_start, gather_rows, scatter_rows
 from ..common.engram import Engram, EngramLayout, NgramHashState
 from ..glp import glp_steering, steer_post_layer
-from .b12x_attention import DeepseekV41B12xAttention
 
 if typing.TYPE_CHECKING:
     pass
@@ -77,16 +70,14 @@ logger = init_logger(__name__)
 
 
 def _select_dsv4_attn_cls(vllm_config):
-    backend = vllm_config.attention_config.backend
-    if backend == AttentionBackendEnum.TILELANG:
-        from ..tilelang.attention import DeepseekV41TileLangAttention
+    if vllm_config.attention_config.backend not in (
+        None,
+        AttentionBackendEnum.TILELANG,
+    ):
+        raise ValueError("DeepSeek V4.1 requires the TILELANG attention backend")
+    from ..tilelang.attention import DeepseekV41TileLangAttention
 
-        return DeepseekV41TileLangAttention
-    if backend not in (None, AttentionBackendEnum.B12X):
-        raise ValueError(
-            "DeepSeek V4.1 requires the B12X or TILELANG attention backend"
-        )
-    return DeepseekV41B12xAttention
+    return DeepseekV41TileLangAttention
 
 
 def _use_sequence_parallel(vllm_config):
@@ -632,11 +623,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if self.engram_hash is None:
             raise RuntimeError("Disk Engram requires initialized hash state")
         tokens = input_ids.shape[0]
-        # Each layer's IDs land in its own plane; the TileLang hash finds the image
-        # sentinel in the ids itself.
+        # Each layer's IDs land in its own plane; the hash finds the image sentinel
+        # in the ids itself.
         self.engram_hash.run_native(
             input_ids,
-            None if kernels.uses_tilelang() else ~image_sentinel_mask(input_ids),
             query_start_loc,
             lookback_token_ids,
             self.prepared_engram_hashes[:tokens],
@@ -768,12 +758,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         engram_mask: torch.Tensor | None = None
         if self.disk_engram and input_ids is not None:
             engram_hashes = self.prepared_engram_hashes[: input_ids.shape[0]]
-            # The TileLang gate takes the ids: the image sentinel's rows pass.
-            engram_mask = (
-                input_ids
-                if kernels.uses_tilelang()
-                else ~image_sentinel_mask(input_ids)
-            )
+            # The gate takes the ids: the image sentinel's rows pass.
+            engram_mask = input_ids
         elif self.engram_hash is not None and input_ids is not None:
             attn_metadata = (
                 get_forward_context().attn_metadata
@@ -797,15 +783,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
                 query_start_loc[1] = input_ids.shape[0]
                 lookback_token_ids = input_ids.new_full((1, 3), -1)
-            image_mask = (
-                None if kernels.uses_tilelang() else image_sentinel_mask(input_ids)
-            )
-            engram_mask = input_ids if image_mask is None else ~image_mask
+            engram_mask = input_ids
             engram_hashes = self.engram_hash(
                 input_ids,
                 positions,
                 query_start_loc,
-                image_mask,
                 lookback_token_ids,
             )
             for layer in islice(self.layers, self.start_layer, self.end_layer):
@@ -1235,12 +1217,6 @@ class DeepseekV41LLMForCausalLM(UpstreamDeepseekV41LLMForCausalLM):
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mhc_broadcast_weights()
         for module in self.modules():
-            if isinstance(module, DeepseekV4DecoderLayer):
-                name = b12x_layer_prefix(module)
-                register_b12x_layer(name, module)
-                if not kernels.uses_tilelang():
-                    set_b12x_preparation_provider(module, module.mhc)
-                    module.mhc.bind_layer_name(name)
             if isinstance(module, DeepseekV4Attention):
                 module.setup_wo_projection()
             if isinstance(module, Engram):

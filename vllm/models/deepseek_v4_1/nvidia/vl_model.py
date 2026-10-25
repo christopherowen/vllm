@@ -35,7 +35,6 @@ from vllm.models.deepseek_v41.nvidia.vl_model import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.utils.torch_utils import async_tensor_h2d
 
-from .. import kernels
 from ..tilelang import ced as ced_kernels
 from ..tilelang import prepare
 from .model import (
@@ -45,20 +44,14 @@ from .model import (
 
 
 def _vision_tower():
-    """The kernel family's ViT, aligner and data-parallel image runner. Both
-    families keep the checkpoint's parameter tree, so loading is the same."""
-    if kernels.uses_tilelang():
-        from .tilelang_vision import (
-            DeepseekV4Aligner,
-            DeepseekV4ViT,
-            run_dp_sharded_vision_tower,
-        )
-    else:
-        from .b12x_vision import (
-            DeepseekV4Aligner,
-            DeepseekV4ViT,
-            run_dp_sharded_vision_tower,
-        )
+    """The TileLang ViT, aligner and data-parallel image runner, over the
+    checkpoint's parameter tree."""
+    from .tilelang_vision import (
+        DeepseekV4Aligner,
+        DeepseekV4ViT,
+        run_dp_sharded_vision_tower,
+    )
+
     return DeepseekV4ViT, DeepseekV4Aligner, run_dp_sharded_vision_tower
 
 

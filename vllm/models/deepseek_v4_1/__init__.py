@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DeepSeek V4.1 native b12x model entry points."""
+"""DeepSeek V4.1 model entry points (TileLang kernels)."""
 
 from .quant_config import DeepseekV41FP8Config
 

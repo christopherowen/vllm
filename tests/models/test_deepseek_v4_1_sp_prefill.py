@@ -294,23 +294,26 @@ def test_moe_reduce_scatter_sums_shared_and_routed_before_the_scatter(monkeypatc
 
 
 def test_engram_gates_only_the_real_local_rows(monkeypatch):
+    # Engram's geometry and token map are b12x's; its gate is TileLang's.
     pytest.importorskip("b12x")
+    pytest.importorskip("tilelang")
     from vllm.models.deepseek_v4_1.common import engram as engram_ops
+    from vllm.models.deepseek_v4_1.tilelang import columns
+    from vllm.models.deepseek_v4_1.tilelang import engram as tl_engram
+    from vllm.models.deepseek_v4_1.tilelang.engram_hash import IMAGE_SENTINEL
 
     tokens, streams, width = 10, 2, 4
 
-    def mix(state, kv, norm_weights, *, eps, plan, out, token_mask=None):
+    def gate(state, kv, norm_weights, token_ids, out, eps, hc_mult):
         assert kv.shape[0] == state.shape[0] == out.shape[0]
-        gate = kv[:, : state.shape[1]]
-        if token_mask is not None:
-            assert token_mask.shape == (state.shape[0],)
-            gate = gate * token_mask[:, None]
-        return out.copy_(state + gate)
+        assert token_ids.shape == (state.shape[0],)
+        text = (token_ids != IMAGE_SENTINEL)[:, None]
+        return out.copy_(state + kv[:, : state.shape[1]] * text)
 
-    monkeypatch.setattr(engram_ops.hyperconnection, "run_engram_mix", mix)
+    # The TileLang gate and pass-through copy, stubbed as torch.
+    monkeypatch.setattr(tl_engram, "engram_gate", gate)
+    monkeypatch.setattr(columns, "copy_columns", lambda src, dst: dst.copy_(src))
     monkeypatch.setattr(engram_ops, "tensor_model_parallel_all_reduce", lambda x: x)
-    # The B12X mix, stubbed above, whatever backend the process selects.
-    monkeypatch.setattr(engram_ops.kernels, "uses_tilelang", lambda: False)
     staged = torch.randn(tokens, 6)
     engram = SimpleNamespace(
         embed_tokens=SimpleNamespace(table_memory="device", columns=None),
@@ -319,17 +322,17 @@ def test_engram_gates_only_the_real_local_rows(monkeypatch):
         wkv=lambda rows: rows.repeat(1, 2),
         norm_weights=None,
         eps=1e-6,
-        mix_plans={False: None, True: None},
+        hc_mult=streams,
     )
     hidden = torch.randn(tokens, streams, width)
     hash_ids = torch.zeros(tokens, 24, dtype=torch.int64)
-    mask = torch.arange(tokens) % 3 != 1
-    full = engram_ops.Engram.forward(engram, hidden, hash_ids, mask)
+    token_ids = torch.where(torch.arange(tokens) % 3 != 1, 7, IMAGE_SENTINEL)
+    full = engram_ops.Engram.forward(engram, hidden, hash_ids, token_ids)
     for rank in range(3):
         layout = sp_prefill.SPRows(tokens, 3, rank)
         local = layout.local_slice(hidden)
         output = engram_ops.Engram.forward(
-            engram, local, hash_ids, mask, sp_rows=layout
+            engram, local, hash_ids, token_ids, sp_rows=layout
         )
         real = layout.real_rows
         assert output.shape == local.shape

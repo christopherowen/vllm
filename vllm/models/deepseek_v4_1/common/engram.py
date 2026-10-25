@@ -7,8 +7,7 @@ from functools import lru_cache
 
 import torch
 import torch.nn as nn
-from b12x.norm import hyperconnection
-from b12x.preparation import PreparedCall, require_prepared
+from b12x.preparation import PreparedCall
 from b12x.sequence import engram as native
 
 from vllm.config import get_current_vllm_config
@@ -22,9 +21,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.model_executor.weight_transfer import copy_weight, get_file_tensor_source
-from vllm.models.deepseek_v4_1 import kernels
 from vllm.models.deepseek_v4_1.engram_rows import EngramDiskRows, MappedHostAllocation
-from vllm.triton_utils import tl, triton
 from vllm.utils.b12x import (
     B12xPreparationUnit,
     B12xWorkload,
@@ -194,10 +191,6 @@ class EngramLayout:
             )
             for layer in self.layer_ids
         )
-        self.hash_plans = tuple(
-            native.plan(caps, token_map=token_map, geometry=self.geometry)
-            for caps in self.caps
-        )
         # Disk tables gather with the TileLang kernel; only resident tables use
         # the B12X lookup.
         self.lookup_plans = tuple(
@@ -221,191 +214,26 @@ class EngramLayout:
         return cls(config) if getattr(config, "engram_layer_ids", None) else None
 
 
-@triton.jit(do_not_specialize=["tokens", "seqs"])
-def _prepare_metadata(
-    ids,
-    mask,
-    starts,
-    history,
-    token_map,
-    ids_out,
-    mask_out,
-    starts_out,
-    history_out,
-    slots,
-    num_seqs_out,
-    num_tokens_out,
-    tokens,
-    seqs,
-    max_tokens: tl.constexpr,
-    max_seqs: tl.constexpr,
-    history_stride: tl.constexpr,
-    vocab: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    # Captured input tensors include padding; starts carries the live count.
-    live_tokens = tl.load(starts + seqs)
-    value = tl.load(ids + i, (i < tokens) & (i < live_tokens), other=0)
-    keep = tl.load(mask + i, (i < tokens) & (i < live_tokens), other=False)
-    tl.store(ids_out + i, value, i < max_tokens)
-    tl.store(mask_out + i, keep, i < max_tokens)
-    start = tl.load(starts + i, i <= seqs, other=live_tokens)
-    tl.store(starts_out + i, start, i <= max_seqs)
-    tl.store(slots + i, i.to(tl.int32), i < max_seqs)
-    r, col = i // 3, i % 3
-    raw = tl.load(history + r * history_stride + col, r < seqs, other=-1)
-    valid = (r < seqs) & (raw >= 0) & (raw < vocab) & (raw != 129264)
-    compressed = tl.load(token_map + raw, valid, other=-1)
-    tl.store(history_out + i, compressed, i < max_seqs * 3)
-    if tl.program_id(0) == 0:
-        tl.store(num_seqs_out, seqs)
-        tl.store(num_tokens_out, live_tokens)
-
-
 class NgramHashState(nn.Module):
     def __init__(self, vllm_config, layout, swa_cache_module):
         super().__init__()
+        from vllm.models.deepseek_v4_1.tilelang.engram_hash import geometry_tensors
+
         self.layout = layout
         self.lookback_depth = 3
         self.use_slot_cache = False
         c = layout.caps[0]
-        self.bindings = []
-        self._scratch = []
-        self._hashes = []
-        self._token_map = None
-        for i in range(len(layout.hash_plans)):
+        for name in ("num_seqs", "num_tokens"):
             self.register_buffer(
-                f"hashes_{i}",
-                torch.empty((0,), dtype=torch.int64, device=c.device),
+                name,
+                torch.empty((1,), dtype=torch.int32, device=c.device),
                 persistent=False,
             )
-        for name, shape, dtype in (
-            ("ids", (c.max_tokens,), torch.int64),
-            ("mask", (c.max_tokens,), torch.bool),
-            ("starts", (c.max_seqs + 1,), torch.int32),
-            ("history", (c.max_requests, 3), torch.int64),
-            ("slots", (c.max_seqs,), torch.int32),
-            ("num_seqs", (1,), torch.int32),
-            ("num_tokens", (1,), torch.int32),
-        ):
-            self.register_buffer(
-                name, torch.empty(shape, dtype=dtype, device=c.device), persistent=False
-            )
-        if kernels.uses_tilelang():
-            from vllm.models.deepseek_v4_1.tilelang.engram_hash import (
-                geometry_tensors,
-            )
-
-            # The TileLang hash reads the tokenizer map and geometry directly.
-            self._tl_token_map = torch.tensor(
-                layout.token_map, dtype=torch.int64, device=c.device
-            )
-            self._tl_geometry = geometry_tensors(layout.geometry, c.device)
-        set_b12x_preparation_provider(self, self)
-
-    def _ensure_bindings(self) -> None:
-        """Bind the runner-owned buffers to each prepared hash plan, once."""
-        if self.bindings:
-            return
-        bindings, scratch, hashes = [], [], []
-        token_map = None
-        for plan in self.layout.hash_plans:
-            state = require_prepared(plan, "sequence.engram")
-            if token_map is None:
-                token_map = state.token_map
-            (spec,) = state.scratch_specs()
-            buffer = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-            hash_ids = torch.empty(
-                (state.caps.max_tokens, 24), dtype=torch.int64, device=state.caps.device
-            )
-            scratch.append(buffer)
-            hashes.append(hash_ids)
-            bindings.append(
-                native.bind(
-                    plan,
-                    scratch=buffer,
-                    token_ids=self.ids,
-                    token_mask=self.mask,
-                    query_start_loc=self.starts,
-                    request_slots=self.slots,
-                    committed_history=self.history,
-                    num_seqs=self.num_seqs,
-                    num_tokens=self.num_tokens,
-                    hash_ids=hash_ids,
-                )
-            )
-        self.bindings, self._scratch, self._hashes = bindings, scratch, hashes
-        self._token_map = token_map
-
-    def get_b12x_preparation_units(
-        self, layer: torch.nn.Module, workload: B12xWorkload
-    ) -> tuple[B12xPreparationUnit, ...]:
-        if workload.max_tokens > self.layout.caps[0].max_tokens:
-            return ()
-        if kernels.uses_tilelang():
-            return ()
-
-        def make_call(state):
-            from b12x.sequence.engram._impl import _bind_state
-
-            (spec,) = state.scratch_specs()
-            scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-            hashes = torch.empty(
-                (state.caps.max_tokens, 24), dtype=torch.int64, device=state.caps.device
-            )
-            ids = torch.full(
-                (state.caps.max_tokens,), 2, dtype=torch.int64, device=state.caps.device
-            )
-            mask = torch.ones(
-                (state.caps.max_tokens,), dtype=torch.bool, device=state.caps.device
-            )
-            starts = torch.zeros(
-                (state.caps.max_seqs + 1,), dtype=torch.int32, device=state.caps.device
-            )
-            starts[1] = 1
-            slots = torch.zeros(
-                (state.caps.max_seqs,), dtype=torch.int32, device=state.caps.device
-            )
-            num_seqs = torch.ones((1,), dtype=torch.int32, device=state.caps.device)
-            num_tokens = torch.ones((1,), dtype=torch.int32, device=state.caps.device)
-            binding = _bind_state(
-                state,
-                scratch=scratch,
-                token_ids=ids,
-                token_mask=mask,
-                query_start_loc=starts,
-                request_slots=slots,
-                committed_history=self.history,
-                num_seqs=num_seqs,
-                num_tokens=num_tokens,
-                hash_ids=hashes,
-            )
-            history_before = self.history[0].clone()
-
-            return PreparedCall(
-                run=lambda: state.run(binding, 1),
-                produce=lambda: self.history[0].fill_(DEAD_ID),
-                restore=lambda: self.history[0].copy_(history_before),
-                owners=(self.history,),
-            )
-
-        requests = tuple(
-            plan.request(
-                name=f"engram/hash/{index}",
-                prepare_call=make_call,
-                benchmark_call=make_call,
-            )
-            for index, plan in enumerate(self.layout.hash_plans)
+        # The TileLang hash reads the tokenizer map and geometry directly.
+        self._tl_token_map = torch.tensor(
+            layout.token_map, dtype=torch.int64, device=c.device
         )
-        return (
-            B12xPreparationUnit(
-                name="EngramHash",
-                key=(id(self.layout), workload.max_tokens),
-                requests=requests,
-                stage="weights",
-            ),
-        )
+        self._tl_geometry = geometry_tensors(layout.geometry, c.device)
 
     def ensure_cache(self):
         return True  # Hash history belongs to the runner, never the KV slot pool.
@@ -414,8 +242,6 @@ class NgramHashState(nn.Module):
         """Declare the TileLang hash of every Engram layer. The runner's token ids
         and the model state's lookback window are int32 (profiling's window takes
         the ids' dtype)."""
-        if not kernels.uses_tilelang():
-            return
         from vllm.models.deepseek_v4_1.tilelang import prepare
         from vllm.models.deepseek_v4_1.tilelang.engram_hash import engram_hash_kernel
 
@@ -428,12 +254,11 @@ class NgramHashState(nn.Module):
         )
         prepare.declare(lambda: [call])
 
-    def run_native(self, ids, mask, starts, history, out):
-        """Hash ``ids`` for every Engram layer into ``out`` [T, layers, 24].
+    def run_native(self, ids, starts, history, out):
+        """Hash ``ids`` for every Engram layer into ``out`` [T, layers, 24]; the
+        hash finds the image tokens (the sentinel's ids) itself."""
+        from vllm.models.deepseek_v4_1.tilelang.engram_hash import engram_hash
 
-        ``mask`` marks the tokens to hash under the B12X kernels; the TileLang
-        hash finds the image tokens (the sentinel's ids) itself and takes None.
-        """
         retain_cuda_graph_capture_resource(self)
         c = self.layout.caps[0]
         seqs = starts.numel() - 1
@@ -443,65 +268,33 @@ class NgramHashState(nn.Module):
             raise ValueError(
                 "Engram requires chronological accepted history [requests,3]"
             )
-        if kernels.uses_tilelang():
-            from vllm.models.deepseek_v4_1.tilelang.engram_hash import engram_hash
-
-            engram_hash(
-                ids,
-                starts,
-                history,
-                self._tl_token_map,
-                *self._tl_geometry,
-                out,
-                self.num_seqs,
-                self.num_tokens,
-            )
-            return
-        self._ensure_bindings()
-        work = max(c.max_tokens, c.max_seqs * 3, c.max_seqs + 1)
-        _prepare_metadata[(triton.cdiv(work, 256),)](
+        engram_hash(
             ids,
-            mask,
             starts,
             history,
-            self._token_map,
-            self.ids,
-            self.mask,
-            self.starts,
-            self.history,
-            self.slots,
+            self._tl_token_map,
+            *self._tl_geometry,
+            out,
             self.num_seqs,
             self.num_tokens,
-            ids.numel(),
-            seqs,
-            c.max_tokens,
-            c.max_seqs,
-            history.stride(0),
-            c.vocab_size,
-            256,
         )
-        for i, binding in enumerate(self.bindings):
-            native.run(binding, token_count=ids.numel())
-            out[:, i].copy_(binding.hash_ids[: ids.numel()])
 
     def forward(
         self,
         input_ids,
         positions,
         query_start_loc,
-        dead_mask,
         lookback_token_ids,
         lookback_dead_mask=None,
         slot_mapping=None,
         block_table=None,
     ):
         out = torch.empty(
-            (input_ids.numel(), len(self.layout.hash_plans), 24),
+            (input_ids.numel(), len(self.layout.layer_ids), 24),
             dtype=torch.int64,
             device=input_ids.device,
         )
-        mask = None if kernels.uses_tilelang() else ~dead_mask
-        self.run_native(input_ids, mask, query_start_loc, lookback_token_ids, out)
+        self.run_native(input_ids, query_start_loc, lookback_token_ids, out)
         return out
 
 
@@ -906,35 +699,13 @@ class Engram(nn.Module):
             ),
             persistent=False,
         )
-        mix_caps = hyperconnection.Caps(
-            device=caps.device,
-            max_tokens=caps.max_tokens,
-            hidden_size=self.dim,
-            streams=self.hc_mult,
-        )
-        # The TileLang kernels gate through tilelang/engram.py, with no B12X plan.
-        self.mix_plans = (
-            {}
-            if kernels.uses_tilelang()
-            else {
-                masked: hyperconnection.plan(
-                    mix_caps,
-                    invocation={
-                        "operation": "engram_mix",
-                        "eps": self.eps,
-                        "token_mask": masked,
-                    },
-                )
-                for masked in (False, True)
-            }
-        )
+        # A resident table's lookup is prepared through B12X (the lookup unit).
         set_b12x_preparation_provider(self, self)
 
     def get_b12x_preparation_units(
         self, layer: torch.nn.Module, workload: B12xWorkload
     ) -> tuple[B12xPreparationUnit, ...]:
-        caps = self.embed_tokens.caps
-        if workload.max_tokens > caps.max_tokens:
+        if workload.max_tokens > self.embed_tokens.caps.max_tokens:
             return ()
 
         def make_call(state):
@@ -972,95 +743,27 @@ class Engram(nn.Module):
                 owners=(embed.weight, embed.weight_scale_inv),
             )
 
-        lookup_requests = ()
-        if self.embed_tokens.table_memory != "disk":
-            lookup_requests = (
-                self.embed_tokens.plan.request(
-                    name=f"{id(self)}/engram-lookup",
-                    prepare_call=make_call,
-                    benchmark_call=make_call,
-                ),
-            )
-
-        def make_mix_call(state):
-            from b12x.norm.hyperconnection._impl import run_engram_mix_impl
-
-            rows = state.query.max_tokens
-            width = self.hc_mult * self.dim
-            residual = torch.empty(
-                (rows, width),
-                dtype=torch.bfloat16,
-                device=caps.device,
-            )
-            projected = torch.empty(
-                (rows, width + self.dim),
-                dtype=torch.bfloat16,
-                device=caps.device,
-            )
-            out = torch.empty_like(residual)
-            mask = (
-                torch.ones(rows, dtype=torch.bool, device=caps.device)
-                if state.query.token_mask
-                else None
-            )
-            if mask is not None:
-                mask[::2] = False
-
-            def produce():
-                residual.fill_(0.125)
-                projected.fill_(0.25)
-
-            return PreparedCall(
-                run=lambda: run_engram_mix_impl(
-                    residual,
-                    projected,
-                    self.norm_weights,
-                    eps=self.eps,
-                    plan=state,
-                    out=out,
-                    token_mask=mask,
-                ),
-                produce=produce,
-                output=out,
-                owners=(self.norm_weights,),
-            )
-
-        mix_requests = tuple(
-            plan.request(
-                name=f"{id(self)}/engram-mix/{masked}",
-                prepare_call=make_mix_call,
-                benchmark_call=make_mix_call,
-            )
-            for masked, plan in self.mix_plans.items()
+        if self.embed_tokens.table_memory == "disk":
+            return ()
+        request = self.embed_tokens.plan.request(
+            name=f"{id(self)}/engram-lookup",
+            prepare_call=make_call,
+            benchmark_call=make_call,
         )
-        units = []
-        if lookup_requests:
-            units.append(
-                B12xPreparationUnit(
-                    name="EngramLookup",
-                    key=(id(self), workload.max_tokens),
-                    requests=lookup_requests,
-                    stage="weights",
-                )
-            )
-        if mix_requests:
-            units.append(
-                B12xPreparationUnit(
-                    name="EngramMix",
-                    key=(id(self), workload.max_tokens),
-                    requests=mix_requests,
-                    stage="weights",
-                )
-            )
-        return tuple(units)
+        return (
+            B12xPreparationUnit(
+                name="EngramLookup",
+                key=(id(self), workload.max_tokens),
+                requests=(request,),
+                stage="weights",
+            ),
+        )
 
     def declare_kernels(self) -> None:
         """Declare the TileLang gate: on packed rows always, and on the column blocks
         of a column-parallel projection when the model runs prefill sequence
         parallel (the blocked gate, one block per rank). The model passes the
         step's int32 token ids, the gate finding the image sentinel itself."""
-        if not kernels.uses_tilelang():
-            return
         from vllm.models.deepseek_v4_1.tilelang import prepare
         from vllm.models.deepseek_v4_1.tilelang.engram import (
             engram_gate_blocked_kernel,
@@ -1125,8 +828,7 @@ class Engram(nn.Module):
     def forward(self, hidden_states, hash_ids, token_mask=None, sp_rows=None):
         """Gate ``hidden_states`` with this layer's Engram rows.
 
-        ``token_mask`` marks the tokens to gate under the B12X kernels; under the
-        TileLang kernels it is the step's token ids (the image sentinel's rows pass
+        ``token_mask`` is the step's token ids (the image sentinel's rows pass
         through).
 
         With ``sp_rows`` (prefill sequence parallelism) ``hidden_states`` holds
@@ -1154,16 +856,12 @@ class Engram(nn.Module):
                 self.staged_rows[: hash_ids.shape[0]]
             )
         # With SP and a column-parallel projection, kv is every rank's column block
-        # of this rank's rows, [N, L, C]: the TileLang gate reads the blocks in
-        # place, B12X's mix packed rows.
+        # of this rank's rows, [N, L, C]: the gate reads the blocks in place.
         blocked = sp_rows is not None and isinstance(
             self.wkv, _PaddedColumnParallelLinear
         )
         if blocked:
             kv = sp_rows.exchange_rows(self.wkv.local_product(rows))
-            if not kernels.uses_tilelang():
-                kv = sp_rows.pack_columns(kv, self.wkv.logical_output_size)
-                blocked = False
             kv_start = 0
         else:
             kv = self.wkv(rows)
@@ -1175,12 +873,9 @@ class Engram(nn.Module):
             # Gate the real local rows; the trailing pad rows pass through.
             start, real = sp_rows.start, sp_rows.real_rows
             if real < state.shape[0]:
-                if kernels.uses_tilelang():
-                    from vllm.models.deepseek_v4_1.tilelang import columns
+                from vllm.models.deepseek_v4_1.tilelang import columns
 
-                    columns.copy_columns(state[real:], out[real:])
-                else:
-                    out[real:].copy_(state[real:])
+                columns.copy_columns(state[real:], out[real:])
             if real == 0:
                 return out.view_as(hidden_states)
             state, mix_out = state[:real], out[:real]
@@ -1188,31 +883,12 @@ class Engram(nn.Module):
                 kv = kv[kv_start : kv_start + real]
             if token_mask is not None:
                 token_mask = token_mask[start : start + real]
-        if kernels.uses_tilelang():
-            from vllm.models.deepseek_v4_1.tilelang.engram import (
-                engram_gate,
-                engram_gate_blocked,
-            )
-
-            # The TileLang model passes the token ids: the sentinel's rows pass.
-            gate = engram_gate_blocked if blocked else engram_gate
-            gate(
-                state,
-                kv,
-                self.norm_weights,
-                token_mask,
-                mix_out,
-                self.eps,
-                self.hc_mult,
-            )
-            return out.view_as(hidden_states)
-        hyperconnection.run_engram_mix(
-            state,
-            kv,
-            self.norm_weights,
-            eps=self.eps,
-            plan=self.mix_plans[token_mask is not None],
-            out=mix_out,
-            token_mask=token_mask,
+        from vllm.models.deepseek_v4_1.tilelang.engram import (
+            engram_gate,
+            engram_gate_blocked,
         )
+
+        # The model passes the token ids: the sentinel's rows pass.
+        gate = engram_gate_blocked if blocked else engram_gate
+        gate(state, kv, self.norm_weights, token_mask, mix_out, self.eps, self.hc_mult)
         return out.view_as(hidden_states)

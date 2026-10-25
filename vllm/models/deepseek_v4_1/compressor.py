@@ -4,22 +4,11 @@
 
 import torch
 import torch.nn as nn
-from b12x.attention import mla_compress
-from b12x.gemm import bf16_gemv
-from b12x.preparation import PreparedCall
 
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
-from vllm.models.deepseek_v4_1 import kernels
-from vllm.models.deepseek_v4_1.b12x_layers import B12xLinearMethod, B12xRMSNorm
 from vllm.models.deepseek_v4_1.sparse_mla import SLOT_DTYPE, DeepseekV41B12xBackend
 from vllm.triton_utils import tl, triton
-from vllm.utils.b12x import (
-    B12xPreparationUnit,
-    B12xWorkload,
-    PreparationResourceUnavailableError,
-    set_b12x_preparation_provider,
-)
 from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.kv_cache_interface import CircularBufferSpec
 
@@ -151,28 +140,16 @@ class DeepseekCompressor(nn.Module):
             prefix=f"{prefix}.fused_wkv_wgate",
             params_dtype=torch.bfloat16,
         )
-        if kernels.uses_tilelang():
-            from vllm.models.deepseek_v4_1.tilelang.linear import (
-                TileLangSplitLinearMethod,
-            )
+        from vllm.models.deepseek_v4_1.tilelang.linear import TileLangSplitLinearMethod
 
-            # wkv and wgate (ratio 2) each project into their own buffer.
-            self.fused_wkv_wgate.quant_method = TileLangSplitLinearMethod(
-                compress_ratio
-            )
-        else:
-            self.fused_wkv_wgate.quant_method = B12xLinearMethod()
+        # wkv and wgate (ratio 2) each project into their own buffer.
+        self.fused_wkv_wgate.quant_method = TileLangSplitLinearMethod(compress_ratio)
         self.fused_wkv_wgate.out_dtype = (
             torch.float32 if compress_ratio == 2 else torch.bfloat16
         )
-        if kernels.uses_tilelang():
-            # The TileLang compression applies the norm's weight itself: the
-            # module only holds the parameter, under its checkpoint name.
-            self.norm = nn.Module()
-        else:
-            self.norm = B12xRMSNorm(
-                512, vllm_config.model_config.hf_config.rms_norm_eps
-            )
+        # The TileLang compression applies the norm's weight itself: the module
+        # only holds the parameter, under its checkpoint name.
+        self.norm = nn.Module()
         self.norm.weight = nn.Parameter(
             torch.ones(512, dtype=torch.float32), requires_grad=False
         )
@@ -181,24 +158,16 @@ class DeepseekCompressor(nn.Module):
             if compress_ratio == 2
             else None
         )
-        self._plan = None
-        self._projection_plans = {}
         self._values = self._latent = self._emitted = self._slots = None
         self._gates = self._pending_values = self._pending_gates = None
         self._pending_tags = self._local_ids = self._row_ids = None
-        self._primer_starts = self._primer_positions = self._primer_state_ids = None
-        self._primer_slots = self._primer_counts = None
-        set_b12x_preparation_provider(self, self)
 
     def _ensure_capacity_buffers(self, device, t, r) -> None:
         """Allocate the reusable serving storage for ``t`` tokens and ``r``
-        requests once, before memory profiling: B12X allocates it while
-        preparing its plan, TileLang when its kernels are bound."""
+        requests once, before memory profiling, when the kernels are bound."""
         if self._values is not None:
             if self._values.shape[0] != t:
-                raise PreparationResourceUnavailableError(
-                    "compressor capacity changed after preparation"
-                )
+                raise RuntimeError("compressor capacity changed after preparation")
             return
 
         def alloc(shape, dtype):
@@ -217,230 +186,14 @@ class DeepseekCompressor(nn.Module):
             self._pending_tags = alloc((r,), torch.int64)
             self._local_ids = alloc((r,), torch.int64)
 
-    def _ensure_primer_buffers(self, device, t, r) -> None:
-        """Allocate the metadata of B12X's priming invocation."""
-        if self._primer_starts is not None:
-            return
-        self._primer_starts = torch.empty((r + 1,), dtype=torch.int32, device=device)
-        self._primer_positions = torch.empty((r,), dtype=torch.int64, device=device)
-        self._primer_state_ids = torch.empty((r,), dtype=torch.int64, device=device)
-        self._primer_slots = torch.empty((t,), dtype=torch.int64, device=device)
-        self._primer_counts = torch.empty((2,), dtype=torch.int32, device=device)
-
-    def _reset_primer_state(self) -> None:
-        """Restore all reusable mutable capacity storage after a trial."""
-        self._values.zero_()
-        self._latent.zero_()
-        self._emitted.zero_()
-        self._slots.fill_(-1)
-        self._primer_starts.zero_()
-        self._primer_positions.fill_(-1)
-        self._primer_state_ids.fill_(-1)
-        self._primer_slots.fill_(-1)
-        self._primer_counts.zero_()
-        if self.compress_ratio == 2:
-            self._gates.zero_()
-            self._pending_values.zero_()
-            self._pending_gates.zero_()
-            self._pending_tags.fill_(-1)
-            self._local_ids.fill_(-1)
-
-    def _produce_primer_input(self) -> None:
-        """Prime native code with a real nonzero ratio-one/pair invocation."""
-        self._reset_primer_state()
-        tokens = 2 if self.compress_ratio == 2 else 1
-        self._values[0].fill_(0.25)
-        if tokens == 2:
-            self._values[1].fill_(1.5)
-            self._gates[0].fill_(-0.75)
-            self._gates[1].fill_(0.5)
-        self._primer_starts[1].fill_(tokens)
-        self._primer_positions[0].zero_()
-        self._primer_state_ids[0].zero_()
-        self._primer_slots[0].fill_(5)
-        if tokens == 2:
-            self._primer_slots[1].fill_(6)
-        self._primer_counts[0].fill_(tokens)
-        self._primer_counts[1].fill_(1)
-
-    def _primer_binding(self, state):
-        return state.bind(
-            values=self._values,
-            gates=self._gates,
-            weight=self.norm.weight,
-            query_start_loc=self._primer_starts,
-            positions=self._primer_positions,
-            state_ids=self._primer_state_ids,
-            destination_slots=self._primer_slots,
-            live_counts=self._primer_counts,
-            out=self._latent,
-            emitted=self._emitted,
-            emitted_slots=self._slots,
-            pending_values=self._pending_values,
-            pending_gates=self._pending_gates,
-            pending_position=self._pending_tags,
-        )
-
-    def _projection_unit(self, workload):
-        weight = self.fused_wkv_wgate.weight
-        capacities = tuple(sorted({workload.max_tokens, *workload.token_counts}))
-        self._projection_capacity = workload.max_tokens
-        dtype = torch.float32 if self.compress_ratio == 2 else torch.bfloat16
-
-        def prepare(state):
-            source = torch.empty(
-                (state.query.max_rows, weight.shape[1]),
-                dtype=torch.bfloat16,
-                device=weight.device,
-            )
-            outputs = tuple(
-                torch.empty(
-                    (state.query.max_rows, 512),
-                    dtype=dtype,
-                    device=weight.device,
-                )
-                for _ in range(self.compress_ratio)
-            )
-
-            def run():
-                for index, output in enumerate(outputs):
-                    state.run(
-                        source, weight[index * 512 : (index + 1) * 512], out=output
-                    )
-                return outputs
-
-            return PreparedCall(
-                run=run,
-                output=outputs,
-                produce=lambda: source.normal_(std=0.25),
-                owners=(weight,),
-            )
-
-        requests = []
-        for rows in capacities:
-            if rows not in self._projection_plans:
-                self._projection_plans[rows] = bf16_gemv.plan(
-                    bf16_gemv.GemvQuery(
-                        source_dtype="bfloat16",
-                        weight_dtype="bfloat16",
-                        output_dtype=str(dtype).removeprefix("torch."),
-                        max_rows=rows,
-                        in_features=weight.shape[1],
-                        out_features=512,
-                        source_contiguous=True,
-                        source_aligned=True,
-                        weight_contiguous=weight.is_contiguous(),
-                        weight_aligned=weight.data_ptr() % 16 == 0,
-                    )
-                )
-            requests.append(
-                self._projection_plans[rows].request(
-                    name=f"{self.prefix}/projection.m{rows}",
-                    prepare_call=prepare,
-                    benchmark_call=prepare,
-                )
-            )
-        return B12xPreparationUnit(
-            name="V41CompressorProjection",
-            key=(self.prefix, capacities),
-            requests=tuple(requests),
-            stage="weights",
-        )
-
     def _project(self, hidden_states):
-        rows = hidden_states.shape[0]
-        if kernels.uses_tilelang():
-            from vllm.models.deepseek_v4_1.tilelang.linear import project_parts
+        from vllm.models.deepseek_v4_1.tilelang.linear import project_parts
 
-            project_parts(
-                self.fused_wkv_wgate,
-                hidden_states,
-                (self._values, self._gates)[: self.compress_ratio],
-                rows,
-            )
-            return
-        plan = self._projection_plans.get(rows)
-        if plan is None:
-            plan = self._projection_plans[self._projection_capacity]
-        for index, output in enumerate(
-            (self._values, self._gates)[: self.compress_ratio]
-        ):
-            bf16_gemv.mm(
-                hidden_states,
-                self.fused_wkv_wgate.weight[index * 512 : (index + 1) * 512],
-                out=output[:rows],
-                output_dtype=output.dtype,
-                plan=plan,
-            )
-
-    def get_b12x_preparation_units(
-        self, layer: object, workload: B12xWorkload
-    ) -> tuple[B12xPreparationUnit, ...]:
-        # The TileLang compression and projection are declared kernels
-        # (declare_kernels); B12X prepares nothing for them.
-        if kernels.uses_tilelang():
-            return ()
-        if workload.max_tokens > self.capacity:
-            return ()
-        if self.fused_wkv_wgate.weight.is_meta or self.norm.weight.is_meta:
-            return ()
-        if self._plan is None:
-            device = self.fused_wkv_wgate.weight.device
-            self._plan = mla_compress.plan(
-                mla_compress.Caps(
-                    device=device,
-                    max_tokens=self.capacity,
-                    max_requests=self.requests,
-                    max_states=self.requests,
-                    ratio=self.compress_ratio,
-                )
-            )
-        declaration = self._plan
-
-        def make_call(state):
-            caps = state.caps
-            self._ensure_capacity_buffers(
-                caps.device, caps.max_tokens, caps.max_requests
-            )
-            self._ensure_primer_buffers(caps.device, caps.max_tokens, caps.max_requests)
-            binding = self._primer_binding(state)
-            return PreparedCall(
-                run=lambda: state.run(binding),
-                produce=self._produce_primer_input,
-                reset=self._reset_primer_state,
-                restore=self._reset_primer_state,
-                owners=(
-                    self.norm.weight,
-                    self._values,
-                    self._gates,
-                    self._primer_starts,
-                    self._primer_positions,
-                    self._primer_state_ids,
-                    self._primer_slots,
-                    self._primer_counts,
-                    self._latent,
-                    self._emitted,
-                    self._slots,
-                    self._pending_values,
-                    self._pending_gates,
-                    self._pending_tags,
-                    self._local_ids,
-                ),
-            )
-
-        request = declaration.request(
-            name=f"{self.prefix}/mla-compress",
-            prepare_call=make_call,
-            benchmark_call=make_call,
-        )
-        return (
-            self._projection_unit(workload),
-            B12xPreparationUnit(
-                name="DeepseekCompressor",
-                key=(self.prefix, self.compress_ratio, self.capacity, self.requests),
-                requests=(request,),
-                stage="state",
-            ),
+        project_parts(
+            self.fused_wkv_wgate,
+            hidden_states,
+            (self._values, self._gates)[: self.compress_ratio],
+            hidden_states.shape[0],
         )
 
     def _tilelang_calls(self) -> list:
@@ -464,8 +217,6 @@ class DeepseekCompressor(nn.Module):
         loading); binding allocates the serving storage and ratio 1's placeholder
         operands before memory profiling, so the first call, possibly under graph
         capture, allocates nothing."""
-        if not kernels.uses_tilelang():
-            return
         from vllm.models.deepseek_v4_1.tilelang import compress as tl
         from vllm.models.deepseek_v4_1.tilelang import prepare
 
@@ -510,65 +261,8 @@ class DeepseekCompressor(nn.Module):
 
     def forward(self, hidden_states, metadata, state_metadata=None):
         rows = hidden_states.shape[0]
-        if kernels.uses_tilelang():
-            if self._values is None:
-                raise PreparationResourceUnavailableError(
-                    "compressor kernels must be bound before forwarding"
-                )
-            self._project(hidden_states)
-            self._forward_tilelang(rows, metadata, state_metadata)
-            return self._latent[:rows], self._slots[:rows]
-        if self._plan is None or self._plan.prepared is None:
-            raise PreparationResourceUnavailableError(
-                "compressor plan must be prepared before forwarding"
-            )
+        if self._values is None:
+            raise RuntimeError("compressor kernels must be bound before forwarding")
         self._project(hidden_states)
-        if self.compress_ratio == 2:
-            if state_metadata is None:
-                raise RuntimeError("ratio2 compression requires request-state metadata")
-            pool = self.state_cache.kv_cache
-            _load_partial_state[(self.requests,)](
-                pool,
-                state_metadata.block_table,
-                state_metadata.query_start_loc,
-                state_metadata.request_positions,
-                self._pending_values,
-                self._pending_gates,
-                self._pending_tags,
-                self._local_ids,
-                state_metadata.live_counts,
-                pool.stride(0),
-                state_metadata.block_table.stride(0),
-                state_metadata.block_size,
-            )
-            _save_partial_states[(self.capacity,)](
-                pool,
-                state_metadata.slot_mapping,
-                self._values,
-                self._gates,
-                state_metadata.live_counts,
-                pool.stride(0),
-                state_metadata.block_size,
-            )
-            ids = self._local_ids
-        else:
-            ids = self._row_ids
-        binding = mla_compress.bind(
-            self._plan,
-            values=self._values,
-            gates=self._gates,
-            weight=self.norm.weight,
-            query_start_loc=metadata.query_start_loc,
-            positions=metadata.request_positions,
-            state_ids=ids,
-            destination_slots=metadata.slot_mapping,
-            live_counts=metadata.live_counts,
-            out=self._latent,
-            emitted=self._emitted,
-            emitted_slots=self._slots,
-            pending_values=self._pending_values,
-            pending_gates=self._pending_gates,
-            pending_position=self._pending_tags,
-        )
-        mla_compress.run(binding)
+        self._forward_tilelang(rows, metadata, state_metadata)
         return self._latent[:rows], self._slots[:rows]
