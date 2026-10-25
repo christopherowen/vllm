@@ -26,7 +26,6 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.request import Request
-from vllm.v1.sample.ops.topk_topp_sampler import warmup_top_k_top_p
 from vllm.v1.worker.gpu.input_batch import (
     combine_sampled_and_draft_tokens,
     get_num_sampled_and_rejected,
@@ -577,13 +576,5 @@ def _warmup_kernels(
             model_runner.model_config.get_vocab_size(),
             model_runner.device,
             use_fp64=model_runner.model_config.use_fp64_gumbel,
-        )
-        warmup_top_k_top_p(
-            model_runner.model_config.get_vocab_size(),
-            min(
-                model_runner.scheduler_config.max_num_batched_tokens,
-                model_runner.max_num_reqs * decode_query_len,
-            ),
-            model_runner.device,
         )
     torch.accelerator.synchronize()
