@@ -35,6 +35,8 @@ from vllm.models.deepseek_v4_1.tilelang import prepare  # noqa: E402
 from vllm.models.deepseek_v4_1.tilelang.collectives import (  # noqa: E402
     RankOrderParts,
 )
+from vllm.models.deepseek_v4_1.tilelang.gemm import scale_words  # noqa: E402
+from vllm.models.deepseek_v4_1.tilelang.linear import mxfp8_rows  # noqa: E402
 from vllm.models.deepseek_v4_1.tilelang.mhc import (  # noqa: E402
     BLOCK_H,
     MIXES,
@@ -110,9 +112,47 @@ def _close_bf16(actual, expected, ulps=1):
     )
 
 
+def _per_token_cast(y):
+    """TileKernels' MXFP8 cast of BF16 rows, as the projections cast their input
+    before the entry wrote it: E4M3 bytes and packed UE8M0 bytes, whole words a row."""
+    rows, hidden = y.shape
+    values = torch.empty((rows, hidden), dtype=torch.float8_e4m3fn, device=DEVICE)
+    scales = torch.empty(
+        (rows, 4 * scale_words(hidden)), dtype=torch.uint8, device=DEVICE
+    )
+    tile_kernels.quant.per_token_cast(
+        y, "e4m3", 32, round_sf=True, use_packed_ue8m0=True, out=(values, scales)
+    )
+    return values, scales
+
+
+def _assert_bytes_equal(actual, expected, what=""):
+    actual, expected = actual.view(torch.uint8), expected.view(torch.uint8)
+    assert actual.shape == expected.shape
+    differ = actual != expected
+    if differ.any():
+        where = differ.nonzero()[:4].tolist()
+        raise AssertionError(
+            f"{what}{int(differ.sum())} of {differ.numel()} bytes differ; first at "
+            f"{where}"
+        )
+
+
+def _assert_cast(cast, y, what=""):
+    """An entry's ``MXFP8Rows`` hold ``per_token_cast``'s bytes of the ``y`` it wrote,
+    in buffers of whole decode tiles."""
+    tokens = y.shape[0]
+    assert cast.rows is y
+    assert cast.values.shape == (mxfp8_rows(tokens), y.shape[1])
+    assert cast.scales.shape == (mxfp8_rows(tokens), 4 * scale_words(y.shape[1]))
+    values, scales = _per_token_cast(y)
+    _assert_bytes_equal(cast.values[:tokens], values, f"{what}E4M3: ")
+    _assert_bytes_equal(cast.scales[:tokens], scales, f"{what}scales: ")
+
+
 def _check(actual, expected, tokens):
     post, comb, y, pre = expected
-    residual_out, a_post, a_comb, a_y, a_pre = actual
+    residual_out, a_post, a_comb, a_y, a_pre, a_cast = actual
     assert residual_out.shape == (tokens, 4, HIDDEN)
     # The projection runs on TF32 tensor cores, as in DeepGEMM.
     torch.testing.assert_close(a_post, post, atol=2e-3, rtol=0)
@@ -121,6 +161,7 @@ def _check(actual, expected, tokens):
     # y takes no projection. The collapse is rounded to BF16 before the norm,
     # so an ulp of difference there can become two in y.
     _close_bf16(a_y, y, ulps=2)
+    _assert_cast(a_cast, a_y)
 
 
 @pytest.mark.parametrize("tokens", [1, 7, 16, 33, 64, 200])
@@ -162,8 +203,10 @@ def test_post_pre_adds_rank_order_parts(mhc, world, tokens):
     actual = mhc.post_pre(
         RankOrderParts(parts), residual, post, comb, fn, scale, base, weight, incoming
     )
-    for a, b in zip(actual, expected):
+    for a, b in zip(actual[:5], expected[:5]):
         assert torch.equal(a, b)
+    _assert_bytes_equal(actual[5].values[:tokens], expected[5].values[:tokens])
+    _assert_bytes_equal(actual[5].scales[:tokens], expected[5].scales[:tokens])
     assert torch.equal(
         mhc.post(RankOrderParts(parts), residual, post, comb),
         mhc.post(summed, residual, post, comb),
@@ -186,13 +229,24 @@ def test_first_layer_broadcast_matches_expanded(mhc):
 def test_rows_independent_of_batch(mhc):
     residual, fn, scale, base, weight, incoming = _inputs(130, seed=9)
     full = mhc.pre(residual, fn, scale, base, weight, incoming)
+
+    def same(part, rows):
+        for a, b in zip(part[1:5], full[1:5]):
+            assert torch.equal(a, b[rows]), rows
+        cast, whole = part[5], full[5]
+        n = cast.rows.shape[0]
+        _assert_bytes_equal(cast.values[:n], whole.values[rows], f"{rows}: ")
+        _assert_bytes_equal(cast.scales[:n], whole.scales[rows], f"{rows}: ")
+
     for rows in (1, 2, 7, 16, 17, 33, 64):
-        part = mhc.pre(residual[:rows], fn, scale, base, weight, incoming[:rows])
-        for a, b in zip(part[1:], full[1:]):
-            assert torch.equal(a, b[:rows]), rows
-    part = mhc.pre(residual[70:71], fn, scale, base, weight, incoming[70:71])
-    for a, b in zip(part[1:], full[1:]):
-        assert torch.equal(a, b[70:71])
+        same(
+            mhc.pre(residual[:rows], fn, scale, base, weight, incoming[:rows]),
+            slice(0, rows),
+        )
+    same(
+        mhc.pre(residual[70:71], fn, scale, base, weight, incoming[70:71]),
+        slice(70, 71),
+    )
 
 
 def test_pre_nan_token(mhc):
@@ -201,13 +255,68 @@ def test_pre_nan_token(mhc):
     token."""
     tokens, t = 33, 7
     residual, fn, scale, base, weight, incoming = _inputs(tokens, seed=11)
-    clean = [a.clone() for a in mhc.pre(residual, fn, scale, base, weight, incoming)]
+    clean = [
+        a.clone() for a in mhc.pre(residual, fn, scale, base, weight, incoming)[:5]
+    ]
     residual = residual.clone()
     residual[t, 2, 100] = NAN
     actual = mhc.pre(residual, fn, scale, base, weight, incoming)
     for name, got, before in zip(("post", "comb", "y", "pre"), actual[1:], clean[1:]):
         assert_rows_nan(got, [t], f"{name}: ")
         assert_other_rows_equal(got, before, [t], f"{name}: ")
+
+
+# The entries' MXFP8 cast of y, for the sublayer's block-32 projections: TileKernels'
+# per_token_cast's bytes (E4M3 and packed UE8M0), which the projections no longer write.
+
+
+@pytest.mark.parametrize("first", [False, True])
+@pytest.mark.parametrize("tokens", [1, 6, 64, 65, 96, 129, 300, 2048])
+def test_entry_cast_is_per_token_cast(mhc, tokens, first):
+    """At decode and prefill sizes (decode sizes in whole tiles), from both finalize
+    widths (the first layer's broadcast, four streams), and in every scale regime the
+    norm weight gives y: zeroed blocks (the 1e-4 amax floor), blocks far below it,
+    blocks above 448 (positive exponents) and block maxima a power of two apart."""
+    residual, fn, scale, base, weight, incoming = _inputs(tokens, seed=1300 + tokens)
+    weight[:64] = 0.0
+    weight[64:128] = 1e-30
+    weight[128:192] *= 4096.0
+    weight[192:256] = 2.0 ** torch.arange(-16, 48, device=DEVICE, dtype=torch.float32)
+    if first:
+        embedding = residual[:, 0].contiguous()
+        broadcast = fn.view(MIXES, 4, HIDDEN).sum(1)
+        out = mhc.pre(embedding, broadcast, scale, base, weight, None)
+    else:
+        out = mhc.pre(residual, fn, scale, base, weight, incoming)
+    _assert_cast(out[5], out[3])
+
+
+def test_entry_cast_of_a_nan_token(mhc):
+    """A NaN token's y row casts as per_token_cast casts it; no other row moves."""
+    tokens, t = 33, 7
+    residual, fn, scale, base, weight, incoming = _inputs(tokens, seed=17)
+    clean = mhc.pre(residual, fn, scale, base, weight, incoming)
+    residual = residual.clone()
+    residual[t, 2, 100] = NAN
+    actual = mhc.pre(residual, fn, scale, base, weight, incoming)
+    assert_rows_nan(actual[3], [t])
+    _assert_cast(actual[5], actual[3])
+    others = [r for r in range(tokens) if r != t]
+    for name in ("values", "scales"):
+        _assert_bytes_equal(
+            getattr(actual[5], name).view(torch.uint8)[others],
+            getattr(clean[5], name).view(torch.uint8)[others],
+            f"{name}: ",
+        )
+
+
+@pytest.mark.parametrize("tokens", [1, 70, 300])
+def test_cast_rows_is_per_token_cast(mhc, tokens):
+    """Rows regrouped after their entry (a CED boundary's compact rows, prefill SP's
+    gathered rows) are cast by per_token_cast into the same padded buffers."""
+    _, state, _, _ = _post_inputs(tokens, seed=1400 + tokens)
+    rows = state[:, 1].contiguous()
+    _assert_cast(mhc.cast_rows(rows), rows)
 
 
 @pytest.mark.parametrize("block_M", [16, 32])

@@ -163,6 +163,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             shared.act_fn = kernels.shared_expert_activation(
                 shared.act_fn, shared.gate_up_proj.output_size_per_partition // 2
             )
+        # The mHC entries write these projections' MXFP8 input (the routed
+        # experts' too): ``forward`` hands it over and they cast nothing.
+        self.attn.fused_wqa_wkv.tilelang_mxfp8_input = True
+        if shared is not None:
+            shared.gate_up_proj.tilelang_mxfp8_input = True
 
         # A CED decoder layer routes the compact decoder rows, whose padding
         # mask differs from the step's. Tag its router by layer, never by the
@@ -225,11 +230,17 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
 
     def declare_kernels(self) -> None:
-        """Declare the MoE router's kernels (a router is not a module)."""
+        """Declare the MoE router's kernels (a router is not a module) and the MXFP8
+        cast of the rows a forward regroups after the mHC entry that cast them
+        (CED's compact rows, prefill SP's gathered rows)."""
+        from ..tilelang import prepare
+        from ..tilelang.linear import _warm_casts
+
         router = getattr(self.ffn.experts, "router", None)
         declare = getattr(router, "declare_kernels", None)
         if declare is not None:
             declare()
+        prepare.declare(warm=lambda: _warm_casts(self.hidden_size))
 
     def build_l2_prefetch(self, nxt: "DeepseekV4DecoderLayer | None") -> str:
         """Install this layer's L2 prefetch windows; see ``l2_prefetch``."""
@@ -313,7 +324,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 sp_rows=sp_rows,
             )
         fn = self.hc_attn_fn_broadcast if residual.ndim == 2 else self.hc_attn_fn
-        residual, post_mix, res_mix, x, attn_pre = self.mhc.pre(
+        # x_q: x's MXFP8 cast for the sublayer's projections.
+        residual, post_mix, res_mix, x, attn_pre, x_q = self.mhc.pre(
             residual,
             fn,
             self.hc_attn_scale,
@@ -330,6 +342,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             # residual updates and experts only need the selected replay rows.
             global_kv_ready = self.attn.prepare_global_kv(positions, x)
             x = gather_rows(x, ced_indices)
+            x_q = self.mhc.cast_rows(x)
             residual = gather_rows(residual, ced_indices)
             post_mix = gather_rows(post_mix, ced_indices)
             res_mix = gather_rows(res_mix, ced_indices)
@@ -338,14 +351,15 @@ class DeepseekV4DecoderLayer(nn.Module):
             if input_ids is not None:
                 input_ids = gather_rows(input_ids, ced_indices)
         if sp_rows is None:
-            x = self.attn(positions, x, None, global_kv_ready=global_kv_ready)
+            with kernels.mxfp8_inputs(x_q):
+                x = self.attn(positions, x, None, global_kv_ready=global_kv_ready)
         else:
             # SP: attention gathers every row and reduce-scatters its output.
-            with sp_prefill.activate(sp_rows):
+            with sp_prefill.activate(sp_rows), kernels.mxfp8_inputs(x_q):
                 x = self.attn(positions, x, None, global_kv_ready=global_kv_ready)
             if sp_rows.unreduced:
                 x = sp_prefill.unreduced_parts(x)
-        residual, post_mix, res_mix, x, ffn_pre = self.mhc.post_pre(
+        residual, post_mix, res_mix, x, ffn_pre, x_q = self.mhc.post_pre(
             x,
             residual,
             post_mix,
@@ -357,15 +371,18 @@ class DeepseekV4DecoderLayer(nn.Module):
             attn_pre,
         )
         if sp_rows is None:
-            x = self.ffn(x, input_ids)
+            with kernels.mxfp8_inputs(x_q):
+                x = self.ffn(x, input_ids)
         else:
             # SP: route every row; the TP partial sum is reduce-scattered.
             with sp_prefill.activate(sp_rows):
-                x = self.ffn(
-                    sp_rows.gather(x),
-                    input_ids,
-                    reduce_scatter_rows=sp_rows.padded_rows,
-                )
+                rows = sp_rows.gather(x)
+                with kernels.mxfp8_inputs(self.mhc.cast_rows(rows)):
+                    x = self.ffn(
+                        rows,
+                        input_ids,
+                        reduce_scatter_rows=sp_rows.padded_rows,
+                    )
             if sp_rows.unreduced:
                 x = sp_prefill.unreduced_parts(x)
         return x, residual, post_mix, res_mix, ffn_pre

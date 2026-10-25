@@ -26,7 +26,10 @@ from vllm.models.deepseek_v4_1.tilelang.gemm import (  # noqa: E402
     pack_scale_codes,
     pack_scale_words,
 )
-from vllm.models.deepseek_v4_1.tilelang.linear import _calls  # noqa: E402
+from vllm.models.deepseek_v4_1.tilelang.linear import (  # noqa: E402
+    _calls,
+    cast_mxfp8,
+)
 from vllm.models.deepseek_v4_1.tilelang.moe import (  # noqa: E402
     MoeDispatchV41Plan,
     MoeExpertsV41Plan,
@@ -37,9 +40,6 @@ from vllm.models.deepseek_v4_1.tilelang.moe import (  # noqa: E402
     tile_expert_weights,
     workspace_bytes,
 )
-
-# Declaring a plan warms TileKernels' token cast for the scheduler's batch buckets.
-pytestmark = pytest.mark.usefixtures("default_vllm_config")
 
 DEVICE = "cuda"
 E2M1 = (
@@ -140,7 +140,7 @@ def test_moe_experts(rows, idx_dtype, hidden, intermediate, num_experts=32, topk
         dtype=torch.uint8,
         device=DEVICE,
     )
-    plan.run(x, ids, route_weights, weights, out, workspace)
+    plan.run(cast_mxfp8(x), ids, route_weights, weights, out, workspace)
     ref = _reference(x, ids, route_weights, w13, w2, intermediate)
     scale = ref.abs().max().item()
     torch.testing.assert_close(out.float(), ref, rtol=3e-2, atol=3e-2 * scale)
@@ -148,7 +148,13 @@ def test_moe_experts(rows, idx_dtype, hidden, intermediate, num_experts=32, topk
     # A token's output does not depend on the rest of the batch.
     for r in {0, rows - 1}:
         solo = torch.empty_like(x[r : r + 1])
-        plan.run(x[r : r + 1], ids[r : r + 1], route_weights[r : r + 1], weights, solo)
+        plan.run(
+            cast_mxfp8(x[r : r + 1]),
+            ids[r : r + 1],
+            route_weights[r : r + 1],
+            weights,
+            solo,
+        )
         assert torch.equal(solo[0], out[r]), f"row {r} changed with batch composition"
 
 
@@ -175,13 +181,17 @@ def test_moe_experts_fp32_output(
     for dtype, plan in plans.items():
         assert plan.out_dtype == dtype
         outs[dtype] = torch.empty((rows, hidden), dtype=dtype, device=DEVICE)
-        plan.run(x, ids, route_weights, weights, outs[dtype])
+        plan.run(cast_mxfp8(x), ids, route_weights, weights, outs[dtype])
     assert torch.equal(outs[torch.float32].bfloat16(), outs[torch.bfloat16])
     assert not torch.equal(outs[torch.float32], outs[torch.bfloat16].float())
     for r in {0, rows - 1}:
         solo = torch.empty((1, hidden), dtype=torch.float32, device=DEVICE)
         plans[torch.float32].run(
-            x[r : r + 1], ids[r : r + 1], route_weights[r : r + 1], weights, solo
+            cast_mxfp8(x[r : r + 1]),
+            ids[r : r + 1],
+            route_weights[r : r + 1],
+            weights,
+            solo,
         )
         assert torch.equal(solo[0], outs[torch.float32][r])
 
@@ -204,16 +214,17 @@ def test_moe_experts_fold_shared(
     x = (torch.randn((rows, hidden), generator=_gen(3), device=DEVICE) * 0.5).bfloat16()
     shared = (torch.randn((rows, hidden), generator=_gen(5), device=DEVICE)).bfloat16()
     ids, route_weights = _routes(rows, num_experts, topk, 4, torch.int32)
+    tokens = cast_mxfp8(x)
     wide = torch.empty((rows, hidden), dtype=torch.float32, device=DEVICE)
-    plan.run(x, ids, route_weights, weights, wide)
+    plan.run(tokens, ids, route_weights, weights, wide)
     folded = torch.empty((rows, hidden), dtype=torch.bfloat16, device=DEVICE)
-    plan.run(x, ids, route_weights, weights, folded, shared=shared)
+    plan.run(tokens, ids, route_weights, weights, folded, shared=shared)
     assert torch.equal(folded, (shared + wide).to(torch.bfloat16))  # all-reduce path
     buffer = torch.empty_like(folded)
     torch.add(shared, wide, out=buffer)  # reduce-scatter buffer
     assert torch.equal(folded, buffer)
     with pytest.raises(AssertionError):
-        plan.run(x, ids, route_weights, weights, folded)  # BF16 out needs the shared
+        plan.run(tokens, ids, route_weights, weights, folded)  # BF16 needs the shared
 
 
 @pytest.mark.parametrize("rows", [1, 12, 96])
@@ -233,8 +244,9 @@ def test_moe_experts_fold_deferred_shared(
     x = (torch.randn((rows, hidden), generator=_gen(3), device=DEVICE) * 0.5).bfloat16()
     source = torch.randn((rows, hidden), generator=_gen(5), device=DEVICE)
     ids, route_weights = _routes(rows, num_experts, topk, 4, torch.int32)
+    tokens = cast_mxfp8(x)
     direct = torch.empty((rows, hidden), dtype=torch.bfloat16, device=DEVICE)
-    plan.run(x, ids, route_weights, weights, direct, shared=source.bfloat16())
+    plan.run(tokens, ids, route_weights, weights, direct, shared=source.bfloat16())
 
     side, ready = torch.cuda.Stream(), torch.cuda.Event()
     side.wait_stream(torch.cuda.current_stream())
@@ -249,7 +261,7 @@ def test_moe_experts_fold_deferred_shared(
         return shared
 
     deferred = torch.empty_like(direct)
-    plan.run(x, ids, route_weights, weights, deferred, shared=resolve)
+    plan.run(tokens, ids, route_weights, weights, deferred, shared=resolve)
     assert calls == [1]
     assert torch.equal(deferred, direct)
 
@@ -264,7 +276,7 @@ def _case(rows, hidden=384, intermediate=576, num_experts=32, topk=6):
 
     def run(tokens):
         out = torch.empty_like(tokens)
-        plan.run(tokens, ids, route_weights, weights, out)
+        plan.run(cast_mxfp8(tokens), ids, route_weights, weights, out)
         return out
 
     return run, x, ids, route_weights, w13, w2, intermediate

@@ -54,7 +54,7 @@ from .gemm import (
     pack_scale_codes,
     scale_words,
 )
-from .linear import _calls, _launch, _warm_casts
+from .linear import MXFP8Rows, _calls, _launch
 
 # Routes handled by one CTA of the dispatch kernels.
 _CHUNK = 512
@@ -1139,11 +1139,13 @@ class MoeExpertsV41Plan:
 
     Expert weights come from ``prepare_weights``: ``w13`` (``[E, 2I, H / 2]``
     packed E2M1, gate rows first) and ``w2`` (``[E, H, I / 2]``), each with
-    its UE8M0 bytes, become tile-major. The fused SwiGLU (``moe_swiglu_cast``:
-    DeepSeek's clamp, route weight before the down projection, MXFP8 cast) runs
-    between the GEMMs. The plan holds no buffers; ``workspace_specs(rows)``
-    lists one call's scratch. Its owner calls ``declare_kernels()`` when
-    preparing kernels; ``run`` launches the kernels it binds.
+    its UE8M0 bytes, become tile-major. The tokens arrive cast to MXFP8 by the
+    kernel that produced them (``linear.MXFP8Rows``: the mHC entry). The fused
+    SwiGLU (``moe_swiglu_cast``: DeepSeek's clamp, route weight before the down
+    projection, MXFP8 cast) runs between the GEMMs. The plan holds no buffers;
+    ``workspace_specs(rows)`` lists one call's scratch. Its owner calls
+    ``declare_kernels()`` when preparing kernels; ``run`` launches the kernels it
+    binds.
     """
 
     def __init__(
@@ -1216,8 +1218,7 @@ class MoeExpertsV41Plan:
 
     def declare_kernels(self) -> None:
         """Declare the grouped GEMMs, the fused SwiGLU and each dispatch plan's
-        kernels, stored on the plans once prepared, and warm TileKernels' MXFP8
-        cast of the tokens for each batch bucket a step can launch."""
+        kernels, stored on the plans once prepared."""
 
         def calls() -> list[prepare.TileLangCall]:
             out = _calls(self.kernels())
@@ -1231,7 +1232,7 @@ class MoeExpertsV41Plan:
             for dispatch in self.dispatch.values():
                 dispatch.bind()
 
-        prepare.declare(calls, bind=bind, warm=lambda: _warm_casts(self.hidden))
+        prepare.declare(calls, bind=bind)
 
     def prepare_weights(self, w13, w13_scale, w2, w2_scale):
         """Per GEMM ``(tiles, tails, scale codes, row bases)`` from E2M1 weights and
@@ -1260,42 +1261,48 @@ class MoeExpertsV41Plan:
         hidden, inter = self.hidden, self.intermediate
         return (
             *dispatch.workspace_specs(rows),
-            ((rows, hidden), torch.float8_e4m3fn),  # tokens, MXFP8
-            ((rows, 4 * scale_words(hidden)), torch.uint8),
             ((layout_rows, 2 * inter), torch.bfloat16),  # gate/up output
             ((layout_rows, inter), torch.float8_e4m3fn),  # down input, MXFP8
             ((layout_rows, 4 * scale_words(inter)), torch.uint8),
             ((layout_rows, hidden), torch.bfloat16),  # down output
         )
 
-    def run(self, x, topk_ids, topk_weights, weights, out, workspace=None, shared=None):
+    def run(
+        self,
+        x: MXFP8Rows,
+        topk_ids,
+        topk_weights,
+        weights,
+        out,
+        workspace=None,
+        shared=None,
+    ):
         """``out[t] = sum_k w[t, k] * down_e(swiglu(gate_up_e(x[t]))) (+ shared[t])``.
 
-        ``e`` is the token's k-th expert. ``weights`` comes from
-        ``prepare_weights``; ``workspace`` is a byte buffer of at least
+        ``e`` is the token's k-th expert. ``x`` is the tokens' MXFP8 rows, as their
+        producer wrote them. ``weights`` comes from ``prepare_weights``;
+        ``workspace`` is a byte buffer of at least
         ``workspace_bytes(workspace_specs(rows))``. ``shared`` (BF16 rows) is added
         to the FP32 sum before the one rounding to ``out``'s dtype; a callable
         ``shared`` is called just before the combine launch (it may wait for
         another stream) and returns those rows.
         """
-        rows = x.shape[0]
+        rows = topk_ids.shape[0]
         dispatch = self.dispatch[topk_ids.dtype]
         specs = self.workspace_specs(rows, topk_ids.dtype)
         if workspace is None:
             workspace = torch.empty(
-                workspace_bytes(specs), dtype=torch.uint8, device=x.device
+                workspace_bytes(specs), dtype=torch.uint8, device=x.values.device
             )
         buffers = carve(workspace, specs)
         count = len(dispatch.workspace_specs(rows))
-        xq, x_sf, h, hq, h_sf, y = buffers[count:]
+        h, hq, h_sf, y = buffers[count:]
         gate_up, down = weights
         layout = dispatch.dispatch(topk_ids, topk_weights, buffers[:count])
-        self.tk.quant.per_token_cast(
-            x, "e4m3", SF_BLOCK, round_sf=True, use_packed_ue8m0=True, out=(xq, x_sf)
-        )
         order, tile_expert = layout["order"], layout["tile_expert"]
-        x_words, h_words = x_sf.view(torch.uint32), h_sf.view(torch.uint32)
-        self.gate_up(xq, x_words, *_present(gate_up), order, tile_expert, h)
+        # The gather reads the live rows only; padding rows past them are not read.
+        x_words, h_words = x.scales.view(torch.uint32), h_sf.view(torch.uint32)
+        self.gate_up(x.values, x_words, *_present(gate_up), order, tile_expert, h)
         self.swiglu(h, hq, h_sf, order, layout["layout_weights"], tile_expert)
         self.down(hq, h_words, *_present(down), order, tile_expert, y)
         if callable(shared):

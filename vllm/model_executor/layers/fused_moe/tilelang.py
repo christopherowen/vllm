@@ -5,13 +5,14 @@
 One layer runs, all from the modular kernel's workspace:
 
 1. dispatch: routes grouped by expert in the contiguous grouped-GEMM layout;
-2. MXFP8 cast of the tokens (TileKernels ``per_token_cast``);
-3. grouped gate/up GEMM over the dispatched rows, gathering tokens with
-   ``cp.async`` from tile-major expert weights;
-4. SwiGLU with DeepSeek's clamp, the route weight and the MXFP8 cast of the
-   down projection's input, fused (TileKernels);
-5. grouped down GEMM;
-6. combine: each token's expert outputs summed in slot order in FP32.
+2. grouped gate/up GEMM over the dispatched rows, gathering the tokens' MXFP8
+   rows with ``cp.async`` from tile-major expert weights; the kernel that produced
+   the tokens wrote that cast (the mHC entry, ``linear.MXFP8Rows``) and hands it
+   over for the call (``linear.provide_mxfp8``);
+3. SwiGLU with DeepSeek's clamp, the route weight and the MXFP8 cast of the
+   down projection's input, fused (TileKernels' arithmetic);
+4. grouped down GEMM;
+5. combine: each token's expert outputs summed in slot order in FP32.
 
 Route weights are applied before the down projection, as DeepSeek does. No
 step uses atomics on results, so a token's output does not depend on the
@@ -49,6 +50,12 @@ def _kernels():
     from vllm.models.deepseek_v4_1.tilelang import moe
 
     return moe
+
+
+def _provided_mxfp8(hidden_states: torch.Tensor):
+    from vllm.models.deepseek_v4_1.tilelang.linear import provided_mxfp8
+
+    return provided_mxfp8(hidden_states)
 
 
 def _output_dtype() -> torch.dtype:
@@ -289,7 +296,13 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
             assert self.combine_addend is not None, "the shared output must be given"
             shared = self.combine_addend
         self._plan.run(
-            hidden_states, topk_ids, topk_weights, weights, output, workspace, shared
+            _provided_mxfp8(hidden_states),
+            topk_ids,
+            topk_weights,
+            weights,
+            output,
+            workspace,
+            shared,
         )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:

@@ -7,6 +7,8 @@ checks that explicit attention, linear and MoE backends name it. Model code asks
 this module for the implementation of each component instead of naming it.
 """
 
+import contextlib
+
 import torch
 from torch import nn
 
@@ -63,6 +65,25 @@ def mhc(config) -> nn.Module:
     from .tilelang.mhc import TileKernelsMHC
 
     return TileKernelsMHC(config)
+
+
+def cast_mxfp8(rows: torch.Tensor):
+    """The MXFP8 cast of rows regrouped after their producer (``linear.MXFP8Rows``),
+    for projections that read their input's cast."""
+    from .tilelang.linear import cast_mxfp8
+
+    return cast_mxfp8(rows)
+
+
+def mxfp8_inputs(rows) -> contextlib.AbstractContextManager:
+    """Hand a sublayer's projections their input's MXFP8 cast (``linear.MXFP8Rows``,
+    from the mHC entry or ``cast_mxfp8``) for the calls inside; nothing for None
+    (the model tests' mHC stand-ins return no cast)."""
+    if rows is None:
+        return contextlib.nullcontext()
+    from .tilelang.linear import provide_mxfp8
+
+    return provide_mxfp8(rows)
 
 
 def rms_norm(hidden_size: int, eps: float = 1e-6) -> nn.Module:

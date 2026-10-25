@@ -412,10 +412,14 @@ class _Mix:
             torch.eye(4).expand(rows, 4, 4),
             residual[:, 0, :] * 0.5 + residual[:, 1, :] * 0.5,
             mix,
+            None,  # no MXFP8 cast: the stand-in projections take any rows
         )
 
     def post_pre(self, x, residual, post, comb, fn, scale, base, norm, pre):
         return self.pre(self.post(x, residual, post, comb), fn, scale, base, norm, pre)
+
+    def cast_rows(self, rows):
+        return None
 
 
 def _partial(world, rows, result):

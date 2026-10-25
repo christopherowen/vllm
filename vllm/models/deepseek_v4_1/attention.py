@@ -783,11 +783,15 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             hidden_states = None
             rows = sp_rows.num_tokens
         else:
+            gathered = None
             if sp_rows is not None:
-                # Sequence-parallel prefill: attention runs on every row.
+                # Sequence-parallel prefill: attention runs on every row, and the
+                # projection reads the gathered rows' MXFP8 cast.
                 hidden_states = sp_rows.gather(hidden_states)
+                gathered = kernels.cast_mxfp8(hidden_states)
             rows = hidden_states.shape[0]
-            qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+            with kernels.mxfp8_inputs(gathered):
+                qr_kv, _ = self.fused_wqa_wkv(hidden_states)
             qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
             qr, kv = self.q_norm(qr), self.kv_norm(kv)
         q = self.wq_b(qr).view(rows, self.n_local_heads, 512)

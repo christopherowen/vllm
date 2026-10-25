@@ -294,6 +294,60 @@ def test_block32_rows(default_vllm_config, n=1792, k=5120, start=1280):
         TileLangBlock32Rows(layer, start + 16)
 
 
+# Attention's fused Q-A/KV (1792 x 5120 at TP4) and the shared expert's gate/up
+# (1152 x 5120) read their input's MXFP8 cast from the mHC entry that wrote it.
+@pytest.mark.parametrize("n, k", [(1792, 5120), (1152, 5120)])
+def test_block32_reads_its_producers_cast(default_vllm_config, n, k):
+    """A projection marked ``tilelang_mxfp8_input`` gives, from the cast handed over
+    with its input (``provide_mxfp8``), the bits it gives casting the input itself:
+    decode tiles over the padded rows and prefill GEMMs over the live rows. Without
+    a cast, or with another tensor's, it fails rather than casting."""
+    from torch import nn
+
+    from vllm.models.deepseek_v4_1.tilelang.linear import (
+        TileLangBlock32Rows,
+        cast_mxfp8,
+        provide_mxfp8,
+    )
+    from vllm.v1.worker.workspace import use_preallocated_workspace
+
+    weight, exps, _ = _block32_weight(n, k, 6)
+    layer = nn.Module()
+    layer.weight, layer.weight_scale_inv = weight, exps
+    casting = TileLangBlock32Rows(layer, 0)
+    casting.declare_kernels()
+    fed = TileLangBlock32Rows(layer, 0)
+    fed.tilelang_mxfp8_input = True
+    fed.declare_kernels()
+    x = torch.randn((300, k), generator=_gen(8), device=DEVICE).bfloat16()
+    scratch = torch.empty(16 << 20, dtype=torch.uint8, device=DEVICE)
+    with use_preallocated_workspace(scratch):
+        for count in (1, 7, 16, 17, 64, 65, 96, 128, 129, 300):
+            rows = x[:count]
+            expected = casting(rows)
+            with provide_mxfp8(cast_mxfp8(rows)):
+                assert torch.equal(fed(rows), expected), f"rows={count}"
+            with pytest.raises(RuntimeError):
+                fed(rows)
+            with provide_mxfp8(cast_mxfp8(rows.clone())), pytest.raises(RuntimeError):
+                fed(rows)
+
+
+def test_block32_split_cannot_read_a_producers_cast(default_vllm_config):
+    """A split-K projection's decode scratch is its own: marking it is refused."""
+    from torch import nn
+
+    from vllm.models.deepseek_v4_1.tilelang.linear import TileLangBlock32Rows
+
+    weight, exps, _ = _block32_weight(1792, 5120, 6)
+    layer = nn.Module()
+    layer.weight, layer.weight_scale_inv = weight, exps
+    narrow = TileLangBlock32Rows(layer, 1280)  # 512 x 5120: splits K
+    narrow.tilelang_mxfp8_input = True
+    with pytest.raises(ValueError):
+        narrow.declare_kernels()
+
+
 # The router splits K eight ways; (100, 200) cannot split.
 @pytest.mark.parametrize("n, k", [(384, 5120), (100, 200)])
 @pytest.mark.parametrize("rows", [7, 65])
