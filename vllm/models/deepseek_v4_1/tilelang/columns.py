@@ -37,6 +37,10 @@ _HEADER = r"""
 __device__ __forceinline__ void vllm_columns_b128(void* d, const void* s) {
   *reinterpret_cast<uint4*>(d) = *reinterpret_cast<const uint4*>(s);
 }
+
+__device__ __forceinline__ void vllm_columns_zero_b128(void* d) {
+  *reinterpret_cast<uint4*>(d) = make_uint4(0u, 0u, 0u, 0u);
+}
 """
 
 
@@ -74,6 +78,35 @@ def copy_columns_kernel(width: int, dtype: str):
                 )
 
     return copy_columns
+
+
+@tilelang.jit(pass_configs=_PASS)
+def zero_packs_kernel():
+    """Zero bits into the first ``packs`` 16-byte packs of ``out``, any dtype (viewed
+    as int32 words, four a pack)."""
+    words = T.dynamic("words")
+
+    @T.prim_func
+    def zero_packs(out: T.Tensor((words,), T.int32), packs: T.int32):
+        with T.Kernel(T.ceildiv(packs, _THREADS), threads=_THREADS) as bx:
+            T.import_source(_HEADER)
+            p = bx * _THREADS + T.get_thread_binding()
+            if p < packs:
+                T.call_extern(
+                    "handle", "vllm_columns_zero_b128", T.address_of(out[p * 4])
+                )
+
+    return zero_packs
+
+
+def zero_(out: torch.Tensor) -> torch.Tensor:
+    """``out.zero_()`` for a contiguous tensor of whole 16-byte packs."""
+    nbytes = out.numel() * out.element_size()
+    if not out.is_contiguous() or nbytes % _VECTOR_BYTES or out.data_ptr() % 16:
+        raise ValueError("zero_ fills contiguous 16-byte packs")
+    if nbytes:
+        zero_packs_kernel()(out.view(-1).view(torch.int32), nbytes // _VECTOR_BYTES)
+    return out
 
 
 def _move(part, whole, join: bool):
@@ -198,6 +231,8 @@ def join_columns(parts: list[torch.Tensor], out: torch.Tensor) -> torch.Tensor:
 
 
 __all__ = [
+    "zero_",
+    "zero_packs_kernel",
     "copy_columns",
     "copy_columns_kernel",
     "copy_columns_key",

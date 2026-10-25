@@ -79,6 +79,23 @@ def test_join_columns_like_torch_cat(parts, rows):
     assert torch.equal(_bits(out), _bits(torch.cat(states, dim=-1)))
 
 
+@pytest.mark.parametrize(
+    "shape, dtype",
+    [
+        ((8192, 5120), torch.bfloat16),  # CED's full hidden rows
+        ((37, 4), torch.float32),  # pre_mix / sink columns
+        ((3, 8), torch.bfloat16),
+    ],
+)
+def test_zero_fills_every_byte(shape, dtype):
+    """CED's full-row output starts as zeros (torch's new_zeros), any dtype."""
+    out = torch.full(shape, float("nan"), dtype=dtype, device=DEVICE)
+    assert columns.zero_(out) is out
+    assert not out.view(torch.uint8).any()
+    with pytest.raises(ValueError, match="16-byte"):
+        columns.zero_(torch.empty(3, 5, dtype=torch.bfloat16, device=DEVICE))
+
+
 def test_float32_parts():
     gathered = _rows(9, 64 + 32 + 16, 5, torch.float32)
     expected = [p.contiguous() for p in gathered.split((64, 32, 16), dim=-1)]
