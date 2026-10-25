@@ -29,15 +29,29 @@ from vllm.models.deepseek_v41.nvidia.vl_model import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
-from .b12x_vision import (
-    DeepseekV4Aligner,
-    DeepseekV4ViT,
-    run_dp_sharded_vision_tower,
-)
+from .. import kernels
 from .model import (
     DeepseekV41LLMForCausalLM,
     _linear_scale_param_name,
 )
+
+
+def _vision_tower():
+    """The kernel family's ViT, aligner and data-parallel image runner. Both
+    families keep the checkpoint's parameter tree, so loading is the same."""
+    if kernels.uses_tilelang():
+        from .tilelang_vision import (
+            DeepseekV4Aligner,
+            DeepseekV4ViT,
+            run_dp_sharded_vision_tower,
+        )
+    else:
+        from .b12x_vision import (
+            DeepseekV4Aligner,
+            DeepseekV4ViT,
+            run_dp_sharded_vision_tower,
+        )
+    return DeepseekV4ViT, DeepseekV4Aligner, run_dp_sharded_vision_tower
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -67,10 +81,11 @@ class DeepseekV41ForCausalLM(UpstreamDeepseekV41ForCausalLM):
 
         # The tower is always built; _mark_tower_model stubs it out
         # (StageMissingLayer, weights skipped) when the image limit is 0.
+        vit, aligner, self._run_dp_sharded_vision_tower = _vision_tower()
         with self._mark_tower_model(vllm_config, {"image"}):
             self.use_data_parallel = True
-            self.vision = DeepseekV4ViT(config)
-            self.aligner = DeepseekV4Aligner(config)
+            self.vision = vit(config)
+            self.aligner = aligner(config)
             self.image_start = nn.Parameter(
                 torch.empty(config.hidden_size, dtype=torch.float32)
             )
@@ -113,7 +128,7 @@ class DeepseekV41ForCausalLM(UpstreamDeepseekV41ForCausalLM):
         if self.use_data_parallel and get_tensor_model_parallel_world_size() > 1:
             # Data-parallel ViT: shard images across TP ranks and all-gather
             # the per-image embeddings (weights are replicated on every rank).
-            image_embeds_list = run_dp_sharded_vision_tower(
+            image_embeds_list = self._run_dp_sharded_vision_tower(
                 self.vision, self.aligner, patches, vit_grid
             )
         else:
