@@ -10,6 +10,7 @@ from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+from vllm.model_executor.model_loader.direct_loader import DirectModelLoader
 from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
 from vllm.model_executor.model_loader.modelexpress_loader import (
     ModelExpressModelLoader,
@@ -34,6 +35,7 @@ logger = init_logger(__name__)
 LoadFormats = Literal[
     "auto",
     "b12x",
+    "direct",
     "hf",
     "dummy",
     "fastsafetensors",
@@ -52,6 +54,7 @@ LoadFormats = Literal[
 ]
 _LOAD_FORMAT_TO_MODEL_LOADER: dict[str, type[BaseModelLoader]] = {
     "auto": DefaultModelLoader,
+    "direct": DirectModelLoader,
     "hf": DefaultModelLoader,
     "dummy": DummyModelLoader,
     "fastsafetensors": DefaultModelLoader,
@@ -160,6 +163,7 @@ __all__ = [
     "BaseModelLoader",
     "ModelExpressModelLoader",
     "DefaultModelLoader",
+    "DirectModelLoader",
     "DummyModelLoader",
     "IpcModelLoader",
     "RunaiModelStreamerLoader",
