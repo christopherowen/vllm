@@ -140,6 +140,20 @@ def test_dflash_uses_draft_group_dcp_slot_parameters(
         "build_slot_mappings_by_layer",
         lambda *_args, **_kwargs: {},
     )
+    # The padding rows are a TileLang launch, a CUDA kernel. This stub's buffers are
+    # host tensors, where a host fill stands in for it; on CUDA the kernel runs.
+    from vllm.v1.worker.gpu import tilelang_inputs
+
+    padding_rows = tilelang_inputs.padding_rows
+    monkeypatch.setattr(
+        tilelang_inputs,
+        "padding_rows",
+        lambda is_padding, live, rows: (
+            padding_rows(is_padding, live, rows)
+            if is_padding.is_cuda
+            else is_padding[:rows].copy_(torch.arange(rows) >= live)
+        ),
+    )
 
     block_tables = SimpleNamespace(
         slot_mappings=torch.zeros((1, 1), dtype=torch.int64),
