@@ -157,3 +157,31 @@ def test_adaptive_verification_kernels_are_declared_before_the_manager_exists(
     budget = (tilelang_inputs.assign_draft_budget_kernel, (steps, "int64"))
     assert budget in calls
     assert (tilelang_inputs.fill_rows_kernel, ("int64", "float32")) in calls
+
+
+def test_sink_declares_ranks_for_dense_alternate_rows(monkeypatch):
+    """The sink ranks its alternates in dense copies of their rows: at TP3 the
+    logits' padded row stride (129408) is not the vocabulary (129280), so the
+    dense stride needs its own declaration."""
+    import torch
+
+    from vllm.v1.worker.gpu.sample import tilelang_logprob, tilelang_sampling
+    from vllm.v1.worker.gpu.sample.sink import SinkSampler
+
+    declared: list = []
+    monkeypatch.setattr(tilelang_sampling, "declare", lambda calls: None)
+    monkeypatch.setattr(
+        tilelang_logprob,
+        "register_ranks",
+        lambda logits, vocab_size: declared.append((list(logits), vocab_size)),
+    )
+    vocab, padded = 129280, 129408
+    SinkSampler.register_warmups(
+        SimpleNamespace(num_alternates=4, rejection=True),
+        logits=((torch.bfloat16, padded),),
+        processed_logits_strides=(vocab, padded),
+        sampled_widths=(1, 6),
+        bin_counts_stride=vocab,
+        vocab_size=vocab,
+    )
+    assert declared == [([(torch.bfloat16, vocab), (torch.float32, vocab)], vocab)]
