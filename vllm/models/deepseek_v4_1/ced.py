@@ -208,6 +208,8 @@ class CEDState:
             lambda: [
                 prepare.call(ced_kernels.indices_kernel, self.max_requests),
                 prepare.call(ced_kernels.token_metadata_kernel),
+                prepare.call(ced_kernels.routing_mask_kernel),
+                prepare.call(ced_kernels.slots_kernel),
                 # Packed rows of each layout. A source view of wider rows would
                 # stop its first CED step with KernelNotPreparedError.
                 *(

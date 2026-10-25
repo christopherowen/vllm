@@ -15,7 +15,6 @@ from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport
-from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     get_kv_cache_spec_sliding_window,
@@ -709,10 +708,10 @@ class DFlashSpeculator(DraftModelSpeculator):
             # Keep query anchors and rejection masking in the ORIGINAL target
             # coordinates. Only the prepared context inputs are packed afterward.
             context_positions = gather_rows(self.context_positions, ced_indices)
+            from vllm.models.deepseek_v4_1.tilelang import ced as ced_kernels
+
             packed_context_slots = [
-                gather_rows(slots, ced_indices).masked_fill(
-                    ced_indices < 0, PAD_SLOT_ID
-                )
+                ced_kernels.gather_slots(slots, ced_indices)
                 for slots in self._context_slot_mappings
             ]
         # Each layer uses the context slots of its own KV-cache group. V4.1 can
