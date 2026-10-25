@@ -348,13 +348,15 @@ def test_prompt_ids_shift_each_chunk_to_its_next_token(index_dtype, length):
 
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("topk", [0, 1, 7, 1024])
-def test_custom_logprob_ids_override_topk_without_touching_padding(index_dtype, topk):
+def test_custom_logprob_ids_override_topk_and_clear_the_rest(index_dtype, topk):
+    """Every column is written: the Triton reference over the zeros the outputs
+    were allocated with before, from garbage outputs here."""
     from vllm.v1.worker.gpu.sample.logprob import _fill_logprob_token_ids_kernel
 
     states, rows = 11, 6
     cols = max(topk, 17)
     output = torch.full((rows, cols + 1), -19, device="cuda", dtype=torch.int64)
-    valid = torch.zeros_like(output, dtype=torch.bool)
+    valid = torch.ones_like(output, dtype=torch.bool)
     mapping = torch.tensor([10, 2, 4, 7, 5, 8], device="cuda", dtype=index_dtype)
     sampled = torch.randint(129280, (rows,), device="cuda", dtype=torch.int64)
     top_ids = torch.randint(
@@ -366,7 +368,8 @@ def test_custom_logprob_ids_override_topk_without_touching_padding(index_dtype, 
     if topk == 0:
         # The owner reuses the state-capacity tensor as an unused pointer.
         top_ids = custom
-    expected, expected_valid = output.clone(), valid.clone()
+    expected = torch.zeros_like(output)
+    expected_valid = torch.zeros_like(valid)
     _fill_logprob_token_ids_kernel[(rows,)](
         expected,
         expected.stride(0),
