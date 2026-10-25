@@ -2155,12 +2155,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         tilelang_inputs.declare(
             lambda: tilelang_inputs.gather_hidden_rows_calls(self.dtype, hidden_size)
         )
-        # The logits rows' inputs (InputBatch.logits_rows): a step's logits
-        # indices are int64, a dummy batch's int32.
-        tilelang_inputs.declare(
-            lambda: tilelang_inputs.logits_rows_calls(torch.int64)
-            + tilelang_inputs.logits_rows_calls(torch.int32)
-        )
+        # The logits rows' inputs (InputBatch.logits_rows): every batch's logits
+        # indices are int64, a dummy's too.
+        tilelang_inputs.declare(lambda: tilelang_inputs.logits_rows_calls(torch.int64))
 
         language_model = self._language_model()
         head = getattr(language_model, "lm_head", None)

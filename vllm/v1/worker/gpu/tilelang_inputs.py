@@ -632,15 +632,18 @@ def logits_rows_calls(index_dtype: torch.dtype) -> list:
 
 
 def gather_hidden_rows(source: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-    """``source[indices]`` for in-range indices: the hidden rows the LM head and the
-    drafter's head project, through the CED decoder's TileLang row copy (packed
-    rows, 16-byte pieces). A dummy batch's int32 indices are widened first."""
+    """``source[indices]`` for in-range int64 indices: the hidden rows the LM head
+    and the drafter's head project, through the CED decoder's TileLang row copy
+    (packed rows, 16-byte pieces)."""
     from vllm.models.deepseek_v4_1.tilelang import ced
 
+    if indices.dtype != torch.int64:
+        raise TypeError(
+            f"hidden rows are gathered by int64 indices, not {indices.dtype}"
+        )
     out = source.new_empty((indices.shape[0], *source.shape[1:]))
     if out.numel():
-        rows = indices if indices.dtype == torch.int64 else indices.long()
-        ced.copy_rows(source, rows, out, scatter=False)
+        ced.copy_rows(source, indices, out, scatter=False)
     return out
 
 

@@ -198,7 +198,8 @@ class InputBatch:
         input_buffers.is_padding[:num_tokens].fill_(True)
         is_padding = input_buffers.is_padding[:num_tokens]
 
-        logits_indices = query_start_loc[1:] - 1
+        # int64, as a real step's: the dummy runs the kernels serving runs.
+        logits_indices = (query_start_loc[1:] - 1).long()
         cu_num_logits = torch.arange(num_reqs + 1, device=device, dtype=torch.int32)
         cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
         # Copy so set_dummy_context can add context in place without touching

@@ -654,14 +654,15 @@ def test_expand_idx_mapping(num_reqs, idx_dtype):
 
 
 @pytest.mark.parametrize("num_rows", [1, 6, 96, 1000])
-@pytest.mark.parametrize("index_dtype", [torch.int64, torch.int32])
-def test_gather_hidden_rows(num_rows, index_dtype):
+def test_gather_hidden_rows(num_rows):
     """The hidden rows the heads project, against torch's indexing: repeated rows,
-    any order, a dummy batch's int32 indices."""
+    any order. Indices are int64, a dummy batch's too; others are refused."""
     gen = _gen(num_rows + 9)
     hidden = torch.randn(MAX_TOKENS // 8, 5120, generator=gen, device=DEVICE)
     hidden = hidden.to(torch.bfloat16)
-    indices = _randint(0, hidden.shape[0], (num_rows,), gen, index_dtype)
+    with pytest.raises(TypeError, match="int64"):
+        tli.gather_hidden_rows(hidden, torch.zeros(1, dtype=torch.int32, device=DEVICE))
+    indices = _randint(0, hidden.shape[0], (num_rows,), gen, torch.int64)
     if num_rows > 1:
         indices[1] = indices[0]
     out = tli.gather_hidden_rows(hidden, indices)
