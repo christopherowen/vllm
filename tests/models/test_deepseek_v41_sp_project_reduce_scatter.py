@@ -59,6 +59,57 @@ def test_wo_slices():
     assert sp_prefill.wo_slices(2048) == 2
 
 
+def test_moe_slices():
+    assert sp_prefill.moe_slices(205) == 1
+    assert sp_prefill.moe_slices(8191) == 1
+    assert sp_prefill.moe_slices(8192) == 2
+    assert sp_prefill.moe_slices(15395) == 3  # request inventory 5's prompt
+    assert sp_prefill.moe_slices(16288) == 3  # the TP4 recipe's long-prefill chunk
+    assert sp_prefill.moe_slices(16384) == 4  # a full step of its token budget
+
+
+def _fake_exchange(monkeypatch, rank, world, own_rows, events=None):
+    """The TP group and ``exchange_into`` faked for one rank: each call's chunks are
+    cloned as sent, and every other rank's partial of this rank's rows is stood in
+    by this rank's own (``own_rows``, ``(L, ...)``), delivered on the exchange's
+    stream; the slice comes from the parts' row offset. Returns the sent clones."""
+    from types import SimpleNamespace
+
+    from vllm.models.deepseek_v4_1.tilelang import collectives
+
+    group = SimpleNamespace(device_communicator=SimpleNamespace(pynccl_comm="comm"))
+    monkeypatch.setattr(sp_prefill, "get_tp_group", lambda: group)
+    sent = []
+
+    def exchange_into(comm, chunks, parts, r, w):
+        assert (comm, r, w) == ("comm", rank, world)
+        lo = parts.storage_offset() // parts.stride(1)
+        hi = lo + parts.shape[1]
+        if events is not None:
+            events.append(("exchange", lo, hi))
+        sent.append(chunks.clone())
+        for peer in range(world):
+            if peer != rank:
+                parts[peer].copy_(own_rows[lo:hi])
+
+    monkeypatch.setattr(collectives, "exchange_into", exchange_into)
+    return sent
+
+
+def _assert_exchanged_under_own_block(events, rank, world, local, tokens):
+    """Every slice's exchange comes after the other ranks' projected rows of it and
+    before this rank's own."""
+    for kind, lo, hi in events:
+        if kind != "exchange":
+            continue
+        at = events.index((kind, lo, hi))
+        for owner in range(world):
+            start, stop = owner * local + lo, min(owner * local + hi, tokens)
+            if stop > start:
+                index = events.index(("project", start, stop))
+                assert (index > at) == (owner == rank), (owner, lo, hi)
+
+
 @pytest.mark.parametrize("tokens", [37, 40, 205])
 @pytest.mark.parametrize("rank", [0, 2, 3])
 @pytest.mark.parametrize("slices", [1, 2, 3])
@@ -68,37 +119,31 @@ def test_unreduced_parts_hold_every_block(monkeypatch, tokens, rank, slices, per
     rank's own block in its slot of the parts (the other ranks stood in by
     copies of it). Only real rows are projected; the pad rows of the last rank's
     block are zeroed by TileLang's fill (never torch's), so the parts and their
-    sums are the zero-padded projection's, pad rows included."""
-    from types import SimpleNamespace
-
+    sums are the zero-padded projection's, pad rows included. Block by block, a
+    slice is exchanged once the other ranks' blocks of it are projected and
+    before this rank's own is."""
     from vllm.models.deepseek_v4_1.tilelang import collectives
 
     world = 4
     rows = sp_prefill.SPRows(
         num_tokens=tokens, world_size=world, rank=rank, unreduced=True
     )
-    group = SimpleNamespace(device_communicator=SimpleNamespace(pynccl_comm="comm"))
-    monkeypatch.setattr(sp_prefill, "get_tp_group", lambda: group)
+    local = rows.local_rows
+    source = torch.randn(tokens, 8, device="cuda")
+    padded = torch.zeros(rows.padded_rows, 8, device="cuda")
+    padded[:tokens] = source
+    blocks = padded.view(world, local, 8)
+    events = []
+    sent = _fake_exchange(monkeypatch, rank, world, blocks[rank], events)
 
     def refuse(self, *args, **kwargs):
         raise AssertionError("a pad row was zeroed by torch")
 
     monkeypatch.setattr(torch.Tensor, "zero_", refuse)
-    sent = []
-
-    def exchange_into(comm, chunks, parts, r, w):
-        assert (comm, r, w) == ("comm", rank, world)
-        sent.append(chunks.clone())
-        for peer in range(world):
-            if peer != rank:
-                parts[peer].copy_(parts[rank])
-
-    monkeypatch.setattr(collectives, "exchange_into", exchange_into)
-    source = torch.randn(tokens, 8, device="cuda")
-    calls, order = [], []
+    order = []
 
     def project(start, stop, out):
-        calls.append((start, stop))
+        events.append(("project", start, stop))
         out.copy_(source[start:stop])
 
     parts = rows.project_reduce_scatter(
@@ -107,17 +152,19 @@ def test_unreduced_parts_hold_every_block(monkeypatch, tokens, rank, slices, per
         source.dtype,
         source.device,
         slices=slices,
-        then=lambda: order.append(len(calls)),
+        then=lambda: order.append(len(events)),
         per_block=per_block,
     )
     torch.cuda.synchronize()
     monkeypatch.undo()
+    calls = [(start, stop) for kind, start, stop in events if kind == "project"]
     if slices == 1 and not per_block:
         assert calls == [(0, tokens)]  # one projection
-    padded = torch.zeros(rows.padded_rows, 8, device="cuda")
-    padded[:tokens] = source
-    blocks = padded.view(world, rows.local_rows, 8)
-    local = rows.local_rows
+        assert events[-1] == ("exchange", 0, local)
+        assert order == [len(events) - 1]  # then() before the exchange
+    else:
+        _assert_exchanged_under_own_block(events, rank, world, local, tokens)
+        assert order == [len(events)]  # then() after the last projection
     assert parts.shape == (world, local, 8)
     for peer in range(world):
         assert torch.equal(parts[peer], blocks[rank])
@@ -127,11 +174,107 @@ def test_unreduced_parts_hold_every_block(monkeypatch, tokens, rank, slices, per
             assert torch.equal(sent[peer], blocks[peer])
     projected = sorted(i for start, stop in calls for i in range(start, stop))
     assert projected == list(range(tokens))
-    assert order == [len(calls)]
     total = sp_prefill.materialize(sp_prefill.unreduced_parts(parts))
     assert torch.equal(total, collectives.rank_order_sum(list(parts)))
     zero_padded = collectives.rank_order_sum([blocks[rank]] * world)
     assert torch.equal(total, zero_padded)
+
+
+def _moe_case(tokens, hidden=384, intermediate=576, num_experts=32, topk=6):
+    """A V4.1 TileLang MoE plan with the FP32 combine the shared expert folds into,
+    its prepared weights, and one forward's tokens, routes and shared output."""
+    from vllm.models.deepseek_v4_1.tilelang.moe import MoeExpertsV41Plan
+
+    gen = torch.Generator(device="cuda").manual_seed(0)
+
+    def experts(n, k):  # packed E2M1 [E, n, k / 2] and UE8M0 [E, n, k / 32]
+        packed = torch.randint(
+            0, 256, (num_experts, n, k // 2), generator=gen, device="cuda"
+        ).to(torch.uint8)
+        exps = torch.randint(
+            118, 122, (num_experts, n, k // 32), generator=gen, device="cuda"
+        ).to(torch.uint8)
+        return packed, exps
+
+    plan = MoeExpertsV41Plan(
+        num_experts, topk, hidden, intermediate, swiglu_limit=10.0,
+        out_dtype=torch.float32,
+    )  # fmt: skip
+    plan.declare_kernels()
+    weights = plan.prepare_weights(
+        *experts(2 * intermediate, hidden), *experts(hidden, intermediate)
+    )
+    x = torch.randn((tokens, hidden), generator=gen, device="cuda") * 0.5
+    shared = torch.randn((tokens, hidden), generator=gen, device="cuda")
+    scores = torch.rand((tokens, num_experts), generator=gen, device="cuda")
+    ids = scores.argsort(dim=1)[:, :topk].to(torch.int32).contiguous()
+    route_weights = torch.rand((tokens, topk), generator=gen, device="cuda") + 0.1
+    return plan, weights, x.bfloat16(), shared.bfloat16(), ids, route_weights
+
+
+@pytest.mark.parametrize("tokens", [37, 205])
+@pytest.mark.parametrize("rank", [0, 3])
+@pytest.mark.parametrize("slice_tokens", [4096, 64, 16])
+def test_moe_combine_writes_the_exchange_slots(
+    monkeypatch, default_vllm_config, tokens, rank, slice_tokens
+):
+    """The MoE runner's reduce-scatter hook, given the experts' deferred combine
+    (shared expert folded in), has it write the exchange slots block by block and
+    slice by slice: each other rank's block into its send slot and this rank's into
+    its part carry the bits the one combine into the whole output gave, which the
+    copies moved there before. Pad rows are TileLang's zeros, and each slice is
+    exchanged before this rank's own block of it is combined."""
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_device_capability_family(120):
+        pytest.skip("TileLang V4.1 kernels target SM120/SM121")
+    pytest.importorskip("tilelang")
+    pytest.importorskip("tile_kernels")
+    from vllm.models.deepseek_v4_1.tilelang.linear import cast_mxfp8
+
+    world, hidden = 4, 384
+    plan, weights, x, shared, ids, route_weights = _moe_case(tokens, hidden)
+    whole = torch.empty((tokens, hidden), dtype=torch.bfloat16, device="cuda")
+    x_q = cast_mxfp8(x)  # the experts read their tokens' cast (mHC finalize's)
+    plan.run(x_q, ids, route_weights, weights, whole, shared=shared)
+    combine = plan.run(x_q, ids, route_weights, weights, None, shared=shared)
+
+    rows = sp_prefill.SPRows(
+        num_tokens=tokens, world_size=world, rank=rank, unreduced=True
+    )
+    local = rows.local_rows
+    padded = torch.zeros(
+        (rows.padded_rows, hidden), dtype=torch.bfloat16, device="cuda"
+    )
+    padded[:tokens] = whole
+    blocks = padded.view(world, local, hidden)
+    events = []
+    sent = _fake_exchange(monkeypatch, rank, world, blocks[rank], events)
+    monkeypatch.setattr(sp_prefill, "MOE_SLICE_TOKENS", slice_tokens)
+    slices = sp_prefill.moe_slices(tokens)
+
+    def refuse(self, *args, **kwargs):
+        raise AssertionError("a pad row was zeroed by torch")
+
+    monkeypatch.setattr(torch.Tensor, "zero_", refuse)
+
+    def project(start, stop, out):
+        events.append(("project", start, stop))
+        combine(start, stop, out)
+
+    with sp_prefill.activate(rows):
+        parts = sp_prefill.project_reduce_scatter_current(
+            project, tokens, rows.padded_rows, (hidden,), torch.bfloat16, x.device
+        )
+    torch.cuda.synchronize()
+    monkeypatch.undo()
+    assert sum(kind == "exchange" for kind, _, _ in events) == slices
+    _assert_exchanged_under_own_block(events, rank, world, local, tokens)
+    assert torch.equal(parts[rank], blocks[rank])
+    sent = torch.cat(sent, dim=1)
+    for peer in range(world):
+        if peer != rank:
+            assert torch.equal(sent[peer], blocks[peer])
 
 
 @pytest.mark.parametrize("tokens", [37, 40, 205])

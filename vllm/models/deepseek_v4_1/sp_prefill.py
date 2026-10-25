@@ -79,6 +79,9 @@ hands it on as ``RankOrderParts``. TileLang mHC's ``post_pre`` adds the parts in
 rank order as it loads them, the same arithmetic and the same bits as the
 rank-order reduce-scatter; any other consumer calls ``sum()``. Only real rows are
 projected into the buffers; the pad rows of the last rank's block are zeroed.
+The MoE combine (shared expert folded in) is that projection: it writes each
+rank's block straight into its slot, the other ranks' first, and the exchange of
+each slice runs under the combine of this rank's block and of the next slice.
 """
 
 from collections.abc import Iterator
@@ -258,11 +261,13 @@ class SPRows:
 
         With ``unreduced`` rows the result is every rank's unreduced partial of
         this rank's rows instead, ``(N, L, *row_shape)``; see "Unreduced results".
-        In one slice, ``per_block`` writes each rank's block with its own call,
-        this rank's straight into its slot (for writers that cost nothing per
-        call, such as an elementwise sum); otherwise one call writes every row
-        and this rank's block is copied into its slot (a projection reads its
-        weights once).
+        Block by block (``per_block``, or ``slices`` > 1), each rank's block is
+        written with its own call, this rank's straight into its slot, and each
+        slice's exchange starts on the side stream once the other ranks' blocks
+        are written, under this rank's own and the next slice (for writers that
+        cost nothing per call, such as the MoE combine). Otherwise one call
+        writes every row and this rank's block is copied into its slot (a
+        projection reads its weights once).
         """
         if self.unreduced:
             return self._project_exchange(
@@ -309,9 +314,10 @@ class SPRows:
     ):
         """``project_reduce_scatter`` without the sum: each rank's block goes into
         its slot of one send buffer, this rank's own straight into its slot of
-        the parts, and the chunks are exchanged into the parts; with ``slices``
-        > 1 each slice is exchanged on the side stream while the next is
-        projected."""
+        the parts, and the chunks are exchanged into the parts. Block by block,
+        each slice is exchanged on the side stream once the other ranks' blocks
+        of it are projected, while this rank's own block and the next slice
+        are."""
         from vllm.models.deepseek_v4_1.tilelang import columns
         from vllm.models.deepseek_v4_1.tilelang.collectives import exchange_into
 
@@ -329,32 +335,32 @@ class SPRows:
                 then()
             exchange_into(comm, send, parts, self.rank, world)
             return parts
+
+        def write(owner, lo, hi):
+            dest = parts if owner == self.rank else send
+            start, stop = owner * local + lo, owner * local + hi
+            real = max(0, min(stop, tokens) - start)
+            if real:
+                project(start, start + real, dest[owner, lo : lo + real])
+            columns.zero_(dest[owner, lo + real : hi])
+
         bounds = [local * i // slices for i in range(slices + 1)]
         main = torch.cuda.current_stream(device)
-        side = _side_stream(device) if slices > 1 else None
+        side = _side_stream(device)
         for lo, hi in zip(bounds, bounds[1:]):
             if hi == lo:
                 continue
             for owner in range(world):
-                dest = parts if owner == self.rank else send
-                start, stop = owner * local + lo, owner * local + hi
-                real = max(0, min(stop, tokens) - start)
-                if real:
-                    project(start, start + real, dest[owner, lo : lo + real])
-                columns.zero_(dest[owner, lo + real : hi])
-            if side is not None:
-                side.wait_stream(main)
-                with torch.cuda.stream(side):
-                    exchange_into(
-                        comm, send[:, lo:hi], parts[:, lo:hi], self.rank, world
-                    )
+                if owner != self.rank:
+                    write(owner, lo, hi)
+            side.wait_stream(main)
+            with torch.cuda.stream(side):
+                exchange_into(comm, send[:, lo:hi], parts[:, lo:hi], self.rank, world)
+            write(self.rank, lo, hi)
         if then is not None:
             then()
-        if side is None:
-            exchange_into(comm, send, parts, self.rank, world)
-        else:
-            # send and parts are freed only after this wait, on this stream.
-            main.wait_stream(side)
+        # send and parts are freed only after this wait, on this stream.
+        main.wait_stream(side)
         return parts
 
 
@@ -366,6 +372,17 @@ WO_SLICE_TOKENS = 2048
 def wo_slices(num_tokens: int) -> int:
     """Slices of a sequence-parallel WO projection of ``num_tokens`` tokens."""
     return 2 if num_tokens >= WO_SLICE_TOKENS else 1
+
+
+# The MoE output is exchanged in one slice per this many tokens: each slice's
+# exchange runs under the combine of the next. A slice's message to a peer is at
+# least 1,024 rows at TP4, so an exchange's fixed cost stays small beside it.
+MOE_SLICE_TOKENS = 4096
+
+
+def moe_slices(num_tokens: int) -> int:
+    """Slices of a sequence-parallel MoE output exchange of ``num_tokens`` tokens."""
+    return max(1, num_tokens // MOE_SLICE_TOKENS)
 
 
 # Results of sequence-parallel steps stay unreduced where the TP group's
@@ -400,7 +417,9 @@ def project_reduce_scatter_current(
     project, rows, padded_rows, row_shape, dtype, device, then=None
 ) -> torch.Tensor:
     """The MoE runner's reduce-scatter hook: ``project_reduce_scatter`` over the
-    rows of the active SP forward (``activate``)."""
+    rows of the active SP forward (``activate``). ``project`` is the experts'
+    combine, so each block is combined straight into its exchange slot, and the
+    exchange runs in ``moe_slices`` slices under the rest of the combine."""
     sp = current()
     if sp is None or sp.num_tokens != rows or sp.padded_rows != padded_rows:
         raise RuntimeError(
@@ -408,7 +427,13 @@ def project_reduce_scatter_current(
             f"forward ({sp})"
         )
     return sp.project_reduce_scatter(
-        project, row_shape, dtype, device, then=then, per_block=True
+        project,
+        row_shape,
+        dtype,
+        device,
+        slices=moe_slices(rows),
+        then=then,
+        per_block=True,
     )
 
 

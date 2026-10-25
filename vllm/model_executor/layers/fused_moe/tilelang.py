@@ -164,6 +164,12 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
     # The plan resolves a callable addend just before its combine launch, so an
     # aux-stream shared expert overlaps the routed experts' GEMMs.
     folds_deferred_shared_output: bool = True
+    # Set by the MoE runner around one folded call whose output goes straight into
+    # a sequence-parallel exchange: ``apply`` leaves ``output`` unwritten and keeps
+    # the combine as ``deferred_combine(start, stop, out)``, which writes the
+    # output's rows ``start:stop`` into ``out`` (the exchange's blocks).
+    defer_combine: bool = False
+    deferred_combine: Callable[[int, int, torch.Tensor], None] | None = None
 
     @property
     def folds_shared_output(self) -> bool:
@@ -295,15 +301,19 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
         if self.fold_shared:
             assert self.combine_addend is not None, "the shared output must be given"
             shared = self.combine_addend
-        self._plan.run(
+        if self.defer_combine:
+            assert self.fold_shared, "only a folded combine is deferred"
+        combine = self._plan.run(
             _provided_mxfp8(hidden_states),
             topk_ids,
             topk_weights,
             weights,
-            output,
+            None if self.defer_combine else output,
             workspace,
             shared,
         )
+        if self.defer_combine:
+            self.deferred_combine = combine
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
         raise NotImplementedError("LoRA is not supported for TileLangExperts")

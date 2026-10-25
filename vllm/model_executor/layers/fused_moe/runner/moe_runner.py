@@ -575,12 +575,16 @@ class MoERunner(MoERunnerInterface):
         padded_rows: int,
         trunc_size: int | None,
         output_is_reduced: bool,
+        combine: Callable[[int, int, torch.Tensor], None] | None = None,
     ) -> torch.Tensor:
         """Sequence-parallel replacement for the late all-reduce.
 
         The combined output is written into a ``padded_rows`` buffer whose
         trailing rows are zero and reduce-scattered along dim 0, so TP rank r
         receives rows ``[r * padded_rows // tp, (r + 1) * padded_rows // tp)``.
+        ``combine(start, stop, out)`` is the experts' deferred combine (shared
+        output folded in): ``fused_output`` is then unwritten, and the model's
+        reduce-scatter hook has the combine write its buffers' rows itself.
         """
         if (
             output_is_reduced
@@ -603,24 +607,20 @@ class MoERunner(MoERunnerInterface):
         _hook = getattr(self, "_l2_prefetch_pre_reduce_hook", None)
         # A model-installed replacement for the buffer and reduce-scatter below:
         # hook(write, rows, padded_rows, row_shape, dtype, device, then), where
-        # write(start, stop, out) fills rows start:stop of the combined output.
+        # write(start, stop, out) fills rows start:stop of the combined output:
+        # the deferred combine, writing straight into the hook's buffers.
         _reduce = getattr(self, "_sp_project_reduce_scatter_hook", None)
         if _reduce is not None:
             if trunc_size is not None:
                 raise NotImplementedError(
                     "MoE reduce-scatter hook with a trimmed output"
                 )
-
-            def write(start: int, stop: int, out: torch.Tensor) -> None:
-                if shared_output is None:
-                    out.copy_(fused_output[start:stop])
-                else:
-                    torch.add(
-                        shared_output[start:stop], fused_output[start:stop], out=out
-                    )
-
+            if combine is None:
+                raise NotImplementedError(
+                    "MoE reduce-scatter hook needs the experts' deferred combine"
+                )
             return _reduce(
-                write,
+                combine,
                 rows,
                 padded_rows,
                 fused_output.shape[1:],
@@ -922,8 +922,17 @@ class MoERunner(MoERunnerInterface):
             if og_hidden_dim_pre_xform is None and og_hidden_dim_post_xform is None
             else None
         )
+        # A folded combine bound for the model's sequence-parallel exchange is left
+        # to the exchange, which has it write each destination's rows in place.
+        defer = (
+            fold is not None
+            and reduce_scatter_rows is not None
+            and getattr(self, "_sp_project_reduce_scatter_hook", None) is not None
+        )
+        combine = None
         if fold is not None:
             fold.fold_shared = True
+            fold.defer_combine = defer
         try:
             result = self._forward_entry(
                 hidden_states,
@@ -936,10 +945,15 @@ class MoERunner(MoERunnerInterface):
                 else 0,
                 self._quant_method.output_dtype,
             )
+            if defer:
+                combine = fold.deferred_combine
+                assert combine is not None, "the experts did not defer their combine"
         finally:
             if fold is not None:
                 fold.fold_shared = False
                 fold.combine_addend = None
+                fold.defer_combine = False
+                fold.deferred_combine = None
 
         #
         # Note: there are two all-reduce points below. They are mutually
@@ -1022,6 +1036,7 @@ class MoERunner(MoERunnerInterface):
                 reduce_scatter_rows,
                 og_hidden_dim_post_xform,
                 fused_output_is_reduced,
+                combine,
             )
         if shared_output is not None:
             result = (

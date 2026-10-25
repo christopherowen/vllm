@@ -542,14 +542,20 @@ class MoeDispatchV41Plan:
             )
         return layout
 
-    def combine(self, y, layout, out, topk_weights=None, shared=None):
-        """Sum each token's expert outputs into ``out``.
+    def combine(
+        self, y, layout, out, topk_weights=None, shared=None, start=0, stop=None
+    ):
+        """Sum each token's expert outputs into ``out``: tokens ``start:stop`` (every
+        token by default) into ``out``'s rows.
 
         Pass ``topk_weights`` only if the experts did not apply them. A BF16 ``out``
         of a plan with a wider output dtype takes ``shared``: the routes' FP32 sum
-        plus the shared output, rounded once.
+        plus the shared output, rounded once. A token's sum reads only its own
+        routes, so its row has the same bits however the tokens are split.
         """
-        rows = layout["route_pos"].shape[0]
+        route_pos = layout["route_pos"]
+        rows = route_pos.shape[0]
+        stop = rows if stop is None else stop
         weights = (
             layout["layout_weights"][: rows * self.topk].view(rows, self.topk)
             if topk_weights is None
@@ -565,7 +571,13 @@ class MoeDispatchV41Plan:
                 (shared is not None, topk_weights is not None)
             ]
         # Without a shared input the kernel never reads it: any BF16 rows do.
-        kernel(y, layout["route_pos"], weights, y if shared is None else shared, out)
+        kernel(
+            y,
+            route_pos[start:stop],
+            weights[start:stop],
+            y if shared is None else shared[start:stop],
+            out,
+        )
         return out
 
 
@@ -1286,6 +1298,13 @@ class MoeExpertsV41Plan:
         to the FP32 sum before the one rounding to ``out``'s dtype; a callable
         ``shared`` is called just before the combine launch (it may wait for
         another stream) and returns those rows.
+
+        With ``out`` None the combine is not launched: the result is
+        ``combine(start, stop, rows_out)``, which writes the output's rows
+        ``start:stop`` into ``rows_out`` (in the dtype ``out`` would have) with one
+        launch, the same bits however the rows are split. It reads ``workspace``
+        and ``shared`` (a callable one is still called here), which must stay
+        unchanged until its last call.
         """
         rows = topk_ids.shape[0]
         dispatch = self.dispatch[topk_ids.dtype]
@@ -1307,7 +1326,13 @@ class MoeExpertsV41Plan:
         self.down(hq, h_words, *_present(down), order, tile_expert, y)
         if callable(shared):
             shared = shared()
-        return dispatch.combine(y, layout, out, shared=shared)
+        if out is not None:
+            return dispatch.combine(y, layout, out, shared=shared)
+
+        def combine(start, stop, rows_out):
+            dispatch.combine(y, layout, rows_out, shared=shared, start=start, stop=stop)
+
+        return combine
 
 
 def _present(weights):

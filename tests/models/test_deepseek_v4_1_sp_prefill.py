@@ -293,6 +293,182 @@ def test_moe_reduce_scatter_sums_shared_and_routed_before_the_scatter(monkeypatc
         )
 
 
+def _hook_runner(events):
+    """A runner's attributes for ``_reduce_scatter_final_output`` with the model's
+    reduce-scatter hook installed (it records its call and fires ``then``)."""
+
+    def reduce(write, rows, padded_rows, row_shape, dtype, device, then):
+        events.append(("reduce", write, rows, padded_rows, tuple(row_shape), dtype))
+        then()
+        return "parts"
+
+    return dict(
+        moe_config=SimpleNamespace(
+            is_sequence_parallel=False,
+            skip_final_all_reduce=False,
+            in_dtype=torch.bfloat16,
+        ),
+        router=object(),
+        _l2_prefetch_pre_reduce_hook=lambda rows: events.append(("hook", rows)),
+        _sp_project_reduce_scatter_hook=reduce,
+    )
+
+
+def test_moe_reduce_scatter_hook_writes_with_the_deferred_combine():
+    """The model's hook gets the experts' deferred combine as its writer, and
+    nothing reads the unwritten output; without a deferred combine it refuses."""
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner
+
+    events = []
+    runner = SimpleNamespace(**_hook_runner(events))
+    unwritten = torch.empty((10, 2), dtype=torch.bfloat16)
+
+    def combine(start, stop, out):
+        raise AssertionError("only the hook calls the combine")
+
+    output = moe_runner.MoERunner._reduce_scatter_final_output(
+        runner, None, unwritten, 12, None, False, combine
+    )
+    assert output == "parts"
+    assert events == [
+        ("reduce", combine, 10, 12, (2,), torch.bfloat16),
+        ("hook", 10),
+    ]
+    with pytest.raises(NotImplementedError):
+        moe_runner.MoERunner._reduce_scatter_final_output(
+            runner, None, unwritten, 12, None, False
+        )
+
+
+def test_moe_runner_defers_a_folded_combine_to_the_hook(monkeypatch):
+    """A folded SP forward with the hook installed asks the experts to defer their
+    combine inside the MoE op, hands that combine to the hook, and resets the
+    experts' call state after the op; without the hook nothing is deferred."""
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner
+
+    monkeypatch.setattr(
+        moe_runner, "tensor_model_parallel_reduce_scatter", lambda states, dim: "rs"
+    )
+    runner_cls = moe_runner.MoERunner
+    events = []
+    experts = SimpleNamespace(
+        fold_shared=False, combine_addend=None, defer_combine=False,
+        deferred_combine=None,
+    )  # fmt: skip
+    seen = []
+
+    def combine(start, stop, out):
+        raise AssertionError("only the hook calls the combine")
+
+    def entry(hidden, logits, shared_in, ids, name, unpadded, dtype):
+        seen.append((experts.fold_shared, experts.defer_combine))
+        if experts.defer_combine:
+            experts.deferred_combine = combine
+        experts.combine_addend = "shared rows"
+        return torch.zeros_like(hidden), torch.empty_like(hidden)
+
+    class Runner:
+        forward = runner_cls.forward
+        apply_routed_input_transform = runner_cls.apply_routed_input_transform
+        _maybe_pad_hidden_states = runner_cls._maybe_pad_hidden_states
+        _maybe_reduce_routed_output_before_transform = (
+            runner_cls._maybe_reduce_routed_output_before_transform
+        )
+        _maybe_reduce_shared_expert_output = (
+            runner_cls._maybe_reduce_shared_expert_output
+        )
+        _maybe_apply_routed_scale_to_output = (
+            runner_cls._maybe_apply_routed_scale_to_output
+        )
+        apply_routed_output_transform = runner_cls.apply_routed_output_transform
+        _reduce_scatter_final_output = runner_cls._reduce_scatter_final_output
+
+    runner = Runner()
+    for name, value in _hook_runner(events).items():
+        setattr(runner, name, value)
+    runner.moe_config.hidden_dim = 2
+    runner.routed_input_transform = runner.routed_output_transform = None
+    runner.routed_scaling_factor = 1.0
+    runner._shared_experts = object()
+    runner._quant_method = SimpleNamespace(
+        skip_forward_padding=True, has_unpadded_output=False, output_dtype=None
+    )
+    runner._fused_output_is_reduced = False
+    runner._shared_output_fold = lambda shared_in: experts
+    runner._forward_entry = entry
+    runner._encode_layer_name = lambda: "layer"
+    hidden = torch.ones((10, 2), dtype=torch.bfloat16)
+    assert runner.forward(hidden, hidden, reduce_scatter_rows=12) == "parts"
+    assert seen == [(True, True)]
+    assert events == [
+        ("reduce", combine, 10, 12, (2,), torch.bfloat16),
+        ("hook", 10),
+    ]
+    assert vars(experts) == dict(
+        fold_shared=False, combine_addend=None, defer_combine=False,
+        deferred_combine=None,
+    )  # fmt: skip
+    del runner._sp_project_reduce_scatter_hook
+    assert runner.forward(hidden, hidden, reduce_scatter_rows=12) == "rs"
+    assert seen[-1] == (True, False)
+
+
+def test_tilelang_experts_defer_only_a_folded_combine(monkeypatch):
+    """With ``defer_combine`` the TileLang experts run their plan without an output
+    (everything but the combine), leave ``output`` unwritten and keep the plan's
+    deferred combine; an unfolded call is never deferred."""
+    from vllm.model_executor.layers.fused_moe import tilelang as tilelang_experts
+    from vllm.model_executor.layers.fused_moe.tilelang import TileLangExperts
+
+    # The tokens' cast comes from the mHC entry; the stand-in plan reads none.
+    monkeypatch.setattr(tilelang_experts, "_provided_mxfp8", lambda rows: rows)
+    runs = []
+
+    def run(x, ids, weights, gemm_weights, out, workspace, shared):
+        runs.append((out, shared))
+        return "combine" if out is None else out
+
+    experts = SimpleNamespace(
+        _plan=SimpleNamespace(run=run),
+        _tails=(None, None),
+        _bases=(None, None),
+        w1_scale=None,
+        w2_scale=None,
+        fold_shared=True,
+        combine_addend="shared rows",
+        defer_combine=True,
+        deferred_combine=None,
+    )
+    output = torch.full((4, 2), float("nan"), dtype=torch.bfloat16)
+    call = dict(
+        output=output,
+        hidden_states=torch.zeros((4, 2), dtype=torch.bfloat16),
+        w1=None,
+        w2=None,
+        topk_weights=torch.zeros((4, 6)),
+        topk_ids=torch.zeros((4, 6), dtype=torch.int32),
+        activation=None,
+        global_num_experts=32,
+        expert_map=None,
+        a1q_scale=None,
+        a2_scale=None,
+        workspace13=None,
+        workspace2=torch.zeros(16, dtype=torch.bfloat16),
+        expert_tokens_meta=None,
+        apply_router_weight_on_input=False,
+    )
+    TileLangExperts.apply(experts, **call)
+    assert runs == [(None, "shared rows")]
+    assert experts.deferred_combine == "combine"
+    assert output.isnan().all()
+    experts.defer_combine, experts.deferred_combine = False, None
+    TileLangExperts.apply(experts, **call)
+    assert runs[-1] == (output, "shared rows") and experts.deferred_combine is None
+    experts.fold_shared, experts.defer_combine = False, True
+    with pytest.raises(AssertionError):
+        TileLangExperts.apply(experts, **call)
+
+
 def test_engram_gates_only_the_real_local_rows(monkeypatch):
     # Engram's geometry and token map are b12x's; its gate is TileLang's.
     pytest.importorskip("b12x")

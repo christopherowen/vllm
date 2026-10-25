@@ -266,6 +266,60 @@ def test_moe_experts_fold_deferred_shared(
     assert torch.equal(deferred, direct)
 
 
+@pytest.mark.parametrize("rows", [1, 12, 300])
+@pytest.mark.parametrize(
+    "plan_dtype, out_dtype, fold",
+    [
+        (torch.bfloat16, torch.bfloat16, False),
+        (torch.float32, torch.float32, False),
+        (torch.float32, torch.bfloat16, True),  # the shared expert folded in
+    ],
+)
+def test_moe_experts_deferred_combine_has_the_combine_bits(
+    rows, plan_dtype, out_dtype, fold, hidden=384, intermediate=576, num_experts=32
+):
+    """Without an output the plan launches everything but the combine and returns
+    it: the rows combined piece by piece, each piece a launch into its own buffer
+    (the SP exchange's slots), carry the bits of the one combine into the whole
+    output. A callable shared addend is called once, by ``run``."""
+    w13_packed, w13_sf, _ = _experts(num_experts, 2 * intermediate, hidden, 1)
+    w2_packed, w2_sf, _ = _experts(num_experts, hidden, intermediate, 2)
+    topk = 6
+    plan = _plan(
+        num_experts, topk, hidden, intermediate, swiglu_limit=LIMIT,
+        out_dtype=plan_dtype,
+    )  # fmt: skip
+    weights = plan.prepare_weights(w13_packed, w13_sf, w2_packed, w2_sf)
+    x = (torch.randn((rows, hidden), generator=_gen(3), device=DEVICE) * 0.5).bfloat16()
+    shared = torch.randn((rows, hidden), generator=_gen(5), device=DEVICE).bfloat16()
+    ids, route_weights = _routes(rows, num_experts, topk, 4, torch.int32)
+    whole = torch.empty((rows, hidden), dtype=out_dtype, device=DEVICE)
+    tokens = cast_mxfp8(x)
+    plan.run(
+        tokens, ids, route_weights, weights, whole, shared=shared if fold else None
+    )
+    calls = []
+
+    def resolve():
+        calls.append(1)
+        return shared
+
+    combine = plan.run(
+        tokens, ids, route_weights, weights, None, shared=resolve if fold else None
+    )
+    assert calls == ([1] if fold else [])
+    cuts = sorted({0, rows // 3, rows // 2 + 1, rows - 1, rows})
+    pieces = []
+    for start, stop in zip(cuts, cuts[1:]):
+        piece = torch.full(
+            (stop - start, hidden), float("nan"), dtype=out_dtype, device=DEVICE
+        )
+        combine(start, stop, piece)
+        pieces.append(piece)
+    assert torch.equal(torch.cat(pieces), whole)
+    assert calls == ([1] if fold else [])
+
+
 def _case(rows, hidden=384, intermediate=576, num_experts=32, topk=6):
     w13_packed, w13_sf, w13 = _experts(num_experts, 2 * intermediate, hidden, 1)
     w2_packed, w2_sf, w2 = _experts(num_experts, hidden, intermediate, 2)
