@@ -541,11 +541,21 @@ CASES = {
         (f"{r} rows", markov_pair_case(r)) for r in (1, 6, 16, 96)
     ],
     "greedy_shard_pair": [(f"{r} rows", shard_pair_case(r)) for r in (6, 36, 96, 384)],
-    "select_first_argmax": [(f"{r} rows", select_case(r)) for r in (1, 16, 96)],
+    # The DSpark drafter's last step (a request a row; verification's rows go
+    # through greedy_rejection, which selects its targets itself).
+    "select_first_argmax": [(f"{r} rows", select_case(r)) for r in (1, 16)],
     "sample_greedy_markov": [(f"{r} rows", markov_full_case(r)) for r in (1, 16)],
     # The fused selection and verification against Triton's two launches.
     "greedy_rejection": [(f"{r} requests", rejection_case(r)) for r in (1, 16, 64)],
 }
+
+
+# Kernels reported but not gated, each with the owner's acceptance. The plain
+# select_first_argmax runs once a decode step (the drafter's last step, 0.86 us at
+# c1) and has trailed Triton's by about 0.05 us at 1-16 rows since run 20; two
+# layout rewrites did not close it, and the gap is about 0.0001% of a step
+# (accepted 2026-10-25, experiments/2026-10-24-tilelang-completion).
+ACCEPTED = {"select_first_argmax"}
 
 
 def main() -> None:
@@ -557,10 +567,23 @@ def main() -> None:
     for name in args.only or CASES:
         for shape, make in CASES[name]:
             rows.append(measure(name, shape, make))
-    slower = [f"{r['kernel']} {r['shape']}" for r in rows if r["slower"]]
+    slower = [
+        f"{r['kernel']} {r['shape']}"
+        for r in rows
+        if r["slower"] and r["kernel"] not in ACCEPTED
+    ]
+    accepted = [
+        f"{r['kernel']} {r['shape']}"
+        for r in rows
+        if r["slower"] and r["kernel"] in ACCEPTED
+    ]
     print(
         json.dumps(
-            {"summary": "slower" if slower else "level or faster", "slower": slower}
+            {
+                "summary": "slower" if slower else "level or faster",
+                "slower": slower,
+                "accepted": accepted,
+            }
         ),
         flush=True,
     )
