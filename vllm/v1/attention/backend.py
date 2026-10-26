@@ -653,10 +653,13 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
                 speculative_config is not None
                 and speculative_config.num_speculative_tokens is not None
             ):
-                max_num_queries_for_spec = (
+                # A copying request verifies up to num_verification_tokens
+                # drafts (copy drafts), every other one the drafter's block.
+                max_num_queries_for_spec = max(
                     1
                     + (2 if speculative_config.parallel_drafting else 1)
-                    * speculative_config.num_speculative_tokens
+                    * speculative_config.num_speculative_tokens,
+                    1 + speculative_config.num_verification_tokens,
                 )
                 self.reorder_batch_threshold = max(
                     self.reorder_batch_threshold,

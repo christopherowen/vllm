@@ -3,6 +3,8 @@
 """DeepSeek-V4.1 TileLang CSA compression against DeepSeek's arithmetic and torch
 references of the state ring."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -265,3 +267,92 @@ def test_token_independent_of_batch_and_graphs(ratio):
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(out[:rows], together)
+
+
+def _verify_block_then_resume(draft_tokens, page, accepted):
+    """One request verifies a block of ``1 + draft_tokens`` rows from an even
+    position, writing every row's state to its ring; the next step resumes after
+    ``accepted`` drafts. Returns the carry that step gathers (value, gate, tag) and
+    the block's state at the position it carries from."""
+    g = torch.Generator(device="cpu").manual_seed(draft_tokens * 100 + accepted)
+    rows, first, block = 1 + draft_tokens, 40, 3
+
+    def request(position, tokens):
+        starts = torch.full((REQUESTS + 1,), tokens, dtype=torch.int32)
+        starts[0] = 0
+        positions = torch.full((REQUESTS,), -1, dtype=torch.int64)
+        positions[0] = position
+        state_slots = torch.full((CAPACITY,), -1, dtype=torch.int64)
+        state_slots[:tokens] = block * page + (position + torch.arange(tokens)) % page
+        return {
+            "starts": starts.to(DEVICE),
+            "positions": positions.to(DEVICE),
+            "state_slots": state_slots.to(DEVICE),
+            "counts": torch.tensor([tokens, 1], dtype=torch.int32, device=DEVICE),
+        }
+
+    table = torch.full((REQUESTS, 4), 1, dtype=torch.int32, device=DEVICE)
+    table[0, 0] = block
+    pool = torch.zeros(BLOCKS, page * STATE, device=DEVICE)
+    values = torch.randn(CAPACITY, DIM, generator=g).to(DEVICE)
+    gates = torch.randn(CAPACITY, DIM, generator=g).to(DEVICE)
+    weight = (torch.rand(DIM, generator=g) + 0.5).to(DEVICE)
+    slots = torch.arange(CAPACITY, dtype=torch.int64, device=DEVICE)
+
+    def carry(step):
+        pv = torch.zeros((REQUESTS, DIM), device=DEVICE)
+        pg = torch.zeros_like(pv)
+        tags = torch.full((REQUESTS,), 7, dtype=torch.int64, device=DEVICE)
+        ids = torch.full_like(tags, 7)
+        gather_partial_state(
+            pool, table, step["starts"], step["positions"], step["counts"],
+            pv, pg, tags, ids, page=page,
+        )  # fmt: skip
+        return pv, pg, tags, ids
+
+    a = request(first, rows)
+    pv, pg, tags, ids = carry(a)
+    out = torch.zeros(CAPACITY, DIM, dtype=torch.bfloat16, device=DEVICE)
+    emitted = torch.zeros(CAPACITY, dtype=torch.bool, device=DEVICE)
+    eslots = torch.zeros(CAPACITY, dtype=torch.int64, device=DEVICE)
+    compress(
+        rows, 2, values, gates, weight, a["starts"], a["positions"], ids, slots,
+        a["counts"], out, emitted, eslots, pending_values=pv, pending_gates=pg,
+        tags=tags, pool=pool, state_slots=a["state_slots"], page=page,
+    )  # fmt: skip
+    resumed = first + accepted + 1
+    pv, pg, tags, _ = carry(request(resumed, 1))
+    row = resumed - 1 - first
+    return (pv[0], pg[0], int(tags[0])), (values[row], gates[row], resumed - 1)
+
+
+@pytest.mark.parametrize("draft_tokens", [5, 16, 64])
+def test_a_rejected_block_leaves_every_accepted_prefix_its_carry(draft_tokens):
+    """The ring a request's verification writes before acceptance is known keeps
+    the state of every position a resumed step can carry from: the state ring
+    (CompressorStateCache) has a slot for each of its rows and one more, so a block
+    of the verification lookahead (copy drafts: 16, or 64) overwrites none of them."""
+    from vllm.models.deepseek_v4_1.compressor import CompressorStateCache
+
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(num_verification_tokens=draft_tokens),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    page = CompressorStateCache(config, f"ring-{draft_tokens}").block_size
+    assert page > draft_tokens + 1
+    for accepted in range(0, draft_tokens + 1, 2):  # odd positions carry
+        (value, gate, tag), (want_v, want_g, want_tag) = _verify_block_then_resume(
+            draft_tokens, page, accepted
+        )
+        assert tag == want_tag
+        assert torch.equal(value, want_v) and torch.equal(gate, want_g), accepted
+
+
+def test_a_short_ring_loses_a_wide_blocks_carry():
+    """The control: DSpark's ring of 8 under a block of 17 rows. A resumed step
+    early in the block carries a later row's state, which shares its slot."""
+    lost = 0
+    for accepted in range(0, 9, 2):
+        (value, _, _), (want_v, _, _) = _verify_block_then_resume(16, 8, accepted)
+        lost += not torch.equal(value, want_v)
+    assert lost > 0

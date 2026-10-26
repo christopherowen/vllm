@@ -28,7 +28,8 @@ class CompressorStateCache(nn.Module, AttentionLayerBase):
         self.prefix = prefix
         self.kv_cache = torch.tensor([])
         spec = config.speculative_config
-        draft_tokens = spec.num_speculative_tokens if spec is not None else 0
+        # Every draft a request verifies in a step (copy drafts widen it).
+        draft_tokens = spec.num_verification_tokens if spec is not None else 0
         # Drafts, the bonus token, and the previous row must coexist until
         # rejection selects the accepted boundary, as in upstream V4.1.
         self.block_size = max(8, 1 << (draft_tokens + 1).bit_length())

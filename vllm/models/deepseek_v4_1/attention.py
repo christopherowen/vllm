@@ -493,6 +493,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             else 1
         )
         decode_rows = self.config.scheduler_config.max_num_seqs * query_width
+        # A copying request verifies past the drafter's block (copy drafts),
+        # within the scheduler's decode-row envelope.
+        decode_rows += self.config.max_decode_rows - (
+            self.config.scheduler_config.max_num_seqs
+            * self.config.uniform_decode_query_len
+        )
         # Graph buffers include padding beyond the live decode-token bound.
         decode_rows = max(
             decode_rows,

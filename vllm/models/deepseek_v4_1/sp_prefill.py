@@ -143,11 +143,10 @@ def resolve_min_rows(vllm_config, *, static_sequence_parallel: bool = False) -> 
     if reason is not None:
         logger.info("DeepSeek V4.1 prefill sequence parallelism off: %s", reason)
         return 0
-    spec = vllm_config.speculative_config
     decode_rows = max(
         vllm_config.compilation_config.max_cudagraph_capture_size or 0,
-        vllm_config.scheduler_config.max_num_seqs
-        * (1 + (spec.num_speculative_tokens if spec is not None else 0)),
+        # Every decode row the scheduler lays out, copy drafts' included.
+        vllm_config.max_decode_rows,
         parallel.tensor_parallel_size,
     )
     rows = decode_rows + 1

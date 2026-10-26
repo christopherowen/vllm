@@ -195,7 +195,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.context_positions,
                 self._context_slot_mappings,
                 self._layer_group_idx,
-                self.max_num_reqs * (1 + self.num_speculative_steps),
+                # A decode step's target rows, copy drafts' included.
+                self.vllm_config.max_decode_rows,
             )
 
     def load_draft_model(
