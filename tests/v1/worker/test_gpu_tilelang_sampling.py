@@ -535,6 +535,41 @@ def test_sink_candidates_int32_positions():
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("case", CASES)
+def test_sink_candidates_with_dead_rows(dtype, case):
+    """With a dead-row cut, verification ended each request's block at its cut, so
+    a last draw at or past the cut was the block's bonus, which masked no draft:
+    the candidates are those of the same drafts with each request's drafts from its
+    cut on as -1 placeholders."""
+    counts = [6, 1, 6, 3, 6, 2, 6, 6, 1, 4, 6]
+    width, slots = 6, 16
+    cu, num_sampled, drafts, sampled, mapping = _batch(counts, width, slots, 3)
+    rows = int(cu[-1])
+    logits = _logits(rows, _stride(VOCAB, STRIDES[0]), dtype, case, 3)
+    _, temperature, seeds, _ = _sampling_inputs(len(counts), slots, "mixed", 3)
+    pos = torch.randint(0, 1 << 20, (rows,), device=DEVICE)
+    # Cuts from none live to all of a request's drafts, and past them.
+    cut = torch.tensor(
+        [min(i % 4, c - 1) if i % 5 else 9 for i, c in enumerate(counts)],
+        dtype=torch.int32,
+        device=DEVICE,
+    )
+    placeholders = drafts.clone()
+    for r, c in enumerate(cut.tolist()):
+        start, end = int(cu[r]), int(cu[r + 1])
+        placeholders[start + 1 + c : end] = -1
+    ours, expected = (
+        tls.sink_candidates(
+            logits, VOCAB, cu, num_sampled, sampled, d, mapping, temperature,
+            seeds, pos, 4, True, dead_cut,
+        )
+        for d, dead_cut in ((drafts, cut), (placeholders, None))
+    )  # fmt: skip
+    _assert_same(ours[0], expected[0], "candidate values")
+    _assert_same(ours[1], expected[1], "candidate indices")
+
+
 def _check_sink_candidates(
     dtype, vocab, stride, case, num_candidates, mask_rejected_draft, pos_dtype
 ):
