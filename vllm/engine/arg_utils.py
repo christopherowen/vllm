@@ -117,6 +117,7 @@ from vllm.config.scheduler import (
     PrefillComputeHalfLife,
     PrefillComputeShare,
     PrefillPolicy,
+    PrefillYield,
     SchedulerPolicy,
 )
 from vllm.config.utils import get_field
@@ -728,6 +729,8 @@ class EngineArgs:
     max_parallel_prefills: MaxParallelPrefills = SchedulerConfig.max_parallel_prefills
     prefill_policy: PrefillPolicy = SchedulerConfig.prefill_policy
     decode_refill_target: DecodeRefillTarget = SchedulerConfig.decode_refill_target
+    prefill_yield: PrefillYield = SchedulerConfig.prefill_yield
+    prefill_yield_limit_s: float = SchedulerConfig.prefill_yield_limit_s
 
     watermark: float = SchedulerConfig.watermark
 
@@ -1767,6 +1770,12 @@ class EngineArgs:
             "--decode-refill-target", **decode_refill_target_kwargs
         )
         scheduler_group.add_argument(
+            "--prefill-yield", **scheduler_kwargs["prefill_yield"]
+        )
+        scheduler_group.add_argument(
+            "--prefill-yield-limit-s", **scheduler_kwargs["prefill_yield_limit_s"]
+        )
+        scheduler_group.add_argument(
             "--disable-hybrid-kv-cache-manager",
             **scheduler_kwargs["disable_hybrid_kv_cache_manager"],
         )
@@ -2618,6 +2627,8 @@ class EngineArgs:
             max_parallel_prefills=self.max_parallel_prefills,
             prefill_policy=self.prefill_policy,
             decode_refill_target=self.decode_refill_target,
+            prefill_yield=self.prefill_yield,
+            prefill_yield_limit_s=self.prefill_yield_limit_s,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,

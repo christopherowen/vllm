@@ -466,6 +466,17 @@ class Scheduler(SchedulerInterface):
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
+        # Prefill yield (SchedulerConfig.prefill_yield): a long prompt's chunk gives
+        # its step to prompts whose prefill finishes within one chunk and, with sink
+        # rejection, to the first decode step of a prompt that just prefilled.
+        self.prefill_yield = self.scheduler_config.prefill_yield == "short"
+        self.prefill_yield_limit_s = self.scheduler_config.prefill_yield_limit_s
+        # Requests whose last prefill chunk is scheduled and whose first decode
+        # step is not: that step releases their held first token.
+        self._first_decode_due: set[str] = set()
+        # Long prefills that yielded, by request id: when they first yielded since
+        # their last chunk.
+        self._yielding_since: dict[str, float] = {}
 
         self.has_mamba_layers = kv_cache_config.has_mamba_layers
         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
@@ -913,6 +924,45 @@ class Scheduler(SchedulerInterface):
             return num_new_tokens
         return min(num_new_tokens, threshold - num_computed_tokens % threshold)
 
+    def _prefill_finishes_in_chunk(
+        self, num_computed_tokens: int, num_tokens: int
+    ) -> bool:
+        """Whether a prompt's next chunk ends its prefill."""
+        remaining = num_tokens - num_computed_tokens
+        threshold = self.scheduler_config.long_prefill_token_threshold
+        if threshold <= 0:
+            return True
+        if self.scheduler_config.align_prefill_chunks:
+            return self._aligned_prefill_chunk(num_computed_tokens, remaining) >= remaining
+        return remaining <= threshold
+
+    def _prefill_yield_expired(self, request_id: str, now: float) -> bool:
+        since = self._yielding_since.get(request_id)
+        return since is not None and now - since >= self.prefill_yield_limit_s
+
+    def _short_prefill_waiting(self, now: float, scan: int = 16) -> bool:
+        """Whether one of the first ``scan`` waiting requests can be admitted and
+        prefills within one chunk (after its prefix-cache hit). A long prefill
+        that outwaited its yield limit counts as well: it goes first."""
+        lookup = (
+            self.connector is None
+            and self.kv_cache_manager.boundary_checkpoints is None
+        )
+        checked = 0
+        for queue in (self.skipped_waiting, self.waiting):
+            for request in queue:
+                if checked >= scan:
+                    return False
+                checked += 1
+                if request.status not in (RequestStatus.WAITING, RequestStatus.PREEMPTED):
+                    continue
+                computed = request.num_computed_tokens
+                if computed == 0 and lookup:
+                    computed = self.kv_cache_manager.get_computed_blocks(request)[1]
+                if self._prefill_finishes_in_chunk(computed, request.num_tokens):
+                    return True
+        return False
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -999,6 +1049,26 @@ class Scheduler(SchedulerInterface):
             and len(self.running) + self.num_waiting_for_streaming_input
             < self.max_num_running_reqs
         )
+        # Prefill yield: a long prompt's chunk waits while a held first token is
+        # due or a waiting prompt can prefill whole in this step. Otherwise this
+        # step schedules exactly as without the option.
+        yield_now = time.monotonic() if self.prefill_yield else 0.0
+        first_decode_due = (
+            self.prefill_yield
+            and self.sink_rejection
+            and any(r.request_id in self._first_decode_due for r in self.running)
+        )
+        yield_long = self.prefill_yield and (
+            first_decode_due
+            or (
+                admission_open
+                and bool(self.waiting or self.skipped_waiting)
+                and self._short_prefill_waiting(yield_now)
+            )
+        )
+        deferred_long: list[Request] = []
+        admitted_short = False
+
         # max_num_scheduled_tokens keeps decode streams moving while a long
         # prompt prefills. With no runnable decode it only shrinks the prefill
         # chunk, so such a step may use the full batched-token budget.
@@ -1173,6 +1243,23 @@ class Scheduler(SchedulerInterface):
                 if defer_prefills and request.is_prefill_chunk:
                     # Defer this in-progress chunk to a cadence-aligned step;
                     # decodes still run to fill this step.
+                    req_index += 1
+                    continue
+
+                if (
+                    yield_long
+                    and request.is_prefill_chunk
+                    and request not in deferred_long
+                    and not self._prefill_finishes_in_chunk(
+                        request.num_computed_tokens, request.num_tokens
+                    )
+                    and not self._prefill_yield_expired(request.request_id, yield_now)
+                ):
+                    # Prefill yield: the chunk keeps its boundaries and waits for
+                    # the work that needs this step; it runs after the waiting
+                    # pass if none took the step.
+                    deferred_long.append(request)
+                    self._yielding_since.setdefault(request.request_id, yield_now)
                     req_index += 1
                     continue
 
@@ -1724,6 +1811,21 @@ class Scheduler(SchedulerInterface):
                         step_skipped_waiting.prepend_request(request)
                         continue
 
+                if (
+                    yield_long
+                    and not load_kv_async
+                    and not self._prefill_finishes_in_chunk(
+                        num_computed_tokens, request.num_tokens
+                    )
+                    and not self._prefill_yield_expired(request_id, yield_now)
+                ):
+                    # Prefill yield: a long prompt waits behind this step's short
+                    # work without holding up the requests queued after it.
+                    self._yielding_since.setdefault(request_id, yield_now)
+                    request_queue.remove_request(request)
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input: list[int] = []
                 new_encoder_compute_budget = encoder_compute_budget
@@ -2017,6 +2119,7 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 self.running.append(request)
+                admitted_short = admitted_short or yield_long
                 if num_external_computed_tokens > 0:
                     # load_kv_async is False here
                     has_sync_kv_loads = True
@@ -2085,6 +2188,17 @@ class Scheduler(SchedulerInterface):
             # record whether it was capacity-bound.
             if not defer_prefills:
                 self.prefill_capacity_bound = bool(self.waiting)
+
+        if (
+            deferred_long
+            and not first_decode_due
+            and not admitted_short
+            and token_budget > 0
+        ):
+            # Prefill yield: nothing short was admitted after all, so the deferred
+            # long chunks take the step's budget as they would have.
+            yield_long = False
+            schedule_running_requests(allow_preemption=False)
 
         if reserve_boundary_logits_step and not boundary_logits_taken:
             # Cache eviction, admission limits, or deferred input can prevent
@@ -2554,6 +2668,7 @@ class Scheduler(SchedulerInterface):
         self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
+        self._first_decode_due.discard(request.request_id)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
         if request.spec_token_ids:
@@ -2595,6 +2710,18 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
+            if self.prefill_yield:
+                self._yielding_since.pop(req_id, None)
+                if request.num_computed_tokens >= request.num_prompt_tokens:
+                    self._first_decode_due.discard(req_id)
+                elif (
+                    request.num_computed_tokens + num_scheduled_token
+                    >= request.num_prompt_tokens
+                    and request.num_output_tokens == 0
+                ):
+                    # The prompt's last chunk: its next step releases the held
+                    # first token.
+                    self._first_decode_due.add(req_id)
             if not scheduler_output.boundary_logits_only:
                 request.num_computed_tokens += num_scheduled_token
             request.num_in_flight_tokens += num_scheduled_token
@@ -3879,6 +4006,8 @@ class Scheduler(SchedulerInterface):
 
         self._inflight_prefills.discard(request)
         self.prefill_interleave_controller.forget(request.request_id)
+        self._first_decode_due.discard(request.request_id)
+        self._yielding_since.pop(request.request_id, None)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
         # EC Connector: mirror the KV hook. The contract requires firing

@@ -28,6 +28,7 @@ PrefillComputeHalfLife = (
 MaxParallelPrefills = Annotated[int, Field(ge=1)] | Literal["auto"]
 PrefillPolicy = Literal["round-robin", "decode-aware"]
 DecodeRefillTarget = Annotated[int, Field(ge=1)] | Literal["auto"]
+PrefillYield = Literal["off", "short"]
 
 
 @config
@@ -251,6 +252,23 @@ class SchedulerConfig:
     This setting is ignored by ``round-robin`` when left at ``auto``.
     """
 
+    prefill_yield: PrefillYield = "off"
+    """Which work a long prompt's prefill chunk yields its step to.
+
+    With aligned prefill chunks a long prompt's whole chunk takes the step's
+    budget beside the decode rows, so a request that arrives while it prefills
+    waits for its last chunk. ``short`` lets a step that would carry such a
+    chunk carry instead the waiting prompts whose prefill finishes within one
+    chunk, and, with sink rejection, the first decode step of a prompt that
+    just finished prefilling (it releases the held first token). The long
+    prompt's chunks keep their boundaries; only the step a chunk runs in
+    changes. ``off`` keeps first-come-first-served prefill.
+    """
+
+    prefill_yield_limit_s: float = Field(default=10.0, gt=0)
+    """With ``prefill_yield``: a long prefill that has yielded this long stops
+    yielding until its next chunk runs."""
+
     async_scheduling: bool | None = None
     """If set to False, disable async scheduling. Async scheduling helps to
     avoid gaps in GPU utilization, leading to better latency and throughput.
@@ -376,6 +394,15 @@ class SchedulerConfig:
             and self.decode_refill_target > self.max_num_seqs
         ):
             raise ValueError("decode_refill_target cannot exceed max_num_seqs")
+        if self.prefill_yield != "off" and (
+            interleaving_enabled
+            or self.prefill_compute_share is not None
+            or self.prefill_schedule_interval > 1
+        ):
+            raise ValueError(
+                "prefill_yield replaces prefill lanes, compute sharing and the "
+                "prefill schedule interval; set none of them with it"
+            )
         if (
             self.prefill_policy != "decode-aware"
             and self.decode_refill_target != "auto"
