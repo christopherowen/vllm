@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
-import model_hosting_container_standards.sagemaker as sagemaker_standards
 from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
@@ -14,6 +13,7 @@ from vllm.entrypoints.serve.lora.protocol import (
     LoadLoRAAdapterRequest,
     UnloadLoRAAdapterRequest,
 )
+from vllm.entrypoints.serve.sagemaker.standards import sagemaker_standards
 from vllm.entrypoints.serve.utils.api_utils import validate_json_request
 from vllm.logger import init_logger
 

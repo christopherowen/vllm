@@ -5,7 +5,6 @@ from collections.abc import Awaitable, Callable
 from http import HTTPStatus
 from typing import Any
 
-import model_hosting_container_standards.sagemaker as sagemaker_standards
 import pydantic
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
@@ -17,6 +16,7 @@ from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 from vllm.entrypoints.serve.engine.serving import BaseServing
 from vllm.entrypoints.serve.instrumentator.basic import base
 from vllm.entrypoints.serve.instrumentator.health import health
+from vllm.entrypoints.serve.sagemaker.standards import sagemaker_standards
 from vllm.entrypoints.serve.utils.api_utils import validate_json_request
 from vllm.tasks import SupportedTask
 
