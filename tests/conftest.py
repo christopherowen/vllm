@@ -306,6 +306,28 @@ def dynamo_reset():
     torch._dynamo.reset()
 
 
+@pytest.fixture(autouse=True)
+def restore_root_logging_levels():
+    """Undo a test's changes to the root logger's level and its handlers' levels.
+
+    Some libraries reconfigure root logging when they are first imported:
+    model_hosting_container_standards (imported with the SageMaker routes) sets
+    the root logger, and raises every root handler below it, to
+    SAGEMAKER_CONTAINER_LOG_LEVEL, ERROR by default. pytest reuses its capture
+    handlers for the whole session, so without this every later test's caplog
+    drops warnings.
+    """
+    import logging
+
+    root = logging.getLogger()
+    level = root.level
+    handler_levels = [(handler, handler.level) for handler in root.handlers]
+    yield
+    root.setLevel(level)
+    for handler, handler_level in handler_levels:
+        handler.setLevel(handler_level)
+
+
 @pytest.fixture
 def example_prompts() -> list[str]:
     return [prompt for filename in _TEST_PROMPTS for prompt in _read_prompts(filename)]
