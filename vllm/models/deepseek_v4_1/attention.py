@@ -395,6 +395,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         self._wo_projection_weights = None
         self._l2pf_wo = None
         self._l2pf_ffn = None
+        self._l2pf_comp = None
         for linear in (self.fused_wqa_wkv, self.wq_b):
             _native_linear(linear)
         # Q-B reads its input's MXFP8 cast from the input's producer: the front's one
@@ -750,6 +751,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             else None
         )
         latent, slots = self.compressor(hidden_states, main, state)
+        self._issue_wo_prefetch(rows, after="compressor")
         # Index K consumes the ordinary-normalized PRE-RoPE latent.
         key = indexer.k_norm(indexer.wk(latent))
         key = self._rope(key, positions, "index_key")
@@ -870,7 +872,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             qr, kv, q_cast = front
         with kernels.mxfp8_inputs(q_cast):
             q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
-        l2_prefetch.issue(self._l2pf_wo, rows)
+        self._issue_wo_prefetch(rows, after="q-b")
         q = self._rope(q, positions, "q")
         output = torch.empty_like(q)
         metadata = cast(
@@ -906,6 +908,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 index_query = (*query, split, reference)
             self.forward_mqa(q, kv, positions, output, index_query=index_query)
         return self._o_proj(output, sp_rows=sp_rows)
+
+    def _issue_wo_prefetch(self, rows, *, after):
+        """Issue the WO window's L2 prefetch at its point in this layer's forward
+        (``l2_prefetch``): after Q-B, or right after the compressor in a layer that
+        owns one. There the compressor's projection between Q-B and WO-A would evict
+        WO's lines; the COMP window, the compressor's own weight, takes WO's place
+        after Q-B, and WO's fill queues behind it."""
+        if after == ("q-b" if self.compressor is None else "compressor"):
+            l2_prefetch.issue(self._l2pf_wo, rows)
+        if after == "q-b":
+            l2_prefetch.issue(self._l2pf_comp, rows)
 
     def _index_query(
         self, qr, positions, hidden_states, index_weights, first, last, swa

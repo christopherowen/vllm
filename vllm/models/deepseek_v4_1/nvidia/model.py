@@ -255,6 +255,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         for name in ("gate_up_proj", "down_proj"):
             ffn += l2_prefetch.linear_segments(name, getattr(shared, name, None))
         attn._l2pf_ffn = l2_prefetch.make_plan(ffn, l2_prefetch.BUDGET_FFN, device)
+        if attn.compressor is not None:
+            # COMP: the compressor's projection, the first weight an owner layer
+            # reads after Q-B.
+            comp = l2_prefetch.linear_segments(
+                "compressor", attn.compressor.fused_wkv_wgate
+            )
+            attn._l2pf_comp = l2_prefetch.make_plan(comp, l2_prefetch.BUDGET_WO, device)
         plan_next = None
         if nxt is not None:
             segments = l2_prefetch.param_segments(
@@ -273,18 +280,36 @@ class DeepseekV4DecoderLayer(nn.Module):
                     f"indexer.{name}", getattr(indexer, name, None)
                 )
             plan_next = l2_prefetch.make_plan(segments, l2_prefetch.BUDGET_NEXT, device)
-        if plan_next is not None:
+        plan_engram = None
+        engram = getattr(nxt, "engram", None)
+        if plan_next is not None and engram is not None:
+            # The next layer runs its Engram projection before anything NEXT holds,
+            # and NEXT's lines would not survive it: that layer issues NEXT between
+            # the projection and its all-gather, and this window prefetches the
+            # projection's first bytes over the latency-bound work before it.
+            plan_engram = l2_prefetch.make_plan(
+                l2_prefetch.linear_segments("engram.wkv", engram.wkv),
+                l2_prefetch.BUDGET_NEXT,
+                device,
+            )
+            engram.l2_prefetch_after_projection = (
+                lambda n, p=plan_next: l2_prefetch.issue(p, n)
+            )
+        hooked = plan_engram if plan_engram is not None else plan_next
+        if hooked is not None:
             object.__setattr__(
                 self.ffn.experts,
                 "_l2_prefetch_pre_reduce_hook",
-                lambda n, p=plan_next: l2_prefetch.issue(p, n),
+                lambda n, p=hooked: l2_prefetch.issue(p, n),
             )
         return " | ".join(
             f"{label} {plan.describe() if plan else '-'}"
             for label, plan in (
                 ("WO", attn._l2pf_wo),
+                ("COMP", attn._l2pf_comp),
                 ("FFN", attn._l2pf_ffn),
                 ("NEXT", plan_next),
+                ("ENGRAM", plan_engram),
             )
         )
 

@@ -14,11 +14,32 @@ At a fixed eight-row verifier, TP4 decode cycles fall from 49.36 to 47.45 ms
 (49.13 ms); WO alone is nearly neutral (49.12 ms) because the fill slows the
 latency-bound sparse-MLA preparation kernels it overlaps.
 
-Windows per decoder layer:
-  WO    after the query up-projection: this layer's WO-A and WO-B
+Windows per decoder layer, in fill order on the one prefetch stream (a window
+issued while the one before it still fills starts when that one ends):
+  WO    after the query up-projection: this layer's WO-A and WO-B. A layer that
+        owns a compressor (and an indexer) issues it right after the compressor
+        instead: issued after Q-B, its lines did not survive the compressor's
+        projection, and WO-A ran at DRAM speed with its fill long done.
+  COMP  an owner layer's compressor projection, after Q-B in WO's place. (The
+        indexer's projections after it gained nothing in this window: the WO
+        fill behind it evicted them before they ran.)
   FFN   before the attention all-reduce: router, mHC FFN mix, shared expert
   NEXT  before the MoE all-reduce: next layer's mHC attention mix, fused
-        Q-A/KV and Q-B projections, and indexer projections
+        Q-A/KV and Q-B projections, and indexer projections. An Engram layer
+        runs its projection before anything NEXT holds, and NEXT's lines did not
+        survive it: that layer issues NEXT between its Engram projection's GEMM
+        and all-gather instead.
+  ENGRAM  before the MoE all-reduce ahead of an Engram layer, in NEXT's place:
+        the first bytes of its Engram projection, over the all-reduce, mHC post
+        and row wait.
+
+A window issued before the lines of the one ahead of it are read evicts those
+unread lines: the consumers' reads keep the lines they read, so the unread ones
+are the oldest. Issuing WO right after the fused Q-A/KV or FFN between WO-A and
+WO-B made forty TP4 decode layers 8-10% slower on one GB10; the owner and Engram
+points made them 1.6% faster at one stream, 0.7% at eight and 0.3% at sixteen,
+spin kernels standing in for the attention core and all-reduces
+(experiments/2026-10-26-l2-prefetch-schedule in spark-ds41f).
 
 Environment:
   VLLM_DS41_L2_PREFETCH=0/1           default on for SM121 (GB10)

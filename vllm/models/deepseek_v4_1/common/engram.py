@@ -53,14 +53,23 @@ class _PaddedColumnParallelLinear(ColumnParallelLinear):
         self.logical_output_size = output_size
         self.padded_output_size = padded
         super().__init__(input_size, padded, **kwargs)
+        if self.bias is not None or self.return_bias:
+            raise ValueError("the padded Engram projection is bias-free")
         if padded != output_size:
             for name in ("weight", "weight_scale_inv", "weight_scale"):
                 param = getattr(self, name, None)
                 if param is not None:
                     param.allow_tp_padding = True
 
-    def forward(self, input_):
-        output = super().forward(input_)
+    def forward(self, input_, after_product=None):
+        """The gathered product; ``after_product(rows)``, when given, runs between
+        this rank's GEMM and the all-gather. Bias-free: Engram's projection has
+        none."""
+        output = self.local_product(input_)
+        if after_product is not None:
+            after_product(input_.shape[0])
+        if self.gather_output and self.tp_size > 1:
+            output = tensor_model_parallel_all_gather(output)
         if self.padded_output_size == self.logical_output_size:
             return output
         return output[..., : self.logical_output_size].contiguous()
@@ -68,6 +77,18 @@ class _PaddedColumnParallelLinear(ColumnParallelLinear):
     def local_product(self, input_):
         """This rank's column block of the product, not gathered."""
         return self.quant_method.apply(self, input_, None)
+
+
+def project_rows(wkv, rows, after_projection=None):
+    """Engram's projection of ``rows``. ``after_projection(rows)``, when given, runs
+    between the GEMM and a column-parallel projection's all-gather (the model's NEXT
+    L2 prefetch window, ``build_l2_prefetch``), else after the GEMM."""
+    if isinstance(wkv, _PaddedColumnParallelLinear):
+        return wkv(rows, after_product=after_projection)
+    kv = wkv(rows)
+    if after_projection is not None:
+        after_projection(rows.shape[0])
+    return kv
 
 
 logger = init_logger(__name__)
@@ -661,6 +682,10 @@ class Engram(nn.Module):
         # The smallest forward the model runs sequence-parallel (0: never); the
         # model sets it.
         self.prefill_sp_min_rows = 0
+        # Called with the row count between the projection's GEMM and its
+        # all-gather: the model issues the layer's NEXT L2 prefetch window there
+        # (``build_l2_prefetch``).
+        self.l2_prefetch_after_projection = None
         projection_tp = getattr(layout, "projection_tp", False)
         projection_cls = (
             _PaddedColumnParallelLinear if projection_tp else ReplicatedLinear
@@ -864,7 +889,7 @@ class Engram(nn.Module):
             kv = sp_rows.exchange_rows(self.wkv.local_product(rows))
             kv_start = 0
         else:
-            kv = self.wkv(rows)
+            kv = project_rows(self.wkv, rows, self.l2_prefetch_after_projection)
             kv_start = 0 if sp_rows is None else sp_rows.start
         state = hidden_states.flatten(1)
         out = torch.empty_like(state)

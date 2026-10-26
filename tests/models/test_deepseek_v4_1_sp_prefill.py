@@ -498,6 +498,7 @@ def test_engram_gates_only_the_real_local_rows(monkeypatch):
         overlap_epochs=None,
         staged_rows=staged,
         wkv=lambda rows: rows.repeat(1, 2),
+        l2_prefetch_after_projection=None,
         norm_weights=None,
         eps=1e-6,
         hc_mult=streams,
