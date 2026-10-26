@@ -435,9 +435,9 @@ def annotate(
         if ctas:
             # Uniform in a CTA, so a range opens and closes in every warp or in none.
             sample += (
-                f"  const bool __tl_iket_cta = (((blockIdx.z * gridDim.y + blockIdx.y) * "
-                "gridDim.x + blockIdx.x) % max(1u, gridDim.x * gridDim.y * gridDim.z / "
-                f"{ctas}u)) == 0u;\n"
+                "  const bool __tl_iket_cta = (((blockIdx.z * gridDim.y + blockIdx.y)"
+                " * gridDim.x + blockIdx.x) % max(1u, gridDim.x * gridDim.y * gridDim.z"
+                f" / {ctas}u)) == 0u;\n"
             )
         if iters:
             # A warp records an event each time a group of its lanes runs it; where its
