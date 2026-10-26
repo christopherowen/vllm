@@ -228,6 +228,7 @@ if TYPE_CHECKING:
     VLLM_DS41_IKET: str | None = None
     VLLM_DS41_IKET_CTAS: int = 0
     VLLM_DS41_IKET_ITERS: int = 0
+    VLLM_DS41_IKET_SKIP: str = ""
     WEIGHTLESS_STEER_PATH: str | None = None
     WEIGHTLESS_STEER_MODEL: str | None = None
     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
@@ -1930,6 +1931,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # With VLLM_DS41_IKET: ranges inside a loop record in at most this many of its
     # iterations, evenly spread (0: all), so no warp's record sizes run-iket's buffer.
     "VLLM_DS41_IKET_ITERS": lambda: int(os.getenv("VLLM_DS41_IKET_ITERS", "0")),
+    # With VLLM_DS41_IKET: TileLang kernels whose name this regex matches compile
+    # without ranges (run-iket still records their warps' lifetimes).
+    "VLLM_DS41_IKET_SKIP": lambda: os.getenv("VLLM_DS41_IKET_SKIP", ""),
     # DeepSeek V4.1 GLP steering (models/deepseek_v4_1/glp.py): the GLP file and
     # the served model name whose requests alone it steers (vllm/weightless.py),
     # set together or not at all. Part of the compile key, as every variable here

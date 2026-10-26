@@ -20,6 +20,10 @@ When on:
 - ``<directory>/sources`` holds each instrumented module's CUDA source and its
   sites (``<kernel>.<hash>.cu`` and ``.json``: each range's name, phase, source
   lines and first statement), which the trace's range names refer to.
+- ``VLLM_DS41_IKET_CTAS``, ``VLLM_DS41_IKET_ITERS`` and ``VLLM_DS41_IKET_SKIP``
+  (optional) sample CTAs and loop iterations and leave named kernels out, which an
+  engine-wide trace needs: run-iket's buffer is one allocation for the process, and
+  every instrumented launch reserves the run's largest warp record for each warp.
 - Traces need NVIDIA's profiler: run the process under ``run-iket profile`` (CuTe
   DSL's ``nvidia-cutlass-dsl-libs-base``), which patches the events into trace
   stores. Outside it an event's placeholder store writes shared address 0x20, in
@@ -505,7 +509,8 @@ def annotate(
 
 _lock = threading.Lock()
 _directory: Path | None = None
-_sampling = (0, 0)  # (CTAs a launch, iterations a loop); 0: all
+# (CTAs a launch, iterations a loop, kernels left as they are); 0 and "": all, none
+_sampling: tuple[int, int, str] = (0, 0, "")
 
 
 def directory() -> Path | None:
@@ -513,13 +518,18 @@ def directory() -> Path | None:
     return _directory
 
 
-def enable(output: str | os.PathLike[str], ctas: int = 0, iters: int = 0) -> Path:
+def enable(
+    output: str | os.PathLike[str], ctas: int = 0, iters: int = 0, skip: str = ""
+) -> Path:
     """Turn the IKET mode on for this process, before it compiles any TileLang
     kernel; ``ctas`` and ``iters`` > 0 sample CTAs and loop iterations
-    (``annotate``). Idempotent for the same directory and sampling."""
+    (``annotate``), and kernels whose name ``skip`` matches (a regex) compile
+    uninstrumented. Idempotent for the same directory and settings."""
     global _directory, _sampling
     root = Path(output).expanduser().resolve()
-    sampling = (int(ctas), int(iters))
+    sampling = (int(ctas), int(iters), skip or "")
+    if skip:
+        re.compile(skip)
     with _lock:
         if _directory is not None:
             if (root, sampling) != (_directory, _sampling):
@@ -565,10 +575,12 @@ def _postproc(code: str, target) -> str:
     from tilelang.tools.cuda.iket.codegen import inject_iket_cuda
 
     digest = hashlib.sha256(code.encode()).hexdigest()[:12]
-    ctas, iters = _sampling
+    ctas, iters, skip = _sampling
+    kernel = next((name for name, *_ in _kernels(code)), "module")
+    if skip and re.search(skip, kernel):
+        return code  # run-iket still records its warps' lifetimes
     annotated, sites = annotate(code, _token, ctas, iters)
     instrumented = inject_iket_cuda(annotated, target, runtime_payloads=False)
-    kernel = next((name for name, *_ in _kernels(code)), "module")
     stem = f"{kernel}.{digest}"
     (_directory / "sources" / f"{stem}.cu").write_text(instrumented)
     manifest = {"kernel": kernel, "ctas": ctas, "iters": iters, "sites": sites}
