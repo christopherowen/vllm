@@ -1510,11 +1510,12 @@ class FusedMoEKernelModularImpl:
         Returns:
         - torch.Tensor: The output tensor after applying the MoE layer.
         """
-        output = (
-            workspace[2]
-            if workspace is not None
-            else torch.empty_like(hidden_states, dtype=self.fused_experts.output_dtype)
-        )
+        # The layer's output outlives this call, so it never lives in the workspace
+        # arena: the arena's views are valid only until its next lease, and the next
+        # consumer leases scratch from the same bytes (at TP1, where no all-reduce
+        # copies the output, the next decoder layer's mHC entry overwrote it as it
+        # read it). The experts still write it directly (``output_alias``).
+        output = torch.empty_like(hidden_states, dtype=self.fused_experts.output_dtype)
 
         local_num_experts = w1.shape[0]
         if global_num_experts == -1:
