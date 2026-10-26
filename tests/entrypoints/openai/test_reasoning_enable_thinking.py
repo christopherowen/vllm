@@ -38,7 +38,9 @@ def _build_responses_request(**kwargs) -> ResponsesRequest:
 class TestChatCompletionReasoningEffort:
     """Chat Completions: reasoning_effort -> enable_thinking."""
 
-    @pytest.mark.parametrize("effort", ["low", "medium", "high"])
+    @pytest.mark.parametrize(
+        "effort", ["minimal", "low", "medium", "high", "max", "ultra"]
+    )
     def test_non_none_effort_injects_enable_thinking_true(self, effort):
         request = _build_chat_request(reasoning_effort=effort)
         params = request.build_chat_params(None, "auto")

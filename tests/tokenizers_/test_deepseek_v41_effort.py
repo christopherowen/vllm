@@ -9,7 +9,16 @@ from vllm.tokenizers.deepseek_v41_encoding import render_reasoning_effort
 
 @pytest.mark.parametrize(
     ("effort", "budget"),
-    [("low", 50), ("high", 75), ("max", 100), ("xhigh", 75), (None, 75)],
+    [
+        ("low", 50),
+        ("high", 75),
+        ("max", 100),
+        ("xhigh", 75),
+        ("minimal", 50),
+        ("medium", 75),
+        ("ultra", 100),
+        (None, 75),
+    ],
 )
 def test_named_and_default_effort_render_configured_numeric_budget(effort, budget):
     assert render_reasoning_effort(0, "thinking", effort).startswith(

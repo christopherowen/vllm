@@ -242,6 +242,10 @@ REASONING_EFFORT_MAPPINGS: Dict[str, int] = {
     # are low, high and max.
     "xhigh": 75,
     "max": 100,
+    # The DeepSeek API's aliases: minimal as low, medium as high, ultra as max.
+    "minimal": 50,
+    "medium": 75,
+    "ultra": 100,
 }
 
 DEFAULT_REASONING_EFFORT = "high"

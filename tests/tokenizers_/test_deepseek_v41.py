@@ -46,6 +46,9 @@ def test_reference_encoder_fixtures(case_id):
         ("high", 75),
         ("xhigh", 75),
         ("max", 100),
+        ("minimal", 50),
+        ("medium", 75),
+        ("ultra", 100),
         (1, 1),
         (42, 42),
         (100, 100),
@@ -62,10 +65,31 @@ def test_numeric_reasoning_effort(effort, budget):
     )
 
 
-@pytest.mark.parametrize("effort", ["medium", "minimal", -1, 0, 101, True, 1.5, []])
+@pytest.mark.parametrize("effort", ["auto", "Medium", -1, 0, 101, True, 1.5, []])
 def test_invalid_effort_is_a_request_error(effort):
     with pytest.raises(ValueError, match="reasoning_effort"):
         render([{"role": "user", "content": "question"}], reasoning_effort=effort)
+
+
+@pytest.mark.parametrize(
+    ("effort", "budget"), [("minimal", 50), ("medium", 75), ("ultra", 100)]
+)
+def test_api_effort_aliases_render_the_api_budgets(effort, budget):
+    """The DeepSeek API's aliases, as an OpenAI-style client sends them, render
+    the budget of the name they alias (minimal as low, medium as high, ultra as
+    max) and turn thinking on."""
+    request = ChatCompletionRequest(
+        model="deepseek-ai/DeepSeek-V4.1-Flash",
+        messages=[{"role": "user", "content": "question"}],
+        reasoning_effort=effort,
+    )
+    kwargs = request.build_chat_params(None, "auto").get_apply_chat_template_kwargs()
+    assert render(request.messages, **kwargs) == (
+        "<｜begin▁of▁sentence｜><｜System｜>"
+        f"Reasoning Effort: {budget} (range 1-100, the higher the value, "
+        "the more thorough the reasoning)\n\n"
+        "<｜User｜>question<｜Assistant｜><think>"
+    )
 
 
 @pytest.mark.parametrize(

@@ -261,16 +261,17 @@ class ChatCompletionRequest(OpenAIBaseModel):
         | None
     ) = "none"
     reasoning_effort: (
-        Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] | None
+        Literal["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+        | None
     ) = Field(
         default=None,
         description=(
             "Constrains effort on reasoning for reasoning models. "
             "Currently supported values are none, minimal, low, medium, "
-            "high, xhigh, and max. Reducing reasoning effort can result in "
+            "high, xhigh, max, and ultra. Reducing reasoning effort can result in "
             "faster responses and fewer tokens used on reasoning in a response. "
-            "Note that 'max' is specific to the DeepSeek V4 series and is not "
-            "part of the standard OpenAI API specification."
+            "Note that 'max' and 'ultra' are specific to the DeepSeek V4 series "
+            "and are not part of the standard OpenAI API specification."
         ),
     )
     thinking: ChatCompletionThinkingParam | None = Field(
