@@ -131,6 +131,9 @@ def requests_case(maximum, requests, length):
     full = torch.arange(maximum, device="cuda") % 2 == 1
     limits = torch.where(full, 2**31 - 1, 128).to(torch.int32)
     prefix = torch.zeros(maximum, dtype=torch.int64, device="cuda")
+    # Final chunks and decode rows: replay_rows' floors give the frozen kernel's
+    # metadata (a chunk over the window replays from the prompt end less it).
+    floors = torch.where(~full & (length > 128), seq.long() - 128, prefix)
 
     def outputs():
         return (
@@ -153,7 +156,7 @@ def requests_case(maximum, requests, length):
             128,
         ),
         lambda out: lambda: ced.requests(
-            starts, seq, limits, prefix, *out, requests, compact=length > 128
+            starts, seq, limits, floors, *out, requests, compact=length > 128
         ),
         outputs,
         lambda a, b: all(torch.equal(x, y) for x, y in zip(a, b)),

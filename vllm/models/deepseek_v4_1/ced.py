@@ -79,20 +79,21 @@ def plan_ced(
     query_lengths, keep_full, capacities: tuple[int, ...], limits=None
 ) -> CEDPlan | None:
     """The CPU bounds of a step's decoder rows: each request's last ``CED_WINDOW``
-    rows, or every row where ``keep_full``. ``limits`` (``nonfinal_limits``) lowers a
-    request's kept rows further; ``max_query_len`` keeps the window bound, so the
-    decoder runs in the mode it would without the limits."""
+    rows, or every row where ``keep_full``. ``limits`` (``replay_rows``) lowers a
+    request's kept rows further. None when every request keeps all its rows;
+    ``max_query_len`` keeps the window bound, so the decoder runs in the mode it
+    would without the limits."""
     bounds = tuple(
         int(q) if full else min(int(q), CED_WINDOW)
         for q, full in zip(query_lengths, keep_full)
     )
-    if all(b == int(q) for b, q in zip(bounds, query_lengths)):
-        return None
     kept = (
         bounds
         if limits is None
         else tuple(min(b, int(limit)) for b, limit in zip(bounds, limits))
     )
+    if all(k == int(q) for k, q in zip(kept, query_lengths)):
+        return None
     count = sum(kept)
     return CEDPlan(
         capacities[bisect_left(capacities, count)],
@@ -102,44 +103,42 @@ def plan_ced(
     )
 
 
-def nonfinal_limits(
-    query_lengths,
-    computed,
-    prefill_lens,
-    keep_full,
-    eligible,
-    *,
-    min_remaining: int,
-    chunk_align: int,
-) -> list[int] | None:
-    """Kept-row limits for prefill chunks whose decoder rows are never read.
+def replay_rows(
+    query_lengths, computed, prefill_lens, prefix_start, keep_full
+) -> tuple[list[int], list[int]]:
+    """Each request's replay floor and kept-row limit, anchored at its prompt end.
 
-    A request's chunk keeps one decoder row instead of its last ``CED_WINDOW``
-    when the chunk is truncated anyway (more than ``CED_WINDOW`` rows, not
-    ``keep_full``), it is ``eligible``, it ends on a multiple of ``chunk_align``
-    (the scheduler's aligned chunk boundaries), and at least ``min_remaining``
-    prefill rows follow it. The next chunk then has more than ``CED_WINDOW`` rows,
-    so its decoder rows replay from inside it, and every later decoder and draft
-    window starts past this chunk. The one row is the chunk's last, whose logits
-    the runner discards (a chunked prefill samples no token). Returns None when no
-    request qualifies.
+    The decoder replays the last ``CED_WINDOW`` tokens of the prompt (the V4.1
+    paper's bounded replay): a prefilling request's floor is ``prefill_len -
+    CED_WINDOW``, or its prefix start where that is later (the decoder has no rows
+    before it), and every chunk of the prompt keeps exactly its rows from the floor
+    on. A chunk that ends at or before the floor keeps one row, its last, whose
+    logits the runner discards (a chunked prefill samples no token); the requests
+    kernel replays that row from itself. Wherever the prompt's chunks end, each
+    replayed row then sees the same decoder rows, and the drafter, whose context
+    rows are the kept rows, the same context. ``prefill_len`` is what the runner
+    prefills: the prompt, and the outputs a resumed request recomputes.
+
+    A decoding request keeps up to ``CED_WINDOW`` rows from its prefix start: its
+    rows lie past the prompt's floor, whose window no longer reaches it. A
+    ``keep_full`` request (prompt logprobs) keeps every row from its prefix start.
     """
-    limits = [CED_WINDOW] * len(query_lengths)
-    skipped = False
-    for i, (q, start, total, full, ok) in enumerate(
-        zip(query_lengths, computed, prefill_lens, keep_full, eligible)
+    floors, limits = [], []
+    for q, start, total, prefix, full in zip(
+        query_lengths, computed, prefill_lens, prefix_start, keep_full
     ):
-        end = int(start) + int(q)
-        if (
-            ok
-            and not full
-            and int(q) > CED_WINDOW
-            and end % chunk_align == 0
-            and int(total) - end >= min_remaining
-        ):
-            limits[i] = 1
-            skipped = True
-    return limits if skipped else None
+        start, total, prefix = int(start), int(total), int(prefix)
+        if full:
+            floors.append(prefix)
+            limits.append(KEEP_ALL)
+        elif start < total:
+            floor = max(prefix, total - CED_WINDOW)
+            floors.append(floor)
+            limits.append(min(max(start + int(q) - floor, 1), CED_WINDOW))
+        else:
+            floors.append(prefix)
+            limits.append(CED_WINDOW)
+    return floors, limits
 
 
 class CEDState:
@@ -158,7 +157,7 @@ class CEDState:
         self.replay_start = torch.empty_like(self.request_positions)
         self.counts = torch.empty(2, dtype=torch.int32, device=device)
         self.limits = torch.empty(max_requests, dtype=torch.int32, device=device)
-        self.prefix_start = torch.empty_like(self.request_positions)
+        self.floors = torch.empty_like(self.request_positions)
         self.plan: CEDPlan | None = None
 
     def warmup(
@@ -239,16 +238,17 @@ class CEDState:
         seq: torch.Tensor,
         query_lengths,
         keep_full,
-        prefix_start,
+        floors,
         limits=None,
     ) -> None:
-        """``limits``: optional per-request kept-row limits (``nonfinal_limits``)."""
+        """``floors``: each request's replay floor; ``limits``: optional per-request
+        kept-row limits (both from ``replay_rows``)."""
         nr = len(query_lengths)
         self.plan = plan_ced(query_lengths, keep_full, self.capacities, limits)
         # Fresh pinned sources remain owned by the async-copy allocator until
         # transfer completion; reusing a CPU staging buffer could race overlap.
         # A request keeps at most its limit of rows: all of them, the window, or
-        # its nonfinal limit.
+        # the rows from its replay floor on.
         limits_host = torch.tensor(
             [
                 KEEP_ALL if full else CED_WINDOW if limits is None else limits[i]
@@ -258,16 +258,16 @@ class CEDState:
             device="cpu",
             pin_memory=True,
         )
-        prefix_host = torch.tensor(
-            prefix_start, dtype=torch.int64, device="cpu", pin_memory=True
+        floors_host = torch.tensor(
+            floors, dtype=torch.int64, device="cpu", pin_memory=True
         )
         self.limits[:nr].copy_(limits_host, non_blocking=True)
-        self.prefix_start[:nr].copy_(prefix_host, non_blocking=True)
+        self.floors[:nr].copy_(floors_host, non_blocking=True)
         ced_kernels.requests(
             starts,
             seq,
             self.limits,
-            self.prefix_start,
+            self.floors,
             self.starts,
             self.request_positions,
             self.replay_start,

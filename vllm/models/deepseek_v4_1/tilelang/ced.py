@@ -41,7 +41,7 @@ def requests_kernel(max_requests: int, compact: bool = True, single: bool = Fals
             starts: T.Tensor((starts_len,), T.int32),
             seq: T.Tensor((seq_len,), T.int32),
             limits: T.Tensor((max_requests,), T.int32),
-            prefix: T.Tensor((max_requests,), T.int64),
+            floors: T.Tensor((max_requests,), T.int64),
             out_starts: T.Tensor((max_requests + 1,), T.int32),
             positions: T.Tensor((max_requests,), T.int64),
             replay: T.Tensor((max_requests,), T.int64),
@@ -53,14 +53,14 @@ def requests_kernel(max_requests: int, compact: bool = True, single: bool = Fals
                 q = _load32(starts[1]) - _load32(starts[0])
                 kept = T.min(q, _load32(limits[0]))
                 last = T.cast(_load32(seq[0]), T.int64)
-                bound = _load64(prefix[0])
+                floor = _load64(floors[0])
                 if r <= max_requests:
                     out_starts[r] = T.if_then_else(r == 0, 0, kept)
                 if r < max_requests:
                     if r == 0:
                         position = last - kept
                         positions[0] = position
-                        replay[0] = T.max(bound, T.if_then_else(q > kept, position, 0))
+                        replay[0] = T.min(floor, position)
                     else:
                         positions[r] = -1
                         replay[r] = 0
@@ -77,7 +77,7 @@ def requests_kernel(max_requests: int, compact: bool = True, single: bool = Fals
             starts: T.Tensor((starts_len,), T.int32),
             seq: T.Tensor((seq_len,), T.int32),
             limits: T.Tensor((max_requests,), T.int32),
-            prefix: T.Tensor((max_requests,), T.int64),
+            floors: T.Tensor((max_requests,), T.int64),
             out_starts: T.Tensor((max_requests + 1,), T.int32),
             positions: T.Tensor((max_requests,), T.int64),
             replay: T.Tensor((max_requests,), T.int64),
@@ -90,13 +90,14 @@ def requests_kernel(max_requests: int, compact: bool = True, single: bool = Fals
                 start = _load32(starts[T.min(r, nr)])
                 end = _load32(starts[r + 1], live)
                 last = T.cast(_load32(seq[r], live), T.int64)
-                bound = _load64(prefix[r], live)
+                floor = _load64(floors[r], live)
                 total = _load32(starts[nr])
                 if r <= max_requests:
                     out_starts[r] = start
                 if r < max_requests:
-                    positions[r] = T.if_then_else(live, last - (end - start), -1)
-                    replay[r] = T.if_then_else(live, bound, 0)
+                    position = last - (end - start)
+                    positions[r] = T.if_then_else(live, position, -1)
+                    replay[r] = T.if_then_else(live, T.min(floor, position), 0)
                 if r == 0:
                     counts[0] = total
                     counts[1] = nr
@@ -108,7 +109,7 @@ def requests_kernel(max_requests: int, compact: bool = True, single: bool = Fals
         starts: T.Tensor((starts_len,), T.int32),
         seq: T.Tensor((seq_len,), T.int32),
         limits: T.Tensor((max_requests,), T.int32),
-        prefix: T.Tensor((max_requests,), T.int64),
+        floors: T.Tensor((max_requests,), T.int64),
         out_starts: T.Tensor((max_requests + 1,), T.int32),
         positions: T.Tensor((max_requests,), T.int64),
         replay: T.Tensor((max_requests,), T.int64),
@@ -124,12 +125,12 @@ def requests_kernel(max_requests: int, compact: bool = True, single: bool = Fals
             for chunk in T.serial(chunks):
                 r = chunk * 32 + lane
                 # Every input loads before the scan, so one memory latency covers
-                # the request's lengths, sequence end and prefix bound.
+                # the request's lengths, sequence end and replay floor.
                 live = r < nr
                 q = _load32(starts[r + 1], live) - _load32(starts[r], live)
                 limit = _load32(limits[r], live)
                 end = T.cast(_load32(seq[r], live), T.int64)
-                bound = _load64(prefix[r], live)
+                floor = _load64(floors[r], live)
                 kept = T.min(q, limit)
                 if nr <= 1:
                     cumulative = T.shfl_sync(kept, 0) + carry
@@ -145,9 +146,9 @@ def requests_kernel(max_requests: int, compact: bool = True, single: bool = Fals
                     out_starts[r] = cumulative - kept
                     position = end - kept
                     positions[r] = T.if_then_else(live, position, -1)
-                    replay[r] = T.if_then_else(
-                        live, T.max(bound, T.if_then_else(q > kept, position, 0)), 0
-                    )
+                    # The replay starts at the request's floor; a chunk that ends
+                    # before it keeps one row (``replay_rows``), replayed from itself.
+                    replay[r] = T.if_then_else(live, T.min(floor, position), 0)
                 carry = T.shfl_sync(cumulative, last_lane)
             if lane == 0:
                 out_starts[max_requests] = carry
@@ -161,7 +162,7 @@ def requests(
     starts,
     seq,
     limits,
-    prefix,
+    floors,
     out_starts,
     positions,
     replay,
@@ -171,7 +172,7 @@ def requests(
     compact=True,
 ):
     requests_kernel(positions.shape[0], compact, compact and nr == 1)(
-        starts, seq, limits, prefix, out_starts, positions, replay, counts, nr
+        starts, seq, limits, floors, out_starts, positions, replay, counts, nr
     )
 
 

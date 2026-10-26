@@ -22,10 +22,87 @@ from vllm.triton_utils import triton  # noqa: E402
 DEVICE = "cuda"
 
 
+def _requests_reference(starts, seq, limits, floors, nr, max_requests, compact):
+    """The requests kernel's outputs from the CPU: each request keeps its last
+    ``min(rows, limit)`` rows; ``positions`` holds the first kept row's position and
+    the replay starts at ``min(floor, position)``. Padding requests keep nothing."""
+    starts, seq = starts.cpu().long(), seq.cpu().long()
+    limits, floors = limits.cpu().long(), floors.cpu().long()
+    rows = starts[1 : nr + 1] - starts[:nr]
+    kept = torch.minimum(rows, limits[:nr]) if compact else rows
+    out = torch.zeros(max_requests + 1, dtype=torch.long)
+    out[1 : nr + 1] = kept.cumsum(0)
+    out[nr + 1 :] = out[nr]
+    positions = torch.full((max_requests,), -1, dtype=torch.long)
+    positions[:nr] = seq[:nr] - kept
+    replay = torch.zeros(max_requests, dtype=torch.long)
+    replay[:nr] = torch.minimum(floors[:nr], positions[:nr])
+    counts = torch.tensor([int(out[nr]), nr])
+    return out.int(), positions, replay, counts.int()
+
+
 @pytest.mark.parametrize("max_requests", [1, 8, 16, 32, 48, 64])
 @pytest.mark.parametrize("nr", [0, 1, 3, 35, 64])
-def test_ced_requests_preserves_compaction_and_replay_bounds(max_requests, nr):
-    """Per-request limits preserve the old 128/full-row metadata, including padding."""
+def test_ced_requests_replay_from_the_floor(max_requests, nr):
+    """Kept rows, positions and replay starts for limits of one row, part of the
+    window, the window and every row, with floors before, at and after the first
+    kept row; the unchanged-row kernel where every request keeps its rows."""
+    from vllm.models.deepseek_v4_1.tilelang import ced
+
+    nr = min(nr, max_requests)
+    choices = (1, 37, 128, 2**31 - 1)
+    for lengths in (
+        [0] * nr,
+        [1] * nr,
+        [3 + i * 7 for i in range(nr)],
+        [129 + i * 511 for i in range(nr)],
+    ):
+        starts = torch.tensor(
+            [0, *torch.tensor(lengths).cumsum(0).tolist()],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        seq = torch.arange(max_requests, dtype=torch.int32, device="cuda") * 701
+        seq += 40000
+        limits = torch.tensor(
+            [choices[r % 4] for r in range(max_requests)],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        # Floors past every row, at the window start and before the chunk.
+        floors = seq.long() - torch.tensor(
+            [(0, 128, 90000)[r % 3] for r in range(max_requests)], device="cuda"
+        ).clamp_max(seq.long())
+        for compact in (True, False):
+            if not compact and any(
+                min(q, int(limits[r])) < q for r, q in enumerate(lengths)
+            ):
+                continue
+            out = torch.full((max_requests + 1,), 7, dtype=torch.int32, device="cuda")
+            positions = torch.full((max_requests,), 7, dtype=torch.int64, device="cuda")
+            replay = torch.full_like(positions, 7)
+            counts = torch.full((2,), 7, dtype=torch.int32, device="cuda")
+            ced.requests(
+                starts, seq, limits, floors, out, positions, replay, counts, nr,
+                compact=compact,
+            )  # fmt: skip
+            expected = _requests_reference(
+                starts, seq, limits, floors, nr, max_requests, compact
+            )
+            if not compact:
+                # The unchanged-row kernel passes the step's starts through.
+                passed = torch.arange(max_requests + 1).clamp_max(nr)
+                expected = (starts.cpu()[passed], *expected[1:])
+            for want, got in zip(expected, (out, positions, replay, counts)):
+                assert torch.equal(want, got.cpu()), (compact, lengths)
+
+
+@pytest.mark.parametrize("max_requests", [1, 8, 16, 32, 48, 64])
+@pytest.mark.parametrize("nr", [0, 1, 3, 35, 64])
+def test_ced_requests_final_chunks_keep_the_released_metadata(max_requests, nr):
+    """Final prompt chunks and decode rows, whose per-chunk anchor (the frozen r6x
+    kernel's) was the prompt end already: the floors ``replay_rows`` gives them
+    reproduce that kernel's metadata, including padding."""
     from benchmarks.kernels.ced_reference import _decoder_requests
     from vllm.models.deepseek_v4_1.tilelang import ced
 
@@ -36,10 +113,17 @@ def test_ced_requests_preserves_compaction_and_replay_bounds(max_requests, nr):
             dtype=torch.int32,
             device="cuda",
         )
-        seq = torch.full((max_requests,), 5000, dtype=torch.int32, device="cuda")
+        # Every chunk ends its sequence's prompt or decode rows: no longer than it.
+        seq = torch.full((max_requests,), 40000, dtype=torch.int32, device="cuda")
         prefix = torch.arange(max_requests, dtype=torch.int64, device="cuda") * 17
         full = torch.arange(max_requests, device="cuda") % 2 == 0
         limits = torch.where(full, 2**31 - 1, 128).to(torch.int32)
+        rows = torch.tensor(lengths + [0] * (max_requests - nr), device="cuda")
+        # A final chunk of more than the window replays from the prompt end less
+        # the window; decode rows, short prompts and prompt logprobs from the prefix.
+        floors = torch.where(
+            ~full & (rows > 128), torch.maximum(prefix, seq.long() - 128), prefix
+        )
         outputs = []
         for implementation in ("triton", "tilelang"):
             out = torch.full((max_requests + 1,), 7, dtype=torch.int32, device="cuda")
@@ -63,7 +147,7 @@ def test_ced_requests_preserves_compaction_and_replay_bounds(max_requests, nr):
                 )
             else:
                 ced.requests(
-                    starts, seq, limits, prefix, out, positions, replay, counts, nr
+                    starts, seq, limits, floors, out, positions, replay, counts, nr
                 )
             if implementation == "tilelang" and all(
                 q <= 128 or r % 2 == 0 for r, q in enumerate(lengths)
@@ -72,7 +156,7 @@ def test_ced_requests_preserves_compaction_and_replay_bounds(max_requests, nr):
                     starts,
                     seq,
                     limits,
-                    prefix,
+                    floors,
                     out,
                     positions,
                     replay,

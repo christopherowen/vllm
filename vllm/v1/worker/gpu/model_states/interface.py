@@ -49,6 +49,11 @@ class ModelState(ABC):
     def can_use_single_request_prefill_graph(self, num_reqs, num_tokens, req_ids):
         return False
 
+    def compacts_short_queries(self, batch_req_state) -> bool:
+        """Whether the model compacts a request's rows although every query fits
+        ``max_cudagraph_query_len``; such a step runs eagerly."""
+        return False
+
     def finalize_cudagraph_inputs(self, model_inputs, cg_mode):
         """Refresh model-owned inputs after capture attention metadata is staged."""
         return None

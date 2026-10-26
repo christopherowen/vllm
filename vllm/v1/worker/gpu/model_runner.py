@@ -2721,7 +2721,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         exceeds_cudagraph_query_len = (
             max_cudagraph_query_len is not None
-            and max_query_len > max_cudagraph_query_len
+            and (
+                max_query_len > max_cudagraph_query_len
+                or self.model_state.compacts_short_queries(batch_req_state)
+            )
             and not self.model_state.can_use_single_request_prefill_graph(
                 num_reqs, num_toks, scheduler_output.num_scheduled_tokens
             )
