@@ -360,6 +360,27 @@ _FOR = re.compile(
 )
 
 
+def _trips(header: str) -> int | None:
+    """The iterations of a TVM ``for`` loop with literal bounds; None otherwise."""
+    loop = _FOR.match(header)
+    start, bound = (loop.group(2).strip(), loop.group(3).strip()) if loop else ("", "")
+    if not (start.isdigit() and bound.isdigit()):
+        return None
+    return int(bound) - int(start)
+
+
+def _loop_trips(headers: tuple[str, ...]) -> int | None:
+    """The iterations of nested loops: the product of their trips, None if one has no
+    literal bounds."""
+    total = 1
+    for header in headers:
+        trips = _trips(header)
+        if trips is None:
+            return None
+        total *= trips
+    return total
+
+
 def _iterations(header: str, iters: int) -> str | None:
     """True in at most ``iters`` iterations of a TVM ``for`` loop (``for (int v =
     start; v < bound; ++v)``), each in the middle of its share of the loop, so one
@@ -481,6 +502,8 @@ def annotate(
                 "last_line": code.count("\n", 0, item.last.end - 1) + 1,
                 "statement": " ".join(item.first.text.split())[:160],
                 "loops": len(item.loops),
+                # A trace holds the sampled iterations; these scale them to the loops.
+                **({"loop_trips": _loop_trips(item.loops)} if item.loops else {}),
                 **({"unsampled_loops": unsampled} if unsampled else {}),
                 "traced": item.name in traced,
             }
