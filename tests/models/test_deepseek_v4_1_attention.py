@@ -142,3 +142,41 @@ def test_global_preparation_dependency_survives_functionalization(monkeypatch):
         # Preparation must remain visible to later consumers as well; mutable
         # alias-list functionalization used to copy stale clones back here.
         torch.testing.assert_close(backing, torch.cat((hidden * 2, hidden * 3)))
+
+
+def test_decode_front_is_one_kernel_at_decode_rows(monkeypatch):
+    """At decode rows with cache pages, the front after the fused projection is
+    ``attention_front``'s one launch, at the SWA slots and page size, and Q-B gets its
+    cast; sequence-parallel rows, rows past a decode tile and memory profiling (no
+    cache pages) run the separate kernels."""
+    from vllm.models.deepseek_v4_1 import attention
+    from vllm.models.deepseek_v4_1.tilelang import front
+
+    module = _tilelang_layer(layer_id=3)
+    module.q_lora_rank = 1280
+    module.q_norm = SimpleNamespace(weight=torch.ones(1280), variance_epsilon=1e-6)
+    module.kv_norm = SimpleNamespace(weight=torch.ones(512), variance_epsilon=1e-6)
+    module.swa_cache_layer = SimpleNamespace(
+        prefix="swa", kv_cache=torch.empty(2, 8, dtype=torch.uint8), block_size=128
+    )
+    launches = []
+    monkeypatch.setattr(front, "attention_front", lambda *args: launches.append(args))
+    slots = torch.arange(100, dtype=torch.int64)
+    metadata = {"swa": SimpleNamespace(slot_mapping=slots)}
+    monkeypatch.setattr(
+        attention,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=metadata),
+    )
+    positions = torch.zeros(6, dtype=torch.int64)
+    qr, kv, cast = module._front(torch.zeros(6, 1792), positions, None)
+    (args,) = launches
+    assert args[7].tolist() == list(range(6)) and args[8] == 128
+    assert args[9] is qr and args[12] is kv
+    assert cast.rows is qr and args[10] is cast.values and args[11] is cast.scales
+    assert qr.shape == (6, 1280) and kv.shape == (6, 512)
+    assert module._front(torch.zeros(6, 1792), positions, object()) is None
+    assert module._front(torch.zeros(65, 1792), positions, None) is None
+    metadata = None
+    assert module._front(torch.zeros(6, 1792), positions, None) is None
+    assert len(launches) == 1
