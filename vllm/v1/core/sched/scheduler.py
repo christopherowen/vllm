@@ -356,6 +356,15 @@ class Scheduler(SchedulerInterface):
         self.use_eagle = False
         self.use_eagle_block_drop = False
         self.num_spec_tokens = vllm_config.num_speculative_tokens
+        # Copy drafts: a copying request verifies up to num_verification_tokens
+        # drafts, laid out from the copy state its last output reported; the
+        # drafter's block (num_spec_tokens) stays every other request's width.
+        self.num_verification_tokens = vllm_config.num_verification_tokens
+        self.copy_drafts = (
+            speculative_config is not None
+            and speculative_config.copy_drafts is not None
+        )
+        self.max_decode_rows = vllm_config.max_decode_rows
         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
         if self.scheduler_config.align_prefill_chunks:
             self._check_aligned_prefill_chunks()
@@ -900,7 +909,7 @@ class Scheduler(SchedulerInterface):
         """A whole aligned chunk must fit beside every decoding request's rows, or
         a long prompt would wait for the decodes to end."""
         threshold = self.scheduler_config.long_prefill_token_threshold
-        decode_rows = self.max_num_running_reqs * (1 + self.num_spec_tokens)
+        decode_rows = self.max_decode_rows
         if threshold <= 0 or threshold + decode_rows > self.max_num_scheduled_tokens:
             raise ValueError(
                 "aligned prefill chunks need long_prefill_token_threshold "
@@ -962,6 +971,30 @@ class Scheduler(SchedulerInterface):
                 if self._prefill_finishes_in_chunk(computed, request.num_tokens):
                     return True
         return False
+
+    def _widen_copy_placeholders(self, request: Request, rows_left: int) -> int:
+        """Lay out a decoding request's draft placeholders for the copy drafts its
+        last output asked for (``copy_draft_alloc``): DSpark's block and at most
+        ``rows_left`` rows more; returns the rows added.
+
+        Only the -1 placeholders of async scheduling are laid out (the worker
+        verifies its own copy of the drafts): ``num_spec_tokens`` of them, after
+        draft zero with sink rejection, or more where an earlier attempt widened
+        them and the request was not scheduled.
+        """
+        placeholders = request.spec_token_ids
+        base = self.num_spec_tokens + self.sink_rejection
+        if (
+            request.is_prefill_chunk
+            or len(placeholders) < base
+            or placeholders[0] != -1
+            or placeholders[-1] != -1
+        ):
+            return 0
+        rows = max(0, min(request.copy_draft_alloc - self.num_spec_tokens, rows_left))
+        if len(placeholders) != base + rows:
+            request.spec_token_ids = [-1] * (base + rows)
+        return rows
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
@@ -1154,6 +1187,17 @@ class Scheduler(SchedulerInterface):
             if needs_multiple_running_passes
             else None
         )
+        # Copy drafts: the rows copying requests may take beyond the uniform
+        # decode width. Every running request, and every waiting one that may
+        # take a free slot this step, may hold the uniform width, so the step's
+        # decode rows stay within max_decode_rows.
+        copy_rows_left = 0
+        if self.copy_drafts:
+            slots = min(
+                self.max_num_running_reqs,
+                len(self.running) + len(self.waiting) + len(self.skipped_waiting),
+            )
+            copy_rows_left = self.max_decode_rows - slots * (1 + self.num_spec_tokens)
 
         def schedule_running_requests(
             service_class: ComputeServiceClass | None = None,
@@ -1161,6 +1205,7 @@ class Scheduler(SchedulerInterface):
             allow_preemption: bool = True,
             enforce_lora_limit: bool = False,
         ) -> None:
+            nonlocal copy_rows_left
             nonlocal draft_input_budget
             nonlocal encoder_compute_budget
             nonlocal input_budget
@@ -1270,6 +1315,10 @@ class Scheduler(SchedulerInterface):
                     req_index += 1
                     continue
 
+                if self.copy_drafts:
+                    copy_rows_left -= self._widen_copy_placeholders(
+                        request, copy_rows_left
+                    )
                 num_new_tokens = (
                     request.num_tokens_with_spec
                     + request.num_output_placeholders
@@ -2677,6 +2726,8 @@ class Scheduler(SchedulerInterface):
         # has no draft zero. The held token stays until an in-flight output
         # of the request (stale) commits draft zero with its kept logprobs.
         request.sink_draft_zero = False
+        # The worker resets the request's copy state when it resumes.
+        request.copy_draft_alloc = 0
         # Async scheduling: mark all in-flight output as stale. Its tokens are
         # still delivered on return (dropping them would perturb spec-decode
         # acceptance) but must not mutate the reset counters; each step drains
@@ -3219,6 +3270,14 @@ class Scheduler(SchedulerInterface):
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
+            if model_runner_output.copy_draft_alloc is not None and not (
+                output_is_stale
+            ):
+                # The copy state this step's proposal left: the drafts the
+                # request's steps after the next one are laid out with.
+                request.copy_draft_alloc = model_runner_output.copy_draft_alloc[
+                    req_index
+                ]
             # Sink rejection: whether this step's spec tokens started with
             # draft zero, the provisional token of the request's previous step.
             draft_zero = self.sink_rejection and req_id in (
@@ -3929,7 +3988,7 @@ class Scheduler(SchedulerInterface):
             self.requests[request.request_id] = request
             if self.spec_decode_metrics_level != "none":
                 request.spec_decode_metrics = RequestSpecDecodeMetrics.new(
-                    self.num_spec_tokens
+                    self.num_verification_tokens
                 )
             if self.connector is not None:
                 self.connector.on_new_request(request)
@@ -4365,7 +4424,7 @@ class Scheduler(SchedulerInterface):
         if not self.log_stats or not num_draft_tokens:
             return spec_decoding_stats
         if spec_decoding_stats is None:
-            spec_decoding_stats = SpecDecodingStats.new(self.num_spec_tokens)
+            spec_decoding_stats = SpecDecodingStats.new(self.num_verification_tokens)
         spec_decoding_stats.observe_draft(
             num_draft_tokens=num_draft_tokens, num_accepted_tokens=num_accepted_tokens
         )

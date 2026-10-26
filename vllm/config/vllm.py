@@ -768,6 +768,30 @@ class VllmConfig:
         return 0
 
     @property
+    def num_verification_tokens(self) -> int:
+        """The most drafts one request verifies in a step, which sizes every
+        buffer a verified row touches: ``num_speculative_tokens`` unless copy
+        drafts widen it (``SpeculativeConfig.num_verification_tokens``)."""
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.num_speculative_tokens is not None
+        ):
+            return self.speculative_config.num_verification_tokens
+        return self.num_speculative_tokens
+
+    @property
+    def max_decode_rows(self) -> int:
+        """The most rows a step's decoding requests hold: every running request
+        at the uniform decode width, plus one request's verification beyond it
+        (copy drafts). The scheduler keeps a step's decode rows within it, so an
+        aligned prefill chunk always fits beside them."""
+        return (
+            self.scheduler_config.max_num_seqs * self.uniform_decode_query_len
+            + self.num_verification_tokens
+            - self.num_speculative_tokens
+        )
+
+    @property
     def num_lookahead_tokens(self) -> int:
         """KV slots to reserve past the tokens the target model is scheduled for.
 
@@ -1762,6 +1786,19 @@ class VllmConfig:
                 "async speculative decoding).",
             )
             self.model_config.disable_cascade_attn = True
+
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.copy_drafts is not None
+        ):
+            # The scheduler lays out a copying request's rows from the copy
+            # state the V2 runner returns with each step's output.
+            if not self.scheduler_config.async_scheduling:
+                raise ValueError("copy_drafts requires async scheduling")
+            if not self.use_v2_model_runner:
+                raise ValueError("copy_drafts requires the V2 model runner")
+            if self.parallel_config.pipeline_parallel_size > 1:
+                raise ValueError("copy_drafts does not support pipeline parallelism")
 
         if (
             self.observability_config.per_request_spec_decode_metrics != "none"

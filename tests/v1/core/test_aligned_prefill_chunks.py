@@ -29,20 +29,29 @@ def test_chunks_end_at_multiples_of_the_threshold():
 
 
 def test_a_whole_chunk_must_fit_beside_the_decode_rows():
-    def check(threshold, budget, seqs=16, spec=5):
+    def check(threshold, budget, seqs=16, spec=5, lookahead=5):
+        # VllmConfig.max_decode_rows: every stream at the drafter's block, and
+        # one request's copy drafts past it.
         owner = SimpleNamespace(
             scheduler_config=SimpleNamespace(long_prefill_token_threshold=threshold),
-            max_num_running_reqs=seqs,
-            num_spec_tokens=spec,
+            max_decode_rows=seqs * (1 + spec) + lookahead - spec,
             max_num_scheduled_tokens=budget,
         )
         scheduler_module.Scheduler._check_aligned_prefill_chunks(owner)
 
     check(8096, 8192)  # TP4: 16 streams of six rows beside a chunk
     check(4048, 4096, seqs=8)  # TP3
-    for threshold, budget in ((8192, 8192), (0, 8192), (8097, 8192)):
+    # Copy drafts to 16: one stream of 17 rows, the others six.
+    check(8085, 8192, lookahead=16)
+    check(4037, 4096, seqs=8, lookahead=16)
+    for threshold, budget, lookahead in (
+        (8192, 8192, 5),
+        (0, 8192, 5),
+        (8097, 8192, 5),
+        (8096, 8192, 16),
+    ):
         with pytest.raises(ValueError):
-            check(threshold, budget)
+            check(threshold, budget, lookahead=lookahead)
 
 
 # A minimal OPT-125m configuration, so the scheduler builds without the hub.

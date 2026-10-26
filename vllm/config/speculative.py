@@ -375,6 +375,50 @@ def _validate_qwen3_omni_dspark(
 
 
 @config
+class CopyDraftsConfig:
+    """Copy drafts beside DSpark: a request's own earlier text proposes the tokens
+    that follow the longest suffix match of its context.
+
+    Each step, a request whose context ends with the same ``min_match`` tokens
+    (or 2, 4, ... times as many, up to ``MAX_LEVEL``) as an earlier position of
+    its own prompt and output is offered the tokens that followed the latest
+    such position, in place of DSpark's drafts; DSpark drafts everywhere else.
+    The search reads only the request's own history: nothing is shared between
+    requests. Drafts never change what is committed, only how many tokens a
+    step verifies."""
+
+    MAX_LEVEL = 256
+    """The longest suffix compared: a match of 256 tokens ranks above every
+    shorter one, and longer matches rank as 256."""
+
+    min_match: int = Field(default=16, ge=1)
+    """The shortest suffix that proposes a copy."""
+
+    max_drafts: int = Field(default=16, ge=1)
+    """The most copy drafts a step verifies for one request: the verification
+    lookahead, which every buffer a verified row touches is sized for."""
+
+    initial_drafts: int = Field(default=8, ge=1)
+    """A copy's first proposal offers at most this many drafts; each step whose
+    copy drafts were all accepted doubles it, up to ``max_drafts``, and a
+    rejected copy draft returns it here."""
+
+    def levels(self) -> tuple[int, ...]:
+        """The suffix lengths compared, shortest first: ``min_match`` doubling
+        up to ``MAX_LEVEL``."""
+        out = []
+        level = self.min_match
+        while level <= self.MAX_LEVEL:
+            out.append(level)
+            level *= 2
+        return tuple(out)
+
+    def compute_hash(self) -> str:
+        factors = [self.min_match, self.max_drafts, self.initial_drafts]
+        return safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
+
+
+@config
 class SpeculativeConfig:
     """Configuration for speculative decoding."""
 
@@ -623,6 +667,22 @@ class SpeculativeConfig:
     """For Qwen3 DSpark drafting, evaluate the Markov projection only for the
     top-k base-logit candidates. Requires draft tensor parallel size 1."""
 
+    copy_drafts: CopyDraftsConfig | None = None
+    """Copy drafts from the request's own history beside DSpark
+    (``CopyDraftsConfig``). Its ``max_drafts`` is the verification lookahead
+    (``num_verification_tokens``); ``num_speculative_tokens`` stays DSpark's
+    block. Requires DSpark with adaptive verification, greedy drafts and async
+    scheduling."""
+
+    @property
+    def num_verification_tokens(self) -> int:
+        """The most drafts one request verifies in a step: what sizes every
+        buffer a verified row touches. DSpark's block (``num_speculative_tokens``)
+        unless copy drafts widen it."""
+        if self.copy_drafts is None:
+            return self.num_speculative_tokens
+        return max(self.num_speculative_tokens, self.copy_drafts.max_drafts)
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -666,6 +726,10 @@ class SpeculativeConfig:
                     False,
                 )
             )
+
+        if self.copy_drafts is not None:
+            # The verification lookahead sizes the decode graphs' query width.
+            factors.append(self.copy_drafts.compute_hash())
 
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
@@ -1728,6 +1792,34 @@ class SpeculativeConfig:
             raise ValueError(
                 "adaptive_verification_row_cost requires DSpark adaptive verification"
             )
+
+        if self.copy_drafts is not None:
+            # The draft budget decides how many of a copy's drafts a step
+            # verifies; copy drafts are one-hot proposals, as greedy DSpark
+            # drafts are, so no draft logits exist for them.
+            if self.method != "dspark" or not self.enable_adaptive_verification:
+                raise ValueError(
+                    "copy_drafts requires method 'dspark' with "
+                    "enable_adaptive_verification"
+                )
+            if self.draft_sample_method != "greedy":
+                raise ValueError("copy_drafts requires draft_sample_method 'greedy'")
+            copy_drafts = self.copy_drafts
+            if copy_drafts.max_drafts < self.num_speculative_tokens:
+                raise ValueError(
+                    f"copy_drafts.max_drafts ({copy_drafts.max_drafts}) must be at "
+                    f"least num_speculative_tokens ({self.num_speculative_tokens})"
+                )
+            if copy_drafts.initial_drafts > copy_drafts.max_drafts:
+                raise ValueError(
+                    f"copy_drafts.initial_drafts ({copy_drafts.initial_drafts}) "
+                    f"must not exceed max_drafts ({copy_drafts.max_drafts})"
+                )
+            if copy_drafts.min_match > CopyDraftsConfig.MAX_LEVEL:
+                raise ValueError(
+                    f"copy_drafts.min_match ({copy_drafts.min_match}) must not "
+                    f"exceed {CopyDraftsConfig.MAX_LEVEL}"
+                )
 
         if (
             self.adaptive_speculative_tokens_initial is not None

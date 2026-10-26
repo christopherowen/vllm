@@ -253,6 +253,10 @@ class Request:
         # step that samples a provisional token is scheduled, cleared when the
         # request loses it (preemption, a new streaming input).
         self.sink_draft_zero = False
+        # Copy drafts: the drafts the worker's copy state asks for in this
+        # request's next steps (its last output's report), 0 when it reported
+        # none. The scheduler widens the request's draft placeholders to it.
+        self.copy_draft_alloc = 0
 
         self.block_hashes: list[BlockHash] = []
         # Store the block hasher without binding self to avoid creating a

@@ -276,7 +276,7 @@ class SpecDecodingProm:
         ] = {}
         if not is_diffusion:
             assert speculative_config is not None
-            num_spec_tokens = speculative_config.num_speculative_tokens
+            num_spec_tokens = speculative_config.num_verification_tokens
             pos_labelnames = labelnames + ["position"]
             base_counter = self._counter_cls(
                 name="vllm:spec_decode_num_accepted_tokens_per_pos",
