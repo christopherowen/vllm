@@ -35,7 +35,7 @@ class _WorkspaceMoEApply(Protocol):
         shared_experts: "SharedExperts | None",
         shared_experts_input: torch.Tensor | None,
         *,
-        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None],
     ) -> torch.Tensor: ...
 
 
@@ -181,12 +181,15 @@ class FusedMoEMethodBase(QuantizeMethodBase):
 
     def prepare_workspace(
         self, hidden_states: torch.Tensor, shared_workspace_size: int
-    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None], torch.Tensor]:
         """Reserve disjoint routed/shared scratch before either branch runs.
 
         Any modular kernel leases both from the workspace manager in one call,
         so the shared experts never draw a view that overlaps the routed
         experts' buffers while the two branches run on different streams.
+        The layer's output is a tensor of its own, shaped as ``hidden_states``,
+        so when the experts write it in place the lease holds no output buffer
+        (the third view is None).
         """
         kernel = self.moe_kernel
         impl = getattr(kernel, "impl", None)
@@ -216,6 +219,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             None,
             self.moe.activation,
             shared_workspace_size,
+            output_shape=tuple(hidden_states.shape),
         )
         assert shared_workspace is not None
         return workspace, shared_workspace
@@ -228,7 +232,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         topk_ids: torch.Tensor,
         shared_experts: "SharedExperts | None",
         shared_experts_input: torch.Tensor | None,
-        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None],
     ) -> torch.Tensor:
         apply = cast(_WorkspaceMoEApply, self.apply)
         return apply(

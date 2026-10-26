@@ -1134,13 +1134,20 @@ class FusedMoEKernelModularImpl:
         expert_tokens_meta: ExpertTokensMetadata | None,
         activation: MoEActivation,
         shared_workspace_size: int = 0,
-    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor | None]:
+        output_shape: tuple[int, ...] | None = None,
+    ) -> tuple[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor | None], torch.Tensor | None
+    ]:
         """
         Allocate temporary and output buffers for the fused experts op.
         Inputs:
         - in_dtype: input type used for workspace tensors.
         - out_dtype: output type of the fused experts tensor.
         - device: the device of the workspace and output tensors.
+        - output_shape: the shape of the output the caller will pass as
+          ``output_alias`` (an ``out_dtype`` tensor of its own), if any. When the
+          experts will write it directly, no output buffer is leased and the
+          third routed view is None.
         See `workspace_shapes` for a description of the remainder of arguments.
         Returns routed views and an optional disjoint shared-expert scratch view.
         """
@@ -1172,10 +1179,19 @@ class FusedMoEKernelModularImpl:
             activation,
         )
 
+        # The caller's own output, written in place, makes the arena's output
+        # buffer dead weight: it would hold M_full x K for nothing.
+        lease_output = not (
+            output_shape is not None
+            and tuple(output_shape) == tuple(fused_out_shape)
+            and self._experts_write_output_alias()
+        )
         shared_output_storage = out_dtype is in_dtype or out_dtype is workspace_dtype
         specs: tuple[tuple[tuple[int, ...], torch.dtype], ...]
         if shared_output_storage:
-            max_shape_size = max(prod(workspace13_shape), prod(fused_out_shape))
+            max_shape_size = max(
+                prod(workspace13_shape), prod(fused_out_shape) if lease_output else 0
+            )
             specs = (
                 ((max_shape_size,), workspace_dtype),
                 (workspace2_shape, workspace_dtype),
@@ -1184,7 +1200,7 @@ class FusedMoEKernelModularImpl:
             specs = (
                 (workspace13_shape, workspace_dtype),
                 (workspace2_shape, workspace_dtype),
-                (fused_out_shape, out_dtype),
+                *(((fused_out_shape, out_dtype),) if lease_output else ()),
             )
         if shared_workspace_size:
             specs = (*specs, ((shared_workspace_size,), torch.uint8))
@@ -1199,14 +1215,28 @@ class FusedMoEKernelModularImpl:
             )
         else:
             buffers = current_workspace_manager().get_simultaneous(*specs)
+        fused_out: torch.Tensor | None = None
         if shared_output_storage:
             workspace13 = _resize_cache(buffers[0], workspace13_shape)
             workspace2 = buffers[1]
-            fused_out = _resize_cache(buffers[0], fused_out_shape)
+            if lease_output:
+                fused_out = _resize_cache(buffers[0], fused_out_shape)
         else:
-            workspace13, workspace2, fused_out = buffers[:3]
+            workspace13, workspace2 = buffers[:2]
+            if lease_output:
+                fused_out = buffers[2]
         shared_workspace = buffers[-1] if shared_workspace_size else None
         return (workspace13, workspace2, fused_out), shared_workspace
+
+    @staticmethod
+    def _experts_write_output_alias() -> bool:
+        """Whether the experts write a matching ``output_alias`` directly rather
+        than an output buffer of their own (which the finalize then copies)."""
+        if current_platform.is_rocm():
+            from vllm._aiter_ops import rocm_aiter_ops
+
+            return rocm_aiter_ops.is_fused_moe_enabled()
+        return True
 
     def _maybe_apply_shared_experts(
         self,
@@ -1326,7 +1356,7 @@ class FusedMoEKernelModularImpl:
         apply_router_weight_on_input: bool,
         expert_tokens_meta: ExpertTokensMetadata | None,
         output_alias: torch.Tensor | None = None,
-        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None,
     ) -> torch.Tensor:
         _, M_full, N, K, top_k = self.fused_experts.moe_problem_size(
             a1q, w1, w2, topk_ids
@@ -1342,6 +1372,16 @@ class FusedMoEKernelModularImpl:
         if M_full == 0:
             return torch.empty_like(a1q, dtype=output_dtype)
 
+        # The caller's output, if the experts could write it in place: a lease
+        # sized for it holds no output buffer (_allocate_buffers).
+        alias_shape = (
+            tuple(output_alias.shape)
+            if output_alias is not None
+            and output_alias.dtype == output_dtype
+            and output_alias.device == a1q.device
+            and output_alias.is_contiguous()
+            else None
+        )
         if workspace is None:
             workspace, _ = self._allocate_buffers(
                 in_dtype,
@@ -1356,28 +1396,42 @@ class FusedMoEKernelModularImpl:
                 local_num_experts,
                 expert_tokens_meta,
                 activation,
+                output_shape=alias_shape,
             )
         workspace13, workspace2, fused_out = workspace
 
-        use_output_alias = (
-            output_alias is not None
-            and output_alias.shape == fused_out.shape
-            and output_alias.dtype == fused_out.dtype
-            and output_alias.device == fused_out.device
-            and output_alias.is_contiguous()
-        )
-
-        # If caller's output buffer already matches fused_out shape/dtype, alias
-        # to skip the redundant copy in TopKWeightAndReduceNoOP.apply downstream.
-        # This eliminates ~94% of __amd_rocclr_copyBuffer events (Copy 2 of the
-        # double-copy MoE write-back path).
-        if current_platform.is_rocm():
-            from vllm._aiter_ops import rocm_aiter_ops
-
-            if use_output_alias and rocm_aiter_ops.is_fused_moe_enabled():
-                fused_out = output_alias
-        elif use_output_alias:
+        if fused_out is None:
+            _, _, fused_out_shape = self.fused_experts.workspace_shapes(
+                M_full,
+                N,
+                K,
+                top_k,
+                global_num_experts,
+                local_num_experts,
+                expert_tokens_meta,
+                activation,
+            )
+            if alias_shape != tuple(fused_out_shape):
+                raise ValueError(
+                    "The MoE workspace holds no output buffer, but the caller's "
+                    f"output ({alias_shape}) is not the experts' "
+                    f"{tuple(fused_out_shape)} {output_dtype} output"
+                )
             fused_out = output_alias
+        else:
+            use_output_alias = (
+                output_alias is not None
+                and output_alias.shape == fused_out.shape
+                and output_alias.dtype == fused_out.dtype
+                and output_alias.device == fused_out.device
+                and output_alias.is_contiguous()
+            )
+            # If caller's output buffer already matches fused_out shape/dtype,
+            # alias to skip the redundant copy in TopKWeightAndReduceNoOP.apply
+            # downstream. This eliminates ~94% of __amd_rocclr_copyBuffer events
+            # (Copy 2 of the double-copy MoE write-back path).
+            if use_output_alias and self._experts_write_output_alias():
+                fused_out = output_alias
 
         self.fused_experts.apply(
             output=fused_out,
@@ -1480,7 +1534,7 @@ class FusedMoEKernelModularImpl:
         apply_router_weight_on_input: bool = False,
         shared_experts: SharedExperts | None = None,
         shared_experts_input: torch.Tensor | None = None,
-        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None,
     ) -> torch.Tensor:
         """
         This function computes a Mixture of Experts (MoE) layer using two sets
@@ -1767,7 +1821,7 @@ class FusedMoEKernel:
         apply_router_weight_on_input: bool,
         shared_experts: SharedExperts | None = None,
         shared_experts_input: torch.Tensor | None = None,
-        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None,
     ) -> torch.Tensor:
         assert isinstance(self.impl, FusedMoEKernelModularImpl)
         return self.impl.apply(

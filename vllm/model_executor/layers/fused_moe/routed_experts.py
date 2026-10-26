@@ -1221,7 +1221,7 @@ class RoutedExperts(PluggableLayer):
         topk_ids: torch.Tensor,
         shared_experts: "SharedExperts | None" = None,
         shared_experts_input: torch.Tensor | None = None,
-        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None,
     ) -> torch.Tensor:
         """
         Execute routed experts using the quantization method's apply function.

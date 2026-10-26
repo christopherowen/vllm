@@ -315,10 +315,13 @@ def test_preallocated_moe_output_matches_activation_packing(
 
     workspace, shared = FusedMoEMethodBase.prepare_workspace(method, hidden, 512)
 
-    assert workspace[2].shape == hidden.shape
+    # The layer's output is a tensor of its own, so the lease holds no output buffer.
+    assert workspace[2] is None
     assert shared.numel() == 512
     assert shared.untyped_storage().data_ptr() not in {
-        buffer.untyped_storage().data_ptr() for buffer in workspace
+        buffer.untyped_storage().data_ptr()
+        for buffer in workspace
+        if buffer is not None
     }
 
 
@@ -391,11 +394,17 @@ def test_flashinfer_nvfp4_shared_workspace_graph(rows, workspace_init):
     torch.accelerator.synchronize()
     allocations = torch.accelerator.memory_stats()["allocation.all.allocated"]
     for _ in range(3):
-        workspace[2].fill_(float("nan"))
+        replayed.fill_(float("nan"))
         graph.replay()
     torch.accelerator.synchronize()
     assert torch.accelerator.memory_stats()["allocation.all.allocated"] == allocations
-    assert replayed.data_ptr() == workspace[2].data_ptr()
+    # The output lives outside the workspace arena (never a view of its lease).
+    assert workspace[2] is None
+    assert replayed.untyped_storage().data_ptr() not in {
+        buffer.untyped_storage().data_ptr()
+        for buffer in workspace
+        if buffer is not None
+    }
     assert torch.all(shared == 37)
     torch.testing.assert_close(replayed, expected, atol=0, rtol=0)
 
