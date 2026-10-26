@@ -478,6 +478,20 @@ def annotate(
             f"{indent}{guard}TL_IKET_EVENT({RANGE_END});\n"
         )
         inserts.append((item.last.end, 0, end))
+    # The events a warp can record, with the loops sampled: each range opens and closes
+    # in at most ``iters`` iterations of each loop around it. None: no bound.
+    bounds: dict[str, int | None] = {}
+    for site in sites:
+        if not site.get("traced"):
+            continue
+        count = None if site["loops"] and not iters else 2 * iters ** site["loops"]
+        if site.get("unsampled_loops"):
+            count = None
+        previous = bounds.get(site["kernel"], 0)
+        bounds[site["kernel"]] = None if None in (previous, count) else previous + count
+    for site in sites:
+        if "range" in site:
+            site["events_per_warp_bound"] = bounds.get(site["kernel"])
     out, last = [], 0
     # At one offset a range's end goes before the next range's start.
     for offset, _, text in sorted(inserts, key=lambda insert: insert[:2]):
