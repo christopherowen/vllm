@@ -457,10 +457,13 @@ class SinkSampler:
         seeds: torch.Tensor,
         pos: torch.Tensor,
         mask_rejected_draft: bool,
+        dead_cut: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The next ``max_retries`` candidates of each request's last draw
         from the full-vocabulary scores it was drawn from (after sampling
-        parameters, with the cut applied)."""
+        parameters, with the cut applied). ``dead_cut``: verification ended each
+        request's block at its dead-row cut, so a draw at the cut was the bonus,
+        which masked no draft."""
         from vllm.v1.worker.gpu.sample import tilelang_sampling
 
         values, indices = tilelang_sampling.sink_candidates(
@@ -476,6 +479,7 @@ class SinkSampler:
             pos,
             self.num_candidates,
             mask_rejected_draft,
+            dead_cut,
         )
         return tilelang_sampling.sink_merge(
             values, indices, sampled, num_sampled, self.num_alternates

@@ -1267,6 +1267,14 @@ def sink_rows(
 SINK_CANDIDATE_BLOCK = 1024
 
 
+def _drafted_row(live, local, dead_cut, req, dead_rows: bool):
+    """Whether a request's last sampled row (``local`` in its block) verified a
+    draft: not its last row (``live``) and, with ``dead_rows``, before its cut."""
+    if dead_rows:
+        return live & (local < dead_cut[req])
+    return live
+
+
 @tilelang.jit(pass_configs=_PASS)
 def sink_candidates_kernel(
     logits_dtype: str,
@@ -1275,20 +1283,23 @@ def sink_candidates_kernel(
     mask_rejected_draft: bool,
     run: int,
     pos_dtype: str = "int64",
+    dead_rows: bool = False,
 ):
     """``sink._sink_candidates_kernel``: one block of 128 threads per ``(request,
     vocabulary block of 1024)``, a thread's elements in runs of ``run``
     (``_triton_run``). The scores are the request's last sampled row's logits (with a
     rejected one-hot draft masked when ``mask_rejected_draft``) plus the draw's
     noise; the block's ``num_candidates`` best, in descending order, each found by
-    Triton's argmax and then masked."""
+    Triton's argmax and then masked. With ``dead_rows``, verification ended each
+    request's block at its ``dead_cut``: a row at the cut drew the bonus, which
+    masks nothing, as the last row does."""
     reqs, rows, vocab, candidates = T.dynamic("reqs, rows, vocab, candidates")
     # Inputs may be longer than the batch: each has its own length.
     cu_len, num_len, sampled_rows, sampled_width = T.dynamic(
         "cu_len, num_len, sampled_rows, sampled_width"
     )
-    drafts_len, idx_len, temp_len, seed_len, pos_len = T.dynamic(
-        "drafts_len, idx_len, temp_len, seed_len, pos_len"
+    drafts_len, idx_len, temp_len, seed_len, pos_len, cut_len = T.dynamic(
+        "drafts_len, idx_len, temp_len, seed_len, pos_len, cut_len"
     )
     logits_stride, candidates_stride, sampled_stride = T.dynamic(
         "logits_stride, candidates_stride, sampled_stride", "int64"
@@ -1335,6 +1346,7 @@ def sink_candidates_kernel(
         temperature: T.Tensor((temp_len,), T.float32),
         seeds: T.Tensor((seed_len,), T.int64),
         pos: T.Tensor((pos_len,), pos_dtype),
+        dead_cut: T.Tensor((cut_len,), T.int32),
     ):
         with T.Kernel(
             reqs, T.ceildiv(vocab, SINK_CANDIDATE_BLOCK), threads=_THREADS
@@ -1386,7 +1398,9 @@ def sink_candidates_kernel(
                     init=drafts[T.min(row[0] + 1, T.cast(drafts_len - 1, T.int64))],
                 )
                 emitted = T.alloc_var(T.int64, init=sampled[req, local[0]])
-                live = row[0] != end - 1
+                live = _drafted_row(
+                    row[0] != end - 1, local[0], dead_cut, req, dead_rows
+                )
                 verified[0] = T.if_then_else(live, draft, -1)
                 rejected[0] = T.if_then_else(
                     live
@@ -1431,6 +1445,7 @@ def sink_candidates_key(
     mask_rejected_draft: bool,
     run: int = 1,
     pos_dtype: torch.dtype = torch.int64,
+    dead_rows: bool = False,
 ) -> tuple:
     return (
         _DTYPES[logits_dtype],
@@ -1439,6 +1454,7 @@ def sink_candidates_key(
         mask_rejected_draft,
         run,
         _DTYPES[pos_dtype],
+        dead_rows,
     )
 
 
@@ -1455,10 +1471,12 @@ def sink_candidates(
     pos: torch.Tensor,
     num_candidates: int,
     mask_rejected_draft: bool,
+    dead_cut: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``SinkSampler.alternates_of``'s launch: each request's candidates per
     vocabulary block, ``(values, indices)`` of ``[num_reqs, blocks *
-    num_candidates]``, in vocabulary order of the blocks."""
+    num_candidates]``, in vocabulary order of the blocks; ``dead_cut`` ([num_reqs]
+    int32) where verification ended each block at its dead-row cut."""
     num_reqs = idx_mapping.shape[0]
     num_blocks = -(-vocab_size // SINK_CANDIDATE_BLOCK)
     width = num_blocks * num_candidates
@@ -1474,6 +1492,7 @@ def sink_candidates(
                 mask_rejected_draft,
                 _triton_run(logits),
                 pos.dtype,
+                dead_cut is not None,
             ),
         )
         kernel(
@@ -1488,6 +1507,8 @@ def sink_candidates(
             temperature,
             seeds,
             pos,
+            # Without a cut it is not read: the counts stand in.
+            num_sampled if dead_cut is None else dead_cut,
         )
     return values, indices
 
@@ -2800,8 +2821,8 @@ def sink_calls(
     for each sampled width, with and without logprobs; with rejection on, the
     candidates of logits of each of
     ``logits_dtypes`` (a rejected draft masked when more than one row is
-    sampled), and the alternates' rows for their logprobs (with ``logits_mode``,
-    their logits too)."""
+    sampled, with and without dead rows), and the alternates' rows for their
+    logprobs (with ``logits_mode``, their logits too)."""
     calls = [_call(sink_flags_kernel, dead_rows) for dead_rows in (False, True)]
     if rejection:
         # The cut and its restore, on raw and processed logits and on a rank's
@@ -2850,12 +2871,18 @@ def sink_calls(
             _call(
                 sink_candidates_kernel,
                 *sink_candidates_key(
-                    dtype, RUNNER_IDX_DTYPE, num_alternates + 1, width > 1, run
+                    dtype,
+                    RUNNER_IDX_DTYPE,
+                    num_alternates + 1,
+                    width > 1,
+                    run,
+                    dead_rows=dead_rows,
                 ),
             )
             for dtype in logits_dtypes
             for run in _runs(dtype)
             for width in sampled_widths
+            for dead_rows in ((False, True) if width > 1 else (False,))
         ]
     return _unique(calls)
 

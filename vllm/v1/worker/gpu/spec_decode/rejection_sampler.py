@@ -165,9 +165,25 @@ class RejectionSampler:
         """Register verification of target logits given as ``(dtype, row stride)``
         pairs, raw (``logits``) or after sampling parameters (``processed_logits``),
         and the logprobs of verified tokens. Draft logits and watermarking are not
-        covered by Triton warmup; the TileLang insertion is always declared, also
-        capped at a dead-row cut when the step can have dead rows (``dead_rows``)."""
-        limits = (False, True) if dead_rows else (False,)
+        covered by Triton warmup; the TileLang insertion is always declared. When
+        the step can have dead rows (``dead_rows``), block verification declares its
+        kernels with a dead-row cut (and refuses the configurations its TileLang
+        kernels do not serve), and the other methods the insertion capped at it."""
+        triton_only = (
+            has_draft_logits
+            or self.watermark_key is not None
+            or self.sampler.use_fp64_gumbel
+        )
+        if dead_rows and self.use_block_verification and triton_only:
+            raise ValueError(
+                "Adaptive verification's dead rows (SPARK_DS41F_DSPARK_DEAD_ROWS_TAU) "
+                "need block verification's TileLang kernels, which end each block at "
+                "its cut: one-hot drafts (draft_sample_method greedy), FP32 draws and "
+                "no watermark. Set the threshold to 0 or use standard verification."
+            )
+        limits = (
+            (False, True) if dead_rows and not self.use_block_verification else (False,)
+        )
         register_insert(
             triton.cdiv(vocab_size, _RESAMPLE_BLOCK_SIZE),
             self.sampler.use_fp64_gumbel,
@@ -190,6 +206,7 @@ class RejectionSampler:
             synthetic_mode=self.synthetic_conditional_rates is not None,
             use_block_verification=self.use_block_verification,
             use_fp64=self.sampler.use_fp64_gumbel,
+            dead_rows=dead_rows,
         )
         tilelang_inputs.declare(tilelang_inputs.flatten_sampled_calls)
         use_processed = self.sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
@@ -274,8 +291,9 @@ class RejectionSampler:
         dead_row_cut: torch.Tensor | None = None,
         sink: _SinkChunk | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """With ``dead_row_cut`` ([num_reqs] int32), each request's count is capped
-        at its cut plus one (the insertion of the resampled token stores it so)."""
+        """With ``dead_row_cut`` ([num_reqs] int32), each request commits at most its
+        cut plus one: block verification ends its block at the cut, the other
+        methods cap the count (the insertion of the resampled token stores it so)."""
         processed_logits = self.sampler.apply_sampling_params(
             logits,
             expanded_idx_mapping,
@@ -330,6 +348,8 @@ class RejectionSampler:
                 self.sampler.sampling_states.seeds.gpu,
                 pos,
                 mask_rejected_draft=True,
+                # A block that ends at the cut drew its last token as the bonus.
+                dead_cut=dead_row_cut if self.use_block_verification else None,
             )
             cut.restore()
         return processed_logits, sampled, num_sampled
@@ -349,8 +369,8 @@ class RejectionSampler:
     ) -> tuple[torch.Tensor, torch.Tensor, LogprobsTensors | None]:
         """With ``sink_flags`` (sink rejection), cuts the verification at
         flagged drafter rows and appends the alternates of each request's last
-        draw to ``sink_alternates``. With ``dead_row_cut``, the counts are capped
-        at it (``_verify``)."""
+        draw to ``sink_alternates``. With ``dead_row_cut``, each request commits at
+        most its cut plus one (``_verify``)."""
         cu_num_logits_np = input_batch.cu_num_logits_np
         use_processed_logits = self.sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
         num_reqs = input_batch.num_reqs
@@ -484,13 +504,9 @@ class RejectionSampler:
             pos,
             chunk_logit_limit,
             logprobs_dims,
-            # Logprobs (and the sink alternates) take their token counts
-            # inside the chunks; clamp there too so they match the committed
-            # tokens.
-            dead_row_cut
-            if dead_row_cut is not None
-            and (logprobs_dims is not None or sink_rejection)
-            else None,
+            # Block verification ends each block at the cut; logprobs (and the
+            # sink alternates) take their token counts inside the chunks.
+            dead_row_cut,
             sink_flags if sink_rejection else None,
             alternates_chunks,
         )
