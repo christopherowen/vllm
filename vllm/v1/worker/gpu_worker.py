@@ -426,6 +426,12 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Init device")
     def init_device(self):
+        if envs.VLLM_DS41_IKET:
+            # Debug only: IKET phase ranges in every TileLang kernel this process
+            # compiles, so it must be on before the first one.
+            from vllm.models.deepseek_v4_1.tilelang import iket
+
+            iket.enable(envs.VLLM_DS41_IKET)
         if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)

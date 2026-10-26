@@ -225,6 +225,7 @@ if TYPE_CHECKING:
     VLLM_DS41_HEAD_DTYPE: Literal["float32", "model"] = "float32"
     VLLM_STARTUP_HEARTBEAT_TIMEOUT_S: float = 120.0
     VLLM_DS41_ENGRAM_OVERLAP: bool = True
+    VLLM_DS41_IKET: str | None = None
     WEIGHTLESS_STEER_PATH: str | None = None
     WEIGHTLESS_STEER_MODEL: str | None = None
     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
@@ -1917,6 +1918,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DS41_ENGRAM_OVERLAP": lambda: bool(
         int(os.getenv("VLLM_DS41_ENGRAM_OVERLAP", "1"))
     ),
+    # Debug only: instrument every TileLang kernel with IKET phase ranges and keep
+    # TileLang's caches under this directory (models/deepseek_v4_1/tilelang/iket.py).
+    # Traces need the process to run under NVIDIA's run-iket profiler.
+    "VLLM_DS41_IKET": lambda: os.getenv("VLLM_DS41_IKET") or None,
     # DeepSeek V4.1 GLP steering (models/deepseek_v4_1/glp.py): the GLP file and
     # the served model name whose requests alone it steers (vllm/weightless.py),
     # set together or not at all. Part of the compile key, as every variable here
