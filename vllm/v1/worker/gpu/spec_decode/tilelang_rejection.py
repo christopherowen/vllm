@@ -1112,6 +1112,7 @@ def verify_and_resample(
     num_speculative_steps: int,
     # [num_reqs] int32
     dead_row_cut: torch.Tensor | None = None,
+    kernel_steps: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """``rejection_sample``'s launches before the insertion, with one-hot drafts,
     block verification, FP32 draws and no watermark: the sampled tokens
@@ -1119,9 +1120,14 @@ def verify_and_resample(
     token, their counts ([num_reqs], int32), and the block winners of that token's
     resampling (``[num_reqs, cdiv(V, 1024)]`` indices, int64, and scores, FP32).
     With ``dead_row_cut``, each request's block ends at its cut: a count is at most
-    the cut, and the token after it comes from a live row."""
+    the cut, and the token after it comes from a live row. ``kernel_steps``: a step
+    whose requests verify at most this many drafts runs the kernels at that width
+    (copy drafts: DSpark's block on a step without a copy); the sampled tokens keep
+    every column."""
     num_reqs = cu_num_logits.shape[0] - 1
     num_logits, vocab_size = target_logits.shape
+    steps = num_speculative_steps if kernel_steps is None else kernel_steps
+    assert steps <= num_speculative_steps
 
     # The per-vocab-block logits stats: target argmax for greedy requests, target
     # max and summed exponentials for the others.
@@ -1139,7 +1145,7 @@ def verify_and_resample(
         expanded_idx_mapping,
         expanded_local_pos,
         temperature,
-        num_speculative_steps,
+        steps,
     )
 
     # Verification up to the first rejected or bonus token.
@@ -1151,7 +1157,7 @@ def verify_and_resample(
     target_rejected_logsumexp = target_logits.new_empty(num_reqs, dtype=torch.float32)
     draft_rejected_logsumexp = target_logits.new_empty(num_reqs, dtype=torch.float32)
     verify(
-        sampled,
+        sampled[:, : steps + 1],
         num_sampled,
         target_rejected_logsumexp,
         draft_rejected_logsumexp,
@@ -1166,7 +1172,7 @@ def verify_and_resample(
         temperature,
         seed,
         pos,
-        num_speculative_steps,
+        steps,
         dead_row_cut,
     )
 

@@ -156,6 +156,7 @@ def test_adaptive_verification_kernels_are_declared_before_the_manager_exists(
         _register_kv_cache_warmups=lambda *_: None,
         speculator=SimpleNamespace(enable_adaptive_verification=True),
         adaptive_verification=None,
+        copy_drafter=None,
         batch_sharder=None,
         num_speculative_steps=steps,
         draft_tokens_handler=SimpleNamespace(track_consumed_drafts=False),
@@ -255,6 +256,7 @@ def test_dead_row_caps_are_declared_before_the_manager_exists(monkeypatch):
                 enable_adaptive_verification=True, draft_logits=None
             ),
             adaptive_verification=None,  # built later, by initialize_kv_cache
+            copy_drafter=None,
             batch_sharder=None,
             num_speculative_steps=steps,
             draft_tokens_handler=SimpleNamespace(track_consumed_drafts=False),

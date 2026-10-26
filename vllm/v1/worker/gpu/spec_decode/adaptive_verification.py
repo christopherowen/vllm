@@ -116,6 +116,7 @@ class AdaptiveVerificationManager:
         num_bonus_tokens: int,
         max_total_logits: int,
         row_cost: float,
+        planned_confidences: bool = False,
     ):
         self.req_states = req_states
         self.num_speculative_steps = req_states.num_speculative_steps
@@ -142,12 +143,17 @@ class AdaptiveVerificationManager:
         self.query_start_loc = query_start_loc
         self._batch_budget: tuple[dict[str, int], dict[str, int], int] | None = None
         max_num_reqs = req_states.max_num_reqs
-        # Current per-slot confidences
-        self._confidence_probs = torch.empty(
-            (max_num_reqs, self.num_speculative_steps),
+        # Current per-slot confidences, and with copy drafts (planned_confidences)
+        # the confidences a later step's budget reads: a copy's are those of the
+        # proposal after the current one, whose rows the scheduler lays out from
+        # the same copy state. One buffer, so one broadcast keeps both TP-wide.
+        self._confidence_buffer = torch.empty(
+            (1 + planned_confidences, max_num_reqs, self.num_speculative_steps),
             dtype=torch.float32,
             device=device,
         )
+        self._confidence_probs = self._confidence_buffer[0]
+        self._planned_probs = self._confidence_buffer[-1]
         self._batch_draft_capacity = torch.empty(
             max_num_reqs, dtype=torch.int32, device=device
         )
@@ -184,6 +190,9 @@ class AdaptiveVerificationManager:
                 self._new_rows, dtype=torch.int64, device=self._confidence_probs.device
             )
             tilelang_inputs.fill_rows(rows, self._confidence_probs, 1.0)
+            if self._confidence_buffer.shape[0] > 1:
+                # Nothing of the slot's previous request reaches a later budget.
+                tilelang_inputs.fill_rows(rows, self._planned_probs, 1.0)
             self._new_rows.clear()
 
     def warm_tail_shapes(
@@ -222,9 +231,11 @@ class AdaptiveVerificationManager:
         self,
         confidence_probs: torch.Tensor,
         input_batch: "InputBatch",
+        planned: torch.Tensor | None = None,
     ) -> None:
         """Publish this step's raw confidences for the ranking kernel and start
-        copying them to the CPU, where a later step's budget reads them."""
+        copying them to the CPU, where a later step's budget reads them; with
+        copy drafts, ``planned`` holds what that budget reads instead."""
         ready_idx = self._stale_idx ^ 1
         with gpu_sync_allowed():
             self._copy_events[ready_idx].synchronize()
@@ -238,14 +249,19 @@ class AdaptiveVerificationManager:
         tilelang_inputs.scatter_rows(
             input_batch.idx_mapping, confidence_probs, self._confidence_probs
         )
+        assert (planned is not None) == (self._confidence_buffer.shape[0] > 1)
+        if planned is not None:
+            tilelang_inputs.scatter_rows(
+                input_batch.idx_mapping, planned, self._planned_probs
+            )
         # Replicated projections may differ through unordered floating-point
         # reductions. Both CPU graph selection and GPU request compaction must
         # consume one TP-wide confidence snapshot to issue matching collectives.
         tp_group = get_tp_group()
         if tp_group.world_size > 1:
-            tp_group.broadcast(self._confidence_probs, src=0)
+            tp_group.broadcast(self._confidence_buffer, src=0)
         write_slot = self._stale_confidences[write_idx]
-        write_slot.gpu.copy_(self._confidence_probs)
+        write_slot.gpu.copy_(self._planned_probs)
 
         current_stream = torch.cuda.current_stream(self.req_states.device)
         self._copy_stream.wait_stream(current_stream)
@@ -473,6 +489,7 @@ def maybe_create_adaptive_verification_manager(
     adaptive_verification_row_cost: float = 0.02,
     target_layer_names: set[str] | None = None,
     additional_attn_cg_support: tuple[AttentionCGSupport, str | None] | None = None,
+    planned_confidences: bool = False,
 ) -> AdaptiveVerificationManager | None:
     if not enable_adaptive_verification:
         return None
@@ -540,4 +557,5 @@ def maybe_create_adaptive_verification_manager(
         num_bonus_tokens,
         max_total_logits=max_total_logits,
         row_cost=adaptive_verification_row_cost,
+        planned_confidences=planned_confidences,
     )

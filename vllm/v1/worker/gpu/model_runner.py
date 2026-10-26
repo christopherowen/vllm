@@ -197,6 +197,7 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     maybe_create_adaptive_verification_manager,
     resolve_adaptive_cudagraph_mode,
 )
+from vllm.v1.worker.gpu.spec_decode.copy_drafts import CopyDrafter
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
     DFlashSpeculator,
     DraftBlockTableLayout,
@@ -347,7 +348,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Speculative decoding.
         self.speculator = None
         self.use_aux_hidden_state_outputs = False
-        self.num_speculative_steps = vllm_config.num_speculative_tokens
+        # The most drafts a request verifies in a step, which sizes every buffer
+        # a verified row touches; copy drafts widen it past the drafter's block
+        # (num_draft_steps), which stays the speculator's.
+        self.num_speculative_steps = vllm_config.num_verification_tokens
+        self.num_draft_steps = vllm_config.num_speculative_tokens
+        self.copy_drafter: CopyDrafter | None = None
         if self.speculative_config is not None:
             if self.is_last_pp_rank:
                 self.speculator = init_speculator(self.vllm_config, self.device)
@@ -399,6 +405,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             device=self.device,
             num_prefill_lookahead=num_prefill_lookahead,
         )
+        copy_drafts = (
+            self.speculative_config.copy_drafts
+            if self.speculative_config is not None
+            else None
+        )
+        if copy_drafts is not None and self.speculator is not None:
+            if vllm_config.use_request_boundary_checkpoints:
+                raise ValueError(
+                    "copy_drafts does not support request-boundary checkpoints"
+                )
+            self.copy_drafter = CopyDrafter(
+                copy_drafts,
+                self.req_states,
+                num_draft_steps=self.num_draft_steps,
+                device=self.device,
+            )
         self.adaptive_verification: AdaptiveVerificationManager | None = None
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
@@ -538,9 +560,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.vllm_config, self.model, self.encoder_cache, self.device
             )
 
+        # A decoding request's rows at most (its verification), and the rows of
+        # a request at the drafter's block, every request's width without copy
+        # drafts (the uniform decode batch).
         self.decode_query_len = (
             self.num_speculative_steps
             + self.model_state.num_new_sampled_tokens_per_step
+        )
+        self.uniform_decode_query_len = (
+            self.num_draft_steps + self.model_state.num_new_sampled_tokens_per_step
         )
 
         if self.parallel_config.enable_batch_sharded_sampling:
@@ -793,7 +821,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ),
             target_layer_names=target_attn_layer_names,
             additional_attn_cg_support=additional_attn_cg_support,
+            planned_confidences=self.copy_drafter is not None,
         )
+        if self.copy_drafter is not None and self.adaptive_verification is None:
+            # The draft budget decides how many of a copy's drafts a step
+            # verifies; the drafter's checkpoint must carry a confidence head.
+            raise ValueError(
+                "copy_drafts requires adaptive verification, which this drafter "
+                "does not provide"
+            )
 
         self.block_tables = BlockTables(
             block_sizes=block_sizes,
@@ -1532,6 +1568,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_index = self.req_states.req_id_to_index[req_id]
             if self.adaptive_verification is not None:
                 self.adaptive_verification.add_request(req_index)
+            if self.copy_drafter is not None:
+                # A slot's copy state starts afresh with each request it holds.
+                self.copy_drafter.add_request(req_index)
 
             if self.pooling_runner is not None:
                 assert new_req_data.pooling_params is not None
@@ -1568,6 +1607,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.model_state.apply_staged_writes()
             if self.adaptive_verification is not None:
                 self.adaptive_verification.apply_staged_writes()
+            if self.copy_drafter is not None:
+                self.copy_drafter.apply_staged_writes()
         if self.sampler is not None:
             self.sampler.apply_staged_writes()
 
@@ -1631,7 +1672,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         draft_tokens = self._drafter_spec_tokens(scheduler_output)
         # batch_idx -> req_id
         req_ids = sort_batch_req_ids(
-            num_tokens_per_req, draft_tokens, self.decode_query_len
+            num_tokens_per_req, draft_tokens, self.uniform_decode_query_len
         )
 
         numtoks_iter = map(num_tokens_per_req.__getitem__, req_ids)
@@ -2160,6 +2201,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 + tilelang_inputs.fill_rows_calls(torch.int64, torch.float32)
             )
         self.req_states.register_warmups()
+        if self.copy_drafter is not None:
+            self.copy_drafter.register_warmups()
         if not samples:
             return
         assert self.sampler is not None
@@ -2745,7 +2788,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             allow_ubatching=(
                 self.ubatch_runner is not None and not skip_attn_for_dummy_run
             ),
-            uniform_decode=uniform_tok_count == self.decode_query_len,
+            uniform_decode=uniform_tok_count == self.uniform_decode_query_len,
         )
 
         if batch_desc.num_tokens == 0:
@@ -2799,7 +2842,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     routed_experts=None,
                     cudagraph_stats=cudagraph_stats,
                     num_spec_tokens_to_schedule=scheduler_output.resolve_num_spec_tokens_to_schedule(
-                        self.num_speculative_steps
+                        self.num_draft_steps
                     ),
                     boundary_logits_only=True,
                     boundary_aux_block_id=checkpoint.auxiliary_block_ids[0],
@@ -3094,7 +3137,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cudagraph_stats=cudagraph_stats,
             num_spec_tokens_to_schedule=(
                 scheduler_output.resolve_num_spec_tokens_to_schedule(
-                    self.num_speculative_steps
+                    self.num_draft_steps
                 )
             ),
         )
@@ -3370,7 +3413,35 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 draft_tokens = limit_draft_tokens(
                     draft_tokens,
                     num_spec_tokens_to_schedule,
-                    self.num_speculative_steps,
+                    self.num_draft_steps,
+                )
+            confidences = self.speculator.draft_token_confidence_probs
+            planned_confidences = None
+            if self.copy_drafter is not None:
+                # A request whose context repeats its own earlier text takes the
+                # copy in place of DSpark's drafts.
+                assert self.adaptive_verification is not None
+                verified = (
+                    self.adaptive_verification.get_verified_draft_counts(
+                        input_batch.num_reqs
+                    )
+                    if input_batch.num_draft_tokens_per_req is not None
+                    else None
+                )
+                draft_tokens, confidences, planned_confidences = (
+                    self.copy_drafter.propose(
+                        input_batch.idx_mapping,
+                        draft_tokens,
+                        confidences,
+                        num_sampled,
+                        verified,
+                        self._dead_row_cut if verified is not None else None,
+                    )
+                )
+                async_output.attach_copy_draft_alloc(
+                    self.copy_drafter.alloc[: input_batch.num_reqs],
+                    self.output_copy_stream,
+                    self.main_stream,
                 )
             num_draft_tokens = draft_tokens.shape[1]
             if num_draft_tokens > 0:
@@ -3385,7 +3456,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 draft_tokens_for_next_step = draft_tokens
             if self.adaptive_verification is not None:
                 self.adaptive_verification.record_confidences(
-                    self.speculator.draft_token_confidence_probs, input_batch
+                    confidences, input_batch, planned=planned_confidences
                 )
         elif self.speculator is not None:
             draft_tokens_for_next_step = self.req_states.draft_tokens[

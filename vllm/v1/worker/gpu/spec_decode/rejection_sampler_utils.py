@@ -1336,6 +1336,9 @@ def rejection_sample(
     # the other methods, which verify each draft from its own row, cap the count at
     # the cut + 1.
     dead_row_cut: torch.Tensor | None = None,
+    # Block verification's TileLang kernels at this many drafts for a step whose
+    # requests verify no more (copy drafts: DSpark's block without a copy).
+    kernel_steps: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert target_logits.ndim == 2 and target_logits.stride(-1) == 1
     assert draft_logits is None or (
@@ -1372,6 +1375,7 @@ def rejection_sample(
                 seed,
                 num_speculative_steps,
                 dead_row_cut,
+                kernel_steps,
             )
         )
         # A block that ends at the cut commits at most the cut + 1: no cap.

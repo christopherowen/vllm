@@ -145,6 +145,10 @@ class AsyncOutput(AsyncModelRunnerOutput):
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.cuda.Event(blocking=True)
         self._has_fault: torch.Tensor | None = None
+        # Copy drafts: the allocation the drafter reports after it proposed.
+        self.copy_draft_alloc: torch.Tensor | None = None
+        self.copy_draft_alloc_np: np.ndarray | None = None
+        self.copy_draft_alloc_event: torch.cuda.Event | None = None
 
         # Sink rejection replaces the sampled tokens by the committed ones
         # with draft zero in front (vllm.v1.worker.gpu.sample.sink).
@@ -207,6 +211,23 @@ class AsyncOutput(AsyncModelRunnerOutput):
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
             self.copy_event.record(copy_stream)
 
+    def attach_copy_draft_alloc(
+        self,
+        copy_draft_alloc: torch.Tensor,
+        copy_stream: torch.cuda.Stream,
+        main_stream: torch.cuda.Stream,
+    ) -> None:
+        """Copy the copy drafter's per-request allocation (``[num_reqs]`` int32),
+        written by this step's proposal after the outputs' copy began, to the host
+        behind that proposal. The drafter reuses its buffer next step: the copy
+        reads a snapshot."""
+        self.copy_draft_alloc = copy_draft_alloc.clone()
+        self.copy_draft_alloc_event = torch.cuda.Event(blocking=True)
+        with stream(copy_stream, main_stream):
+            copy_stream.wait_stream(main_stream)
+            self.copy_draft_alloc_np = async_copy_to_np(self.copy_draft_alloc)
+            self.copy_draft_alloc_event.record(copy_stream)
+
     def get_output(self) -> ModelRunnerOutput:
         self.copy_event.synchronize()
 
@@ -226,6 +247,12 @@ class AsyncOutput(AsyncModelRunnerOutput):
         if self.num_verified_draft_tokens_np is not None:
             self.model_runner_output.num_verified_draft_tokens = (
                 self.num_verified_draft_tokens_np.tolist()
+            )
+        if self.copy_draft_alloc_np is not None:
+            assert self.copy_draft_alloc_event is not None
+            self.copy_draft_alloc_event.synchronize()
+            self.model_runner_output.copy_draft_alloc = (
+                self.copy_draft_alloc_np.tolist()
             )
 
         if self.sampling_mask_tensors is not None:

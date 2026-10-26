@@ -335,6 +335,7 @@ def _warmup_kernels(
         return
     num_spec_steps = model_runner.num_speculative_steps
     decode_query_len = model_runner.decode_query_len
+    uniform_query_len = model_runner.uniform_decode_query_len
     # Use decode_query_len + 1 tokens so the prefill batch's per-request query
     # length exceeds decode_query_len, preventing it from being misclassified as
     # a uniform decode batch.
@@ -463,7 +464,10 @@ def _warmup_kernels(
         draft_zero = _sink_draft_zero(model_runner)
 
         def _run_decode_step(indices: list[int], spec_flags: list[bool]) -> None:
-            """Decode `indices`, spec-decoding the ones flagged in `spec_flags`."""
+            """Decode `indices`, spec-decoding the ones flagged in `spec_flags`:
+            the first at the verification width, the others at the drafter's
+            block (they differ with copy drafts), as the scheduler lays them
+            out within its decode rows."""
             cached_req_data = CachedRequestData.make_empty()
             cached_req_data.req_ids = [req_ids[i] for i in indices]
             cached_req_data.num_computed_tokens = [req_computed[i] for i in indices]
@@ -472,8 +476,9 @@ def _warmup_kernels(
 
             step_num_scheduled_tokens: dict[str, int] = {}
             step_spec_tokens: dict[str, list[int]] = {}
-            for i, use_spec in zip(indices, spec_flags):
-                num_tokens = decode_query_len if use_spec else 1
+            for position, (i, use_spec) in enumerate(zip(indices, spec_flags)):
+                query_len = decode_query_len if position == 0 else uniform_query_len
+                num_tokens = query_len if use_spec else 1
                 after = req_computed[i] + num_tokens
                 deltas = [
                     block_count(after, spec) - held
@@ -489,7 +494,9 @@ def _warmup_kernels(
                 if draft_zero:
                     step_spec_tokens[req_ids[i]] = [0] * (num_tokens)
                 elif use_spec:
-                    step_spec_tokens[req_ids[i]] = [0] * num_spec_steps
+                    step_spec_tokens[req_ids[i]] = [0] * (
+                        query_len - decode_query_len + num_spec_steps
+                    )
 
             decode_output = SchedulerOutput.make_empty()
             decode_output.scheduled_cached_reqs = cached_req_data
@@ -505,8 +512,8 @@ def _warmup_kernels(
             worker_execute_model(decode_output)
             worker_sample_tokens(None)
 
-            for i, use_spec in zip(indices, spec_flags):
-                req_computed[i] += decode_query_len if use_spec else 1
+            for i in indices:
+                req_computed[i] += step_num_scheduled_tokens[req_ids[i]]
 
         all_indices = list(range(num_reqs))
         use_spec_decode = num_spec_steps > 0

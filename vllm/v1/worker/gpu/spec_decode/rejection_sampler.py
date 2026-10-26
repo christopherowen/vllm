@@ -136,7 +136,11 @@ class RejectionSampler:
         self.sink: SinkSampler | None = None
         if watermark_key is not None:
             assert isinstance(sampler, GPUWatermarkSampler)
-        self.num_speculative_steps = spec_config.num_speculative_tokens
+        # The most drafts a request verifies (copy drafts widen DSpark's block),
+        # and the drafter's block: a step with no copy verifies at most that many,
+        # and block verification runs its kernels at that width.
+        self.num_speculative_steps = spec_config.num_verification_tokens
+        self.num_draft_steps = spec_config.num_speculative_tokens
         self.enable_adaptive_verification = spec_config.enable_adaptive_verification
         rejection_sample_method = spec_config.rejection_sample_method
         self.use_block_verification: bool = False
@@ -199,15 +203,16 @@ class RejectionSampler:
             )
         if has_draft_logits or self.watermark_key is not None:
             return
-        register_rejection_sample_warmups(
-            logits=(*logits, *processed_logits),
-            vocab_size=vocab_size,
-            num_speculative_steps=self.num_speculative_steps,
-            synthetic_mode=self.synthetic_conditional_rates is not None,
-            use_block_verification=self.use_block_verification,
-            use_fp64=self.sampler.use_fp64_gumbel,
-            dead_rows=dead_rows,
-        )
+        for steps in dict.fromkeys((self.num_speculative_steps, self.num_draft_steps)):
+            register_rejection_sample_warmups(
+                logits=(*logits, *processed_logits),
+                vocab_size=vocab_size,
+                num_speculative_steps=steps,
+                synthetic_mode=self.synthetic_conditional_rates is not None,
+                use_block_verification=self.use_block_verification,
+                use_fp64=self.sampler.use_fp64_gumbel,
+                dead_rows=dead_rows,
+            )
         tilelang_inputs.declare(tilelang_inputs.flatten_sampled_calls)
         use_processed = self.sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
         register_topk_scores_warmup(
@@ -290,10 +295,13 @@ class RejectionSampler:
         expanded_local_pos: torch.Tensor,
         dead_row_cut: torch.Tensor | None = None,
         sink: _SinkChunk | None = None,
+        kernel_steps: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """With ``dead_row_cut`` ([num_reqs] int32), each request commits at most its
         cut plus one: block verification ends its block at the cut, the other
-        methods cap the count (the insertion of the resampled token stores it so)."""
+        methods cap the count (the insertion of the resampled token stores it so).
+        ``kernel_steps``: the drafts every request of the step verifies at most,
+        the width block verification's kernels run at."""
         processed_logits = self.sampler.apply_sampling_params(
             logits,
             expanded_idx_mapping,
@@ -329,6 +337,7 @@ class RejectionSampler:
             use_fp64=self.sampler.use_fp64_gumbel,
             use_block_verification=self.use_block_verification,
             dead_row_cut=dead_row_cut,
+            kernel_steps=kernel_steps,
             **self._watermarking_kwargs(
                 draft_sampled, expanded_idx_mapping, expanded_local_pos
             ),
@@ -374,6 +383,14 @@ class RejectionSampler:
         cu_num_logits_np = input_batch.cu_num_logits_np
         use_processed_logits = self.sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
         num_reqs = input_batch.num_reqs
+        # Copy drafts: a step where no request was scheduled more than the
+        # drafter's block (no copy) verifies at that width, as without them.
+        kernel_steps = None
+        drafts = input_batch.num_draft_tokens_per_req
+        if self.num_draft_steps < self.num_speculative_steps and (
+            drafts is None or int(drafts.max(initial=0)) <= self.num_draft_steps
+        ):
+            kernel_steps = self.num_draft_steps
 
         if logits.shape[0] <= max_chunk_logits:
             # One chunk covers the batch. Adaptive verification compacts the logits
@@ -421,6 +438,7 @@ class RejectionSampler:
                 input_batch.expanded_local_pos[lo:hi],
                 None if dead_row_cut is None else dead_row_cut[start:end],
                 sink,
+                kernel_steps,
             )
             if sink is not None:
                 alternates = sink.alternates

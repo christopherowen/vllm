@@ -29,6 +29,7 @@ per-request seeds, and logits with ties, infinities and NaN."""
 
 import itertools
 import math
+import os
 
 import pytest
 import torch
@@ -49,7 +50,9 @@ pytestmark = pytest.mark.skipif(
 
 DEVICE = torch.device("cuda")
 VOCAB = 129280  # DeepSeek V4.1
-STEPS = 5  # DSpark's num_speculative_steps
+# DSpark's num_speculative_steps; VLLM_TEST_VERIFICATION_STEPS=16 reruns the file
+# at copy drafts' verification lookahead.
+STEPS = int(os.environ.get("VLLM_TEST_VERIFICATION_STEPS", "5"))
 SLOTS = 160
 # A sum of the other columns' exponentials within this of its value (the
 # exponentials' and the sums' roundings: tests/v1/worker/
@@ -96,8 +99,9 @@ def _assert_close(ours: float, ref: float, bound: float, what: str) -> None:
 
 def _counts(rows: int) -> list[int]:
     """Logits rows of the requests covering ``rows`` rows: 1 to STEPS + 1 each (0 to
-    5 drafts, adaptive verification's shorter blocks included)."""
-    pattern = itertools.cycle([6, 1, 4, 6, 2, 5, 3, 6])
+    STEPS drafts, adaptive verification's shorter blocks included)."""
+    full = STEPS + 1
+    pattern = itertools.cycle([full, 1, 4, full, 2, 5, 3, full])
     counts: list[int] = []
     while sum(counts) < rows:
         counts.append(min(next(pattern), rows - sum(counts)))
@@ -981,6 +985,33 @@ def test_rejection_sample_rows_do_not_depend_on_the_batch():
         assert torch.equal(sampled[0, : count.item()], whole[r, : count.item()])
 
 
+@pytest.mark.parametrize("temps", ["sampled", "mixed"])
+@pytest.mark.parametrize("dead_rows", [False, True])
+def test_a_step_without_a_copy_verifies_at_the_block(temps, dead_rows):
+    """Copy drafts widen the sampled tokens to the lookahead (16); a step whose
+    requests verify at most DSpark's block (5) runs the kernels at the block's
+    width (``kernel_steps``), into the wide output: the same tokens and counts,
+    bit for bit, as verification compiled at the block."""
+    batch = _batch([6, 1, 4, 6, 2, 5, 3, 6] * 2, temps, 71, VOCAB)
+    logits = _logits(batch, VOCAB, torch.float32, "peaked", 71)
+    cut = _cut(batch, 71) if dead_rows else None
+
+    def run(steps, kernel_steps=None):
+        return rs.rejection_sample(
+            logits, None, batch["drafts"], batch["cu"], batch["pos"],
+            batch["idx_mapping"], batch["expanded"], batch["local"],
+            batch["temperature"], batch["seeds"], steps,
+            use_block_verification=True, dead_row_cut=cut, kernel_steps=kernel_steps,
+        )  # fmt: skip
+
+    block, block_counts = run(5)
+    wide, wide_counts = run(16, kernel_steps=5)
+    assert wide.shape == (block.shape[0], 17)
+    _assert_same(wide_counts, block_counts, "counts")
+    for r, n in enumerate(block_counts.tolist()):
+        assert torch.equal(wide[r, :n], block[r, :n]), r
+
+
 def test_rejection_sample_without_requests():
     """No launch: TileLang's grids may not be empty."""
     index = torch.empty(0, dtype=torch.int64, device=DEVICE)
@@ -1260,20 +1291,22 @@ def test_capping_after_the_scan_is_not_the_truncated_block():
     """The positive control of the truncated-block tests: verifying every draft and
     capping each count at its cut plus one afterwards commits other tokens or
     counts than the truncated block for some sampled requests (the dead rows'
-    thresholds decide where a block ends), here with random dead rows."""
-    batch = _batch(_counts(480), "sampled", 61, VOCAB)
-    cut = _cut(batch, 61)
-    clean = _logits(batch, VOCAB, torch.float32, "peaked", 61)
-    logits = _garbage(clean, batch, cut, "random", 61)
-    sampled, counts = _rejection_sample(logits, batch)
-    counts = torch.minimum(counts, cut + 1)
-    expected, expected_counts = _rejection_sample(*_truncated(clean, batch, cut))
+    thresholds decide where a block ends), here with random dead rows, over a few
+    batches (at the copy lookahead most blocks end before their cut)."""
     differ = 0
-    for r in range(cut.shape[0]):
-        n = int(expected_counts[r])
-        differ += int(counts[r]) != n or not torch.equal(
-            sampled[r, :n], expected[r, :n]
-        )
+    for seed in range(61, 69):
+        batch = _batch(_counts(480), "sampled", seed, VOCAB)
+        cut = _cut(batch, seed)
+        clean = _logits(batch, VOCAB, torch.float32, "peaked", seed)
+        logits = _garbage(clean, batch, cut, "random", seed)
+        sampled, counts = _rejection_sample(logits, batch)
+        counts = torch.minimum(counts, cut + 1)
+        expected, expected_counts = _rejection_sample(*_truncated(clean, batch, cut))
+        for r in range(cut.shape[0]):
+            n = int(expected_counts[r])
+            differ += int(counts[r]) != n or not torch.equal(
+                sampled[r, :n], expected[r, :n]
+            )
     assert differ > 0
 
 

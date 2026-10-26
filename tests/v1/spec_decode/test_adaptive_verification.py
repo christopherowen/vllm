@@ -71,7 +71,10 @@ def test_confidence_snapshot_agrees_before_cpu_and_gpu_budgeting(
     leader = torch.tensor([[np.nextafter(np.float32(0.5), np.float32(1.0))]])
     manager = make_manager(local.numpy().copy(), row_cost=1.0)
     manager.req_states.device = torch.device("cpu")
-    manager._confidence_probs = torch.empty_like(local)
+    # Without copy drafts the planned confidences are the current ones.
+    manager._confidence_buffer = torch.empty((1, *local.shape))
+    manager._confidence_probs = manager._confidence_buffer[0]
+    manager._planned_probs = manager._confidence_buffer[-1]
     manager._pending_resets = []
 
     class CopyBuffer:
@@ -125,6 +128,74 @@ def test_confidence_snapshot_agrees_before_cpu_and_gpu_budgeting(
     assert manager.get_num_tokens({"low": 2}, {"low": [7]}) == 1 + expected_budget
     assert len(calls) == (2 if world_size > 1 else 0)
     assert local.item() < 0.5  # The caller's proposal confidence is not mutated.
+
+
+def test_planned_confidences_reach_the_budget_and_the_current_the_ranking(
+    monkeypatch,
+):
+    """Copy drafts: the host budget reads a later proposal's planned confidences,
+    the device ranking the current ones; one broadcast keeps both TP-wide, and a
+    new request's planned row starts at 1 like its current one."""
+    steps = 4
+    current = torch.tensor([[0.9, 0.9, 0.0, 0.0]])
+    planned = torch.tensor([[0.9, 0.9, 0.9, 0.9]])
+    manager = make_manager(np.ones((2, steps), dtype=np.float32))
+    manager.req_states.device = torch.device("cpu")
+    manager._confidence_buffer = torch.full((2, 2, steps), -1.0)
+    manager._confidence_probs = manager._confidence_buffer[0]
+    manager._planned_probs = manager._confidence_buffer[-1]
+    manager._pending_resets = []
+    manager._new_rows = []
+
+    class CopyBuffer:
+        def __init__(self):
+            self.np = np.ones((2, steps), dtype=np.float32)
+            self.gpu = torch.empty((2, steps))
+
+        def copy_to_cpu(self):
+            self.np[:] = self.gpu.numpy()
+
+    manager._stale_confidences = [CopyBuffer(), CopyBuffer()]
+    manager._stale_idx = 0
+    manager._copy_events = [
+        SimpleNamespace(synchronize=lambda: None, record=lambda: None) for _ in range(2)
+    ]
+    manager._copy_stream = SimpleNamespace(wait_stream=lambda _stream: None)
+    broadcasts = []
+    monkeypatch.setattr(
+        adaptive_module,
+        "get_tp_group",
+        lambda: SimpleNamespace(
+            world_size=2, broadcast=lambda t, src: broadcasts.append(t)
+        ),
+    )
+    monkeypatch.setattr(adaptive_module, "gpu_sync_allowed", nullcontext)
+    monkeypatch.setattr(adaptive_module.torch.cuda, "current_stream", lambda _: None)
+    monkeypatch.setattr(adaptive_module, "stream", lambda *_: nullcontext())
+
+    def scatter_rows(idx_mapping, source, state, gather=False):
+        state[idx_mapping, : source.shape[1]] = source
+
+    def fill_rows(rows, state, value):
+        state[rows] = value
+
+    monkeypatch.setattr(adaptive_module.tilelang_inputs, "scatter_rows", scatter_rows)
+    monkeypatch.setattr(adaptive_module.tilelang_inputs, "fill_rows", fill_rows)
+    monkeypatch.setattr(
+        adaptive_module, "async_tensor_h2d", lambda v, **_: torch.tensor(v)
+    )
+    batch = SimpleNamespace(num_reqs=1, idx_mapping=torch.tensor([0]))
+    for _ in range(2):
+        manager.record_confidences(current, batch, planned=planned)
+    assert [t is manager._confidence_buffer for t in broadcasts] == [True, True]
+    torch.testing.assert_close(manager._confidence_probs[0], current[0])
+    np.testing.assert_array_equal(
+        manager._stale_confidences[manager._stale_idx].np[0], planned[0].numpy()
+    )
+    # A request takes slot 1: both of its rows start at 1.
+    manager.add_request(1)
+    manager.apply_staged_writes()
+    assert (manager._confidence_buffer[:, 1] == 1).all()
 
 
 @pytest.mark.parametrize(
