@@ -381,6 +381,18 @@ def _loop_trips(headers: tuple[str, ...]) -> int | None:
     return total
 
 
+def _sampled_factor(headers: tuple[str, ...], iters: int) -> float | None:
+    """A sampled range's iterations over those it records: the loops' trips over at most
+    ``iters`` of each; None if a loop has no literal bounds."""
+    total, sampled = 1, 1
+    for header in headers:
+        trips = _trips(header)
+        if trips is None or trips < 1:
+            return None
+        total, sampled = total * trips, sampled * min(trips, iters)
+    return total / sampled
+
+
 def _iterations(header: str, iters: int) -> str | None:
     """True in at most ``iters`` iterations of a TVM ``for`` loop (``for (int v =
     start; v < bound; ++v)``), each in the middle of its share of the loop, so one
@@ -464,6 +476,17 @@ def annotate(
     if len({item.name for item in found}) > MAX_EVENTS:
         for item in found:
             item.name = item.base
+    elif iters:
+        # A trace holds a sampled loop's chosen iterations, and does not say which
+        # specialization of a kernel a launch ran: a range's name carries the factor
+        # from those iterations to its loops' all, where their bounds are literals.
+        for item in found:
+            factor = _sampled_factor(item.loops, iters)
+            if factor is None or factor <= 1:
+                continue
+            name = f"{item.name}*{factor:g}"
+            if len(name.encode()) <= MAX_NAME_BYTES:
+                item.name = name
     traced = list(dict.fromkeys(item.name for item in found))[:MAX_EVENTS]
     inserts: list[tuple[int, int, str]] = []
     for kernel in dict.fromkeys(item.kernel for item in found if item.name in traced):
