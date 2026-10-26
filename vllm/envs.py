@@ -227,6 +227,7 @@ if TYPE_CHECKING:
     VLLM_DS41_ENGRAM_OVERLAP: bool = True
     VLLM_DS41_IKET: str | None = None
     VLLM_DS41_IKET_CTAS: int = 0
+    VLLM_DS41_IKET_ITERS: int = 0
     WEIGHTLESS_STEER_PATH: str | None = None
     WEIGHTLESS_STEER_MODEL: str | None = None
     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
@@ -1926,6 +1927,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # With VLLM_DS41_IKET: record ranges in about this many CTAs of each launch, evenly
     # spread (0: all); run-iket still records every warp's lifetime.
     "VLLM_DS41_IKET_CTAS": lambda: int(os.getenv("VLLM_DS41_IKET_CTAS", "0")),
+    # With VLLM_DS41_IKET: ranges inside a loop record in at most this many of its
+    # iterations, evenly spread (0: all), so no warp's record sizes run-iket's buffer.
+    "VLLM_DS41_IKET_ITERS": lambda: int(os.getenv("VLLM_DS41_IKET_ITERS", "0")),
     # DeepSeek V4.1 GLP steering (models/deepseek_v4_1/glp.py): the GLP file and
     # the served model name whose requests alone it steers (vllm/weightless.py),
     # set together or not at all. Part of the compile key, as every variable here
