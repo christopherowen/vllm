@@ -16,6 +16,9 @@ Engram layer's post, the drafter's auxiliary states or the final collapse.
 A row that is not marked is not read or written: its block returns after loading
 its mark, so unsteered rows keep their bits whatever else the step carries.
 
+The kernel is on the decode chain's PDL (``pdl.chain()``): it waits for the layer
+before it reads its mark, so a step with no marked row keeps the chain's overlap.
+
 ``direction`` ([hidden], FP32) is the layer's unit row and ``alpha`` ([1], FP32) a
 buffer, so a file's contents never change the traced graph. A block's 320 threads
 each own sixteen columns of every stream (two loads of eight); a stream's ``h . d``
@@ -33,7 +36,7 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from vllm.models.deepseek_v4_1.tilelang import prepare
+from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
 
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
@@ -58,6 +61,7 @@ def glp_steer_kernel(
         alpha: T.Tensor((1,), T.float32),
     ):
         with T.Kernel(tokens, threads=threads) as t:
+            pdl.chain()
             tx = T.get_thread_binding()
             # The whole block leaves an unmarked row, before any barrier.
             if rows[t] == 0:

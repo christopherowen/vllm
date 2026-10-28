@@ -35,6 +35,7 @@ CHAIN = {
     "gemm_splitk_reduce",
     "gemm_splitk_reduce_cast",
     "gemm_splitk_reduce_two",
+    "glp_steer",
     "indexer_mxfp4_quantize",
     "indexer_score",
     "indexer_topk_merge",
