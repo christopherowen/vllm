@@ -46,6 +46,7 @@ import math
 import tilelang
 import tilelang.language as T
 import torch
+from tilelang.language.builtin import cp_async_barrier_noinc
 
 from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
 
@@ -735,7 +736,10 @@ def grouped_fp8_fp4_gemm(
                         1,
                     )
         T.ptx_commit_group()
-        T.barrier_arrive(loaded[s])
+        # The arrival waits for this thread's copies to land, so the wait on
+        # loaded[s] publishes every thread's codes to the expand, which reads
+        # rows other threads copied (ptx_wait_group covers only its own).
+        cp_async_barrier_noinc(loaded[s])
 
     @T.macro
     def body(A, SFA, B, BT, SFB, SFBase, Order, TileExpert, C):
