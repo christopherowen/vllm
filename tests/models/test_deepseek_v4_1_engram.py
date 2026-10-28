@@ -451,6 +451,7 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
     _prepare_engram(resident_session, resident)
 
     state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
+    state.steering, state.steered_requests = None, None
     state.ced_state = None
     state.lookback_token_ids = torch.empty(2, 3, dtype=torch.int32, device="cuda")
     state.disk_engram_models = (target,)
@@ -611,6 +612,7 @@ def test_disk_engram_rows_the_host_hashed_equal_the_gpu_rows(
 
     prompt = [5, 9, 13, 17, 19, 23]
     state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
+    state.steering, state.steered_requests = None, None
     state.ced_state = None
     state.lookback_token_ids = torch.empty(2, 3, dtype=torch.int32, device="cuda")
     state.disk_engram_models = (target,)

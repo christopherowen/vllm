@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from http import HTTPStatus
+from typing import ClassVar
 
 from fastapi import Request
 
-from vllm import PromptType, SamplingParams, envs
+from vllm import PromptType, SamplingParams, envs, weightless
 from vllm.config import ModelConfig
 from vllm.entrypoints.openai.models.serving import (
     OpenAIModelRegistry,
@@ -27,6 +28,10 @@ from vllm.utils import random_uuid
 
 
 class BaseServing:
+    # Whether this server marks requests to the steered model name
+    # (vllm/weightless.py); one that does not refuses the name.
+    serves_steered_model: ClassVar[bool] = False
+
     def __init__(
         self,
         models: OpenAIServingModels | OpenAIModelRegistry,
@@ -43,6 +48,14 @@ class BaseServing:
     ) -> ErrorResponse | None:
         error_response = None
 
+        if weightless.is_steered_model(request.model) and (
+            not self.serves_steered_model or getattr(request, "use_beam_search", False)
+        ):
+            return self.create_error_response(
+                message=f"The model `{request.model}` is served by chat completions, "
+                "completions, responses and messages, without beam search.",
+                param="model",
+            )
         if self._is_model_supported(request.model):
             return None
         if request.model in self.models.lora_requests:
@@ -66,6 +79,28 @@ class BaseServing:
             status_code=HTTPStatus.NOT_FOUND,
             param="model",
         )
+
+    def _mark_steering(
+        self, request: AnyRequest, sampling_params: SamplingParams | BeamSearchParams
+    ) -> None:
+        """Mark a request to the steered model name in its sampling parameters,
+        and clear any mark its caller set."""
+        if weightless.steered_model() is None or not isinstance(
+            sampling_params, SamplingParams
+        ):
+            return
+        sampling_params.extra_args = weightless.mark(
+            sampling_params.extra_args, weightless.is_steered_model(request.model)
+        )
+
+    def _served_model_name(
+        self, request: AnyRequest, lora_request: LoRARequest | None
+    ) -> str:
+        """The model name a response reports: the steered name for a request to
+        it, otherwise the first served name or the adapter's."""
+        if lora_request is None and weightless.is_steered_model(request.model):
+            return request.model
+        return self.models.model_name(lora_request)
 
     def _is_model_supported(self, model_name: str | None) -> bool:
         if not model_name:

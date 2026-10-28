@@ -279,6 +279,7 @@ def test_prompt_logprobs_zero_keeps_every_prompt_row(monkeypatch):
     monkeypatch.setattr(DefaultModelState, "add_request", lambda *args: None)
     monkeypatch.setattr(DefaultModelState, "remove_request", lambda *args: None)
     state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
+    state.steering, state.steered_requests = None, None
     state.ced_state, starts, seq = _state([4096, 4096])
     state._ced_prompt_logprobs = set()
     state._ced_prefix_start = {}
@@ -419,6 +420,7 @@ def test_prompt_chunks_replay_from_the_prompt_end(monkeypatch, prompt_end, steps
 
     monkeypatch.setattr(DefaultModelState, "add_request", lambda *args: None)
     state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
+    state.steering, state.steered_requests = None, None
     state.ced_state = CEDState(4, 8192, (128, 256, 384, 512, 8192), "cuda")
     state._ced_prompt_logprobs, state._ced_prefix_start = set(), {}
     state.disk_engram_models, state._prefill_tokens = (), {}
@@ -739,6 +741,7 @@ def test_streaming_update_preserves_private_decoder_history(monkeypatch):
     monkeypatch.setattr(DefaultModelState, "add_request", lambda *args: None)
     monkeypatch.setattr(DefaultModelState, "remove_request", lambda *args: None)
     state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
+    state.steering, state.steered_requests = None, None
     state.ced_state, starts, seq = _state([1], [1025])
     state._ced_prompt_logprobs = set()
     state._ced_prefix_start = {"stream": 256}
@@ -782,6 +785,7 @@ def test_large_full_capture_decodes_small_live_prefix(monkeypatch):
     monkeypatch.setattr(DefaultModelState, "prepare_dummy_inputs", lambda *args: {})
     monkeypatch.setattr(DefaultModelState, "prepare_attn", lambda *args: {})
     state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
+    state.steering, state.steered_requests = None, None
     state.ced_state, starts, seq = _state([256])
     state._ced_prompt_logprobs = set()
     state._ced_prefix_start = {}

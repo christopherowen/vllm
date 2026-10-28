@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm import weightless
 from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
@@ -19,6 +20,7 @@ from vllm.models.deepseek_v4_1.tilelang import ced as ced_kernels
 from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadata
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
@@ -140,6 +142,23 @@ class DeepseekV41ModelState(DefaultModelState):
         # the outputs it recomputes), for the host's hash of its prefill chunks.
         self._prefill_tokens: dict[str, np.ndarray] = {}
         self._host_engram_hash = None
+        # GLP steering of the requests made to the steered model name: each
+        # request state's mark, and the steering whose rows a step marks from them.
+        self.steering = next(
+            (
+                module.glp
+                for module in model.modules()
+                if isinstance(module, DeepseekV4Model)
+                and module.glp is not None
+            ),
+            None,
+        )
+        self.steered_requests: UvaBackedTensor | None = None
+        if self.steering is not None:
+            self.steered_requests = UvaBackedTensor(self.max_num_reqs, torch.int32)
+            from vllm.models.deepseek_v4_1.tilelang import glp_rows, prepare
+
+            prepare.declare(lambda: [prepare.call(glp_rows.mark_rows_kernel, "int64")])
 
     def prepare_streaming_update(self, req_id: str) -> None:
         """Keep decoder history when the runner refreshes a live request."""
@@ -155,6 +174,8 @@ class DeepseekV41ModelState(DefaultModelState):
                 new_req_data.prefill_token_ids, dtype=np.int32
             )
         sampling = new_req_data.sampling_params
+        if self.steered_requests is not None:
+            self.steered_requests.np[req_index] = weightless.is_marked(sampling)
         if sampling is not None and sampling.prompt_logprobs is not None:
             self._ced_prompt_logprobs.add(new_req_data.req_id)
         else:
@@ -292,6 +313,17 @@ class DeepseekV41ModelState(DefaultModelState):
             if self._ced_batch is not input_batch:
                 self._stage_ced(input_batch)
             model_inputs["ced_indices"] = self.get_ced_indices()
+        if self.steering is not None:
+            from vllm.models.deepseek_v4_1.tilelang.glp_rows import mark_rows
+
+            # The step's rows of steered requests; padding rows unmarked.
+            num_reqs = input_batch.num_reqs
+            mark_rows(
+                self.steering.step_rows(input_batch.num_tokens_after_padding),
+                input_batch.idx_mapping[:num_reqs],
+                input_batch.query_start_loc[: num_reqs + 1],
+                self.steered_requests.copy_to_uva(),
+            )
         window = self.lookback_token_ids
         if window is None:
             return model_inputs
@@ -367,6 +399,9 @@ class DeepseekV41ModelState(DefaultModelState):
             self.ced_state.replay_start.zero_()
             self._ced_batch = None
             model_inputs["ced_indices"] = None
+        if self.steering is not None:
+            # Captured unmarked; a replay reads the step's marks in place.
+            self.steering.rows.zero_()
         if self.lookback_token_ids is not None:
             # The captured graph reads this buffer; replays refill it in place.
             self.lookback_token_ids.fill_(-1)

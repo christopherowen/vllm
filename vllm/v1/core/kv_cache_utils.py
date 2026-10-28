@@ -12,7 +12,7 @@ from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, NamedTuple, NewType, TypeAlias, cast, overload
 
-from vllm import envs
+from vllm import envs, weightless
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.multimodal.utils import get_mm_features_in_window
@@ -625,9 +625,19 @@ def generate_block_hash_extra_keys(
     prompt_embeds_keys = _gen_prompt_embeds_extra_hash_keys(
         request, start_token_idx, end_token_idx
     )
+    # Steered rows write other KV than the same tokens unsteered.
+    steering_keys: list[Any] = (
+        [weightless.BLOCK_HASH_KEY]
+        if start_token_idx == 0 and weightless.is_marked(request.sampling_params)
+        else []
+    )
 
     extra_keys: list[Any] = (
-        lora_extra_keys + mm_extra_keys + cache_salt_keys + prompt_embeds_keys
+        lora_extra_keys
+        + mm_extra_keys
+        + cache_salt_keys
+        + prompt_embeds_keys
+        + steering_keys
     )
 
     if not extra_keys:

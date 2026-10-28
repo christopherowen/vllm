@@ -30,6 +30,9 @@ logger = init_logger(__name__)
 
 
 class ServingTokenization(BaseServing):
+    # Steering changes no token: the steered name tokenizes as the model does.
+    serves_steered_model = True
+
     def __init__(
         self,
         models: OpenAIServingModels | OpenAIModelRegistry,

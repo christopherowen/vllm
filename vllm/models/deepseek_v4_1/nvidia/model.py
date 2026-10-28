@@ -61,7 +61,7 @@ from .. import kernels, l2_prefetch, sp_prefill
 from ..attention import DeepseekV4Attention
 from ..ced import ced_decoder_start, gather_rows, scatter_rows
 from ..common.engram import Engram, EngramLayout, NgramHashState
-from ..glp import glp_steering, steer_post_layer
+from ..glp import glp_steering
 
 if typing.TYPE_CHECKING:
     pass
@@ -537,10 +537,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 self.hc_mult,
                 dtype=torch.float32,
             )
-        # GLP steering (glp.py) when WEIGHTLESS_STEER_PATH is set; None otherwise,
-        # which leaves the forward as it is.
+        # GLP steering (glp.py) when WEIGHTLESS_STEER_PATH and WEIGHTLESS_STEER_MODEL
+        # are set; None otherwise, which leaves the forward as it is.
         self.glp = glp_steering(
-            config.num_hidden_layers, config.hidden_size, config.hc_mult
+            config.num_hidden_layers,
+            config.hidden_size,
+            config.hc_mult,
+            vllm_config.scheduler_config.max_num_batched_tokens,
         )
         # A captured forward's outputs, written in place: the hidden states and one
         # row block per auxiliary layer (set with them), for the CUDA graph sizes.
@@ -804,6 +807,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
             hidden_states = sp_shard(hidden_states)
             input_ids = sp_shard(input_ids)
+        # GLP steering's row marks for the rows the layers hold: this rank's under
+        # sequence parallelism, the decoder's once CED compacts the step.
+        steer_rows: torch.Tensor | None = None
+        if self.glp is not None:
+            steer_rows = self.glp.step_rows(full_num_tokens)
+            if self.use_sequence_parallel:
+                steer_rows = sp_shard(steer_rows)
+            elif sp is not None:
+                steer_rows = sp.local_slice(steer_rows)
 
         residual, post_mix, res_mix = None, None, None
         pre_mix: torch.Tensor | None = None
@@ -823,6 +835,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             positions = gather_rows(positions, ced_indices)
             if input_ids is not None:
                 input_ids = gather_rows(input_ids, ced_indices)
+            if steer_rows is not None:
+                steer_rows = gather_rows(
+                    self.glp.step_rows(full_num_tokens), ced_indices
+                )
             decoder_compacted = True
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
@@ -858,18 +874,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 positions = gather_rows(positions, ced_indices)
                 if input_ids is not None:
                     input_ids = gather_rows(input_ids, ced_indices)
+                if steer_rows is not None:
+                    steer_rows = gather_rows(
+                        self.glp.step_rows(full_num_tokens), ced_indices
+                    )
                 decoder_compacted = True
-            hidden_states, residual, post_mix, res_mix = steer_post_layer(
-                self.glp, layer.mhc, idx, hidden_states, residual, post_mix, res_mix
-            )
-            if idx + 1 in self.aux_hidden_state_layers:
-                # Reconstruct the aux hidden state for draft models; steering has
-                # already folded it.
-                aux_recon = (
-                    hidden_states
-                    if residual is None
-                    else layer.mhc.post(hidden_states, residual, post_mix, res_mix)
+            if self.glp is not None:
+                self.glp.steer(
+                    idx, hidden_states, residual, post_mix, res_mix, steer_rows
                 )
+            if idx + 1 in self.aux_hidden_state_layers:
+                # Reconstruct the aux hidden state for draft models
+                aux_recon = layer.mhc.post(hidden_states, residual, post_mix, res_mix)
                 aux_out = (
                     self._graph_out(len(aux_hidden_states), full_num_tokens)
                     if sp is None
@@ -897,7 +913,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             # Reuse if the last layer was captured as an aux hidden state
             if self.end_layer in self.aux_hidden_state_layers:
                 hidden_states = final_aux_recon
-            elif residual is not None:
+            else:
                 hidden_states = layer.mhc.post(
                     hidden_states, residual, post_mix, res_mix
                 )

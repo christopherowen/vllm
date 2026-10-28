@@ -93,6 +93,8 @@ logger = init_logger(__name__)
 
 
 class OpenAIServingResponses(GenerateBaseServing):
+    serves_steered_model = True
+
     def __init__(
         self,
         engine_client: EngineClient,
@@ -347,7 +349,7 @@ class OpenAIServingResponses(GenerateBaseServing):
             prev_response = None
 
         lora_request = self._maybe_get_adapters(request)
-        model_name = self.models.model_name(lora_request)
+        model_name = self._served_model_name(request, lora_request)
 
         render_result = await self._render_resolved_response_inputs(
             request,
@@ -415,6 +417,7 @@ class OpenAIServingResponses(GenerateBaseServing):
             sampling_params = request.to_sampling_params(
                 default_max_tokens, self.default_sampling_params
             )
+            self._mark_steering(request, sampling_params)
 
             trace_headers = (
                 None

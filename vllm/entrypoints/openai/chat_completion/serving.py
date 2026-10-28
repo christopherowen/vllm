@@ -117,6 +117,8 @@ def _make_completion_tokens_details(
 
 
 class OpenAIServingChat(GenerateBaseServing):
+    serves_steered_model = True
+
     def __init__(
         self,
         engine_client: EngineClient,
@@ -289,7 +291,7 @@ class OpenAIServingChat(GenerateBaseServing):
 
         lora_request = self._maybe_get_adapters(request, supports_default_mm_loras=True)
 
-        model_name = self.models.model_name(lora_request)
+        model_name = self._served_model_name(request, lora_request)
 
         # Extract data_parallel_rank from header (router can inject it)
         data_parallel_rank = self._get_data_parallel_rank(raw_request)
@@ -329,6 +331,7 @@ class OpenAIServingChat(GenerateBaseServing):
                     max_tokens,
                     self.default_sampling_params,
                 )
+            self._mark_steering(request, sampling_params)
 
             self._log_inputs(
                 sub_request_id,

@@ -14,12 +14,19 @@ projected, so their mean, the reduction the directions are derived on, is
 projected too. The layer's write alone (``ffn_out_pre_residual``) is a different
 site, and a file for it is refused.
 
-Off unless WEIGHTLESS_STEER_PATH names a file; the model then has no steering
-module and its forward is unchanged. The reader is fail-closed: a file this
-runtime cannot apply exactly stops the boot rather than serving unsteered or
-steering at another site. On, the projection is one TileLang launch per layer
-(``tilelang/glp.py``), declared for kernel preparation with the model's other
-kernels.
+Off unless WEIGHTLESS_STEER_PATH names a file and WEIGHTLESS_STEER_MODEL the
+served model name it steers; one without the other stops the boot. Off, the
+model has no steering module and its forward is unchanged. The reader is
+fail-closed: a file this runtime cannot apply exactly stops the boot rather than
+serving unsteered or steering at another site. The file's own layers and
+``glp.alpha_default`` are applied as they are.
+
+On, steering is a property of rows. Each covered layer runs one TileLang launch
+(``tilelang/glp.py``) that folds and projects the rows ``GLPSteering.rows`` marks,
+in place, and leaves every other row untouched. Only the rows of requests made to
+the steered model name are marked (``vllm.weightless``): one engine serves the
+model and its steered variant side by side, and a request to the other names
+gets the same bits as with steering off.
 """
 
 import argparse
@@ -34,7 +41,9 @@ from torch import nn
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.models.deepseek_v4_1 import sp_prefill
 from vllm.models.deepseek_v4_1.tilelang import glp as tilelang_glp
+from vllm.models.deepseek_v4_1.tilelang.collectives import RankOrderParts
 
 logger = init_logger(__name__)
 
@@ -248,108 +257,125 @@ def read_glp(
 
 
 class GLPSteering(nn.Module):
-    """Projects a layer's direction off its folded hyper-connection streams."""
+    """Steers the marked rows of a covered layer's outputs, in place."""
 
-    def __init__(self, directions: torch.Tensor, alpha: float, hc_mult: int):
+    def __init__(
+        self,
+        directions: torch.Tensor,
+        alpha: float,
+        hc_mult: int,
+        layers: list[int],
+        max_tokens: int,
+    ):
         super().__init__()
         self.hc_mult = hc_mult
-        # One float32 row per model layer; unsteered layers are zero rows, so
-        # the traced graph does not depend on which layers a file covers.
+        self.layers = frozenset(layers)
+        # One float32 row per model layer; unsteered layers are zero rows.
         self.register_buffer("directions", directions, persistent=False)
         # A tensor, not a Python float, which would be a graph constant.
         self.register_buffer(
-            "alpha", torch.tensor(alpha, dtype=torch.float32), persistent=False
+            "alpha", torch.tensor([alpha], dtype=torch.float32), persistent=False
+        )
+        # The step's row marks (int32, 0 or 1): the model state marks the rows of
+        # requests made to the steered model name, in place before every step, so
+        # a captured graph reads the replayed step's.
+        self.register_buffer(
+            "rows", torch.zeros(max_tokens, dtype=torch.int32), persistent=False
         )
 
     def declare_kernels(self) -> None:
-        """The projection of the model's streams, the only shape the forward runs."""
-        tilelang_glp.declare(self.hc_mult, self.directions.shape[1])
+        """The steering of the model's streams, for a layer's write and, when
+        sequence-parallel steps hand it on unreduced, for the ranks' parts."""
+        worlds = [1]
+        if sp_prefill.unreduced_enabled():
+            from vllm.distributed import get_tensor_model_parallel_world_size
 
-    def forward(self, streams: torch.Tensor, layer: int) -> torch.Tensor:
-        """``streams`` ([T, hc_mult, hidden], BF16) with layer ``layer``'s direction
-        projected off every stream."""
-        if streams.dtype != torch.bfloat16 or streams.shape[1:] != (
-            self.hc_mult,
-            self.directions.shape[1],
+            world = get_tensor_model_parallel_world_size()
+            if world > 1:
+                worlds.append(world)
+        tilelang_glp.declare(self.hc_mult, self.directions.shape[1], tuple(worlds))
+
+    def step_rows(self, num_tokens: int) -> torch.Tensor:
+        """The marks of a step's ``num_tokens`` rows, a view of ``rows``."""
+        if num_tokens > self.rows.shape[0]:
+            raise ValueError(
+                f"GLP steering marks at most {self.rows.shape[0]} rows, "
+                f"not {num_tokens}"
+            )
+        return self.rows[:num_tokens]
+
+    def steer(
+        self,
+        layer: int,
+        hidden_states,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        res_mix: torch.Tensor,
+        rows: torch.Tensor,
+    ) -> None:
+        """Steer layer ``layer``'s outputs in the rows ``rows`` marks.
+
+        A marked row's write is folded into its streams and projected, and the
+        result left as its ``residual``, with ``res_mix`` the identity and
+        ``post_mix`` zero, so the next layer's fold gives it back. Other rows, and
+        every row of a layer the file does not cover, are untouched.
+        """
+        if layer not in self.layers:
+            return
+        parts = (
+            hidden_states.packed
+            if isinstance(hidden_states, RankOrderParts)
+            else hidden_states.unsqueeze(0)
+        )
+        tokens = residual.shape[0]
+        if (
+            residual.dtype != torch.bfloat16
+            or residual.shape[1:] != (self.hc_mult, self.directions.shape[1])
+            or parts.shape[1:] != (tokens, self.directions.shape[1])
+            or rows.shape != (tokens,)
         ):
             raise ValueError(
-                f"GLP steering projects [T, {self.hc_mult}, "
-                f"{self.directions.shape[1]}] BF16 streams, not "
-                f"{list(streams.shape)} {streams.dtype}"
+                f"GLP steering takes [T, {self.hc_mult}, {self.directions.shape[1]}] "
+                f"BF16 streams with a write and a mark per row, not streams "
+                f"{list(residual.shape)} {residual.dtype}, write {list(parts.shape)} "
+                f"and marks {list(rows.shape)}"
             )
-        streams = streams.contiguous()
-        out = torch.empty_like(streams)
-        tilelang_glp.glp_project(
-            streams, self.directions[layer], self.alpha.view(1), out
+        tilelang_glp.glp_steer(
+            parts,
+            residual,
+            post_mix,
+            res_mix,
+            rows,
+            self.directions[layer],
+            self.alpha,
         )
-        return out
-
-
-def steer_post_layer(
-    glp: GLPSteering | None,
-    mhc: nn.Module,
-    layer: int,
-    hidden_states,
-    residual: torch.Tensor,
-    post_mix: torch.Tensor,
-    res_mix: torch.Tensor,
-):
-    """Layer outputs for the next layer, steered when ``glp`` is set.
-
-    Unsteered, the outputs pass through untouched, for the next layer's fused
-    post/pre. Steered, the layer's write is folded into its streams here,
-    projected, and passed on as the next layer's input with no residual: the
-    layer then reads Engram and runs its pre on the folded streams, as an Engram
-    layer does.
-    """
-    if glp is None:
-        return hidden_states, residual, post_mix, res_mix
-    return (
-        glp(mhc.post(hidden_states, residual, post_mix, res_mix), layer),
-        None,
-        None,
-        None,
-    )
 
 
 def glp_steering(
-    num_layers: int, hidden_size: int, hc_mult: int
+    num_layers: int, hidden_size: int, hc_mult: int, max_tokens: int
 ) -> GLPSteering | None:
-    """The steering WEIGHTLESS_STEER_PATH asks for, or None when it is unset.
-
-    WEIGHTLESS_STEER_ALPHA overrides the file's alpha_default and
-    WEIGHTLESS_STEER_LAYERS restricts steering to a comma list of the file's
-    layers. Both are refused when malformed.
-    """
-    path = envs.WEIGHTLESS_STEER_PATH
-    if path is None:
+    """The steering WEIGHTLESS_STEER_PATH and WEIGHTLESS_STEER_MODEL ask for, or
+    None when neither is set."""
+    path, model = envs.WEIGHTLESS_STEER_PATH, envs.WEIGHTLESS_STEER_MODEL
+    if path is None and model is None:
         return None
+    if path is None or model is None:
+        raise ValueError(
+            "GLP steering needs both WEIGHTLESS_STEER_PATH (the GLP file) and "
+            "WEIGHTLESS_STEER_MODEL (the served model name it steers), not "
+            f"WEIGHTLESS_STEER_PATH={path!r} and WEIGHTLESS_STEER_MODEL={model!r}"
+        )
     directions, alpha = read_glp(path, num_layers, hidden_size)
-    if envs.WEIGHTLESS_STEER_ALPHA is not None:
-        try:
-            alpha = float(envs.WEIGHTLESS_STEER_ALPHA)
-        except ValueError:
-            alpha = math.nan
-        if not math.isfinite(alpha):
-            raise ValueError(
-                f"WEIGHTLESS_STEER_ALPHA is {envs.WEIGHTLESS_STEER_ALPHA!r}"
-            )
     if alpha is None:
-        raise ValueError(f"{path}: no glp.alpha_default and no WEIGHTLESS_STEER_ALPHA")
+        raise ValueError(f"{path}: no glp.alpha_default")
     layers = sorted(directions)
-    if envs.WEIGHTLESS_STEER_LAYERS is not None:
-        layers = _layer_list(envs.WEIGHTLESS_STEER_LAYERS, "WEIGHTLESS_STEER_LAYERS")
-        missing = sorted(set(layers) - set(directions))
-        if not layers or missing:
-            raise ValueError(
-                f"WEIGHTLESS_STEER_LAYERS {envs.WEIGHTLESS_STEER_LAYERS!r} names "
-                f"layers without a direction in {path}: {missing}"
-            )
     stack = torch.zeros((num_layers, hidden_size), dtype=torch.float32)
     for layer in layers:
         stack[layer] = torch.from_numpy(directions[layer])
-    logger.info("GLP steering on: alpha %s, layers %s", alpha, layers)
-    return GLPSteering(stack, alpha, hc_mult)
+    logger.info(
+        "GLP steering on: alpha %s, layers %s, requests to %r", alpha, layers, model
+    )
+    return GLPSteering(stack, alpha, hc_mult, layers, max_tokens)
 
 
 def main() -> None:

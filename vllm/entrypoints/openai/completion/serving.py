@@ -54,6 +54,8 @@ logger = init_logger(__name__)
 
 
 class OpenAIServingCompletion(GenerateBaseServing):
+    serves_steered_model = True
+
     def __init__(
         self,
         engine_client: EngineClient,
@@ -176,6 +178,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                     max_tokens,
                     self.default_sampling_params,
                 )
+            self._mark_steering(request, sampling_params)
 
             request_id_item = f"{request_id}-{i}"
 
@@ -218,7 +221,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
 
         result_generator = merge_async_iterators(*generators)
 
-        model_name = self.models.model_name(lora_request)
+        model_name = self._served_model_name(request, lora_request)
         num_prompts = len(engine_inputs)
 
         # Streaming response

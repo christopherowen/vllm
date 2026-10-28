@@ -226,8 +226,7 @@ if TYPE_CHECKING:
     VLLM_STARTUP_HEARTBEAT_TIMEOUT_S: float = 120.0
     VLLM_DS41_ENGRAM_OVERLAP: bool = True
     WEIGHTLESS_STEER_PATH: str | None = None
-    WEIGHTLESS_STEER_ALPHA: str | None = None
-    WEIGHTLESS_STEER_LAYERS: str | None = None
+    WEIGHTLESS_STEER_MODEL: str | None = None
     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_HC_TP: bool = True
     VLLM_MIMO_L2_PREFETCH: bool = False
@@ -1918,12 +1917,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DS41_ENGRAM_OVERLAP": lambda: bool(
         int(os.getenv("VLLM_DS41_ENGRAM_OVERLAP", "1"))
     ),
-    # DeepSeek V4.1 GLP steering (models/deepseek_v4_1/glp.py): the GLP file,
-    # and overrides of its alpha and steered layers. Part of the compile key, as
-    # every variable here is: steering adds the fold and projection to the graph.
+    # DeepSeek V4.1 GLP steering (models/deepseek_v4_1/glp.py): the GLP file and
+    # the served model name whose requests alone it steers (vllm/weightless.py),
+    # set together or not at all. Part of the compile key, as every variable here
+    # is: steering adds its launch to every covered layer.
     "WEIGHTLESS_STEER_PATH": lambda: os.getenv("WEIGHTLESS_STEER_PATH") or None,
-    "WEIGHTLESS_STEER_ALPHA": lambda: os.getenv("WEIGHTLESS_STEER_ALPHA") or None,
-    "WEIGHTLESS_STEER_LAYERS": lambda: os.getenv("WEIGHTLESS_STEER_LAYERS") or None,
+    "WEIGHTLESS_STEER_MODEL": lambda: os.getenv("WEIGHTLESS_STEER_MODEL") or None,
     # Overlap independent small-batch projections in Qwen3.8-Flash-Next graphs.
     "VLLM_QWEN3_8_FLASH_NEXT_OVERLAP": lambda: bool(
         int(os.getenv("VLLM_QWEN3_8_FLASH_NEXT_OVERLAP", "1"))

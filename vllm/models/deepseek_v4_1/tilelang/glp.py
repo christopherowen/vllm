@@ -1,23 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""GLP steering's projection, ``h <- h - alpha (h . d) d``, in one launch.
+"""GLP steering of the rows a step marks, in one launch a layer.
 
-``streams`` ([T, hc_mult, hidden], BF16) are a layer's folded hyper-connection
-streams, ``direction`` ([hidden], FP32) the layer's unit row (zero for a layer the
-file does not steer) and ``alpha`` ([1], FP32) a buffer, so a file's contents never
-change the traced graph. One block projects one stream of one token: its 320
-threads each load sixteen values of the stream in two loads of eight, widen them to
-FP32, and the block reduces ``h . d`` in a fixed order (each thread's values in
-sequence, then the warp's lanes, then the warps) before every thread writes
-``bf16(h - (alpha (h . d)) d)``. One shape for every batch, so a row's reduction order
-never depends on what else the step carries. Of ten variants measured against the
-compiled torch projection (experiments/2026-10-23-next-release, glp-variants), 320
-threads is faster at every serving shape: one stream 2.2 against 2.6 us, sixteen
-streams 6.9 against 7.9 us, a 16K-token prefill chunk -1.3%. 640 threads was faster on
-prefill but only level at sixteen streams, and slower there in the next run; 128 threads
-(0261) was slower on prefill. Alpha zero and a zero direction return the stream
-unchanged; a non-finite value in a stream reaches its whole row, as it does through
-``h @ d``.
+A layer leaves its write ``x`` and the mixes that fold it into the streams for the
+next layer's fused post/pre: ``h[n] = bf16(post[n] x + sum_m comb[m, n] residual[m])``.
+For each marked row (``rows[t] != 0``) one block folds the write as ``post_streams``
+does (the ranks' unreduced parts of ``x`` first added in rank order, as
+``rank_order_sum`` does), projects every stream, ``h <- h - alpha (h . d) d``, and
+writes the projected streams back as the row's ``residual``, with ``comb`` the
+identity and ``post`` zero. The next layer's fold of that row then gives the
+projected streams back exactly (``1 * r + 0 * ...`` in FP32 is ``r``; only a
+negative zero becomes positive), whichever path reads it: the fused post/pre, an
+Engram layer's post, the drafter's auxiliary states or the final collapse.
+
+A row that is not marked is not read or written: its block returns after loading
+its mark, so unsteered rows keep their bits whatever else the step carries.
+
+``direction`` ([hidden], FP32) is the layer's unit row and ``alpha`` ([1], FP32) a
+buffer, so a file's contents never change the traced graph. A block's 320 threads
+each own sixteen columns of every stream (two loads of eight); a stream's ``h . d``
+is reduced in a fixed order (each thread's values in sequence, then the warp's
+lanes, then the warps), the order of the projection this replaces
+(experiments/2026-10-23-next-release, glp-variants), so a row's result never
+depends on the batch.
 """
 
 # No `from __future__ import annotations`: TileLang reads the prim_func
@@ -32,84 +37,151 @@ from vllm.models.deepseek_v4_1.tilelang import prepare
 
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
-def glp_project_kernel(hc_mult: int, hidden: int, threads: int = 320, vec: int = 8):
+def glp_steer_kernel(
+    hc_mult: int, hidden: int, world: int, threads: int = 320, vec: int = 8
+):
     assert hidden % (threads * vec) == 0 and threads % 32 == 0
+    assert 1 <= world <= 4
     chunks = hidden // (threads * vec)
     warps = threads // 32
+    span = chunks * vec
     tokens = T.dynamic("tokens")
 
     @T.prim_func
-    def glp_project(
-        streams: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
+    def glp_steer(
+        parts: T.Tensor((world, tokens, hidden), T.bfloat16),
+        residual: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
+        post: T.Tensor((tokens, hc_mult), T.float32),
+        comb: T.Tensor((tokens, hc_mult, hc_mult), T.float32),
+        rows: T.Tensor((tokens,), T.int32),
         direction: T.Tensor((hidden,), T.float32),
         alpha: T.Tensor((1,), T.float32),
-        out: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
     ):
-        with T.Kernel(hc_mult, tokens, threads=threads) as (h, t):
+        with T.Kernel(tokens, threads=threads) as t:
             tx = T.get_thread_binding()
-            xs = T.alloc_local((chunks * vec,), T.float32)
-            ds = T.alloc_local((chunks * vec,), T.float32)
-            acc = T.alloc_local((1,), T.float32)
-            partial = T.alloc_shared((warps,), T.float32)
-            scale = T.alloc_shared((1,), T.float32)
-            acc[0] = T.float32(0)
+            # The whole block leaves an unmarked row, before any barrier.
+            if rows[t] == 0:
+                T.thread_return()
+            hs = T.alloc_local((hc_mult * span,), T.float32)
+            ds = T.alloc_local((span,), T.float32)
+            xs = T.alloc_local((vec,), T.float32)
+            rv = T.alloc_local((hc_mult * vec,), T.bfloat16)
+            pv = T.alloc_local((world * vec,), T.bfloat16)
+            pm = T.alloc_local((hc_mult,), T.float32)
+            cm = T.alloc_local((hc_mult * hc_mult,), T.float32)
+            acc = T.alloc_local((hc_mult,), T.float32)
+            fold = T.alloc_var(T.float32)
+            total = T.alloc_var(T.float32)
+            partial = T.alloc_shared((hc_mult, warps), T.float32)
+            scale = T.alloc_shared((hc_mult,), T.float32)
+            for n in T.unroll(hc_mult):
+                pm[n] = post[t, n]
+                acc[n] = T.float32(0)
+            for m in T.unroll(hc_mult):
+                for n in T.unroll(hc_mult):
+                    cm[m * hc_mult + n] = comb[t, m, n]
             for c in T.serial(chunks):
-                for i in T.vectorized(vec):
-                    xs[c * vec + i] = streams[t, h, (c * threads + tx) * vec + i]
-                for i in T.vectorized(vec):
-                    ds[c * vec + i] = direction[(c * threads + tx) * vec + i]
-                for i in T.serial(vec):
-                    acc[0] += xs[c * vec + i] * ds[c * vec + i]
-            acc[0] = T.warp_reduce_sum(acc[0])
-            if tx % 32 == 0:
-                partial[tx // 32] = acc[0]
+                for r in T.unroll(world):
+                    for v in T.vectorized(vec):
+                        pv[r * vec + v] = parts[r, t, (c * threads + tx) * vec + v]
+                for m in T.unroll(hc_mult):
+                    for v in T.vectorized(vec):
+                        rv[m * vec + v] = residual[t, m, (c * threads + tx) * vec + v]
+                for v in T.vectorized(vec):
+                    ds[c * vec + v] = direction[(c * threads + tx) * vec + v]
+                # rank_order_sum: the first part as is, then the others in order.
+                for v in T.unroll(vec):
+                    xs[v] = T.Cast(T.float32, pv[v])
+                    for r in T.serial(world - 1):
+                        xs[v] = xs[v] + T.Cast(T.float32, pv[(r + 1) * vec + v])
+                    xs[v] = T.Cast(T.float32, T.Cast(T.bfloat16, xs[v]))
+                # post_streams: the first stream's rounded product, then FMAs in order.
+                for n in T.unroll(hc_mult):
+                    for v in T.unroll(vec):
+                        fold = cm[n] * T.Cast(T.float32, rv[v])
+                        fold = T.fma(pm[n], xs[v], fold)
+                        for m in T.unroll(1, hc_mult):
+                            fold = T.fma(
+                                cm[m * hc_mult + n],
+                                T.Cast(T.float32, rv[m * vec + v]),
+                                fold,
+                            )
+                        hs[n * span + c * vec + v] = T.Cast(
+                            T.float32, T.Cast(T.bfloat16, fold)
+                        )
+            for n in T.unroll(hc_mult):
+                for i in T.serial(span):
+                    acc[n] += hs[n * span + i] * ds[i]
+                acc[n] = T.warp_reduce_sum(acc[n])
+                if tx % 32 == 0:
+                    partial[n, tx // 32] = acc[n]
             T.sync_threads()
-            if tx == 0:
-                acc[0] = T.float32(0)
-                for warp in T.serial(warps):
-                    acc[0] += partial[warp]
-                scale[0] = alpha[0] * acc[0]
+            if tx < hc_mult:
+                total = T.float32(0)
+                for w in T.serial(warps):
+                    total += partial[tx, w]
+                scale[tx] = alpha[0] * total
             T.sync_threads()
             for c in T.serial(chunks):
-                for i in T.vectorized(vec):
-                    out[t, h, (c * threads + tx) * vec + i] = T.cast(
-                        xs[c * vec + i] - scale[0] * ds[c * vec + i], T.bfloat16
-                    )
+                for n in T.unroll(hc_mult):
+                    for v in T.vectorized(vec):
+                        residual[t, n, (c * threads + tx) * vec + v] = T.Cast(
+                            T.bfloat16,
+                            hs[n * span + c * vec + v] - scale[n] * ds[c * vec + v],
+                        )
+            if tx < hc_mult * hc_mult:
+                comb[t, tx // hc_mult, tx % hc_mult] = T.if_then_else(
+                    tx // hc_mult == tx % hc_mult, T.float32(1), T.float32(0)
+                )
+            if tx < hc_mult:
+                post[t, tx] = T.float32(0)
 
-    return glp_project
+    return glp_steer
 
 
 @cache
-def _kernel(hc_mult: int, hidden: int):
-    return glp_project_kernel(hc_mult, hidden)
+def _kernel(hc_mult: int, hidden: int, world: int):
+    return glp_steer_kernel(hc_mult, hidden, world)
 
 
-@torch.library.custom_op("vllm::dsv41_tilelang_glp_project", mutates_args=("out",))
-def glp_project(
-    streams: torch.Tensor,
+@torch.library.custom_op(
+    "vllm::dsv41_tilelang_glp_steer", mutates_args=("residual", "post", "comb")
+)
+def glp_steer(
+    parts: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    rows: torch.Tensor,
     direction: torch.Tensor,
     alpha: torch.Tensor,
-    out: torch.Tensor,
 ) -> None:
-    """Project ``direction`` off ``streams`` ([T, hc_mult, hidden], BF16) into
-    ``out``, scaled by ``alpha`` ([1], FP32)."""
-    tokens, hc_mult, hidden = streams.shape
+    """Steer the rows ``rows`` (int32, [T]) marks: fold ``parts`` ([world, T, H],
+    BF16, the layer's write or the ranks' unreduced parts of it) into ``residual``
+    ([T, hc_mult, H], BF16) with ``post`` ([T, hc_mult]) and ``comb`` ([T, hc_mult,
+    hc_mult]), project ``direction`` off every stream scaled by ``alpha`` ([1]),
+    and leave the result as the row's ``residual`` with ``comb`` the identity and
+    ``post`` zero. Unmarked rows are untouched."""
+    world, tokens, hidden = parts.shape
     if tokens == 0:
         return
-    _kernel(hc_mult, hidden)(streams, direction, alpha, out)
-
-
-@glp_project.register_fake
-def _glp_project_fake(streams, direction, alpha, out):
-    return None
-
-
-def declare(hc_mult: int, hidden: int) -> None:
-    """Declare the projection of ``hc_mult`` streams of ``hidden``, and keep it."""
-    prepare.declare(
-        lambda: [prepare.call(glp_project_kernel, hc_mult, hidden)],
-        bind=lambda: _kernel(hc_mult, hidden),
+    _kernel(residual.shape[1], hidden, world)(
+        parts, residual, post, comb, rows, direction, alpha
     )
 
 
-__all__ = ["declare", "glp_project", "glp_project_kernel"]
+@glp_steer.register_fake
+def _glp_steer_fake(parts, residual, post, comb, rows, direction, alpha):
+    return None
+
+
+def declare(hc_mult: int, hidden: int, worlds: tuple[int, ...]) -> None:
+    """Declare the steering of ``hc_mult`` streams of ``hidden`` for a write of
+    each of ``worlds`` parts, and keep them."""
+    prepare.declare(
+        lambda: [prepare.call(glp_steer_kernel, hc_mult, hidden, w) for w in worlds],
+        bind=lambda: [_kernel(hc_mult, hidden, w) for w in worlds],
+    )
+
+
+__all__ = ["declare", "glp_steer", "glp_steer_kernel"]

@@ -26,11 +26,9 @@ METADATA = {
     "glp.alpha_default": 0.75,
     "glp.layer_ids_zero_based": "1,2,5",
 }
-STEER_ENV = (
-    "WEIGHTLESS_STEER_PATH",
-    "WEIGHTLESS_STEER_ALPHA",
-    "WEIGHTLESS_STEER_LAYERS",
-)
+STEER_ENV = ("WEIGHTLESS_STEER_PATH", "WEIGHTLESS_STEER_MODEL")
+STEERED = "model-weightless"
+MAX_TOKENS = 64
 
 
 def _string(text: str) -> bytes:
@@ -187,65 +185,57 @@ def test_a_transferred_vector_is_read(tmp_path):
 # Steering on and off.
 
 
-def test_no_path_means_no_steering_module(monkeypatch):
-    monkeypatch.setenv("WEIGHTLESS_STEER_ALPHA", "not a number")
-    monkeypatch.setenv("WEIGHTLESS_STEER_LAYERS", "99")
-    assert glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS) is None
+def steer(monkeypatch, path) -> None:
+    monkeypatch.setenv("WEIGHTLESS_STEER_PATH", path)
+    monkeypatch.setenv("WEIGHTLESS_STEER_MODEL", STEERED)
+
+
+def test_unset_means_no_steering_module():
+    assert glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS) is None
 
 
 def test_steering_stacks_the_file_directions(tmp_path, monkeypatch):
-    monkeypatch.setenv("WEIGHTLESS_STEER_PATH", glp_file(tmp_path))
-    steering = glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS)
+    steer(monkeypatch, glp_file(tmp_path))
+    steering = glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
     assert steering.directions.shape == (NUM_LAYERS, HIDDEN)
     assert steering.directions.dtype == torch.float32
     for layer in range(NUM_LAYERS):
         expected = unit(layer) if layer in LAYERS else np.zeros(HIDDEN)
         np.testing.assert_allclose(steering.directions[layer], expected, atol=1e-7)
     assert steering.alpha.item() == pytest.approx(0.75)
+    assert steering.layers == frozenset(LAYERS)
     # Buffers, never weights: the checkpoint loader must not see them.
     assert dict(steering.named_parameters()) == {}
     assert steering.state_dict() == {}
 
 
-def test_alpha_and_layers_can_be_overridden(tmp_path, monkeypatch):
-    monkeypatch.setenv("WEIGHTLESS_STEER_PATH", glp_file(tmp_path))
-    monkeypatch.setenv("WEIGHTLESS_STEER_ALPHA", "0.5")
-    monkeypatch.setenv("WEIGHTLESS_STEER_LAYERS", "2, 5")
-    steering = glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS)
-    assert steering.alpha.item() == pytest.approx(0.5)
-    assert torch.count_nonzero(steering.directions.abs().sum(-1)) == 2
-    assert steering.directions[1].abs().sum() == 0
+@pytest.mark.parametrize("name", STEER_ENV)
+def test_one_variable_without_the_other_is_refused(tmp_path, monkeypatch, name):
+    steer(monkeypatch, glp_file(tmp_path))
+    monkeypatch.delenv(name)
+    with pytest.raises(ValueError, match="needs both"):
+        glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
 
 
-@pytest.mark.parametrize(
-    "env, message",
-    [
-        ({"WEIGHTLESS_STEER_ALPHA": "strong"}, "WEIGHTLESS_STEER_ALPHA"),
-        ({"WEIGHTLESS_STEER_ALPHA": "inf"}, "WEIGHTLESS_STEER_ALPHA"),
-        ({"WEIGHTLESS_STEER_LAYERS": "1,x"}, "comma list"),
-        ({"WEIGHTLESS_STEER_LAYERS": "1,3"}, "without a direction"),
-        ({"WEIGHTLESS_STEER_LAYERS": ","}, "without a direction"),
-    ],
-)
-def test_malformed_overrides_are_refused(tmp_path, monkeypatch, env, message):
-    monkeypatch.setenv("WEIGHTLESS_STEER_PATH", glp_file(tmp_path))
-    for name, value in env.items():
-        monkeypatch.setenv(name, value)
-    with pytest.raises(ValueError, match=message):
-        glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS)
+@pytest.mark.parametrize("name", ["WEIGHTLESS_STEER_ALPHA", "WEIGHTLESS_STEER_LAYERS"])
+def test_the_file_is_applied_as_it_is(tmp_path, monkeypatch, name):
+    steer(monkeypatch, glp_file(tmp_path))
+    monkeypatch.setenv(name, "2")
+    steering = glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
+    assert steering.alpha.item() == pytest.approx(0.75)
+    assert steering.layers == frozenset(LAYERS)
 
 
 def test_a_missing_file_is_refused(tmp_path, monkeypatch):
-    monkeypatch.setenv("WEIGHTLESS_STEER_PATH", str(tmp_path / "missing.gguf"))
+    steer(monkeypatch, str(tmp_path / "missing.gguf"))
     with pytest.raises(FileNotFoundError):
-        glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS)
+        glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
 
 
-def test_no_alpha_anywhere_is_refused(tmp_path, monkeypatch):
-    path = glp_file(tmp_path, metadata={"glp.alpha_default": None})
-    monkeypatch.setenv("WEIGHTLESS_STEER_PATH", path)
+def test_a_file_without_alpha_is_refused(tmp_path, monkeypatch):
+    steer(monkeypatch, glp_file(tmp_path, metadata={"glp.alpha_default": None}))
     with pytest.raises(ValueError, match="no glp.alpha_default"):
-        glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS)
+        glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
 
 
 def test_the_steering_variables_are_part_of_the_compile_key(monkeypatch):
@@ -256,159 +246,122 @@ def test_the_steering_variables_are_part_of_the_compile_key(monkeypatch):
     assert envs.compile_factors() != unsteered
 
 
-# The projection: one TileLang launch (tilelang/glp.py) on the model's BF16
-# streams, at the serving width. Its precision against FP64 is
-# tests/kernels/test_deepseek_v41_tilelang_glp.py's.
+def test_rows_start_unmarked(tmp_path, monkeypatch):
+    steer(monkeypatch, glp_file(tmp_path))
+    steering = glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
+    assert steering.rows.dtype == torch.int32
+    assert steering.rows.shape == (MAX_TOKENS,)
+    assert bool((steering.rows == 0).all())
+
+
+def test_a_step_reads_a_view_of_the_marks(tmp_path, monkeypatch):
+    steer(monkeypatch, glp_file(tmp_path))
+    steering = glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
+    rows = steering.step_rows(5)
+    assert rows.shape == (5,)
+    assert rows.data_ptr() == steering.rows.data_ptr()
+    with pytest.raises(ValueError, match="at most 64 rows"):
+        steering.step_rows(MAX_TOKENS + 1)
+
+
+# A layer's step: one TileLang launch (tilelang/glp.py) for a covered layer. The
+# kernel's results are tests/kernels/test_deepseek_v41_tilelang_glp.py's.
 
 WIDE = 5120
-on_gpu = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability()[0] != 12,
-    reason="the TileLang projection targets SM120/SM121",
-)
 
 
-def steering(alpha: float, layers=LAYERS) -> glp.GLPSteering:
+def steering(layers=LAYERS) -> glp.GLPSteering:
     directions = torch.zeros(NUM_LAYERS, WIDE)
     for layer in layers:
         directions[layer] = torch.from_numpy(unit(layer, WIDE))
-    return glp.GLPSteering(directions, alpha, STREAMS).cuda()
+    return glp.GLPSteering(directions, 0.75, STREAMS, list(layers), MAX_TOKENS)
 
 
-def streams(tokens: int = 7) -> torch.Tensor:
-    generator = torch.Generator().manual_seed(0)
-    return torch.randn(tokens, STREAMS, WIDE, generator=generator).bfloat16().cuda()
+def _layer_outputs(tokens: int = 3):
+    generator = torch.Generator().manual_seed(1)
+    x = torch.randn(tokens, WIDE, generator=generator).bfloat16()
+    residual = torch.randn(tokens, STREAMS, WIDE, generator=generator).bfloat16()
+    post_mix = torch.rand(tokens, STREAMS, generator=generator)
+    res_mix = torch.rand(tokens, STREAMS, STREAMS, generator=generator)
+    return x, residual, post_mix, res_mix
 
 
-def direction(layer: int) -> torch.Tensor:
-    return torch.from_numpy(unit(layer, WIDE)).double().cuda()
+@pytest.fixture
+def launches(monkeypatch):
+    calls = []
+    monkeypatch.setattr(glp.tilelang_glp, "glp_steer", lambda *args: calls.append(args))
+    return calls
 
 
-@on_gpu
-@pytest.mark.parametrize("alpha", [0.0, 0.25, 0.75, 1.0, 2.0])
-def test_projection_scales_only_the_direction(alpha):
-    d = direction(2)
-    h = streams()
-    out = steering(alpha)(h, 2).double()
-    # One BF16 rounding of each output element bounds the error.
-    torch.testing.assert_close(
-        out @ d, (1 - alpha) * (h.double() @ d), atol=0.05, rtol=0
+def test_a_layer_the_file_does_not_cover_launches_nothing(launches):
+    x, residual, post_mix, res_mix = _layer_outputs()
+    steering().steer(
+        3, x, residual, post_mix, res_mix, torch.ones(3, dtype=torch.int32)
     )
-    rest = lambda x: x - (x @ d).unsqueeze(-1) * d  # noqa: E731
-    torch.testing.assert_close(rest(out), rest(h.double()), atol=0.05, rtol=0.01)
+    assert launches == []
 
 
-@on_gpu
-def test_every_stream_is_projected_so_their_mean_is_too():
-    d = direction(5)
-    h = streams()
-    out = steering(1.0)(h, 5).double()
-    torch.testing.assert_close(
-        out @ d, torch.zeros(7, STREAMS, dtype=torch.float64, device="cuda"),
-        atol=0.05, rtol=0,
+def test_a_covered_layer_steers_its_write_in_place(launches):
+    module = steering()
+    x, residual, post_mix, res_mix = _layer_outputs()
+    rows = torch.tensor([0, 1, 0], dtype=torch.int32)
+    module.steer(5, x, residual, post_mix, res_mix, rows)
+    ((parts, *rest),) = launches
+    assert parts.shape == (1, 3, WIDE) and torch.equal(parts[0], x)
+    assert rest[0] is residual and rest[1] is post_mix and rest[2] is res_mix
+    assert rest[3] is rows
+    assert torch.equal(rest[4], module.directions[5])
+    assert rest[5] is module.alpha
+
+
+def test_the_ranks_unreduced_parts_are_handed_on_as_they_are(launches):
+    from vllm.models.deepseek_v4_1.tilelang.collectives import RankOrderParts
+
+    x, residual, post_mix, res_mix = _layer_outputs()
+    packed = torch.stack([x, x, x])
+    steering().steer(
+        1,
+        RankOrderParts(packed),
+        residual,
+        post_mix,
+        res_mix,
+        torch.ones(3, dtype=torch.int32),
     )
-    mean = h.double().mean(dim=1)
-    torch.testing.assert_close(
-        out.mean(dim=1), mean - (mean @ d).unsqueeze(-1) * d, atol=0.02, rtol=0.01
-    )
+    assert launches[0][0] is packed
 
 
-@on_gpu
-@pytest.mark.parametrize("alpha", [0.0, 0.75, 1.0, 2.0])
-def test_projection_never_adds_to_a_stream(alpha):
-    h = streams()
-    out = steering(alpha)(h, 1)
-    assert (out.double().norm(dim=-1) <= h.double().norm(dim=-1) * (1 + 2**-8)).all()
-
-
-@on_gpu
-def test_an_unsteered_layer_is_unchanged():
-    h = streams()
-    out = steering(0.75)(h, 3)
-    assert out.dtype == torch.bfloat16
-    assert torch.equal(out, h)
-
-
-@on_gpu
-def test_alpha_is_read_when_the_projection_runs():
-    module = steering(1.0)
-    h = streams()
-    full = module(h, 1)
-    module.alpha.fill_(0.0)
-    assert torch.equal(module(h, 1), h)
-    assert not torch.equal(full, h)
-
-
-@on_gpu
-def test_only_the_models_streams_are_projected():
-    module = steering(1.0)
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda o: (o[0], o[1].float(), o[2], o[3], o[4]),
+        lambda o: (o[0], o[1][:, :2], o[2], o[3], o[4]),
+        lambda o: (o[0][:2], o[1], o[2], o[3], o[4]),
+        lambda o: (o[0], o[1], o[2], o[3], o[4][:2]),
+    ],
+)
+def test_only_the_models_streams_and_their_marks_are_steered(launches, change):
+    outputs = (*_layer_outputs(), torch.ones(3, dtype=torch.int32))
     with pytest.raises(ValueError, match="BF16 streams"):
-        module(streams().float(), 1)
-    with pytest.raises(ValueError, match="BF16 streams"):
-        module(streams()[:, :2], 1)
+        steering().steer(1, *change(outputs))
+    assert launches == []
 
 
-def test_the_projection_is_declared_for_the_models_streams(monkeypatch):
+@pytest.mark.parametrize("unreduced, worlds", [(False, (1,)), (True, (1, 4))])
+def test_the_steering_is_declared_for_the_writes_it_takes(
+    monkeypatch, unreduced, worlds
+):
+    import vllm.distributed
+
     declared = []
     monkeypatch.setattr(
         glp.tilelang_glp, "declare", lambda *shape: declared.append(shape)
     )
-    directions = torch.zeros(NUM_LAYERS, WIDE)
-    glp.GLPSteering(directions, 0.75, STREAMS).declare_kernels()
-    assert declared == [(STREAMS, WIDE)]
-
-
-# The model loop's step.
-
-
-class _FoldingMHC(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.calls = 0
-
-    def post(self, x, residual, post_mix, res_mix):
-        self.calls += 1
-        return (
-            post_mix.unsqueeze(-1) * x.float().unsqueeze(1)
-            + res_mix @ residual.float()
-        ).to(residual.dtype)
-
-
-def _layer_outputs(device="cpu"):
-    generator = torch.Generator().manual_seed(1)
-    x = torch.randn(3, WIDE, generator=generator).bfloat16()
-    residual = torch.randn(3, STREAMS, WIDE, generator=generator).bfloat16()
-    post_mix = torch.rand(3, STREAMS, generator=generator)
-    res_mix = torch.rand(3, STREAMS, STREAMS, generator=generator)
-    return tuple(t.to(device) for t in (x, residual, post_mix, res_mix))
-
-
-def test_unsteered_layer_outputs_pass_through_untouched():
-    mhc = _FoldingMHC()
-    outputs = _layer_outputs()
-    passed = glp.steer_post_layer(None, mhc, 1, *outputs)
-    assert all(a is b for a, b in zip(passed, outputs))
-    assert mhc.calls == 0
-
-
-@on_gpu
-def test_steered_layer_outputs_are_the_projected_fold():
-    mhc = _FoldingMHC()
-    outputs = _layer_outputs("cuda")
-    module = steering(1.0)
-    hidden_states, residual, post_mix, res_mix = glp.steer_post_layer(
-        module, mhc, 5, *outputs
+    monkeypatch.setattr(glp.sp_prefill, "unreduced_enabled", lambda: unreduced)
+    monkeypatch.setattr(
+        vllm.distributed, "get_tensor_model_parallel_world_size", lambda: 4
     )
-    assert (residual, post_mix, res_mix) == (None, None, None)
-    assert mhc.calls == 1
-    fold = _FoldingMHC().post(*outputs)
-    assert torch.equal(hidden_states, module(fold, 5))
-    torch.testing.assert_close(
-        hidden_states.double() @ direction(5),
-        torch.zeros(3, STREAMS, dtype=torch.float64, device="cuda"),
-        atol=0.05,
-        rtol=0,
-    )
+    steering().declare_kernels()
+    assert declared == [(STREAMS, WIDE, worlds)]
 
 
 # A real GLP file, when one is named (it is not redistributed with the tests).
@@ -419,7 +372,10 @@ REAL_FILE = os.environ.get("GLP_TEST_FILE")
 @pytest.mark.skipif(not REAL_FILE, reason="GLP_TEST_FILE names no file")
 def test_a_published_ds41_file_holds_only_unit_directions():
     metadata, tensors = glp.read_gguf(REAL_FILE)
-    assert all(key.startswith(("general.", "glp.")) for key in metadata)
+    # controlvector.*: llama.cpp's control-vector header, which the reader ignores.
+    assert all(
+        key.startswith(("general.", "glp.", "controlvector.")) for key in metadata
+    )
     assert all(name.startswith("direction.") for name in tensors)
     directions, alpha = glp.read_glp(REAL_FILE, 40, 5120)
     assert sorted(directions) == list(range(1, 40))
