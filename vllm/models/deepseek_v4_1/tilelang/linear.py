@@ -475,10 +475,20 @@ def _declare_block32(layer, groups: int = 1, cast: bool = True) -> None:
 
 
 def _block32_scale_words(layer) -> None:
-    """The 32x32 block scales become per-row words of four K32 exponents."""
-    layer.tilelang_weight_sf = pack_scale_words(
-        layer.weight_scale_inv.view(torch.uint8), rows=layer.weight.shape[0]
-    )
+    """Pack the 32x32 block-scale grid. The GEMM indexes it with ``row // 32``.
+
+    ``pack_scale_words(..., rows=N)`` repeats this grid once per output row.
+    Storing the grid keeps ``SFB[row // 32, word]`` equal to that expanded word.
+    Grouped weights are stacked in N, so the same index is the broadcast's word.
+    """
+    scales = layer.weight_scale_inv.view(torch.uint8)
+    rows = layer.weight.shape[0]
+    if scales.shape[0] * 32 != rows:
+        raise ValueError(
+            f"block scales have {scales.shape[0]} rows for {rows} outputs; "
+            "the GEMM reads one scale row per 32 output rows"
+        )
+    layer.tilelang_weight_sf = pack_scale_words(scales)
 
 
 def _apply_block32(layer, x: torch.Tensor) -> torch.Tensor:

@@ -12,8 +12,9 @@ per-block promotion loop is needed.
 
 Scales reach ``T.mma_gemm_blockscaled`` as uint32 words, each packing the
 UE8M0 exponents of four consecutive K32 blocks of one row (byte ``j`` covers
-K block ``4 * word + j``). The weight's 32x32 block scales are broadcast to
-per-row words once on the host.
+K block ``4 * word + j``). The weight's 32x32 block scales are stored as that
+packed grid; the GEMM loads ``SFB[row // 32]``, the word a per-row broadcast
+would have copied to that row. Activation scales stay one word per row.
 """
 
 import tilelang
@@ -21,6 +22,7 @@ import tilelang.language as T
 import torch
 
 from . import pdl
+from .scale_pack import pack_scale_words
 
 SF_BLOCK = 32  # K elements per UE8M0 scale
 SF_WORD_K = 4 * SF_BLOCK  # K elements per packed scale word
@@ -64,10 +66,13 @@ def _mxfp8_gemm(
 ):
     """``C[M, N] = (A * SFA) @ (B * SFB)^T`` for MXFP8 ``A[M, K]``, ``B[N, K]``.
 
-    M is dynamic. ``SFA`` / ``SFB`` hold ``ceil(K / 128)`` packed UE8M0 words
-    per row. ``block_K`` is any multiple of 64 dividing K; a block that starts
-    off a 128-element boundary reads the two words it straddles and tells the
-    MMA where it starts (``k_start``), so no operand is padded.
+    M is dynamic. ``SFA`` holds ``ceil(K / 128)`` packed UE8M0 words per
+    activation row. ``SFB`` holds those words once per 32 output rows (the
+    packed 32x32 block-scale grid): row ``r`` reads ``SFB[r // 32]``, including
+    inside a group, where groups are stacked in N. ``block_K`` is any multiple
+    of 64 dividing K; a block that starts off a 128-element boundary reads the
+    two words it straddles and tells the MMA where it starts (``k_start``), so
+    no operand is padded.
 
     With ``padded_rows``, ``A`` and ``SFA`` have ``Mp >= M`` rows, a multiple
     of ``block_M`` (the decode workspace): every activation tile is loaded
@@ -81,10 +86,12 @@ def _mxfp8_gemm(
     weight larger than L2 is read once per panel rather than once per row of
     tiles; it only changes the order tiles run in.
 
-    With ``groups`` > 1 the projection is grouped (the attention's WO-A): ``A`` is
-    ``[M, groups * K]``, ``B`` and ``SFB`` stack the groups' ``[N, K]`` weights,
-    and ``C`` is ``[M, groups * N]``; output columns of group ``g`` read only A's
-    columns ``g * K`` to ``(g + 1) * K``. One launch covers every group.
+    With ``groups`` > 1 the projection is grouped: ``A`` is ``[M, groups * K]``,
+    ``B`` stacks the groups' ``[N, K]`` weights, ``SFB`` stacks their block-scale
+    rows (the same words as broadcasting each group), and ``C`` is
+    ``[M, groups * N]``. Output columns of group ``g`` read only A's columns
+    ``g * K`` to ``(g + 1) * K``. One launch covers every group. ``N`` is a
+    multiple of 32, so a group starts on a block-scale row.
 
     With ``shards`` > 1 each of the ``shards`` equal K ranges is summed from
     zero and the shards are added in order: the arithmetic of
@@ -98,6 +105,7 @@ def _mxfp8_gemm(
     assert K % block_K == 0 and block_K % 64 == 0, (
         "block_K must divide K and be a multiple of 64"
     )
+    assert N % 32 == 0, "block scales are one row per 32 output rows"
     assert groups == 1 or (N % block_N == 0 and K % SF_WORD_K == 0), (
         "grouped tiles must not straddle a group"
     )
@@ -118,7 +126,7 @@ def _mxfp8_gemm(
         A: T.Tensor((Mp, groups * K), in_dtype),
         B: T.Tensor((total_N, K), in_dtype),
         SFA: T.Tensor((Mp, groups * sf_words), T.uint32),
-        SFB: T.Tensor((total_N, sf_words), T.uint32),
+        SFB: T.Tensor((total_N // 32, sf_words), T.uint32),
         C: T.Tensor((M, total_N), out_dtype),
     ):
         with T.Kernel(
@@ -147,6 +155,9 @@ def _mxfp8_gemm(
                 T.copy(A[by * block_M, a_k + ko * block_K], A_shared)
                 T.copy(B[bx * block_N, ko * block_K], B_shared)
                 # Edge tiles clamp their scale rows; those rows are never stored.
+                # SFB is the packed block grid, so the clamped row is divided by
+                # 32. That is the per-row broadcast's word, and it stays on the
+                # last block row when the tile runs past N.
                 word0 = ko * block_K // SF_WORD_K
                 for i, w in T.Parallel(block_M, block_words):
                     SFA_shared[i, w] = SFA[
@@ -154,8 +165,9 @@ def _mxfp8_gemm(
                         a_word + T.min(word0 + w, sf_words - 1),
                     ]
                 for j, w in T.Parallel(block_N, block_words):
+                    row = T.min(bx * block_N + j, total_N - 1)
                     SFB_shared[j, w] = SFB[
-                        T.min(bx * block_N + j, total_N - 1),
+                        row // 32,
                         T.min(word0 + w, sf_words - 1),
                     ]
                 # The staged words start at the block's first word; k_start
@@ -209,6 +221,7 @@ def _mxfp8_gemm_partials(
     workspace). A narrow projection has few N tiles; its shards fill the GPU.
     """
     assert K % block_K == 0 and block_K % 64 == 0 and (K // block_K) % shards == 0
+    assert N % 32 == 0, "block scales are one row per 32 output rows"
     shard_blocks = K // block_K // shards
     M = T.dynamic("M")
     Mp = T.dynamic("Mp")
@@ -221,7 +234,7 @@ def _mxfp8_gemm_partials(
         A: T.Tensor((Mp, K), in_dtype),
         B: T.Tensor((N, K), in_dtype),
         SFA: T.Tensor((Mp, sf_words), T.uint32),
-        SFB: T.Tensor((N, sf_words), T.uint32),
+        SFB: T.Tensor((N // 32, sf_words), T.uint32),
         P: T.Tensor((shards, M, N), T.float32),
     ):
         with T.Kernel(
@@ -245,8 +258,10 @@ def _mxfp8_gemm_partials(
                         T.min(word0 + w, sf_words - 1),
                     ]
                 for j, w in T.Parallel(block_N, block_words):
+                    # Same block-grid address as gemm_mxfp8; clamp, then // 32.
+                    row = T.min(bx * block_N + j, N - 1)
                     SFB_shared[j, w] = SFB[
-                        T.min(bx * block_N + j, N - 1),
+                        row // 32,
                         T.min(word0 + w, sf_words - 1),
                     ]
                 T.mma_gemm_blockscaled(
@@ -1081,22 +1096,6 @@ def bf16_gemm_splitk(
 # ---------------------------------------------------------------------------
 # Scale packing and tile configuration
 # ---------------------------------------------------------------------------
-
-
-def pack_scale_words(exponents: torch.Tensor, rows: int | None = None) -> torch.Tensor:
-    """Pack ``[..., K / 32]`` UE8M0 bytes into ``[..., ceil(K / 128)]`` uint32 words.
-
-    With ``rows``, a ``[rows / 32, K / 32]`` block-scale grid is first
-    broadcast to every row. Rows whose exponent count is not a multiple of
-    four gain unread padding bytes (TP4's 576-wide rows: 18 bytes become 20).
-    """
-    exponents = exponents.view(torch.uint8)
-    if rows is not None and exponents.shape[0] != rows:
-        exponents = exponents.repeat_interleave(rows // exponents.shape[0], dim=0)
-    pad = -exponents.shape[-1] % 4
-    if pad:
-        exponents = torch.nn.functional.pad(exponents, (0, pad), value=127)
-    return exponents.contiguous().view(torch.uint32)
 
 
 def pack_scale_codes(exponents: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

@@ -77,7 +77,8 @@ def _mxfp8(x):
 )
 def test_mxfp8_gemm(n, k):
     weight, exps, weight_values = _block32_weight(n, k, 1)
-    weight_sf = pack_scale_words(exps, rows=n)
+    # Packed block grid. The GEMM loads SFB[row // 32].
+    weight_sf = pack_scale_words(exps)
     x = torch.randn((max(ROWS), k), generator=_gen(2), device=DEVICE).bfloat16()
     xq, sf, x_values = _mxfp8(x)
     ref = x_values @ weight_values.T
@@ -126,7 +127,8 @@ def test_mxfp8_decode_tile_repeats(n=2048, k=2048, runs=100):
     unspecialized pipeline.
     """
     weight, exps, _ = _block32_weight(n, k, 5)
-    weight_sf = pack_scale_words(exps, rows=n)
+    # Packed block grid. The GEMM loads SFB[row // 32].
+    weight_sf = pack_scale_words(exps)
     x = torch.randn((DECODE_ROWS, k), generator=_gen(6), device=DEVICE).bfloat16()
     xq, sf, _ = _mxfp8(x)
     words = sf.contiguous().view(torch.uint32)

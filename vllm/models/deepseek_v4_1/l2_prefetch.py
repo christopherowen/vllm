@@ -60,7 +60,8 @@ def linear_segments(name: str, linear: torch.nn.Module | None) -> list[Segment]:
         return []
     segments = [
         _l2pf.tensor_segment(f"{name}.weight", getattr(linear, "weight", None)),
-        # The TileLang block-32 projections read per-row scale words beside it.
+        # Scale bytes beside the weight: packed 32-row block words, or WO-A's
+        # raw 32x32 exponent grid. The GEMM indexes either with row // 32.
         _l2pf.tensor_segment(
             f"{name}.tilelang_weight_sf",
             getattr(linear, "tilelang_weight_sf", None),
