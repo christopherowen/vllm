@@ -40,6 +40,10 @@ from vllm.models.deepseek_v4_1.tilelang.moe import (  # noqa: E402
     tile_expert_weights,
     workspace_bytes,
 )
+from vllm.models.deepseek_v4_1.tilelang.scale_codes import (  # noqa: E402
+    pack_expert_scale_codes,
+    tile_byte_codes,
+)
 
 DEVICE = "cuda"
 E2M1 = (
@@ -81,6 +85,11 @@ def _experts(num_experts, n, k, seed):
     exps = torch.randint(
         118, 122, (num_experts, n, k // 32), generator=gen, device=DEVICE
     )
+    # 118..121 spans at most 4 values, so every expert would be 2-bit and the
+    # GEMM's 4-bit branch would not run. Expert 1's first row is pinned at both
+    # ends so its span is 6 values whatever the other draws are.
+    exps[1, 0, 0] = 118
+    exps[1, 0, 1] = 118 + 5
     packed = (codes[..., 0::2] | (codes[..., 1::2] << 4)).to(torch.uint8)
     lut = torch.tensor(E2M1, device=DEVICE)
     values = lut[codes] * torch.exp2(exps.float() - 127).repeat_interleave(32, -1)
@@ -666,3 +675,96 @@ def test_coded_scales_give_the_uncoded_gemm_bits(rows, n, k, gather):
     )  # fmt: skip
     live = order >= 0
     assert torch.equal(out1[live].view(torch.int16), out2[live].view(torch.int16))
+
+
+@pytest.mark.parametrize("n, k, gather", [(512, 512, True), (384, 576, False)])
+@pytest.mark.parametrize("rows", [1, 12])
+def test_narrow_and_wide_codes_give_the_uncoded_gemm_bits(rows, n, k, gather):
+    """The mixed 2-bit launch writes the uncoded GEMM's bits.
+
+    Expert 1 is wide, so the kernel takes its 4-bit expand. Every other expert
+    is narrow and takes the 2-bit expand. K=576 keeps the 64-wide tail. The
+    routed set includes both, and the live rows match the uncoded GEMM.
+    """
+    experts, topk, block_N = 32, 6, 128
+    gen = _gen(41)
+    packed_w = torch.randint(
+        0, 256, (experts, n, k // 2), generator=gen, device=DEVICE, dtype=torch.uint8
+    )
+    base = torch.randint(110, 120, (experts, n, 1), generator=gen, device=DEVICE)
+    exps = (
+        base + torch.randint(0, 4, (experts, n, k // 32), generator=gen, device=DEVICE)
+    ).to(torch.uint8)
+    exps[1, 0, 0] = 110
+    exps[1, 0, 1] = 116
+    coded = pack_expert_scale_codes(exps)
+    assert coded.narrow[1].item() == 0
+    assert int(coded.narrow.sum()) == experts - 1
+    tiles, tails = tile_expert_weights(packed_w.view(torch.int8), block_N)
+    dispatch = MoeDispatchV41Plan(experts, topk, 32, k, torch.int32, torch.bfloat16)
+    prepare.declare(lambda: _calls(dispatch.kernels()), bind=dispatch.bind)
+    ids, route_weights = _routes(rows, experts, topk, 42, torch.int32)
+    # Keep one wide expert and one narrow expert in the first token's route.
+    # Overwriting a fixed slot can replace the only copy of the other expert.
+    present = {int(expert) for expert in ids[0].tolist()}
+    slot = 0
+    for expert in (0, 1):
+        if expert in present:
+            continue
+        while int(ids[0, slot]) in (0, 1):
+            slot += 1
+        ids[0, slot] = expert
+        slot += 1
+    routed = [int(expert) for expert in ids[0].tolist()]
+    assert routed.count(0) == 1 and routed.count(1) == 1
+    assert len(routed) == len(set(routed))
+    specs = dispatch.workspace_specs(rows)
+    layout = dispatch.dispatch(
+        ids,
+        route_weights,
+        carve(
+            torch.empty(workspace_bytes(specs), dtype=torch.uint8, device=DEVICE), specs
+        ),
+    )
+    order, tile_expert = layout["order"], layout["tile_expert"]
+    used = {int(expert) for expert in tile_expert.tolist() if int(expert) >= 0}
+    assert {0, 1} <= used
+    a_rows = rows if gather else order.shape[0]
+    x = (torch.randn((a_rows, k), generator=gen, device=DEVICE) * 0.5).bfloat16()
+    xq, sf = tile_kernels.quant.per_token_cast(
+        x, "e4m3", 32, round_sf=True, use_packed_ue8m0=True
+    )
+    x_words = sf.contiguous().view(torch.uint32)
+    extra = (tails,) if tails is not None else ()
+    plain = grouped_fp8_fp4_gemm(experts, n, k, topk, gather, 32, block_N)
+    mixed = grouped_fp8_fp4_gemm(
+        experts,
+        n,
+        k,
+        topk,
+        gather,
+        32,
+        block_N,
+        coded_scales=True,
+        narrow_codes=True,
+    )
+    out_plain = torch.zeros((order.shape[0], n), dtype=torch.bfloat16, device=DEVICE)
+    out_mixed = torch.zeros_like(out_plain)
+    plain(xq, x_words, tiles, *extra, pack_scale_words(exps), order, tile_expert, out_plain)
+    mixed(
+        xq,
+        x_words,
+        tiles,
+        *extra,
+        tile_codes(coded.codes, block_N),
+        tile_byte_codes(coded.codes_2bit, block_N),
+        coded.narrow,
+        coded.base,
+        order,
+        tile_expert,
+        out_mixed,
+    )
+    live = order >= 0
+    assert torch.equal(
+        out_plain[live].view(torch.int16), out_mixed[live].view(torch.int16)
+    )

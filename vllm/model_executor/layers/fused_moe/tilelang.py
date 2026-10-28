@@ -76,6 +76,11 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
         self._plan = None
         # The 64-wide K tails of each GEMM's tile-major weights (None without one).
         self._tails: tuple[torch.Tensor | None, ...] = (None, None)
+        # 2-bit scale codes (contiguous uint8, tile order) and the per-expert
+        # uint8 flag (1 = 2-bit). The GEMM loads these when the flag is 1 and
+        # the 4-bit codes otherwise.
+        self._codes_2bit: tuple[torch.Tensor | None, ...] = (None, None)
+        self._narrow: tuple[torch.Tensor | None, ...] = (None, None)
 
     # -- support --------------------------------------------------------
 
@@ -205,10 +210,14 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
         # Tile-major copies replace the checkpoint layout, so each GEMM tile's
         # weights and scale codes are contiguous. A K that ends 64 past a multiple
         # of 128 (TP4's 576-wide rows) keeps its last 64 columns as compact tails.
-        (t13, tail13, codes13, base13), (t2, tail2, codes2, base2) = (
-            self._plan.prepare_weights(
-                w13, layer.w13_weight_scale, w2, layer.w2_weight_scale
-            )
+        # ``codes`` is the 4-bit tile layout a wide expert loads. ``byte`` is the
+        # narrow experts' 2-bit codes (contiguous uint8); ``narrow`` is 1 for
+        # those experts. The GEMM loads ``byte`` when the flag is 1.
+        (
+            (t13, tail13, codes13, byte13, narrow13, base13),
+            (t2, tail2, codes2, byte2, narrow2, base2),
+        ) = self._plan.prepare_weights(
+            w13, layer.w13_weight_scale, w2, layer.w2_weight_scale
         )
         for name, tensor in (
             ("w13_weight", t13),
@@ -219,6 +228,8 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
             replace_parameter(layer, name, tensor)
         self._tails = (tail13, tail2)
         self._bases = (base13, base2)
+        self._codes_2bit = (byte13, byte2)
+        self._narrow = (narrow13, narrow2)
         self.quant_config._w1.scale = layer.w13_weight_scale
         self.quant_config._w2.scale = layer.w2_weight_scale
 
@@ -292,9 +303,11 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
             raise TypeError("TileLang MoE topk_ids must be contiguous")
         tail13, tail2 = self._tails
         base13, base2 = self._bases
+        byte13, byte2 = self._codes_2bit
+        narrow13, narrow2 = self._narrow
         weights = (
-            (w1, tail13, self.w1_scale, base13),
-            (w2, tail2, self.w2_scale, base2),
+            (w1, tail13, self.w1_scale, byte13, narrow13, base13),
+            (w2, tail2, self.w2_scale, byte2, narrow2, base2),
         )
         workspace = workspace2.view(-1).view(torch.uint8)
         shared = None

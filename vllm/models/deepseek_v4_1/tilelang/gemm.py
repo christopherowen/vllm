@@ -22,6 +22,13 @@ import tilelang.language as T
 import torch
 
 from . import pdl
+from .scale_codes import (
+    expand_scale_codes as expand_scale_codes,
+    expand_scale_codes_2bit as expand_scale_codes_2bit,
+    pack_expert_scale_codes as pack_expert_scale_codes,
+    pack_scale_codes as pack_scale_codes,
+    pack_scale_codes_2bit as pack_scale_codes_2bit,
+)
 from .scale_pack import pack_scale_words
 
 SF_BLOCK = 32  # K elements per UE8M0 scale
@@ -1098,45 +1105,8 @@ def bf16_gemm_splitk(
 # ---------------------------------------------------------------------------
 
 
-def pack_scale_codes(exponents: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """``[..., K / 32]`` UE8M0 bytes as a base exponent per row and 4-bit codes.
-
-    Returns ``(codes, base)``: ``codes[..., ceil(K / 128)]`` (uint16) holds, for each
-    word of ``pack_scale_words``, its four exponents minus the row's ``base[...]``
-    (uint8, the row's smallest exponent), a nibble each, low nibble first. Spreading a
-    code's nibbles into bytes and adding ``base`` to each gives that word byte for byte
-    (``expand_scale_codes``); padding exponents (rows whose count is not a multiple of
-    four) code as 0 and are unread. The routed experts' scales span at most 8 values
-    in a row (DeepSeek-V4.1-Flash, both checkpoints sampled), so the codes are exact;
-    a row spanning more than 16 is refused rather than approximated.
-    """
-    e = exponents.view(torch.uint8)
-    base = e.amin(dim=-1)
-    deltas = e.to(torch.int32) - base.unsqueeze(-1).to(torch.int32)
-    span = int(deltas.max()) if deltas.numel() else 0
-    if span > 15:
-        raise ValueError(
-            f"a row's scale exponents span {span + 1} values; 4-bit codes hold 16"
-        )
-    pad = -e.shape[-1] % 4
-    if pad:
-        deltas = torch.nn.functional.pad(deltas, (0, pad), value=0)
-    d = deltas.view(*deltas.shape[:-1], -1, 4)
-    codes = d[..., 0] | (d[..., 1] << 4) | (d[..., 2] << 8) | (d[..., 3] << 12)
-    return codes.to(torch.int16).view(torch.uint16).contiguous(), base.contiguous()
-
-
-def expand_scale_codes(codes: torch.Tensor, base: torch.Tensor) -> torch.Tensor:
-    """The uint32 words ``pack_scale_codes`` encodes; padding bytes read as ``base``."""
-    c = codes.view(torch.int16).to(torch.int32) & 0xFFFF
-    spread = (
-        (c & 0xF)
-        | ((c >> 4) & 0xF) << 8
-        | ((c >> 8) & 0xF) << 16
-        | ((c >> 12) & 0xF) << 24
-    )
-    words = spread + base.to(torch.int32).unsqueeze(-1) * 0x01010101
-    return words.to(torch.int32).view(torch.uint32)
+# 4-bit and 2-bit scale codes live together in scale_codes.py (torch only)
+# and are re-exported at the top of this module.
 
 
 # SMs of one GB10; a decode split-K grid aims to cover them once.

@@ -432,6 +432,8 @@ def test_tilelang_experts_defer_only_a_folded_combine(monkeypatch):
         _plan=SimpleNamespace(run=run),
         _tails=(None, None),
         _bases=(None, None),
+        _codes_2bit=(None, None),
+        _narrow=(None, None),
         w1_scale=None,
         w2_scale=None,
         fold_shared=True,
