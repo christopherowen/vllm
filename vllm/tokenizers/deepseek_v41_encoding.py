@@ -49,11 +49,166 @@ tool_output_template: str = "<tool_result>{content}</tool_result>"
 
 
 def to_json(value: Any) -> str:
-    """Serialize a value to JSON string."""
+    """Serialize a value to JSON string.
+
+    Key order is the value's own order. DeepSeek's encoder writes the schema
+    it was given, and ``json.dumps`` matches that spelling (spaces, ``false``,
+    and short floats such as ``1e-05``).
+    """
     try:
         return json.dumps(value, ensure_ascii=False)
     except:
         return json.dumps(value, ensure_ascii=True)
+
+
+def response_schema_for_prompt(response_format: Any) -> Optional[Dict[str, Any]]:
+    """The schema DeepSeek's API writes into the prompt for a response format.
+
+    A JSON schema renders its schema and JSON mode renders
+    ``{"type": "json_object"}``. Text and structural tags render nothing.
+    ``strict: true`` is checked the way the API checks it, and rejected
+    requests are not rendered. The returned schema is a copy: callers can put
+    it on a template-kwargs dict without aliasing the request body.
+    """
+    if response_format is None:
+        return None
+    if isinstance(response_format, dict):
+        kind = response_format.get("type")
+        wrapper = response_format.get("json_schema")
+    else:
+        kind = getattr(response_format, "type", None)
+        wrapper = getattr(response_format, "json_schema", None)
+    if kind == "json_object":
+        return {"type": "json_object"}
+    if kind != "json_schema" or wrapper is None:
+        return None
+    if isinstance(wrapper, dict):
+        schema = wrapper["schema"] if "schema" in wrapper else wrapper.get("json_schema")
+        strict = wrapper.get("strict")
+    else:
+        # ``schema`` is a BaseModel method; the field's attribute is json_schema.
+        schema = getattr(wrapper, "json_schema", None)
+        strict = getattr(wrapper, "strict", None)
+    if schema is None:
+        return None
+    if strict is True:
+        _reject_strict_response_schema(schema, top=True)
+    return copy.deepcopy(schema)
+
+
+def _reject_strict_response_schema(schema: Any, *, top: bool) -> None:
+    """Reject a ``strict: true`` response schema the DeepSeek API rejects."""
+    if top and (not isinstance(schema, dict) or schema.get("type") != "object"):
+        raise ValueError("The top level of the json schema must be an object.")
+    if not isinstance(schema, dict) or not any(
+        key in schema for key in ("type", "anyOf", "$ref")
+    ):
+        raise ValueError(
+            "Invalid json schema: one of `type`, `anyOf`, `$ref` field is required"
+        )
+    if "additionalProperties" in schema:
+        additional = schema["additionalProperties"]
+        if not isinstance(additional, bool):
+            raise ValueError(
+                "Invalid json schema: invalid type: map, expected a boolean"
+            )
+        if additional:
+            raise ValueError("additionalProperties should not be true")
+    if schema.get("type") == "object":
+        properties = schema.get("properties")
+        if not isinstance(properties, dict) or not properties:
+            raise ValueError("An object with no properties is not allowed.")
+        required = schema.get("required")
+        if required is not None:
+            if not isinstance(required, list):
+                raise ValueError(
+                    "Required properties must match all properties in the object"
+                )
+            seen: set[Any] = set()
+            for name in required:
+                if name not in properties:
+                    raise ValueError(f"Required property '{name}' not found in object")
+                if name in seen:
+                    raise ValueError(f"Duplicate required property '{name}'")
+                seen.add(name)
+            if seen != set(properties):
+                raise ValueError(
+                    "Required properties must match all properties in the object"
+                )
+        for child in properties.values():
+            _reject_strict_response_schema(child, top=False)
+    items = schema.get("items")
+    if isinstance(items, dict):
+        _reject_strict_response_schema(items, top=False)
+    elif isinstance(items, list):
+        raise ValueError(
+            "Invalid json schema: one of `type`, `anyOf`, `$ref` field is required"
+        )
+    for key in ("anyOf", "oneOf", "allOf"):
+        group = schema.get(key)
+        if isinstance(group, list):
+            for child in group:
+                _reject_strict_response_schema(child, top=False)
+    for key in ("$defs", "definitions"):
+        definitions = schema.get(key)
+        if isinstance(definitions, dict):
+            for child in definitions.values():
+                _reject_strict_response_schema(child, top=False)
+
+
+def chat_template_kwargs_for_api(
+    chat_template_kwargs: Optional[Dict[str, Any]],
+    *,
+    response_format: Any,
+    tool_choice: Any,
+) -> Dict[str, Any]:
+    """Template kwargs for one Chat Completions request.
+
+    Returns the same dict when the request uses none of the API prompt
+    features, so a shared kwargs mapping is not copied or mutated. A response
+    schema is added on a new dict. ``tool_choice`` ``none`` drops the tool
+    catalog from that copy; the caller's tools list stays put.
+    """
+    if chat_template_kwargs is None:
+        chat_template_kwargs = {}
+    schema = response_schema_for_prompt(response_format)
+    drop_tools = tool_choice == "none" and bool(chat_template_kwargs.get("tools"))
+    if schema is None and not drop_tools:
+        return chat_template_kwargs
+    updated = dict(chat_template_kwargs)
+    if drop_tools:
+        updated.pop("tools", None)
+    if schema is not None:
+        updated["response_format"] = schema
+    return updated
+
+
+def insert_system_prompt_fields(
+    conversation: List[Dict[str, Any]],
+    tools: Any,
+    response_format: Any,
+) -> List[Dict[str, Any]]:
+    """Attach tools and a response schema to the first system message.
+
+    ``response_format`` is the schema object ``to_json`` will write, or
+    ``None`` when the request does not render one. An empty schema still
+    renders; only ``None`` is absent.
+    """
+    if not tools and response_format is None:
+        return conversation
+    system = (
+        conversation[0]
+        if conversation and conversation[0].get("role") == "system"
+        else None
+    )
+    if system is None:
+        system = {"role": "system", "content": ""}
+        conversation.insert(0, system)
+    if tools:
+        system["tools"] = tools
+    if response_format is not None:
+        system["response_format"] = response_format
+    return conversation
 
 
 def tools_from_openai_format(tools):

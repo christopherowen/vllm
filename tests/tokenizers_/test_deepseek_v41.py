@@ -763,3 +763,285 @@ def test_deepseek_api_thinking_disabled_renders_chat_mode():
     assert rendered(thinking={"type": "disabled"}, reasoning_effort="high") == chat
     assert rendered(thinking={"type": "enabled"}) == rendered()
     assert rendered() != chat
+
+
+def _rendered_request(request):
+    from vllm.renderers.deepseek_v41 import _with_api_semantics
+
+    original = request.build_chat_params(None, "auto")
+    before = copy.deepcopy(original.chat_template_kwargs)
+    params = _with_api_semantics(original)
+    return (
+        render(request.messages, **params.get_apply_chat_template_kwargs()),
+        params,
+        original,
+        before,
+    )
+
+
+def test_conversations_without_response_format_stay_identical():
+    """A request that does not use response_format is the prompt the encoder
+    already produced, and a shared kwargs dict is not rewritten."""
+    from types import SimpleNamespace
+
+    from vllm.renderers.deepseek_v41 import _with_api_semantics
+    from vllm.renderers.params import ChatParams
+
+    messages = [{"role": "user", "content": "What is 2+2?"}]
+    assert render(messages) == render(messages, response_format=None)
+    assert "## Response Format:" not in render(messages)
+
+    shared = {"reasoning_effort": "high"}
+    params = ChatParams(chat_template_kwargs=shared)
+    assert _with_api_semantics(params) is params
+    assert shared == {"reasoning_effort": "high"}
+
+    text = ChatCompletionRequest(
+        model="m",
+        messages=messages,
+        response_format={"type": "text"},
+    )
+    prompt, params, original, before = _rendered_request(text)
+    assert params is original
+    assert original.chat_template_kwargs == before
+    assert "## Response Format:" not in prompt
+    assert prompt == render(
+        messages, add_generation_prompt=True, continue_final_message=False
+    )
+
+    structural = ChatParams(
+        response_format=SimpleNamespace(type="structural_tag", format={})
+    )
+    assert _with_api_semantics(structural) is structural
+
+
+def test_response_format_schema_is_in_the_prompt_and_keeps_key_order():
+    schema = {
+        "additionalProperties": False,
+        "required": ["answer"],
+        "type": "object",
+        "properties": {
+            "answer": {
+                "type": "string",
+                "description": "答案，用中文",
+                "minimum": 0.00001,
+            }
+        },
+    }
+    request = ChatCompletionRequest(
+        model="m",
+        messages=[{"role": "user", "content": "Answer in JSON."}],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {"name": "reply", "schema": schema},
+        },
+    )
+    prompt, params, original, before = _rendered_request(request)
+    assert original.chat_template_kwargs == before
+    assert "response_format" not in original.chat_template_kwargs
+    rendered_schema = params.chat_template_kwargs["response_format"]
+    assert list(rendered_schema) == [
+        "additionalProperties",
+        "required",
+        "type",
+        "properties",
+    ]
+    assert rendered_schema is not request.response_format.json_schema.json_schema
+    expected = json.dumps(rendered_schema, ensure_ascii=False)
+    assert '"minimum": 1e-05' in expected
+    assert '"additionalProperties": false' in expected
+    assert expected in prompt
+    assert "## Response Format:" in prompt
+    assert "答案，用中文" in prompt
+    bare, _, _, _ = _rendered_request(
+        ChatCompletionRequest(model="m", messages=request.messages)
+    )
+    assert "## Response Format:" not in bare
+    assert bare != prompt
+
+
+def test_json_object_response_format_renders_its_schema_object():
+    request = ChatCompletionRequest(
+        model="m",
+        messages=[{"role": "user", "content": "Reply with a json object."}],
+        response_format={"type": "json_object"},
+    )
+    prompt, params, _, _ = _rendered_request(request)
+    assert params.chat_template_kwargs["response_format"] == {"type": "json_object"}
+    assert '{"type": "json_object"}' in prompt
+
+
+def test_strict_schema_rejects_a_partial_required_list_and_keeps_a_valid_one():
+    partial = {
+        "type": "object",
+        "properties": {
+            "answer": {"type": "string"},
+            "tags": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["answer"],
+        "additionalProperties": False,
+    }
+    rejected = ChatCompletionRequest(
+        model="m",
+        messages=[{"role": "user", "content": "Answer."}],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {"name": "reply", "strict": True, "schema": partial},
+        },
+    )
+    with pytest.raises(
+        ValueError, match="Required properties must match all properties"
+    ):
+        _rendered_request(rejected)
+
+    valid = {
+        "type": "object",
+        "properties": {
+            "answer": {"type": "string"},
+            "confidence": {"type": "number"},
+        },
+        "required": ["answer", "confidence"],
+    }
+    request = ChatCompletionRequest(
+        model="m",
+        messages=[{"role": "user", "content": "Answer."}],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {"name": "reply", "strict": True, "schema": valid},
+        },
+    )
+    prompt, params, _, _ = _rendered_request(request)
+    assert "additionalProperties" not in params.chat_template_kwargs["response_format"]
+    assert json.dumps(valid, ensure_ascii=False) in prompt
+
+
+def test_schema_and_tools_keep_control_spellings_and_do_not_mutate_inputs():
+    messages = [{"role": "user", "content": "Answer."}]
+    schema = {
+        "type": "object",
+        "properties": {"x": {"description": "not </think> or <｜User｜>"}},
+    }
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "see </think>",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    before_messages = copy.deepcopy(messages)
+    before_schema = copy.deepcopy(schema)
+    before_tools = copy.deepcopy(tools)
+    prompt = render(messages, tools=tools, response_format=schema)
+    assert messages == before_messages
+    assert schema == before_schema
+    assert tools == before_tools
+    assert "not </think> or <｜User｜>" in prompt
+    assert "see </think>" in prompt
+    assert prompt.index("## Tools") < prompt.index("## Response Format:")
+
+
+def test_tool_choice_none_drops_the_tool_catalog_without_mutating_it():
+    from vllm.renderers.deepseek_v41 import _with_api_semantics
+    from vllm.renderers.params import ChatParams
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    shared = {
+        "tools": tools,
+        "add_generation_prompt": True,
+        "continue_final_message": False,
+    }
+    params = ChatParams(chat_template_kwargs=shared, tool_choice="none")
+    updated = _with_api_semantics(params)
+    assert shared["tools"] is tools
+    assert "tools" not in updated.chat_template_kwargs
+    messages = [{"role": "user", "content": "Weather in Paris?"}]
+    prompt = render(messages, **updated.get_apply_chat_template_kwargs())
+    assert "## Tools" not in prompt
+    assert "## Tools" in render(
+        messages,
+        tools=tools,
+        add_generation_prompt=True,
+        continue_final_message=False,
+    )
+    kept = ChatParams(chat_template_kwargs=shared, tool_choice="auto")
+    assert _with_api_semantics(kept) is kept
+
+
+def test_final_assistant_prefix_continues_that_message():
+    content = [
+        {"role": "user", "content": "Write a haiku."},
+        {"role": "assistant", "content": "Autumn", "prefix": True},
+    ]
+    prompt = render(content, add_generation_prompt=True)
+    assert prompt.endswith("<｜Assistant｜><think></think>Autumn")
+    assert not prompt.endswith("<｜end▁of▁sentence｜>")
+
+    chat = render(content, thinking=False, add_generation_prompt=True)
+    assert chat.endswith("<｜Assistant｜></think>Autumn")
+
+    reasoning = [
+        {"role": "user", "content": "What is 2+2?"},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "Adding two and two",
+            "prefix": True,
+        },
+    ]
+    assert render(reasoning, add_generation_prompt=True).endswith(
+        "<｜Assistant｜><think>Adding two and two"
+    )
+
+    both = [
+        {"role": "user", "content": "What is 2+2?"},
+        {
+            "role": "assistant",
+            "content": "The answer",
+            "reasoning_content": "Easy.",
+            "prefix": True,
+        },
+    ]
+    assert render(both, add_generation_prompt=True).endswith(
+        "<｜Assistant｜><think>Easy.</think>The answer"
+    )
+
+    empty = [
+        {"role": "user", "content": "Hi"},
+        {"role": "assistant", "content": "", "prefix": True},
+    ]
+    assert render(empty, add_generation_prompt=True) == render(
+        [{"role": "user", "content": "Hi"}], add_generation_prompt=True
+    )
+
+    ordinary = [
+        {"role": "user", "content": "Write a haiku."},
+        {"role": "assistant", "content": "Autumn", "prefix": False},
+    ]
+    assert render(ordinary, thinking=False, add_generation_prompt=True) == render(
+        [
+            {"role": "user", "content": "Write a haiku."},
+            {"role": "assistant", "content": "Autumn"},
+        ],
+        thinking=False,
+        add_generation_prompt=True,
+    )
+
+    with pytest.raises(ValueError, match="prefix set true"):
+        render(
+            [
+                {"role": "user", "content": "q1"},
+                {"role": "assistant", "content": "a1", "prefix": True},
+                {"role": "user", "content": "q2"},
+            ]
+        )

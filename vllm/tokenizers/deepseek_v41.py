@@ -17,6 +17,7 @@ from .deepseek_v41_encoding import (
     REASONING_EFFORT_MAPPINGS,
     encode_messages,
     eos_token,
+    insert_system_prompt_fields,
     thinking_end_token,
     thinking_start_token,
 )
@@ -210,6 +211,28 @@ def _normalize_messages(
     return result
 
 
+_PREFIX_ERROR = (
+    "Invalid completion message: prefix set true with message which is not "
+    "final message or message role is not assistant"
+)
+
+
+def _prefix_continuation(conversation: list[dict[str, Any]]) -> bool:
+    """Whether the final assistant message is a prefix continuation.
+
+    DeepSeek's API rejects ``prefix: true`` on any other message. ``prefix:
+    false`` is an ordinary message.
+    """
+    last = len(conversation) - 1
+    for index, message in enumerate(conversation):
+        if not message.get("prefix"):
+            continue
+        if index != last or message.get("role") != "assistant":
+            raise ValueError(_PREFIX_ERROR)
+        return True
+    return False
+
+
 def _apply_generation_controls(
     prompt: str,
     final: dict[str, Any] | None,
@@ -306,23 +329,22 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
             tools: list[dict[str, Any]] | None = None,
             **kwargs,
         ) -> str | list[int]:
+            # The schema of a response format, which the encoder writes after
+            # the tools in the first system message (the V4.1 renderer sets it
+            # from the request's response_format, as DeepSeek's API does).
+            response_format = kwargs.get("response_format")
             # Control-token spellings in request text must not become control
             # tokens (see _ControlSpellings); requests without any are unchanged.
             controls = _ControlSpellings(text_spellings)
-            messages, tools = controls.protect(messages, tools)
+            protected = controls.protect(messages, tools, response_format)
+            messages, tools, response_format = protected
             # The generic renderer's conversation has already flattened text
             # parts with '\n'. V4.1 encodes the original messages with '\n\n'.
             conversation = _normalize_messages(messages)
-            if tools:
-                system = (
-                    conversation[0]
-                    if conversation and conversation[0]["role"] == "system"
-                    else None
-                )
-                if system is None:
-                    system = {"role": "system", "content": ""}
-                    conversation.insert(0, system)
-                system["tools"] = tools
+            # response_format is the schema dict, or None. An empty schema is
+            # still written; only None is left out. protect() returns one value
+            # per argument, so a schema that is itself a list is not unpacked.
+            insert_system_prompt_fields(conversation, tools, response_format)
 
             thinking = bool(kwargs.get("thinking") or kwargs.get("enable_thinking"))
             if "thinking" not in kwargs and "enable_thinking" not in kwargs:
@@ -345,6 +367,13 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
 
             add_generation_prompt = kwargs.get("add_generation_prompt")
             continue_final_message = bool(kwargs.get("continue_final_message"))
+            # A final assistant message with prefix=true is that message
+            # continued, which is the encoder's continue_final_message. The
+            # chat API defaults add_generation_prompt to true; the prefix
+            # replaces that open turn instead of raising the both-controls error.
+            if _prefix_continuation(conversation):
+                add_generation_prompt = False
+                continue_final_message = True
             if continue_final_message and add_generation_prompt:
                 raise ValueError(
                     "Cannot set both `add_generation_prompt` and "
