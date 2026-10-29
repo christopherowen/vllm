@@ -79,6 +79,30 @@ def test_tilelang_binding_prepares_the_attention_staging(
     assert module._active.tolist() == [16 * 64]
 
 
+@pytest.mark.parametrize(
+    "num_verification_tokens,decode_capacity",
+    [
+        (5, 4 * 11),  # parallel drafting's two spans
+        (16, 4 * 17),  # copy drafts: every request at the reorder threshold
+    ],
+)
+def test_decode_arena_holds_every_request_at_the_reorder_threshold(
+    num_verification_tokens, decode_capacity
+):
+    # A step of short requests (16 of 13-14 tokens under copy drafts' threshold
+    # of 17) is all decode rows; its metadata must not be cut to fewer rows.
+    module = _tilelang_layer(layer_id=3)
+    module.config.speculative_config = SimpleNamespace(
+        num_speculative_tokens=5,
+        parallel_drafting=True,
+        num_verification_tokens=num_verification_tokens,
+    )
+    module._attention_geometry()
+    assert module._decode_capacity == decode_capacity
+    swa_spec = module._attention_workspace_specs["decode"][0]
+    assert swa_spec == ((decode_capacity, module.swa_width), torch.int32)
+
+
 def test_context_kv_write_uses_the_tilelang_writer(monkeypatch):
     from vllm.models.deepseek_v4_1.tilelang import cache_writer, rope
 

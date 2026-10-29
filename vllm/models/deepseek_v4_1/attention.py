@@ -486,19 +486,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         # SWA block); re-reading it here would plan half-size main pages
         # whenever the worker shares the engine's config (the uniproc executor).
         spec = self.config.speculative_config
-        # Parallel drafting can admit two draft spans during verifier profiling.
+        # Every request at or below the backend's reorder threshold is a decode
+        # row, short prefills included, so the decode arena holds max_num_seqs of
+        # the widest: two draft spans (parallel drafting's verifier profiling) or
+        # a copying request's verification (copy drafts).
         query_width = (
-            1 + (2 if spec.parallel_drafting else 1) * spec.num_speculative_tokens
+            max(
+                1 + (2 if spec.parallel_drafting else 1) * spec.num_speculative_tokens,
+                1 + spec.num_verification_tokens,
+            )
             if spec is not None
             else 1
         )
         decode_rows = self.config.scheduler_config.max_num_seqs * query_width
-        # A copying request verifies past the drafter's block (copy drafts),
-        # within the scheduler's decode-row envelope.
-        decode_rows += self.config.max_decode_rows - (
-            self.config.scheduler_config.max_num_seqs
-            * self.config.uniform_decode_query_len
-        )
         # Graph buffers include padding beyond the live decode-token bound.
         decode_rows = max(
             decode_rows,
