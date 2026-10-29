@@ -41,6 +41,7 @@ from vllm.models.deepseek_v4_1.tilelang.moe import (  # noqa: E402
     workspace_bytes,
 )
 from vllm.models.deepseek_v4_1.tilelang.scale_codes import (  # noqa: E402
+    overlay_byte_codes,
     pack_expert_scale_codes,
     tile_byte_codes,
 )
@@ -751,13 +752,18 @@ def test_narrow_and_wide_codes_give_the_uncoded_gemm_bits(rows, n, k, gather):
     out_plain = torch.zeros((order.shape[0], n), dtype=torch.bfloat16, device=DEVICE)
     out_mixed = torch.zeros_like(out_plain)
     plain(xq, x_words, tiles, *extra, pack_scale_words(exps), order, tile_expert, out_plain)
+    codes, byte_codes = overlay_byte_codes(
+        tile_codes(coded.codes, block_N),
+        tile_byte_codes(coded.codes_2bit, block_N),
+        coded.narrow,
+    )
     mixed(
         xq,
         x_words,
         tiles,
         *extra,
-        tile_codes(coded.codes, block_N),
-        tile_byte_codes(coded.codes_2bit, block_N),
+        codes,
+        byte_codes,
         coded.narrow,
         coded.base,
         order,

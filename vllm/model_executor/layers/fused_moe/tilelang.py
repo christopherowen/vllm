@@ -211,8 +211,9 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
         # weights and scale codes are contiguous. A K that ends 64 past a multiple
         # of 128 (TP4's 576-wide rows) keeps its last 64 columns as compact tails.
         # ``codes`` is the 4-bit tile layout a wide expert loads. ``byte`` is the
-        # narrow experts' 2-bit codes (contiguous uint8); ``narrow`` is 1 for
-        # those experts. The GEMM loads ``byte`` when the flag is 1.
+        # same buffer as uint8, holding the narrow experts' 2-bit codes in their
+        # rows; ``narrow`` is 1 for those experts. The GEMM loads ``byte`` when
+        # the flag is 1.
         (
             (t13, tail13, codes13, byte13, narrow13, base13),
             (t2, tail2, codes2, byte2, narrow2, base2),

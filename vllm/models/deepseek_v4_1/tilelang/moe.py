@@ -55,7 +55,7 @@ from .gemm import (
     scale_words,
 )
 from .linear import MXFP8Rows, _calls, _launch
-from .scale_codes import pack_expert_scale_codes, tile_byte_codes
+from .scale_codes import overlay_byte_codes, pack_expert_scale_codes, tile_byte_codes
 
 # Routes handled by one CTA of the dispatch kernels.
 _CHUNK = 512
@@ -925,7 +925,9 @@ def grouped_fp8_fp4_gemm(
         else T.Tensor((num_experts, N, sf_words), T.uint32)
     )
     base_spec = T.Tensor((num_experts, N), T.uint8)
-    sfb8_spec = T.Tensor((num_experts * n_blocks * k_blocks, block_N), T.uint8)
+    # SFB's bytes (``overlay_byte_codes``): a narrow expert's row holds its 2-bit
+    # codes in the first block_N of its 2 * block_N bytes.
+    sfb8_spec = T.Tensor((num_experts * n_blocks * k_blocks, 2 * block_N), T.uint8)
     narrow_spec = T.Tensor((num_experts,), T.uint8)
 
     if tail and coded_scales and narrow_codes:
@@ -1432,22 +1434,27 @@ class MoeExpertsV41Plan:
 
         ``tails`` is None unless the GEMM's K is 64 past a multiple of 128 (the
         down projection of TP4's 576-wide expert rows). ``codes`` is
-        ``pack_scale_codes`` in ``tile_codes`` layout, the bytes the coded GEMM
-        loads today, for every expert. An expert whose every row has delta <= 3
-        also has ``codes_2bit`` in that tile order as contiguous uint8 (four
-        2-bit deltas a byte, low bits first); ``narrow`` is uint8 1 for that
-        expert and 0 otherwise, and a wide expert's ``codes_2bit`` slice is
-        zero. A narrow expert's GEMM loads ``codes_2bit``; a wide expert loads
-        ``codes``. The 4-bit expand is the wide expert's path.
+        ``pack_scale_codes`` in ``tile_codes`` layout for a wide expert. An
+        expert whose every row has delta <= 3 is narrow (``narrow`` uint8 1, else
+        0) and its rows of the same buffer hold 2-bit codes instead (four deltas a
+        byte, low bits first, in each row's first ``block_N`` bytes);
+        ``codes_2bit`` is that buffer as uint8 (``overlay_byte_codes``). A narrow
+        expert's GEMM loads ``codes_2bit``; a wide expert loads ``codes``. No
+        expert holds both forms, so the codes take the 4-bit codes' bytes.
         """
         prepared = []
         for w, scale in ((w13, w13_scale), (w2, w2_scale)):
             packed = pack_expert_scale_codes(scale)
+            codes, codes_2bit = overlay_byte_codes(
+                tile_codes(packed.codes, self.block_N),
+                tile_byte_codes(packed.codes_2bit, self.block_N),
+                packed.narrow,
+            )
             prepared.append(
                 (
                     *tile_expert_weights(w.view(torch.int8), self.block_N),
-                    tile_codes(packed.codes, self.block_N),
-                    tile_byte_codes(packed.codes_2bit, self.block_N),
+                    codes,
+                    codes_2bit,
                     packed.narrow,
                     packed.base,
                 )
