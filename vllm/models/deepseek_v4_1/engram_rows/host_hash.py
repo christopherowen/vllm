@@ -98,4 +98,28 @@ class HostEngramHash:
         return out
 
 
-__all__ = ["HEADS", "UNKNOWN", "HostEngramHash"]
+def placed_by_host(requests: list, drafts: np.ndarray | None) -> list:
+    """``requests`` (``(first_row, rows, tokens, positions)`` in batch order) with the
+    host's positions dropped from every request with drafts (``drafts``, per request).
+
+    Adaptive verification gives verifying requests row counts the GPU chooses, but
+    keeps them at the front of the batch with the host's total, so a request after
+    them starts at the same row on the host and the GPU, and one among them does
+    not. A request still prefilling can carry drafts (the scheduler pads a prompt
+    with one token left to the verification width with placeholder drafts), so its
+    rows stay ``UNKNOWN`` for the GPU to hash. Verifying requests after one without
+    drafts would leave no row placed by the host, so the GPU hashes the whole step."""
+    if drafts is None:
+        return requests
+    verifying = np.flatnonzero(drafts)
+    front = len(verifying)
+    if front and verifying[-1] >= front:
+        front = len(requests)
+    empty = np.empty(0, dtype=np.int64)
+    return [
+        (first, rows, tokens, empty if i < front else positions)
+        for i, (first, rows, tokens, positions) in enumerate(requests)
+    ]
+
+
+__all__ = ["HEADS", "UNKNOWN", "HostEngramHash", "placed_by_host"]

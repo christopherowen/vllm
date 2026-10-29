@@ -352,7 +352,10 @@ class DeepseekV41ModelState(DefaultModelState):
         or None when the step has no prefill chunk to hash."""
         if not input_batch.has_prefill:
             return None
-        from vllm.models.deepseek_v4_1.engram_rows.host_hash import HostEngramHash
+        from vllm.models.deepseek_v4_1.engram_rows.host_hash import (
+            HostEngramHash,
+            placed_by_host,
+        )
 
         if self._host_engram_hash is None:
             layout = model.engram_hash.layout
@@ -375,18 +378,9 @@ class DeepseekV41ModelState(DefaultModelState):
                     start, min(start + rows, len(tokens)), dtype=np.int64
                 )
             requests.append((first, rows, tokens, positions))
-        hashed = [i for i, (*_, positions) in enumerate(requests) if len(positions)]
-        if not hashed:
+        requests = placed_by_host(requests, input_batch.num_draft_tokens_per_req)
+        if not any(len(positions) for *_, positions in requests):
             return None
-        # Adaptive verification gives verifying requests row counts the GPU chooses,
-        # but keeps them at the front of the batch with the host's total, so every
-        # later request starts at the same row on the host and the GPU.
-        drafts = input_batch.num_draft_tokens_per_req
-        if drafts is not None and drafts[hashed[0] :].any():
-            raise RuntimeError(
-                "Engram host hash: a verifying request follows a prefill chunk, so "
-                "the chunk's rows are placed by the GPU"
-            )
         return self._host_engram_hash.step_ids(input_batch.input_ids.shape[0], requests)
 
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
