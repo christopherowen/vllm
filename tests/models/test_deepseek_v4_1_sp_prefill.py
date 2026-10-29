@@ -82,6 +82,7 @@ def _config(
         ),
         compilation_config=SimpleNamespace(max_cudagraph_capture_size=capture),
         scheduler_config=SimpleNamespace(max_num_seqs=seqs),
+        max_decode_rows=seqs * (1 + (spec_tokens or 0)),
         speculative_config=(
             None
             if spec_tokens is None

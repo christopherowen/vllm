@@ -1391,7 +1391,7 @@ def test_insert_resampled_prepared_before_optional_warmup_return(
     )
     owner = module.RejectionSampler.__new__(module.RejectionSampler)
     owner.sampler = SimpleNamespace(use_fp64_gumbel=False)
-    owner.num_speculative_steps = 5
+    owner.num_speculative_steps = owner.num_draft_steps = 5
     owner.watermark_key = watermark
     registry = JitWarmupRegistry(None)
     with registry.activate():
@@ -1557,7 +1557,7 @@ def _rejection_sampler_owner(monkeypatch, *, block, watermark=None, fp64=False):
     )
     owner = module.RejectionSampler.__new__(module.RejectionSampler)
     owner.sampler = SimpleNamespace(use_fp64_gumbel=fp64)
-    owner.num_speculative_steps = 5
+    owner.num_speculative_steps = owner.num_draft_steps = 5
     owner.watermark_key = watermark
     owner.use_block_verification = block
     return owner

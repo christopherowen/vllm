@@ -872,6 +872,7 @@ class MiniRunner:
         )
         spec = SimpleNamespace(
             num_speculative_tokens=k,
+            num_verification_tokens=k,
             enable_adaptive_verification=False,
             rejection_sample_method="block",
             synthetic_acceptance_rates=None,

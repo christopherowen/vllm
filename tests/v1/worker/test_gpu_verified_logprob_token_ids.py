@@ -232,6 +232,7 @@ def _batch(order: list[int]) -> SimpleNamespace:
     return SimpleNamespace(
         num_reqs=len(order),
         num_draft_tokens=total - len(order),
+        num_draft_tokens_per_req=num_logits - 1,
         cu_num_logits_np=cu_num_logits_np,
         cu_num_logits=torch.from_numpy(cu_num_logits_np),
         idx_mapping_np=idx_mapping_np,
@@ -257,6 +258,7 @@ def _rejection_sampler(
     rs.sink = sink
     rs.watermark_key = None
     rs.num_speculative_steps = 3
+    rs.num_draft_steps = 3
     rs.enable_adaptive_verification = adaptive
 
     def verify(

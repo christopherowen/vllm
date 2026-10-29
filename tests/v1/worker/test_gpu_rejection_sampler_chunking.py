@@ -35,6 +35,7 @@ def test_chunked_scores_match_full_batch(logprobs_mode: str):
     idx_mapping_np = np.array([7, 2, 9, 1], dtype=np.int32)
     input_batch = SimpleNamespace(
         num_reqs=4,
+        num_draft_tokens_per_req=num_logits_per_req - 1,
         cu_num_logits_np=cu_num_logits_np,
         cu_num_logits=torch.from_numpy(cu_num_logits_np).to(device),
         idx_mapping_np=idx_mapping_np,
@@ -53,6 +54,7 @@ def test_chunked_scores_match_full_batch(logprobs_mode: str):
         logprobs_mode=logprobs_mode, logprob_token_ids_state=None
     )
     rejection_sampler.num_speculative_steps = 3
+    rejection_sampler.num_draft_steps = 3
     rejection_sampler.enable_adaptive_verification = False
     chunk_offsets: list[torch.Tensor] = []
 

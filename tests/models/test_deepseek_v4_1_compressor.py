@@ -105,7 +105,7 @@ def test_compressor_ring_writes_follow_the_worker_slot_mapping():
         compilation_config=SimpleNamespace(static_forward_context={}),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
         speculative_config=SimpleNamespace(
-            num_speculative_tokens=7, parallel_drafting=False
+            num_speculative_tokens=7, num_verification_tokens=7, parallel_drafting=False
         ),
     )
     ring = CompressorStateCache(config, "layer.state_cache").get_kv_cache_spec(config)
