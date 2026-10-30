@@ -3311,11 +3311,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if isinstance(self.speculator, DraftModelSpeculator):
                 observed_rejected = num_rejected
                 if (
+                    self._dead_row_cut is not None
+                    and self.speculator.acceptance_estimator is not None
+                ):
+                    # Rows past the dead-row cut skipped routed MoE and were
+                    # never verified; only live rows can be observed as rejected.
+                    live_rejected = (
+                        self._dead_row_cut[: input_batch.num_reqs]
+                        - (num_sampled - 1).clamp_min(0)
+                    ).clamp_min(0)
+                    observed_rejected = torch.minimum(
+                        observed_rejected, live_rejected
+                    )
+                if (
                     sampler_output.sink is not None
                     and self.speculator.acceptance_estimator is not None
                 ):
                     # A rejected draft zero left the drafts unjudged.
-                    observed_rejected = num_rejected.masked_fill(
+                    observed_rejected = observed_rejected.masked_fill(
                         sampler_output.sink.events[:, 0] == SinkOutcome.REJECTED, 0
                     )
                 self.speculator.observe_verification(

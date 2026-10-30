@@ -551,3 +551,19 @@ def test_warm_tail_shapes_runs_each_eager_size_once_untimed():
     runs = []
     manager.warm_tail_shapes(lambda **kwargs: runs.append(kwargs), [1, 2, 8])
     assert runs == [{"num_tokens": n} for n in (12, 16, 32, 64, 128, 256, 512, 1024)]
+
+
+def test_live_rejected_clamps_dead_rows_out_of_estimator_observation():
+    # Request 0: capacity=5 (from 1-step stale budget), dead_row_cut=2, and all 2
+    # live drafts are accepted (num_sampled=3, num_rejected=3). Without clamping,
+    # step 2 (a dead row skipped by MoE) is graded as a false rejection.
+    # Request 1: capacity=5, dead_row_cut=2, 1 live draft accepted and 1 live
+    # draft rejected (num_sampled=2, num_rejected=4) -> 1 live rejection.
+    # Request 2: capacity=5, dead_row_cut=0, 0 live drafts (num_sampled=1,
+    # num_rejected=5) -> 0 live rejections.
+    dead_row_cut = torch.tensor([2, 2, 0], dtype=torch.int32)
+    num_sampled = torch.tensor([3, 2, 1], dtype=torch.int32)
+    num_rejected = torch.tensor([3, 4, 5], dtype=torch.int32)
+    live_rejected = (dead_row_cut - (num_sampled - 1).clamp_min(0)).clamp_min(0)
+    observed_rejected = torch.minimum(num_rejected, live_rejected)
+    assert observed_rejected.tolist() == [0, 1, 0]
