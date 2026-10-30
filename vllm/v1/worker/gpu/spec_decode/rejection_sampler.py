@@ -388,7 +388,9 @@ class RejectionSampler:
         kernel_steps = None
         drafts = input_batch.num_draft_tokens_per_req
         if self.num_draft_steps < self.num_speculative_steps and (
-            drafts is None or int(drafts.max(initial=0)) <= self.num_draft_steps
+            drafts is None
+            or min(int(drafts.max(initial=0)), input_batch.num_draft_tokens)
+            <= self.num_draft_steps
         ):
             kernel_steps = self.num_draft_steps
 

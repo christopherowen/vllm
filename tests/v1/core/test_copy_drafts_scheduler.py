@@ -265,3 +265,45 @@ def test_waiting_requests_keep_their_slots_rows(monkeypatch, tmp_path):
         len(scheduled.scheduled_spec_decode_tokens[r.request_id]) for r in requests[:2]
     )
     assert widths == [BLOCK, LOOKAHEAD]
+
+
+def test_active_prefill_chunk_keeps_decode_requests_at_the_block(monkeypatch, tmp_path):
+    """While a multi-chunk prefill is in progress, decode requests stay at the
+    drafter's block so copy lookahead does not inflate prefill-chunk steps."""
+    utils, scheduler = _scheduler(
+        monkeypatch, tmp_path, copy_drafts=True, max_num_seqs=4
+    )
+    decode_req = utils.create_requests(num_requests=1, num_tokens=20, max_tokens=500)[0]
+    long_req = utils.create_requests(num_requests=2, num_tokens=1500, max_tokens=500)[1]
+    alloc = {decode_req.request_id: LOOKAHEAD}
+    scheduler.add_request(decode_req)
+    queue: deque[SchedulerOutput] = deque()
+    for step in range(8):
+        if step == 5:
+            scheduler.add_request(long_req)
+        scheduled = scheduler.schedule()
+        if step == 4:
+            assert (
+                len(scheduled.scheduled_spec_decode_tokens[decode_req.request_id])
+                == LOOKAHEAD
+            )
+        if step == 5:
+            assert long_req.is_prefill_chunk
+        if step == 6:
+            # Step 6 runs while long_req is an active prefill chunk in running:
+            # decode_req must stay at BLOCK instead of widening to LOOKAHEAD.
+            assert (
+                len(scheduled.scheduled_spec_decode_tokens[decode_req.request_id])
+                == BLOCK
+            )
+        if step == 7:
+            # Once long_req finishes its prefill in step 6, decode_req widens again.
+            assert not long_req.is_prefill_chunk
+            assert (
+                len(scheduled.scheduled_spec_decode_tokens[decode_req.request_id])
+                == LOOKAHEAD
+            )
+        queue.append(scheduled)
+        if len(queue) == 2:
+            done = queue.popleft()
+            scheduler.update_from_output(done, _output(done, alloc))

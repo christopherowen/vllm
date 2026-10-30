@@ -635,6 +635,46 @@ def test_a_slot_starts_afresh_with_each_request():
     assert int(drafter.alloc[0]) == 2 * INITIAL
 
 
+def test_prepare_alloc_matches_propose_and_updates_slot_draft_limits():
+    """prepare_alloc computes the same alloc as propose before DSpark runs and
+    writes each slot's valid draft count to slot_draft_limits."""
+    rng = np.random.default_rng(7)
+    states = _request_state(8192)
+    drafter = _drafter(states)
+    S, start = copy_stream(rng, VOCAB, doc=400, edits=0)
+    P, pstart = prose_stream(rng, VOCAB, length=300)
+    slot_copy = _set_history(states, "copy", S[: start + 30])
+    slot_prose = _set_history(states, "prose", P[:pstart])
+    drafter.add_request(slot_copy)
+    drafter.add_request(slot_prose)
+    drafter.apply_staged_writes()
+
+    idx = torch.tensor([slot_copy, slot_prose], dtype=torch.int64, device=DEVICE)
+    one = torch.ones(2, dtype=torch.int32, device=DEVICE)
+    zero = torch.zeros(2, dtype=torch.int32, device=DEVICE)
+    dspark = (
+        torch.full((2, BLOCK), 42, dtype=torch.int64, device=DEVICE),
+        torch.full((2, BLOCK), 0.6, device=DEVICE),
+    )
+    drafter.prepare_alloc(idx, one, zero, None)
+    early_alloc = drafter.alloc[:2].clone()
+    assert int(drafter.slot_draft_limits.gpu[slot_copy]) == INITIAL
+    assert int(drafter.slot_draft_limits.gpu[slot_prose]) == BLOCK
+
+    drafts, confidences, planned = drafter.propose(
+        idx, *dspark, one, zero, None, matched=True
+    )
+    assert torch.equal(early_alloc, drafter.alloc[:2])
+    assert int(early_alloc[0]) == 2 * INITIAL
+    assert int(early_alloc[1]) == BLOCK
+    assert (drafts[0, INITIAL:] == 0).all()
+    assert (drafts[1, BLOCK:] == 0).all()
+    assert (confidences[0, INITIAL:] == 0).all()
+    assert (confidences[1, BLOCK:] == 0).all()
+    assert (planned[0, : 2 * INITIAL] > 0).all()
+
+
+
 # --- Temperature 0: the committed text does not depend on the drafts ------------
 
 
@@ -778,3 +818,40 @@ def test_temperature_zero_text_does_not_depend_on_copy_drafts():
     with_copies = _decode(targets, prompts, count, copy=True)
     assert alone == expected
     assert with_copies == expected
+
+
+def test_prepare_alloc_skips_incomplete_prefill_requests():
+    """Requests still mid-prefill after a step pass -1 in match_idx_mapping so
+    their uncomputed prompt tail is neither scanned nor offered as a copy."""
+    rng = np.random.default_rng(11)
+    states = _request_state(8192)
+    drafter = _drafter(states)
+    repeated = np.tile(rng.integers(0, VOCAB, 32), 4).tolist()
+    s0 = _set_history(states, "decode_req", repeated[:96])
+    s1 = _set_history(states, "mid_prefill_req", repeated[:96])
+    drafter.add_request(s0)
+    drafter.add_request(s1)
+    drafter.apply_staged_writes()
+    idx = torch.tensor([s0, s1], dtype=torch.int64, device=DEVICE)
+    match_idx = torch.tensor([s0, -1], dtype=torch.int64, device=DEVICE)
+    dspark_drafts = torch.arange(1, 1 + 2 * BLOCK, dtype=torch.int64, device=DEVICE).view(
+        2, BLOCK
+    )
+    dspark_conf = torch.full((2, BLOCK), 0.6, device=DEVICE)
+    num_sampled = torch.tensor([1, 0], dtype=torch.int32, device=DEVICE)
+    verified = torch.zeros(2, dtype=torch.int32, device=DEVICE)
+    drafter.prepare_alloc(
+        idx, num_sampled, verified, None, match_idx_mapping=match_idx
+    )
+    drafts, confs, _ = drafter.propose(
+        idx, dspark_drafts, dspark_conf, num_sampled, verified, None, matched=True
+    )
+    # Decoding slot s0 matched and proposes INITIAL copy drafts; mid-prefill slot s1
+    # was masked in copy_match and keeps DSpark's block with pending=0.
+    assert int(drafter.int_state[s0, 1]) == INITIAL
+    assert int(drafter.int_state[s1, 1]) == 0
+    assert int(drafter.alloc[1]) == BLOCK
+    assert int(drafter.slot_draft_limits.gpu[s1]) == BLOCK
+    assert drafts[1, :BLOCK].tolist() == dspark_drafts[1].tolist()
+    assert drafts[1, BLOCK:].tolist() == [0] * (LOOKAHEAD - BLOCK)
+    torch.testing.assert_close(confs[1, :BLOCK], dspark_conf[1])

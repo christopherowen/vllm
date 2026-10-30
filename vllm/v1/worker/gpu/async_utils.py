@@ -3,7 +3,7 @@
 import contextlib
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -216,6 +216,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         copy_draft_alloc: torch.Tensor,
         copy_stream: torch.cuda.Stream,
         main_stream: torch.cuda.Stream,
+        slot_draft_limits: Any = None,
     ) -> None:
         """Copy the copy drafter's per-request allocation (``[num_reqs]`` int32),
         written by this step's proposal after the outputs' copy began, to the host
@@ -226,6 +227,8 @@ class AsyncOutput(AsyncModelRunnerOutput):
         with stream(copy_stream, main_stream):
             copy_stream.wait_stream(main_stream)
             self.copy_draft_alloc_np = async_copy_to_np(self.copy_draft_alloc)
+            if slot_draft_limits is not None:
+                slot_draft_limits.copy_to_cpu()
             self.copy_draft_alloc_event.record(copy_stream)
 
     def get_output(self) -> ModelRunnerOutput:

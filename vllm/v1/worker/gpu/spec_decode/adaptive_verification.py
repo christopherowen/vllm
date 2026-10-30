@@ -117,9 +117,14 @@ class AdaptiveVerificationManager:
         max_total_logits: int,
         row_cost: float,
         planned_confidences: bool = False,
+        num_draft_steps: int | None = None,
+        slot_draft_limits: Callable[[], np.ndarray] | np.ndarray | None = None,
     ):
         self.req_states = req_states
         self.num_speculative_steps = req_states.num_speculative_steps
+        self.num_draft_steps = num_draft_steps or self.num_speculative_steps
+        self.step_steps = self.num_speculative_steps
+        self._slot_draft_limits = slot_draft_limits
         device = req_states.device
         self._copy_stream = torch.cuda.Stream(device)
 
@@ -209,22 +214,24 @@ class AdaptiveVerificationManager:
         so its kernels are loaded at startup rather than on the first step that
         trims a budget."""
         device = self._confidence_probs.device
-        steps = self.num_speculative_steps
+        num_draft_steps = getattr(self, "num_draft_steps", self.num_speculative_steps)
         probs = torch.ones_like(self._confidence_probs)
         max_reqs = probs.shape[0]
-        for num_reqs, draft_budget in ((1, 1), (max_reqs, max_reqs * steps - 1)):
-            if not 0 < draft_budget < num_reqs * steps:
-                continue
-            capacities = torch.full(
-                (num_reqs,),
-                steps,
-                dtype=self._batch_draft_capacity.dtype,
-                device=device,
-            )
-            idx_mapping = torch.arange(num_reqs, dtype=torch.int64, device=device)
-            tilelang_inputs.assign_draft_budget(
-                probs, idx_mapping, capacities, draft_budget, steps
-            )
+        for steps in dict.fromkeys((num_draft_steps, self.num_speculative_steps)):
+            step_probs = probs[:, :steps]
+            for num_reqs, draft_budget in ((1, 1), (max_reqs, max_reqs * steps - 1)):
+                if not 0 < draft_budget < num_reqs * steps:
+                    continue
+                capacities = torch.full(
+                    (num_reqs,),
+                    steps,
+                    dtype=self._batch_draft_capacity.dtype,
+                    device=device,
+                )
+                idx_mapping = torch.arange(num_reqs, dtype=torch.int64, device=device)
+                tilelang_inputs.assign_draft_budget(
+                    step_probs, idx_mapping, capacities, draft_budget, steps
+                )
         torch.cuda.synchronize(device)
 
     def record_confidences(
@@ -299,19 +306,34 @@ class AdaptiveVerificationManager:
             dtype=np.int32,
             count=len(req_ids),
         )
-        stale_confidences = self._stale_confidences[self._stale_idx].np[slots]
+        slot_limits = getattr(self, "_slot_draft_limits", None)
+        if callable(slot_limits):
+            slot_limits = slot_limits()
+        if slot_limits is not None:
+            eligible_drafts = np.minimum(scheduled_drafts, slot_limits[slots])
+        else:
+            eligible_drafts = scheduled_drafts
+        num_draft_steps = getattr(self, "num_draft_steps", self.num_speculative_steps)
+        step_steps = (
+            num_draft_steps
+            if int(eligible_drafts.max(initial=0)) <= num_draft_steps
+            else self.num_speculative_steps
+        )
+        stale_confidences = self._stale_confidences[self._stale_idx].np[
+            slots, :step_steps
+        ]
         survival_probability = np.cumprod(stale_confidences.astype(np.float64), axis=1)
-        steps = np.arange(self.num_speculative_steps)
-        valid = steps[None, :] < scheduled_drafts[:, None]
+        steps = np.arange(step_steps)
+        valid = steps[None, :] < eligible_drafts[:, None]
         scores = np.sort(survival_probability[valid])[::-1]
         max_draft_budget = min(
-            int(scheduled_drafts.sum()),
+            int(eligible_drafts.sum()),
             max(0, self._max_total_logits - num_reqs * self.num_bonus_tokens),
         )
         scores = scores[:max_draft_budget]
         num_drafts_per_req = {
             req_id: int(num_drafts)
-            for req_id, num_drafts in zip(req_ids, scheduled_drafts, strict=True)
+            for req_id, num_drafts in zip(req_ids, eligible_drafts, strict=True)
         }
         num_non_draft_tokens_per_req = {
             req_id: int(num_tokens)
@@ -439,16 +461,23 @@ class AdaptiveVerificationManager:
         # Rank draft slots by survival probability and admit the best prefix.
         # capacities enters holding each request's valid draft count (the kernel
         # uses it to bound eligible slots) and leaves holding the admitted count.
+        num_draft_steps = getattr(self, "num_draft_steps", self.num_speculative_steps)
+        step_steps = (
+            num_draft_steps
+            if int(scheduled_drafts.max(initial=0)) <= num_draft_steps
+            else self.num_speculative_steps
+        )
+        self.step_steps = step_steps
         capacities = self._batch_draft_capacity[:num_reqs]
         if draft_budget:
             async_tensor_h2d(scheduled_drafts, out=capacities)
             if draft_budget < int(scheduled_drafts.sum()):
                 tilelang_inputs.assign_draft_budget(
-                    self._confidence_probs,
+                    self._confidence_probs[:, :step_steps],
                     idx_mapping,
                     capacities,
                     draft_budget,
-                    self.num_speculative_steps,
+                    step_steps,
                 )
 
         num_non_draft_tokens_gpu = self._num_non_draft_tokens[:num_reqs]
@@ -462,7 +491,7 @@ class AdaptiveVerificationManager:
             self.query_start_loc,
             idx_mapping,
             num_reqs * self.num_bonus_tokens + draft_budget,
-            self.num_speculative_steps + self.num_bonus_tokens,
+            step_steps + self.num_bonus_tokens,
             self.num_bonus_tokens,
             num_tokens,
             drafted=draft_budget > 0,
@@ -490,6 +519,7 @@ def maybe_create_adaptive_verification_manager(
     target_layer_names: set[str] | None = None,
     additional_attn_cg_support: tuple[AttentionCGSupport, str | None] | None = None,
     planned_confidences: bool = False,
+    slot_draft_limits: Callable[[], np.ndarray] | np.ndarray | None = None,
 ) -> AdaptiveVerificationManager | None:
     if not enable_adaptive_verification:
         return None
@@ -558,4 +588,11 @@ def maybe_create_adaptive_verification_manager(
         max_total_logits=max_total_logits,
         row_cost=adaptive_verification_row_cost,
         planned_confidences=planned_confidences,
+        num_draft_steps=getattr(
+            getattr(vllm_config, "speculative_config", None),
+            "num_speculative_tokens",
+            None,
+        )
+        or None,
+        slot_draft_limits=slot_draft_limits,
     )

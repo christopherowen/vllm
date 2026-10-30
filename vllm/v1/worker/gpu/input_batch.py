@@ -914,6 +914,7 @@ def declare_input_batch_kernels(
     dead_rows: bool,
     sampled_widths: Sequence[int],
     commits: Sequence[tuple[bool, bool, bool]],
+    draft_widths: Sequence[int] = (),
 ) -> None:
     """Declare the TileLang kernels that prepare a step's inputs from the request
     states and commit its sampled tokens: prefill inputs (``num_lookahead`` tokens
@@ -935,5 +936,6 @@ def declare_input_batch_kernels(
             dead_rows=dead_rows,
             sampled_widths=sampled_widths,
             commits=commits,
+            draft_widths=draft_widths,
         )
     )

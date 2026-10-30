@@ -23,10 +23,13 @@ which the scheduler gives the request's step after next (within its decode-row
 envelope), and the planned confidences the budget reads at that step.
 """
 
+import numpy as np
 import torch
 
 from vllm.config.speculative import CopyDraftsConfig
+from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.torch_utils import async_tensor_h2d
+from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu import tilelang_inputs
 from vllm.v1.worker.gpu.spec_decode import tilelang_copy
 from vllm.v1.worker.gpu.states import RequestState
@@ -74,9 +77,24 @@ class CopyDrafter:
         )
         self.planned = torch.zeros_like(self.confidences)
         self.alloc = torch.zeros(max_reqs, dtype=torch.int32, device=device)
+        # Actual valid draft count per slot from the latest proposal, mirrored to
+        # host so the next step's adaptive budget never admits zero-padded slots.
+        self.slot_draft_limits = CpuGpuBuffer(
+            max_reqs, dtype=torch.int32, device=device
+        )
+        self.slot_draft_limits.np.fill(self.lookahead)
+        self.slot_draft_limits.gpu.fill_(self.lookahead)
+        self._limits_event: torch.cuda.Event | None = None
         # A step that verified no drafts: nothing to judge.
         self._no_drafts = torch.zeros(max_reqs, dtype=torch.int32, device=device)
         self._new_rows: list[int] = []
+
+    def sync_slot_draft_limits(self) -> np.ndarray:
+        if self._limits_event is not None:
+            with gpu_sync_allowed():
+                self._limits_event.synchronize()
+            self._limits_event = None
+        return self.slot_draft_limits.np
 
     def register_warmups(self) -> None:
         """Declare the copy kernels and the copy state's reset."""
@@ -91,6 +109,7 @@ class CopyDrafter:
         )
 
     def add_request(self, req_idx: int) -> None:
+        self.sync_slot_draft_limits()[req_idx] = self.lookahead
         self._new_rows.append(req_idx)
 
     def apply_staged_writes(self) -> None:
@@ -102,7 +121,51 @@ class CopyDrafter:
             )
             tilelang_inputs.fill_rows(rows, self.int_state, 0)
             tilelang_inputs.fill_rows(rows, self.float_state, 0.0)
+            tilelang_inputs.fill_rows(
+                rows, self.slot_draft_limits.gpu[:, None], self.lookahead
+            )
             self._new_rows.clear()
+
+    def prepare_alloc(
+        self,
+        idx_mapping: torch.Tensor,
+        num_sampled: torch.Tensor,
+        verified: torch.Tensor | None,
+        dead_row_cut: torch.Tensor | None,
+        *,
+        match_idx_mapping: torch.Tensor | None = None,
+    ) -> None:
+        """Match the batch's updated histories and write ``alloc[:num_reqs]`` and
+        ``slot_draft_limits.gpu`` before the drafter runs, so the async output
+        copy does not wait behind the drafter."""
+        num_reqs = idx_mapping.shape[0]
+        if verified is None:
+            verified = self._no_drafts[:num_reqs]
+        history = self.req_states.all_token_ids.gpu
+        total_len = self.req_states.total_len.gpu
+        sources = self.sources[:num_reqs]
+        tilelang_copy.copy_match(
+            idx_mapping if match_idx_mapping is None else match_idx_mapping,
+            history,
+            total_len,
+            sources,
+            self.min_match,
+        )
+        tilelang_copy.copy_alloc(
+            idx_mapping,
+            total_len,
+            sources,
+            num_sampled,
+            verified,
+            verified if dead_row_cut is None else dead_row_cut,
+            self.int_state,
+            self.alloc[:num_reqs],
+            self.slot_draft_limits.gpu,
+            self.min_match,
+            self.lookahead,
+            self.num_draft_steps,
+            self.initial,
+        )
 
     def propose(
         self,
@@ -112,6 +175,8 @@ class CopyDrafter:
         num_sampled: torch.Tensor,
         verified: torch.Tensor | None,
         dead_row_cut: torch.Tensor | None,
+        *,
+        matched: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """The batch's drafts, confidences and planned confidences
         (``[num_reqs, lookahead]``), and ``alloc[:num_reqs]``.
@@ -124,6 +189,8 @@ class CopyDrafter:
             verified: The drafts this step verified per request (adaptive
                 verification's admitted counts), None if it verified none.
             dead_row_cut: The live drafts per request, None without dead rows.
+            matched: Whether ``prepare_alloc`` already matched this step's
+                histories into ``sources[:num_reqs]``.
         """
         num_reqs = idx_mapping.shape[0]
         if verified is None:
@@ -131,9 +198,10 @@ class CopyDrafter:
         history = self.req_states.all_token_ids.gpu
         total_len = self.req_states.total_len.gpu
         sources = self.sources[:num_reqs]
-        tilelang_copy.copy_match(
-            idx_mapping, history, total_len, sources, self.min_match
-        )
+        if not matched:
+            tilelang_copy.copy_match(
+                idx_mapping, history, total_len, sources, self.min_match
+            )
         drafts = self.drafts[:num_reqs]
         confidences = self.confidences[:num_reqs]
         planned = self.planned[:num_reqs]

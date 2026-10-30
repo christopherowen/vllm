@@ -822,6 +822,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             target_layer_names=target_attn_layer_names,
             additional_attn_cg_support=additional_attn_cg_support,
             planned_confidences=self.copy_drafter is not None,
+            slot_draft_limits=(
+                self.copy_drafter.sync_slot_draft_limits
+                if self.copy_drafter is not None
+                else None
+            ),
         )
         if self.copy_drafter is not None and self.adaptive_verification is None:
             # The draft budget decides how many of a copy's drafts a step
@@ -1231,12 +1236,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 shard.org_vocab_start_index,
                 get_tensor_model_parallel_world_size(),
             )
-            greedy_rejection_sample(
-                pairs,
-                self.input_buffers.input_ids[:num_reqs],
-                dummy_input_batch.cu_num_logits,
-                self.rejection_sampler.num_speculative_steps,
-            )
+            for steps in dict.fromkeys(
+                (self.num_draft_steps, self.rejection_sampler.num_speculative_steps)
+                if self.num_draft_steps > 0
+                else (self.rejection_sampler.num_speculative_steps,)
+            ):
+                greedy_rejection_sample(
+                    pairs,
+                    self.input_buffers.input_ids[:num_reqs],
+                    dummy_input_batch.cu_num_logits,
+                    steps,
+                )
 
     @torch.inference_mode()
     def _dummy_pooler_run(self, hidden_states: torch.Tensor) -> None:
@@ -1850,6 +1860,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Some input token ids are directly read from the last sampled tokens
         # and draft tokens. Also, get the logits indices to sample tokens from.
+        if adaptive_verification is not None:
+            max_step_drafts = adaptive_verification.step_steps
+        elif num_draft_tokens_per_req is not None:
+            max_step_drafts = int(num_draft_tokens_per_req.max(initial=0))
+        else:
+            max_step_drafts = 0
+        step_draft_steps = (
+            self.num_draft_steps
+            if 0 < self.num_draft_steps < self.req_states.draft_tokens.shape[-1]
+            and max_step_drafts <= self.num_draft_steps
+            else self.req_states.draft_tokens.shape[-1]
+        )
+        self._step_draft_steps = step_draft_steps
         logits_indices = combine_sampled_and_draft_tokens(
             self.input_buffers.input_ids,
             idx_mapping,
@@ -1857,7 +1880,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             query_start_loc,
             seq_lens,
             self.req_states.prefill_len.gpu,
-            self.req_states.draft_tokens,
+            self.req_states.draft_tokens[:, :step_draft_steps],
             cu_num_logits,
             total_num_logits,
             self.model_state.num_new_sampled_tokens_per_step,
@@ -2153,14 +2176,34 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             commits = ((True, True, True), (True, False, False), (True, True, False))
         else:
             commits = ((True, True, False),)
+        num_draft_steps = getattr(self, "num_draft_steps", self.num_speculative_steps)
         declare_input_batch_kernels(
             num_lookahead=self.req_states.next_prefill_tokens.shape[0],
             num_speculative_steps=self.req_states.draft_tokens.shape[-1],
             num_new_sampled_tokens=self.model_state.num_new_sampled_tokens_per_step,
             dead_rows=dead_rows,
+            draft_widths=(
+                (num_draft_steps, self.req_states.draft_tokens.shape[-1])
+                if 0 < num_draft_steps < self.req_states.draft_tokens.shape[-1]
+                else ()
+            ),
             # The sampler's one column, and verification's num_speculative_steps + 1.
-            sampled_widths=(1,)
-            + ((self.num_speculative_steps + 1,) if self.num_speculative_steps else ()),
+            sampled_widths=tuple(
+                dict.fromkeys(
+                    (1,)
+                    + (
+                        (num_draft_steps + 1,)
+                        if num_draft_steps
+                        and num_draft_steps != self.num_speculative_steps
+                        else ()
+                    )
+                    + (
+                        (self.num_speculative_steps + 1,)
+                        if self.num_speculative_steps
+                        else ()
+                    )
+                )
+            ),
             commits=commits,
         )
         if self.speculator is not None and self.num_speculative_steps:
@@ -2169,13 +2212,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             draft_dtype = self.req_states.draft_tokens.dtype
             tilelang_inputs.declare(
                 lambda: tilelang_inputs.scatter_rows_calls(
-                    torch.int64, draft_dtype, gather=True
+                    torch.int64,
+                    draft_dtype,
+                    gather=not self.draft_tokens_handler.track_consumed_drafts,
                 )
                 + (
                     tilelang_inputs.scatter_rows_calls(
                         torch.int64, draft_dtype, gather=False
                     )
                     if self.vllm_config.use_request_boundary_checkpoints
+                    and not self.draft_tokens_handler.track_consumed_drafts
                     else []
                 )
             )
@@ -2189,11 +2235,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # The target's padding rows (prepare_inputs).
             tilelang_inputs.declare(tilelang_inputs.padding_rows_calls)
         if adaptive:
-            steps = self.num_speculative_steps
-            width = steps + self.model_state.num_new_sampled_tokens_per_step
+            step_widths = tuple(
+                dict.fromkeys(
+                    (num_draft_steps, self.num_speculative_steps)
+                    if num_draft_steps > 0
+                    else (self.num_speculative_steps,)
+                )
+            )
             tilelang_inputs.declare(
-                lambda: tilelang_inputs.adaptive_offsets_calls(width)
-                + tilelang_inputs.assign_draft_budget_calls(steps)
+                lambda: [
+                    call
+                    for steps in step_widths
+                    for call in (
+                        tilelang_inputs.adaptive_offsets_calls(
+                            steps + self.model_state.num_new_sampled_tokens_per_step
+                        )
+                        + tilelang_inputs.assign_draft_budget_calls(steps)
+                    )
+                ]
                 + tilelang_inputs.scatter_rows_calls(
                     torch.int64, torch.float32, gather=False
                 )
@@ -2263,11 +2322,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.sink.register_warmups(
                     logits=logits,
                     processed_logits_strides=processed_strides,
-                    sampled_widths=(1,)
-                    + (
-                        (self.num_speculative_steps + 1,)
-                        if self.num_speculative_steps > 0
-                        else ()
+                    sampled_widths=tuple(
+                        dict.fromkeys(
+                            (1,)
+                            + (
+                                (num_draft_steps + 1,)
+                                if num_draft_steps > 0
+                                and num_draft_steps != self.num_speculative_steps
+                                else ()
+                            )
+                            + (
+                                (self.num_speculative_steps + 1,)
+                                if self.num_speculative_steps > 0
+                                else ()
+                            )
+                        )
                     ),
                     bin_counts_stride=self.sampler.penalties_state.output_bin_counts.stride(
                         0
@@ -2286,6 +2355,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 vocab_start=shard.org_vocab_start_index,
                 tp_size=get_tensor_model_parallel_world_size(),
                 num_speculative_steps=self.rejection_sampler.num_speculative_steps,
+                step_widths=tuple(
+                    dict.fromkeys(
+                        (
+                            num_draft_steps,
+                            self.rejection_sampler.num_speculative_steps,
+                        )
+                        if num_draft_steps > 0
+                        else (self.rejection_sampler.num_speculative_steps,)
+                    )
+                ),
             )
         if isinstance(self.speculator, DFlashSpeculator):
             self.speculator.register_warmups(
@@ -2431,11 +2510,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             shard.org_vocab_start_index,
             tp_size,
         )
+        greedy_steps = min(
+            getattr(
+                self,
+                "_step_draft_steps",
+                self.rejection_sampler.num_speculative_steps,
+            ),
+            self.rejection_sampler.num_speculative_steps,
+        )
         sampled, num_sampled = greedy_rejection_sample(
             pairs,
             drafts,
             input_batch.cu_num_logits,
-            self.rejection_sampler.num_speculative_steps,
+            greedy_steps,
         )
         num_sampled, num_rejected = get_num_sampled_and_rejected(
             num_sampled,
@@ -2642,6 +2729,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output_bin_counts = self.sampler.penalties_state.output_bin_counts
         else:
             output_bin_counts = None
+        if (
+            sampled_tokens.dim() == 2
+            and sampled_tokens.shape[1] > self.num_draft_steps + 1 >= 2
+            and getattr(self, "_step_draft_steps", self.num_speculative_steps)
+            <= self.num_draft_steps
+        ):
+            sampled_tokens = sampled_tokens[:, : self.num_draft_steps + 1]
         post_update(
             idx_mapping,
             self.req_states.num_computed_tokens.gpu,
@@ -3385,6 +3479,50 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.sampler._get_contexts(input_batch.idx_mapping),
                     self.sampler.watermarking.gpu[input_batch.idx_mapping],
                 )
+            verified = None
+            if self.copy_drafter is not None:
+                # Match the updated histories and publish next-step alloc and
+                # slot draft limits before the drafter runs, so the async output
+                # copy completes on output_copy_stream while DSpark executes.
+                # Requests still mid-prefill after this step have not reached the
+                # end of their prompt yet and must not be matched.
+                match_idx_mapping = None
+                if input_batch.has_prefill:
+                    incomplete_prefill_np = (
+                        input_batch.num_computed_prefill_tokens_np
+                        + input_batch.num_scheduled_tokens
+                        < input_batch.prefill_len_np
+                    )
+                    if incomplete_prefill_np.any():
+                        match_idx_mapping = async_tensor_h2d(
+                            np.where(
+                                incomplete_prefill_np, -1, input_batch.idx_mapping_np
+                            ),
+                            dtype=input_batch.idx_mapping.dtype,
+                            device=self.device,
+                        )
+                verified = (
+                    self.adaptive_verification.get_verified_draft_counts(
+                        input_batch.num_reqs
+                    )
+                    if self.adaptive_verification is not None
+                    and input_batch.num_draft_tokens_per_req is not None
+                    else None
+                )
+                self.copy_drafter.prepare_alloc(
+                    input_batch.idx_mapping,
+                    num_sampled,
+                    verified,
+                    self._dead_row_cut if verified is not None else None,
+                    match_idx_mapping=match_idx_mapping,
+                )
+                async_output.attach_copy_draft_alloc(
+                    self.copy_drafter.alloc[: input_batch.num_reqs],
+                    self.output_copy_stream,
+                    self.main_stream,
+                    slot_draft_limits=self.copy_drafter.slot_draft_limits,
+                )
+                self.copy_drafter._limits_event = async_output.copy_draft_alloc_event
             with use_workspace_lane(self._draft_workspace_lane):
                 if boundary_state is not None:
                     self.speculator.boundary_checkpoint_capture = (
@@ -3421,14 +3559,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # A request whose context repeats its own earlier text takes the
                 # copy in place of DSpark's drafts. Warmup runs without adaptive
                 # verification (fixed draft counts); its rows verify none.
-                verified = (
-                    self.adaptive_verification.get_verified_draft_counts(
-                        input_batch.num_reqs
-                    )
-                    if self.adaptive_verification is not None
-                    and input_batch.num_draft_tokens_per_req is not None
-                    else None
-                )
                 draft_tokens, confidences, planned_confidences = (
                     self.copy_drafter.propose(
                         input_batch.idx_mapping,
@@ -3437,22 +3567,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         num_sampled,
                         verified,
                         self._dead_row_cut if verified is not None else None,
+                        matched=True,
                     )
-                )
-                async_output.attach_copy_draft_alloc(
-                    self.copy_drafter.alloc[: input_batch.num_reqs],
-                    self.output_copy_stream,
-                    self.main_stream,
                 )
             num_draft_tokens = draft_tokens.shape[1]
             if num_draft_tokens > 0:
                 # Into the request states, and read back for the next step.
-                draft_tokens_for_next_step = tilelang_inputs.scatter_rows(
-                    input_batch.idx_mapping,
-                    draft_tokens,
-                    self.req_states.draft_tokens,
-                    gather=True,
-                )
+                if self.draft_tokens_handler.track_consumed_drafts:
+                    tilelang_inputs.scatter_rows(
+                        input_batch.idx_mapping,
+                        draft_tokens,
+                        self.req_states.draft_tokens,
+                        gather=False,
+                    )
+                    draft_tokens_for_next_step = draft_tokens
+                else:
+                    draft_tokens_for_next_step = tilelang_inputs.scatter_rows(
+                        input_batch.idx_mapping,
+                        draft_tokens,
+                        self.req_states.draft_tokens,
+                        gather=True,
+                    )
             else:
                 draft_tokens_for_next_step = draft_tokens
             if self.adaptive_verification is not None:

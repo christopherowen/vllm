@@ -95,6 +95,7 @@ def register_greedy_verification_warmups(
     vocab_start: int,
     tp_size: int,
     num_speculative_steps: int,
+    step_widths: tuple[int, ...] = (),
 ) -> None:
     """Declare the kernels ``vocab_parallel_pairs`` and ``greedy_rejection_sample``
     launch: this rank's shard of ``compute_logits_local`` (``logits_dtype``, rows
@@ -109,9 +110,10 @@ def register_greedy_verification_warmups(
     )
     from vllm.v1.worker.gpu.sample import tilelang_sampling
 
+    widths = dict.fromkeys(step_widths or (num_speculative_steps,))
     tilelang_sampling.declare(
         lambda: tilelang_sampling.greedy_calls(
-            rejection=[(num_speculative_steps + 1, tp_size, PAIR_WIDTH)]
+            rejection=[(steps + 1, tp_size, PAIR_WIDTH) for steps in widths]
         )
     )
 

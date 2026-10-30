@@ -1030,7 +1030,7 @@ def assign_draft_budget_kernel(steps: int, idx_dtype: str):
     past its scheduled drafts; the ``draft_budget`` best slots as ``torch.topk``
     picks them (radix keys, NaN highest, ties to the lower slot); and each
     request's admitted count into ``capacities``."""
-    num_reqs, prob_rows = T.dynamic("num_reqs, prob_rows")
+    num_reqs, prob_rows, prob_stride = T.dynamic("num_reqs, prob_rows, prob_stride")
     scan_threads = 16  # torch's num_threads_x for these rows (at least 2**4)
     while 2 * scan_threads < steps:
         scan_threads *= 2
@@ -1038,7 +1038,9 @@ def assign_draft_budget_kernel(steps: int, idx_dtype: str):
 
     @T.prim_func
     def assign_draft_budget(
-        confidence_probs: T.Tensor((prob_rows, steps), T.float32),
+        confidence_probs: T.StridedTensor(
+            (prob_rows, steps), (prob_stride, 1), T.float32
+        ),
         idx_mapping: T.Tensor((num_reqs,), idx_dtype),
         capacities: T.Tensor((num_reqs,), T.int32),
         draft_budget: T.int32,
@@ -2562,6 +2564,7 @@ def input_batch_calls(
     dead_rows: bool,
     sampled_widths: Sequence[int],
     commits: Sequence[tuple[bool, bool, bool]],
+    draft_widths: Sequence[int] = (),
 ) -> list:
     """The step-input kernels for the runner's buffers: prefill inputs, positions
     and sequence lengths, the draft combine (with its dead-row variant when
@@ -2575,18 +2578,19 @@ def input_batch_calls(
         ),
         _call(prepare_pos_seq_lens_kernel, *prepare_pos_seq_lens_key(RUNNER_IDX_DTYPE)),
     ]
-    for dead in (False, True) if dead_rows else (False,):
-        calls.append(
-            _call(
-                combine_sampled_and_draft_tokens_kernel,
-                *combine_key(
-                    num_speculative_steps,
-                    num_new_sampled_tokens,
-                    dead,
-                    RUNNER_IDX_DTYPE,
-                ),
+    for steps in dict.fromkeys(draft_widths or (num_speculative_steps,)):
+        for dead in (False, True) if dead_rows else (False,):
+            calls.append(
+                _call(
+                    combine_sampled_and_draft_tokens_kernel,
+                    *combine_key(
+                        steps,
+                        num_new_sampled_tokens,
+                        dead,
+                        RUNNER_IDX_DTYPE,
+                    ),
+                )
             )
-        )
     if num_speculative_steps > 0:
         calls.append(
             _call(

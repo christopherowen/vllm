@@ -69,6 +69,7 @@ MAX_DOUBLINGS = 16
 STATE_COLUMNS = 2
 
 assert MAX_LEVEL == _MATCH_THREADS, "a thread loads one key token"
+assert CHUNKS == _SELECT_THREADS, "a lane reads one chunk's source"
 
 
 def num_levels(min_match: int) -> int:
@@ -112,27 +113,29 @@ def copy_match_kernel(min_match: int, idx_dtype: str):
             for i in tuple(range(count)):
                 best[i] = -1
             T.sync_threads()
+            k0 = T.alloc_var(T.int32, init=key[0])
             ends = T.max(length - min_match, 0)  # window ends min_match .. length - 1
             for k in T.serial(T.ceildiv(ends, span)):
                 e = min_match + k * span + c * _MATCH_THREADS + tx
                 if e < length:
-                    run = T.alloc_var(T.int32, init=0)
-                    # The shortest level first: most ends fail on its first token.
-                    # A token is loaded only while the run reaches it.
-                    for j in T.unroll(min_match):
-                        if run == j:  # noqa: SIM102
-                            if history[slot, e - 1 - j] == key[j]:
-                                run = j + 1
-                    # A longer level only past a full match of the one before.
-                    for i in tuple(range(1, count)):
-                        if run == levels[i - 1]:
-                            for j in T.serial(levels[i - 1], levels[i]):
-                                if run == j and j < e:  # noqa: SIM102
-                                    if history[slot, e - 1 - j] == key[j]:
-                                        run = j + 1
-                    for i in tuple(range(count)):
-                        if run >= levels[i]:
-                            best[i] = e
+                    if history[slot, e - 1] == k0:
+                        run = T.alloc_var(T.int32, init=1)
+                        # The shortest level first: most ends fail on its first token.
+                        # A token is loaded only while the run reaches it.
+                        for j in T.unroll(1, min_match):
+                            if run == j:  # noqa: SIM102
+                                if history[slot, e - 1 - j] == key[j]:
+                                    run = j + 1
+                        # A longer level only past a full match of the one before.
+                        for i in tuple(range(1, count)):
+                            if run == levels[i - 1]:
+                                for j in T.serial(levels[i - 1], levels[i]):
+                                    if run == j and j < e:  # noqa: SIM102
+                                        if history[slot, e - 1 - j] == key[j]:
+                                            run = j + 1
+                        for i in tuple(range(count)):
+                            if run >= levels[i]:
+                                best[i] = e
             for i in tuple(range(count)):
                 for distance in (16, 8, 4, 2, 1):
                     best[i] = T.max(best[i], T.shfl_xor(best[i], distance))
@@ -196,6 +199,14 @@ def copy_select_kernel(
             chosen = T.alloc_shared((3,), T.int32)
             estimate = T.alloc_shared((1,), T.float32)
             slot = T.alloc_var(T.int64, init=T.cast(idx_mapping[r], T.int64))
+            # The longest level with a source wins; its latest source across chunks.
+            source = T.alloc_var(T.int32, init=-1)
+            for i in tuple(range(count)):
+                latest = T.alloc_var(T.int32, init=sources[r, tx, i])
+                for step in (16, 8, 4, 2, 1):
+                    latest = T.max(latest, T.shfl_xor(latest, step))
+                if latest >= 0:
+                    source = latest
             if tx == 0:
                 doublings = T.alloc_var(T.int32, init=int_state[slot, 0])
                 pending = int_state[slot, 1]
@@ -213,14 +224,6 @@ def copy_select_kernel(
                             T.min(accepted + 1, live), T.float32
                         )
                 cap = T.min(T.int32(initial) << doublings, lookahead)
-                # The longest level with a source wins; its latest source.
-                source = T.alloc_var(T.int32, init=-1)
-                for i in tuple(range(count)):
-                    latest = T.alloc_var(T.int32, init=-1)
-                    for ch in T.serial(CHUNKS):
-                        latest = T.max(latest, sources[r, ch, i])
-                    if latest >= 0:
-                        source = latest
                 distance = total_len[slot] - source
                 offered = T.if_then_else(source >= 0, T.min(cap, distance), 0)
                 after = T.if_then_else(
@@ -273,6 +276,64 @@ def copy_select_kernel(
     return copy_select
 
 
+@tilelang.jit(pass_configs=_PASS)
+def copy_alloc_kernel(
+    min_match: int,
+    lookahead: int,
+    block: int,
+    initial: int,
+    idx_dtype: str,
+):
+    """The copy allocation and per-slot valid draft count before the drafter runs."""
+    count = num_levels(min_match)
+    num_reqs = T.dynamic("num_reqs")
+    total_rows = T.dynamic("total_rows")
+    state_rows = T.dynamic("state_rows")
+
+    @T.prim_func
+    def copy_alloc(
+        idx_mapping: T.Tensor((num_reqs,), idx_dtype),
+        total_len: T.Tensor((total_rows,), T.int32),
+        sources: T.Tensor((num_reqs, CHUNKS, count), T.int32),
+        num_sampled: T.Tensor((num_reqs,), T.int32),
+        verified: T.Tensor((num_reqs,), T.int32),
+        cut: T.Tensor((num_reqs,), T.int32),
+        int_state: T.Tensor((state_rows, STATE_COLUMNS), T.int32),
+        alloc: T.Tensor((num_reqs,), T.int32),
+        slot_limits: T.Tensor((state_rows,), T.int32),
+    ):
+        with T.Kernel(num_reqs, threads=_SELECT_THREADS) as r:
+            tx = T.get_thread_binding()
+            slot = T.alloc_var(T.int64, init=T.cast(idx_mapping[r], T.int64))
+            source = T.alloc_var(T.int32, init=-1)
+            for i in tuple(range(count)):
+                latest = T.alloc_var(T.int32, init=sources[r, tx, i])
+                for step in (16, 8, 4, 2, 1):
+                    latest = T.max(latest, T.shfl_xor(latest, step))
+                if latest >= 0:
+                    source = latest
+            if tx == 0:
+                doublings = T.alloc_var(T.int32, init=int_state[slot, 0])
+                pending = int_state[slot, 1]
+                if pending > 0 and num_sampled[r] > 0:
+                    live = T.min(verified[r], cut[r])
+                    if live > 0:
+                        accepted = num_sampled[r] - 1
+                        doublings = T.if_then_else(
+                            accepted >= live, T.min(doublings + 1, MAX_DOUBLINGS), 0
+                        )
+                cap = T.min(T.int32(initial) << doublings, lookahead)
+                distance = total_len[slot] - source
+                offered = T.if_then_else(source >= 0, T.min(cap, distance), 0)
+                after = T.if_then_else(
+                    source >= 0, T.min(T.min(2 * cap, lookahead), distance), 0
+                )
+                alloc[r] = T.max(after, block)
+                slot_limits[slot] = T.if_then_else(source >= 0, offered, block)
+
+    return copy_alloc
+
+
 def copy_match_key(min_match: int, idx_dtype: torch.dtype) -> tuple:
     return (min_match, _DTYPES[idx_dtype])
 
@@ -281,6 +342,40 @@ def copy_select_key(
     min_match: int, lookahead: int, block: int, initial: int, idx_dtype: torch.dtype
 ) -> tuple:
     return (min_match, lookahead, block, initial, _DTYPES[idx_dtype])
+
+
+def copy_alloc(
+    idx_mapping: torch.Tensor,
+    total_len: torch.Tensor,
+    sources: torch.Tensor,
+    num_sampled: torch.Tensor,
+    verified: torch.Tensor,
+    cut: torch.Tensor,
+    int_state: torch.Tensor,
+    alloc: torch.Tensor,
+    slot_limits: torch.Tensor,
+    min_match: int,
+    lookahead: int,
+    block: int,
+    initial: int,
+) -> None:
+    """``alloc[:num_reqs]`` and ``slot_limits[idx_mapping]`` from ``sources`` and
+    the current copy state (read-only), before the drafter proposes."""
+    num_reqs = idx_mapping.shape[0]
+    if not num_reqs:
+        return
+    key = copy_select_key(min_match, lookahead, block, initial, idx_mapping.dtype)
+    _kernel(copy_alloc_kernel, *key)(
+        idx_mapping,
+        total_len,
+        sources,
+        num_sampled,
+        verified,
+        cut,
+        int_state,
+        alloc,
+        slot_limits,
+    )
 
 
 def copy_match(
@@ -351,6 +446,10 @@ def copy_calls(min_match: int, lookahead: int, block: int, initial: int) -> list
     assert _DTYPES[idx] == RUNNER_IDX_DTYPE
     return [
         _call(copy_match_kernel, *copy_match_key(min_match, idx)),
+        _call(
+            copy_alloc_kernel,
+            *copy_select_key(min_match, lookahead, block, initial, idx),
+        ),
         _call(
             copy_select_kernel,
             *copy_select_key(min_match, lookahead, block, initial, idx),

@@ -1192,7 +1192,7 @@ class Scheduler(SchedulerInterface):
         # take a free slot this step, may hold the uniform width, so the step's
         # decode rows stay within max_decode_rows.
         copy_rows_left = 0
-        if self.copy_drafts:
+        if self.copy_drafts and not any(r.is_prefill_chunk for r in self.running):
             slots = min(
                 self.max_num_running_reqs,
                 len(self.running) + len(self.waiting) + len(self.skipped_waiting),
