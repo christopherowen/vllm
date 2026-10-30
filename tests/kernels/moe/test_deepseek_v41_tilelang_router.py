@@ -485,3 +485,90 @@ def test_gate_router_declares_its_masks(
     router._compute_routing(None, x, None, input_ids=input_ids)
     assert launches == [("int64", True) if vision else (None, True)]
     assert set(launches) <= declared
+
+
+def test_provide_routes_scopes_handed_over_routes():
+    rows = torch.empty((8, 5120), dtype=torch.bfloat16, device="cuda")
+    other = torch.empty((8, 5120), dtype=torch.bfloat16, device="cuda")
+    weights = torch.ones((8, 6), dtype=torch.float32, device="cuda")
+    ids = torch.zeros((8, 6), dtype=torch.int64, device="cuda")
+    assert tilelang_router.provided_routes(rows) is None
+    with tilelang_router.provide_routes(rows, weights, ids):
+        assert tilelang_router.provided_routes(rows) == (weights, ids)
+        assert tilelang_router.provided_routes(other) is None
+    assert tilelang_router.provided_routes(rows) is None
+
+
+@pytest.mark.parametrize("num_tokens", [150, 205])
+@pytest.mark.parametrize("vision", [False, True])
+def test_gate_router_route_local_matches_full_rows(
+    plain_scratch, padded_step, num_tokens, vision
+):
+    """Sequence-parallel local routing across ranks matches full-batch routing
+    bit-for-bit across both the split-K partials path (local_rows <= 64) and the
+    full-gate path (local_rows > 64), including vision tokens and padding masks."""
+    from vllm.models.deepseek_v4_1 import sp_prefill
+
+    world_size = 3
+    padded_step(num_tokens, 4)
+    gate = _Gate(384, seed=num_tokens)
+    generator = torch.Generator(device="cuda").manual_seed(num_tokens + int(vision))
+    x = torch.randn(num_tokens, 5120, device="cuda", generator=generator).to(
+        torch.bfloat16
+    )
+    bias = torch.randn(384, device="cuda", generator=generator) * 0.1
+    kwargs = dict(
+        top_k=6,
+        global_num_experts=384,
+        e_score_correction_bias=bias,
+        renormalize=True,
+        routed_scaling_factor=SCALE,
+        scoring_func="sqrtsoftplus",
+    )
+    input_ids = None
+    if vision:
+        kwargs.update(
+            bias_vl=torch.nn.Parameter(
+                torch.randn(384, device="cuda", generator=generator) * 0.1,
+                requires_grad=False,
+            ),
+            image_sentinel_lo=LO,
+            image_sentinel_count=1,
+        )
+        input_ids = torch.randint(
+            0, 1000, (num_tokens,), device="cuda", generator=generator
+        )
+        input_ids[2::5] = LO
+    router = tilelang_router.TileLangGateRouter(gate=gate, **kwargs)
+    router.declare_kernels()
+    expected_weights, expected_ids = router._compute_routing(
+        None, x, None, input_ids=input_ids
+    )
+
+    rank_weights = []
+    rank_ids = []
+    for rank in range(world_size):
+        layout = sp_prefill.SPRows(num_tokens, world_size, rank)
+        local_x = layout.local_slice(x)
+        w, idx = router.route_local(local_x, layout, input_ids=input_ids)
+        assert w.shape == (layout.local_rows, 6)
+        assert idx.shape == (layout.local_rows, 6)
+        assert torch.isfinite(w).all()
+        rank_weights.append(w)
+        rank_ids.append(idx)
+
+    gathered_weights = torch.cat(rank_weights, dim=0)[:num_tokens]
+    gathered_ids = torch.cat(rank_ids, dim=0)[:num_tokens]
+    assert torch.equal(gathered_ids, expected_ids)
+    assert torch.equal(
+        gathered_weights.view(torch.int32), expected_weights.view(torch.int32)
+    )
+
+    # When handed over via provide_routes, _compute_routing returns the gathered
+    # routes directly without touching the gate or reading the BF16 handle.
+    handle = torch.empty_like(x)
+    with tilelang_router.provide_routes(handle, gathered_weights, gathered_ids):
+        handed_w, handed_ids = router._compute_routing(
+            None, handle, None, input_ids=input_ids
+        )
+    assert handed_w is gathered_weights and handed_ids is gathered_ids

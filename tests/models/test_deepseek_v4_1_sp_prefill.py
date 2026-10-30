@@ -255,6 +255,238 @@ def test_activate_scopes_the_rows():
     assert sp_prefill.current() is None
 
 
+def test_gather_many_groups_pynccl_or_falls_back(monkeypatch):
+    layout = sp_prefill.SPRows(10, 3, 2)  # padded=12, local=4, real=2
+    assert layout.gather_many() == ()
+
+    a = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    b = torch.arange(12, dtype=torch.int64).reshape(4, 3)
+
+    # Fallback path when pynccl is disabled or absent.
+    monkeypatch.setattr(
+        sp_prefill,
+        "get_tp_group",
+        lambda: SimpleNamespace(
+            device_communicator=SimpleNamespace(pynccl_comm=None)
+        ),
+    )
+    monkeypatch.setattr(
+        sp_prefill,
+        "tensor_model_parallel_all_gather",
+        lambda x, dim: x.repeat(3, 1),
+    )
+    out_a, out_b = layout.gather_many(a, b, padded_rows=(64,))
+    assert out_a.shape == (64, 2)
+    torch.testing.assert_close(out_a[:10], a.repeat(3, 1)[:10], rtol=0, atol=0)
+    assert out_b.shape == (10, 3)
+    torch.testing.assert_close(out_b, b.repeat(3, 1)[:10], rtol=0, atol=0)
+
+    # Grouped PyNCCL path.
+    events = []
+
+    class _Comm:
+        disabled = False
+
+        def group_start(self):
+            events.append("group_start")
+
+        def all_gather(self, full, local):
+            events.append(("all_gather", tuple(full.shape), tuple(local.shape)))
+            full.copy_(local.repeat(3, *([1] * (local.ndim - 1))))
+
+        def group_end(self):
+            events.append("group_end")
+
+    monkeypatch.setattr(sp_prefill, "model_parallel_is_initialized", lambda: True)
+    monkeypatch.setattr(
+        sp_prefill,
+        "get_tp_group",
+        lambda: SimpleNamespace(
+            device_communicator=SimpleNamespace(pynccl_comm=_Comm())
+        ),
+    )
+    out_a2, out_b2 = layout.gather_many(a, b, padded_rows=(64,))
+    assert events == [
+        "group_start",
+        ("all_gather", (12, 2), (4, 2)),
+        ("all_gather", (12, 3), (4, 3)),
+        "group_end",
+    ]
+    assert out_a2.shape == (64, 2)
+    torch.testing.assert_close(out_a2[:10], out_a[:10], rtol=0, atol=0)
+    torch.testing.assert_close(out_b2, out_b, rtol=0, atol=0)
+    with pytest.raises(ValueError):
+        layout.gather_many(torch.zeros(3, 2))
+
+
+@pytest.mark.parametrize(
+    "num_tokens,expected_q_rows", [(10, 64), (70, 128), (131, 131)]
+)
+def test_gather_mxfp8_gathers_cast_and_extra_tensors(
+    monkeypatch, num_tokens, expected_q_rows
+):
+    from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows
+
+    world = 3
+    layouts = [sp_prefill.SPRows(num_tokens, world, rank) for rank in range(world)]
+    local = layouts[0].local_rows
+    local_q = max(local, 128)
+    full_vals = torch.arange(layouts[0].padded_rows * 64, dtype=torch.uint8).reshape(
+        layouts[0].padded_rows, 64
+    )
+    full_scales = torch.arange(layouts[0].padded_rows * 2, dtype=torch.uint8).reshape(
+        layouts[0].padded_rows, 2
+    )
+    full_weights = torch.arange(
+        layouts[0].padded_rows * 6, dtype=torch.float32
+    ).reshape(layouts[0].padded_rows, 6)
+    full_ids = torch.arange(layouts[0].padded_rows * 6, dtype=torch.int64).reshape(
+        layouts[0].padded_rows, 6
+    )
+
+    rank_0 = layouts[0]
+    vals_0 = torch.zeros((local_q, 64), dtype=torch.uint8)
+    scales_0 = torch.zeros((local_q, 2), dtype=torch.uint8)
+    vals_0[:local] = full_vals[:local]
+    scales_0[:local] = full_scales[:local]
+    x_q = MXFP8Rows(
+        rows=torch.empty((local, 64), dtype=torch.bfloat16),
+        values=vals_0,
+        scales=scales_0,
+    )
+
+    calls = []
+
+    def fake_gather_many(self, *tensors, padded_rows=()):
+        calls.append((len(tensors), padded_rows))
+        sources = (full_vals, full_scales, full_weights, full_ids)[: len(tensors)]
+        outs = []
+        for idx, (t, src) in enumerate(zip(tensors, sources)):
+            assert t.shape[0] == local
+            rows = padded_rows[idx] if idx < len(padded_rows) else self.num_tokens
+            if rows > self.num_tokens:
+                buf = src.new_zeros((rows, *src.shape[1:]))
+                buf[: self.num_tokens] = src[: self.num_tokens]
+                outs.append(buf)
+            else:
+                outs.append(src[: self.num_tokens])
+        return tuple(outs)
+
+    monkeypatch.setattr(sp_prefill.SPRows, "gather_many", fake_gather_many)
+    gathered_q, weights, ids = rank_0.gather_mxfp8(
+        x_q, full_weights[:local], full_ids[:local]
+    )
+    assert calls == [(4, (expected_q_rows, expected_q_rows))]
+    assert gathered_q.rows.shape == (num_tokens, 64)
+    assert gathered_q.rows.dtype == torch.bfloat16
+    assert gathered_q.values.shape == (expected_q_rows, 64)
+    assert gathered_q.scales.shape == (expected_q_rows, 2)
+    torch.testing.assert_close(
+        gathered_q.values[:num_tokens], full_vals[:num_tokens], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        gathered_q.scales[:num_tokens], full_scales[:num_tokens], rtol=0, atol=0
+    )
+    if expected_q_rows > num_tokens:
+        assert not gathered_q.values[num_tokens:].any()
+        assert not gathered_q.scales[num_tokens:].any()
+    torch.testing.assert_close(weights, full_weights[:num_tokens], rtol=0, atol=0)
+    torch.testing.assert_close(ids, full_ids[:num_tokens], rtol=0, atol=0)
+    with pytest.raises(ValueError):
+        rank_0.gather_mxfp8(
+            MXFP8Rows(
+                rows=torch.empty((local + 1, 64), dtype=torch.bfloat16),
+                values=vals_0,
+                scales=scales_0,
+            )
+        )
+
+
+def test_sp_moe_inputs_routes_local_rows_and_skips_duplicate_cast():
+    from vllm.models.deepseek_v4_1 import kernels
+    from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows, provided_mxfp8
+    from vllm.models.deepseek_v4_1.tilelang.router import provided_routes
+
+    layout = sp_prefill.SPRows(10, 3, 0)  # local_rows = 4
+    x = torch.randn(4, 64, dtype=torch.bfloat16)
+    x_q = MXFP8Rows(
+        rows=x,
+        values=torch.ones((128, 64), dtype=torch.uint8),
+        scales=torch.ones((128, 2), dtype=torch.uint8),
+    )
+    input_ids = torch.arange(10, dtype=torch.int64)
+    local_w = torch.ones((4, 6), dtype=torch.float32)
+    local_ids = torch.zeros((4, 6), dtype=torch.int64)
+    full_q = MXFP8Rows(
+        rows=torch.empty((10, 64), dtype=torch.bfloat16),
+        values=torch.ones((128, 64), dtype=torch.uint8),
+        scales=torch.ones((128, 2), dtype=torch.uint8),
+    )
+    full_w = torch.ones((10, 6), dtype=torch.float32)
+    full_ids = torch.zeros((10, 6), dtype=torch.int64)
+    seen = []
+
+    class _FakeSPRows:
+        def gather(self, _):
+            raise AssertionError("BF16 gather should not run when x_q is present")
+
+        def gather_mxfp8(self, q, *extra):
+            seen.append(("gather_mxfp8", q is x_q, len(extra)))
+            return (full_q, full_w, full_ids) if extra else (full_q,)
+
+    fake_sp_rows = _FakeSPRows()
+
+    def route_local(local_x, sp_rows, *, input_ids=None):
+        seen.append(("route_local", local_x is x, sp_rows is fake_sp_rows, input_ids))
+        return local_w, local_ids
+
+    mhc = SimpleNamespace(
+        cast_rows=lambda _: (_ for _ in ()).throw(
+            AssertionError("mhc.cast_rows should not run when x_q is present")
+        )
+    )
+    ffn = SimpleNamespace(
+        experts=SimpleNamespace(router=SimpleNamespace(route_local=route_local))
+    )
+    with kernels.sp_moe_inputs(fake_sp_rows, x, x_q, ffn, input_ids, mhc) as rows:
+        assert rows is full_q.rows
+        assert provided_mxfp8(rows) is full_q
+        assert provided_routes(rows) == (full_w, full_ids)
+    with pytest.raises(RuntimeError):
+        provided_mxfp8(full_q.rows)
+    assert provided_routes(full_q.rows) is None
+    assert seen == [
+        ("route_local", True, True, input_ids),
+        ("gather_mxfp8", True, 2),
+    ]
+
+    # Without route_local, gathers MXFP8 only.
+    seen.clear()
+    ffn_no_router = SimpleNamespace(experts=SimpleNamespace(router=object()))
+    with kernels.sp_moe_inputs(
+        _FakeSPRows(), x, x_q, ffn_no_router, input_ids, mhc
+    ) as rows:
+        assert rows is full_q.rows
+        assert provided_mxfp8(rows) is full_q
+        assert provided_routes(rows) is None
+    with pytest.raises(RuntimeError):
+        provided_mxfp8(full_q.rows)
+    assert seen == [("gather_mxfp8", True, 0)]
+
+    # When x_q is None (CPU stand-in tests), falls back to BF16 gather + cast_rows.
+    fallback_rows = torch.randn(10, 64, dtype=torch.bfloat16)
+    cast_called = []
+    sp_fallback = SimpleNamespace(gather=lambda local_x: fallback_rows)
+    mhc_fallback = SimpleNamespace(
+        cast_rows=lambda r: (cast_called.append(r is fallback_rows), None)[1]
+    )
+    with kernels.sp_moe_inputs(
+        sp_fallback, x, None, ffn, input_ids, mhc_fallback
+    ) as rows:
+        assert rows is fallback_rows
+    assert cast_called == [True]
+
+
 def test_moe_reduce_scatter_sums_shared_and_routed_before_the_scatter(monkeypatch):
     from vllm.model_executor.layers.fused_moe.runner import moe_runner
 

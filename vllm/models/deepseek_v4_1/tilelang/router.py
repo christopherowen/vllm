@@ -27,7 +27,9 @@ memory and each MoE layer runs one launch fewer. At prefill the gate runs its
 own GEMM and TileKernels routes the logits.
 """
 
+import contextlib
 import functools
+from typing import NamedTuple
 
 import tilelang
 import tilelang.language as T
@@ -160,8 +162,17 @@ def _ced_routing_mask(context, rows: int, ced_decoder: bool) -> torch.Tensor | N
     return None
 
 
+def _local_mask(mask: torch.Tensor | None, rows: int, sp_rows) -> torch.Tensor | None:
+    """``mask``'s first ``rows`` rows, or this rank's ``sp_rows.local_rows`` slice."""
+    if mask is None:
+        return None
+    if sp_rows is not None and mask.shape[0] != rows:
+        return sp_rows.local_slice(mask[: sp_rows.num_tokens])
+    return mask if mask.shape[0] == rows else mask[:rows]
+
+
 def _known_routing_mask(
-    rows: int, ced_decoder: bool
+    rows: int, ced_decoder: bool, sp_rows=None
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """``(mask, None)`` when this step's rows to route are known (a CED decoder's,
     or the step's already computed), ``(None, is_padding)`` when the step's padding
@@ -177,7 +188,7 @@ def _known_routing_mask(
         return None, None
     cached = getattr(context, "_ds41_routing_mask", None)
     if cached is not None and cached[0] is is_padding:
-        return cached[1][:rows], None
+        return _local_mask(cached[1], rows, sp_rows), None
     return None, is_padding
 
 
@@ -199,30 +210,30 @@ def _routing_masks(
     count: int,
     *,
     ced_decoder: bool = False,
+    sp_rows=None,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """``(_image_token_mask(input_ids, lo, count), _routing_mask(rows))``, the
     image mask None without ``input_ids``: what a forward's first routing layer
     computes of them, in one launch, and later layers find cached."""
     context = get_forward_context() if is_forward_context_available() else None
     image = None if input_ids is None else _cached_image_mask(context, input_ids)
-    route, is_padding = _known_routing_mask(rows, ced_decoder)
+    route, is_padding = _known_routing_mask(rows, ced_decoder, sp_rows=sp_rows)
     ids = input_ids if image is None else None
-    if ids is None and is_padding is None:
-        return image, route
-    new_image, routed = _masks(ids, lo, count, is_padding)
-    if ids is not None:
-        image = new_image
-        if context is not None:
-            context._ds41_image_token_mask = (ids, image)
-    if is_padding is not None:
-        assert context is not None and routed is not None
-        context._ds41_routing_mask = (is_padding, routed)
-        route = routed[:rows]
-    return image, route
+    if ids is not None or is_padding is not None:
+        new_image, routed = _masks(ids, lo, count, is_padding)
+        if ids is not None:
+            image = new_image
+            if context is not None:
+                context._ds41_image_token_mask = (ids, image)
+        if is_padding is not None:
+            assert context is not None and routed is not None
+            context._ds41_routing_mask = (is_padding, routed)
+            route = _local_mask(routed, rows, sp_rows)
+    return _local_mask(image, rows, sp_rows), route
 
 
 def _partials_mask(
-    rows: int, *, ced_decoder: bool = False
+    rows: int, *, ced_decoder: bool = False, sp_rows=None
 ) -> tuple[torch.Tensor | None, bool]:
     """``route_partials``' mask of this step's rows and whether it is the padding
     mask itself (a set row is skipped; nothing negates it) or a CED decoder's
@@ -234,7 +245,9 @@ def _partials_mask(
     if ced is not None:
         return ced, False
     is_padding = context.is_padding
-    return (None, False) if is_padding is None else (is_padding[:rows], True)
+    if is_padding is None:
+        return None, False
+    return _local_mask(is_padding, rows, sp_rows), True
 
 
 def _routing_mask_variants(vllm_config) -> tuple[bool, ...]:
@@ -320,6 +333,7 @@ class TileKernelsRouter(FusedTopKBiasRouter):
         indices_type: torch.dtype | None,
         *,
         input_ids: torch.Tensor | None = None,
+        sp_rows=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         image_bias = None
         vision = self.bias_vl is not None and self.image_sentinel_lo > 0
@@ -333,6 +347,7 @@ class TileKernelsRouter(FusedTopKBiasRouter):
             self.image_sentinel_lo,
             self.image_sentinel_count,
             ced_decoder=getattr(self, "_ds41_is_ced_decoder", False),
+            sp_rows=sp_rows,
         )
         topk_ids, topk_weights = _topk_gate(
             router_logits,
@@ -511,6 +526,41 @@ def route_partials(
     return router_partials
 
 
+class RoutedRows(NamedTuple):
+    """Top-k routing weights and expert ids computed on local SP rows and
+    gathered beside ``rows``' MXFP8 cast."""
+
+    rows: torch.Tensor
+    weights: torch.Tensor
+    ids: torch.Tensor
+
+
+_PROVIDED_ROUTES: list[RoutedRows] = []
+
+
+@contextlib.contextmanager
+def provide_routes(
+    rows: torch.Tensor, weights: torch.Tensor, ids: torch.Tensor
+):
+    """Hand ``rows``' gathered top-k routing to ``TileLangGateRouter`` for the
+    MoE call inside."""
+    _PROVIDED_ROUTES.append(RoutedRows(rows, weights, ids))
+    try:
+        yield
+    finally:
+        _PROVIDED_ROUTES.pop()
+
+
+def provided_routes(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """The handed-over ``(weights, ids)`` routing of ``x``, or None."""
+    for routes in reversed(_PROVIDED_ROUTES):
+        if routes.rows.data_ptr() == x.data_ptr() and routes.rows.shape == x.shape:
+            return routes.weights, routes.ids
+    return None
+
+
 class TileLangGateRouter(TileKernelsRouter):
     """TileKernelsRouter that also runs the gate, fusing its decode reduction.
 
@@ -623,6 +673,22 @@ class TileLangGateRouter(TileKernelsRouter):
             warm=self._warm,
         )
 
+    def route_local(
+        self,
+        x: torch.Tensor,
+        sp_rows,
+        *,
+        input_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Route this rank's ``sp_rows.local_rows`` rows before the SP MoE gather."""
+        if x.shape[0] != sp_rows.local_rows:
+            raise ValueError(
+                f"SP local routing expects {sp_rows.local_rows} rows, got {x.shape}"
+            )
+        return self._compute_routing(
+            x, x, torch.int64, input_ids=input_ids, sp_rows=sp_rows
+        )
+
     def _compute_routing(
         self,
         hidden_states: torch.Tensor,
@@ -630,16 +696,28 @@ class TileLangGateRouter(TileKernelsRouter):
         indices_type: torch.dtype | None,
         *,
         input_ids: torch.Tensor | None = None,
+        sp_rows=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from .linear import _partial_specs, _scratch, partials_kernel
 
         gate = self.gate
         x = router_logits.reshape(-1, gate.weight.shape[1])
+        provided = provided_routes(x)
+        if provided is not None:
+            if indices_type not in (None, torch.int64):
+                raise ValueError(
+                    f"TileLang routing writes int64 expert ids, not {indices_type}"
+                )
+            return provided
         specs = _partial_specs(gate, x.shape[0])
         if not specs:
             logits, _ = gate(x)
             return super()._compute_routing(
-                hidden_states, logits, indices_type, input_ids=input_ids
+                hidden_states,
+                logits,
+                indices_type,
+                input_ids=input_ids,
+                sp_rows=sp_rows,
             )
         if indices_type not in (None, torch.int64):
             raise ValueError(
@@ -650,9 +728,11 @@ class TileLangGateRouter(TileKernelsRouter):
         image = self.bias_vl is not None and self.image_sentinel_lo > 0
         if image and input_ids is None:
             raise ValueError("DeepSeek V4.1 vision routing requires input_ids")
+        ced_decoder = getattr(self, "_ds41_is_ced_decoder", False)
         route_mask, padding = _partials_mask(
             x.shape[0],
-            ced_decoder=getattr(self, "_ds41_is_ced_decoder", False),
+            ced_decoder=ced_decoder,
+            sp_rows=sp_rows,
         )
         key = (
             {torch.int32: "int32", torch.int64: "int64"}[input_ids.dtype]
@@ -679,9 +759,8 @@ class TileLangGateRouter(TileKernelsRouter):
             )
         # A vision layer's kernel compares the ids with the sentinels itself; a
         # text layer's, and an absent routing mask, read nothing of these rows.
-        image_bias, mask = (
-            (self.bias_vl.data, input_ids) if image else (bias, self._no_image[:rows])
-        )
+        ids = _local_mask(input_ids, rows, sp_rows) if image else self._no_image[:rows]
+        image_bias, mask = (self.bias_vl.data, ids) if image else (bias, ids)
         self._kernels[key](
             partials,
             bias,

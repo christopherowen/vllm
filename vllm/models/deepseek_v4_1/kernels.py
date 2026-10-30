@@ -86,6 +86,51 @@ def mxfp8_inputs(rows) -> contextlib.AbstractContextManager:
     return provide_mxfp8(rows)
 
 
+@contextlib.contextmanager
+def sp_moe_inputs(
+    sp_rows,
+    x: torch.Tensor,
+    x_q,
+    ffn: nn.Module,
+    input_ids: torch.Tensor | None,
+    mhc: nn.Module | None = None,
+):
+    """Gather the MoE sublayer's inputs across sequence-parallel ranks.
+
+    When ``mhc.post_pre`` already cast the rank's local rows into ``x_q``
+    (``MXFP8Rows``), each rank routes its ``sp_rows.local_rows`` BF16 rows and
+    all-gathers ``(x_q.values, x_q.scales, topk_weights, topk_ids)`` in one
+    grouped collective, handing both the gathered MXFP8 cast and the gathered
+    routes to ``ffn`` without all-gathering BF16 ``x`` or re-running
+    ``mhc.cast_rows``. When ``x_q`` is None (mHC stand-ins in model tests),
+    gathers BF16 ``x`` and falls back to ``mhc.cast_rows(rows)``.
+    """
+    if x_q is None:
+        rows = sp_rows.gather(x)
+        cast = None if mhc is None else mhc.cast_rows(rows)
+        with mxfp8_inputs(cast):
+            yield rows
+        return
+    from .tilelang.linear import provide_mxfp8
+    from .tilelang.router import provide_routes
+
+    router = getattr(getattr(ffn, "experts", None), "router", None)
+    route_local = getattr(router, "route_local", None)
+    if callable(route_local):
+        weights, ids = route_local(x, sp_rows, input_ids=input_ids)
+        gathered_q, weights, ids = sp_rows.gather_mxfp8(x_q, weights, ids)
+        with (
+            provide_mxfp8(gathered_q),
+            provide_routes(gathered_q.rows, weights, ids),
+        ):
+            yield gathered_q.rows
+        return
+    (gathered_q,) = sp_rows.gather_mxfp8(x_q)
+    with provide_mxfp8(gathered_q):
+        yield gathered_q.rows
+
+
+
 def rms_norm(hidden_size: int, eps: float = 1e-6) -> nn.Module:
     from .tilelang.norm import TileLangRMSNorm
 

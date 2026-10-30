@@ -397,15 +397,18 @@ class DeepseekV4DecoderLayer(nn.Module):
             with kernels.mxfp8_inputs(x_q):
                 x = self.ffn(x, input_ids)
         else:
-            # SP: route every row; the TP partial sum is reduce-scattered.
-            with sp_prefill.activate(sp_rows):
-                rows = sp_rows.gather(x)
-                with kernels.mxfp8_inputs(self.mhc.cast_rows(rows)):
-                    x = self.ffn(
-                        rows,
-                        input_ids,
-                        reduce_scatter_rows=sp_rows.padded_rows,
-                    )
+            # SP: route local rows, gather MXFP8 + routes, and reduce-scatter.
+            with (
+                sp_prefill.activate(sp_rows),
+                kernels.sp_moe_inputs(
+                    sp_rows, x, x_q, self.ffn, input_ids, self.mhc
+                ) as rows,
+            ):
+                x = self.ffn(
+                    rows,
+                    input_ids,
+                    reduce_scatter_rows=sp_rows.padded_rows,
+                )
             if sp_rows.unreduced:
                 x = sp_prefill.unreduced_parts(x)
         return x, residual, post_mix, res_mix, ffn_pre

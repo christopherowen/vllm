@@ -47,15 +47,20 @@ row and then compacts.
 ## Where each op runs
 
 - Local rows (L): the residual carry, mHC pre / post / post_pre / collapse,
-  attn_norm, ffn_norm, the Engram gate (``run_engram_mix``) and the final norm.
+  attn_norm, ffn_norm, the Engram gate (``run_engram_mix``), the MoE gate and
+  top-k routing, and the final norm.
 - Gathered rows (T): the Engram lookup reduction and ``wkv`` (each rank keeps
   only its own rows of ``wkv``'s product, exchanged all-to-all; the TileLang
   gate reads the exchanged column blocks in place), attention
   (``wq_b``, indexer, compressor, KV cache writes, sparse MLA, WO), and the
-  MoE gate, top-k, routed and shared experts.
+  MoE routed and shared experts.
 - In attention layers without a compressor, the row-wise front
   (``fused_wqa_wkv``, the q/kv norms and the index weights) runs on local
   rows and its narrower product is gathered instead of the hidden state.
+- In MoE layers, ``mhc.post_pre`` already writes the local rows' MXFP8 cast and
+  the router routes the local BF16 rows; one grouped all-gather exchanges the
+  MXFP8 values, scales and local top-k routes instead of gathering the BF16
+  hidden state and casting every row again on every rank.
 
 Per decoder layer: all-gather before attention (inside
 ``DeepseekV4Attention._forward``, behind the opaque attention op, which reads
@@ -197,6 +202,77 @@ class SPRows:
         if x.shape[0] != self.local_rows:
             raise ValueError(f"SP gather expects {self.local_rows} rows, got {x.shape}")
         return tensor_model_parallel_all_gather(x, dim=0)[: self.num_tokens]
+
+    def gather_many(
+        self, *tensors: torch.Tensor, padded_rows: tuple[int, ...] = ()
+    ) -> tuple[torch.Tensor, ...]:
+        """All-gather several L-row tensors into their first T rows (or ``padded_rows``
+        when given for a tensor) in one grouped PyNCCL collective when available."""
+        inputs = []
+        for x in tensors:
+            x = materialize(x)
+            if x.shape[0] != self.local_rows:
+                raise ValueError(
+                    f"SP gather expects {self.local_rows} rows, got {x.shape}"
+                )
+            inputs.append(x)
+        limits = padded_rows + (self.num_tokens,) * (len(inputs) - len(padded_rows))
+        comm = (
+            getattr(get_tp_group().device_communicator, "pynccl_comm", None)
+            if model_parallel_is_initialized()
+            else None
+        )
+        if comm is None or comm.disabled:
+            outs = []
+            for x, rows in zip(inputs, limits):
+                gathered = tensor_model_parallel_all_gather(x, dim=0)
+                if rows > gathered.shape[0]:
+                    padded = x.new_empty((rows, *x.shape[1:]))
+                    padded[: gathered.shape[0]].copy_(gathered)
+                    outs.append(padded)
+                else:
+                    outs.append(gathered[:rows])
+            return tuple(outs)
+        outs = []
+        pairs = []
+        for x, rows in zip(inputs, limits):
+            inp = x.contiguous()
+            alloc_rows = max(self.padded_rows, rows)
+            out = torch.empty(
+                (alloc_rows, *inp.shape[1:]), dtype=inp.dtype, device=inp.device
+            )
+            outs.append(out[:rows])
+            pairs.append((out[: self.padded_rows], inp))
+        comm.group_start()
+        for dst, src in pairs:
+            comm.all_gather(dst, src)
+        comm.group_end()
+        return tuple(outs)
+
+    def gather_mxfp8(self, x_q, *extra: torch.Tensor):
+        """All-gather this rank's L-row ``MXFP8Rows`` (and any ``extra`` L-row
+        tensors, such as local top-k routes) in one grouped collective, returning
+        ``(MXFP8Rows, *extra_gathered)``."""
+        from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows, mxfp8_rows
+
+        local = self.local_rows
+        if x_q.rows.shape[0] != local:
+            raise ValueError(
+                f"SP MXFP8 gather expects {local} rows, got {x_q.rows.shape}"
+            )
+        rows_q = mxfp8_rows(self.num_tokens)
+        values, scales, *rest = self.gather_many(
+            x_q.values[:local],
+            x_q.scales[:local],
+            *extra,
+            padded_rows=(rows_q, rows_q),
+        )
+        rows = torch.empty(
+            (self.num_tokens, *x_q.rows.shape[1:]),
+            dtype=x_q.rows.dtype,
+            device=x_q.rows.device,
+        )
+        return (MXFP8Rows(rows, values, scales), *rest)
 
     def reduce_scatter(self, padded: torch.Tensor) -> torch.Tensor:
         """Sum a zero-padded Tp-row buffer over the ranks into this rank's rows."""
