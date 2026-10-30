@@ -61,3 +61,21 @@ def test_standalone_declaration_prepares_and_binds_now(monkeypatch):
     bound = []
     prepare.declare(lambda: [prepare.call(_rope, 2, 64)], bind=lambda: bound.append(1))
     assert prepared == [(_rope, (2, 64), {})] and bound == [1]
+
+
+def test_registry_warmup_skips_calls_already_prepared_by_prepare_declared(monkeypatch):
+    batches = []
+    monkeypatch.setattr(
+        tilelang, "prepare", lambda calls, **kw: batches.append(list(calls))
+    )
+    registry = JitWarmupRegistry(vllm_config=None)
+    with registry.activate():
+        prepare.declare(lambda: [prepare.call(_gemm, 1024, 512, block_M=16)])
+    assert prepare.prepare_declared(registry) == 1
+    with registry.activate():
+        prepare.declare(lambda: [prepare.call(_rope, 8, 512)])
+    registry.warmup()
+    assert batches == [
+        [(_gemm, (1024, 512), {"block_M": 16})],
+        [(_rope, (8, 512), {})],
+    ]

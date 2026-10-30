@@ -561,15 +561,24 @@ def _bf16_kernels(layer: nn.Module) -> dict:
     n, k = layer.weight.shape
     out_dtype = _out_dtype(layer)
     shards = bf16_shards(n, k)
-    kernels = {
-        "gemm": prepare.call(bf16_gemm, n, k, out_dtype=out_dtype, shards=shards)
-    }
+    router = getattr(layer, "tilelang_router", None)
+    bounded_router = router is not None and router.max_rows is not None
+    kernels = {}
+    if shards == 1 or not bounded_router or router._gates_every_row():
+        kernels["gemm"] = prepare.call(
+            bf16_gemm, n, k, out_dtype=out_dtype, shards=shards
+        )
     if shards > 1:
+        max_rows = router.max_rows if bounded_router else None
         kernels["partials"] = {
             block_M: prepare.call(bf16_gemm_partials, n, k, shards, block_M=block_M)
-            for block_M in PARTIAL_ROW_TILES
+            for i, block_M in enumerate(PARTIAL_ROW_TILES)
+            if i == 0 or max_rows is None or max_rows > PARTIAL_ROW_TILES[i - 1]
         }
-        kernels["reduce"] = prepare.call(splitk_reduce, n, shards, out_dtype=out_dtype)
+        if not bounded_router:
+            kernels["reduce"] = prepare.call(
+                splitk_reduce, n, shards, out_dtype=out_dtype
+            )
     return kernels
 
 

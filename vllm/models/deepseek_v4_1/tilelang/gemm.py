@@ -1272,9 +1272,14 @@ WIDE_DECODE: dict[tuple[int, int], dict[int, int]] = {
 # BF16 projections whose split-K decode path serves rows past DECODE_ROWS, by
 # (N, K): the most rows it serves. The partials plus their reduce add the same
 # shards in the same order as the shard GEMM, so the bits do not change. The
-# router (8 shards) splits faster up to 256 rows, the indexer's head weights (40
-# shards) up to 1024 (decode-rows bundle, 2026-10-10).
-BF16_SPLIT_ROWS: dict[tuple[int, int], int] = {(384, 5120): 256, (32, 5120): 1024}
+# routers (8 shards at 384 experts, 20 at the drafter's 128) split faster up to
+# 256 rows, the indexer's head weights (40 shards) up to 1024 (decode-rows
+# bundle, 2026-10-10).
+BF16_SPLIT_ROWS: dict[tuple[int, int], int] = {
+    (384, 5120): 256,
+    (128, 5120): 256,
+    (32, 5120): 1024,
+}
 
 
 def decode_tile_rows(rows: int, wide: dict[int, int] | None = None) -> int:

@@ -197,6 +197,8 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
         moe = _kernels()
         w13, w2 = layer.w13_weight, layer.w2_weight  # [E, 2I, H/2], [E, H, I/2]
         limit = self.quant_config.gemm1_clamp_limit
+        router = getattr(layer, "router", None)
+        idx_dtype = getattr(router, "indices_dtype", None)
         # The plan's geometry; its kernels are declared when the worker prepares
         # kernels (``declare_kernels``).
         self._plan = moe.MoeExpertsV41Plan(
@@ -206,6 +208,10 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
             w2.shape[2] * 2,
             swiglu_limit=self.moe_config.swiglu_limit if limit is None else limit,
             out_dtype=self.output_dtype,
+            idx_dtypes=(idx_dtype,)
+            if idx_dtype is not None
+            else (torch.int32, torch.int64),
+            max_rows=getattr(router, "max_rows", None),
         )
         # Tile-major copies replace the checkpoint layout, so each GEMM tile's
         # weights and scale codes are contiguous. A K that ends 64 past a multiple

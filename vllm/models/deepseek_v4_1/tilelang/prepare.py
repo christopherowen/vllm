@@ -70,10 +70,14 @@ class TileLangKernels(VllmJitKernel[_CallKey]):
     the owner's kernels once the cache is frozen.
     """
 
+    def __init__(self) -> None:
+        super().__init__()
+        self._prepared_calls: set[int] = set()
+
     def get_warmup_keys(
         self, calls: Calls | None, bind=None, warm=None
     ) -> list[_CallKey]:
-        if calls is None:
+        if calls is None or id(calls) in self._prepared_calls:
             return []
         return [_CallKey(function, args, kwargs) for function, args, kwargs in calls()]
 
@@ -83,8 +87,11 @@ class TileLangKernels(VllmJitKernel[_CallKey]):
     def compile_many(self, compile_keys: Iterable[_CallKey]) -> None:
         import tilelang
 
+        pending = [(key.function, key.args, key.kwargs) for key in compile_keys]
+        if not pending:
+            return
         tilelang.prepare(
-            [(key.function, key.args, key.kwargs) for key in compile_keys],
+            pending,
             num_workers=compile_workers(),
             progress=PROGRESS.report,
         )
@@ -182,8 +189,12 @@ def declared_calls(registry: JitWarmupRegistry) -> list[TileLangCall]:
     for kernel, registrations in registry.registrations():
         if kernel is not TILELANG:
             continue
-        for args, kwargs in registrations:
-            for key in kernel.get_warmup_keys(*args, **kwargs):
+        for args, _ in registrations:
+            fn = args[0] if args else None
+            if fn is None:
+                continue
+            for function, call_args, call_kwargs in fn():
+                key = _CallKey(function, call_args, call_kwargs)
                 calls.setdefault(key, (key.function, key.args, key.kwargs))
     return list(calls.values())
 
@@ -205,6 +216,11 @@ def prepare_declared(registry: JitWarmupRegistry) -> int:
     calls = declared_calls(registry)
     PROGRESS.start(len(calls))
     tilelang.prepare(calls, num_workers=compile_workers(), progress=PROGRESS.report)
+    for kernel, registrations in registry.registrations():
+        if kernel is TILELANG:
+            for args, _ in registrations:
+                if args and args[0] is not None:
+                    TILELANG._prepared_calls.add(id(args[0]))
     return len(calls)
 
 

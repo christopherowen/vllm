@@ -279,3 +279,98 @@ def test_dead_row_caps_are_declared_before_the_manager_exists(monkeypatch):
         runner_module.GPUModelRunner.declare_step_kernels(runner)
         assert declared.pop()["dead_rows"] is enabled
     assert not declared
+
+
+def test_bounded_moe_and_router_declarations_omit_unreachable_cold_boot_kernels():
+    """Target and drafter MoE plans, router gates, and Markov heads declare only the
+    tile heights, dispatch parts, and index dtypes their row bounds can reach."""
+    import torch
+
+    from vllm.models.deepseek_v4_1.tilelang import gemm, linear, moe, vocab
+
+    assert gemm.BF16_SPLIT_ROWS[(128, 5120)] == 256
+
+    drafter = moe.MoeExpertsV41Plan(
+        128,
+        3,
+        5120,
+        576,
+        swiglu_limit=10.0,
+        out_dtype=torch.float32,
+        idx_dtypes=(torch.int64,),
+        max_rows=80,
+    )
+    assert not drafter._has_prefill_tiles()
+    assert set(drafter.kernels()) == {
+        "gate_up",
+        "down",
+        "swiglu",
+        "late_gate_up",
+        "late_down",
+    }
+    drafter_dispatches = drafter._dispatches()
+    assert len(drafter_dispatches) == 1
+    drafter_dispatch_kernels = drafter_dispatches[0].kernels()
+    assert set(drafter_dispatch_kernels) == {
+        "fused",
+        "combine_kernels",
+        "fold_kernels",
+    }
+    assert set(drafter_dispatch_kernels["combine_kernels"]) == {
+        (False, False),
+        (True, False),
+    }
+    assert set(drafter_dispatch_kernels["fold_kernels"]) == {False}
+
+    target = moe.MoeExpertsV41Plan(
+        384,
+        6,
+        5120,
+        576,
+        swiglu_limit=10.0,
+        out_dtype=torch.float32,
+        idx_dtypes=(torch.int64,),
+        max_rows=4096,
+    )
+    assert target._has_prefill_tiles()
+    target_dispatches = target._dispatches()
+    assert len(target_dispatches) == 2
+    assert set(target_dispatches[0].kernels()) == {
+        "fused",
+        "count",
+        "layout",
+        "scatter",
+        "combine_kernels",
+        "fold_kernels",
+    }
+    assert set(target_dispatches[1].kernels()) == {
+        "count",
+        "layout",
+        "scatter",
+        "combine_kernels",
+        "fold_kernels",
+    }
+
+    drafter_gate = SimpleNamespace(
+        weight=torch.empty((128, 5120), dtype=torch.bfloat16),
+        out_dtype=torch.float32,
+        tilelang_router=SimpleNamespace(
+            max_rows=80, _gates_every_row=lambda: False
+        ),
+    )
+    assert set(linear._bf16_kernels(drafter_gate)) == {"partials"}
+
+    target_gate = SimpleNamespace(
+        weight=torch.empty((384, 5120), dtype=torch.bfloat16),
+        out_dtype=torch.float32,
+        tilelang_router=SimpleNamespace(
+            max_rows=4096, _gates_every_row=lambda: True
+        ),
+    )
+    assert set(linear._bf16_kernels(target_gate)) == {"gemm", "partials"}
+
+    markov_head = SimpleNamespace(
+        weight=torch.empty((32320, 256), dtype=torch.bfloat16),
+        tilelang_max_rows=16,
+    )
+    assert set(vocab._bf16_head_kernels(markov_head, torch.bfloat16)) == {16}

@@ -313,6 +313,8 @@ def _warm_topk_gate(num_topk: int, num_experts: int, image: bool, mask: bool) ->
 class TileKernelsRouter(FusedTopKBiasRouter):
     """V4.1 routing through TileKernels' TileLang top-k gate."""
 
+    indices_dtype = torch.int64
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if self._hash_indices_table is not None:
@@ -584,6 +586,7 @@ class TileLangGateRouter(TileKernelsRouter):
             if vllm_config is None
             else vllm_config.scheduler_config.max_num_batched_tokens
         )
+        gate.tilelang_router = self
         self._mask_variants = _routing_mask_variants(vllm_config)
 
     def _partials_kernels(self) -> dict[tuple, prepare.TileLangCall]:

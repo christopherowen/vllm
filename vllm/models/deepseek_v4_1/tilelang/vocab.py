@@ -207,6 +207,16 @@ def packed_vocab_projection(
 _OUT = {torch.bfloat16: T.bfloat16, torch.float32: T.float32}
 
 
+def _head_row_tiles(layer: nn.Module) -> tuple[int, ...]:
+    """The token tiles a head can launch: up to ``tilelang_max_rows`` when set."""
+    max_rows = getattr(layer, "tilelang_max_rows", None)
+    return tuple(
+        block_M
+        for i, block_M in enumerate(ROW_TILES)
+        if i == 0 or max_rows is None or max_rows > ROW_TILES[i - 1]
+    )
+
+
 def _packed_head_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dict:
     """A packed head's projection for every token tile, as calls (its exponent base
     comes from the packed weights)."""
@@ -221,7 +231,7 @@ def _packed_head_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dict:
             out_dtype=_OUT[out_dtype],
             **tile_config(block_M, k),
         )
-        for block_M in ROW_TILES
+        for block_M in _head_row_tiles(layer)
     }
 
 
@@ -229,7 +239,7 @@ def _bf16_head_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dict:
     """A BF16 head's projection for every token tile, as calls."""
     n, k = map(int, layer.weight.shape)
     kernels = {}
-    for block_M in ROW_TILES:
+    for block_M in _head_row_tiles(layer):
         config = dict(BF16_HEAD_CONFIGS[block_M])
         if k % config["block_K"]:
             config["block_K"] = 64

@@ -315,6 +315,10 @@ class DSparkDeepseekV4Model(nn.Module):
             lm_head_quantization="nvfp4" if envs.VLLM_DS41_MARKOV_NVFP4 else None,
             vocab_parallel=_vocab_parallel_greedy(),
         )
+        # Each sequential Markov step projects one row per request.
+        self.markov_head.markov_w2.tilelang_max_rows = (
+            vllm_config.scheduler_config.max_num_seqs
+        )
         self.confidence_head: DSparkConfidenceHead | None = None
         if getattr(config, "enable_confidence_head", True):
             self.confidence_head = kernels.dspark_confidence_head(

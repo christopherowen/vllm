@@ -444,6 +444,10 @@ class MoeDispatchV41Plan:
         hidden,
         idx_dtype=torch.int64,
         out_dtype=torch.bfloat16,
+        *,
+        min_routes: int = 1,
+        max_routes: int | None = None,
+        weighted: bool = False,
     ):
         self.num_experts, self.topk, self.block_M, self.hidden = (
             num_experts,
@@ -453,6 +457,9 @@ class MoeDispatchV41Plan:
         )
         self.idx_dtype = idx_dtype
         self.out_dtype = out_dtype
+        self.min_routes = min_routes
+        self.max_routes = max_routes
+        self.weighted = weighted
 
     def kernels(self) -> dict:
         """Every kernel of the plan, as the calls ``bind`` makes."""
@@ -464,16 +471,25 @@ class MoeDispatchV41Plan:
         )
         tl_idx = {torch.int64: T.int64, torch.int32: T.int32}[self.idx_dtype]
         tl_out = {torch.bfloat16: T.bfloat16, torch.float32: T.float32}[self.out_dtype]
+        parts = (
+            *(("fused",) if self.min_routes <= _CHUNK else ()),
+            *(
+                ("count", "layout", "scatter")
+                if self.max_routes is None or self.max_routes > _CHUNK
+                else ()
+            ),
+        )
         kernels = {
             part: prepare.call(
                 moe_dispatch_v41, num_experts, topk, block_M, part, tl_idx
             )
-            for part in ("fused", "count", "layout", "scatter")
+            for part in parts
         }
+        weights = (False, True) if self.weighted else (False,)
         kernels["combine_kernels"] = {
             (s, w): prepare.call(moe_combine_v41, hidden, topk, s, w, out_dtype=tl_out)
             for s in (False, True)
-            for w in (False, True)
+            for w in weights
         }
         # A wider output (the FP32 partial) can instead take the shared expert's
         # output, add it in FP32 and round once to BF16 (``combine(shared=...)``).
@@ -484,7 +500,7 @@ class MoeDispatchV41Plan:
                 w: prepare.call(
                     moe_combine_v41, hidden, topk, True, w, out_dtype=T.bfloat16
                 )
-                for w in (False, True)
+                for w in weights
             }
         )
         return kernels
@@ -1306,6 +1322,8 @@ class MoeExpertsV41Plan:
         block_N=128,
         num_stages=3,
         out_dtype=torch.bfloat16,
+        idx_dtypes=(torch.int32, torch.int64),
+        max_rows: int | None = None,
     ):
         self.num_experts, self.topk, self.hidden, self.intermediate = (
             num_experts,
@@ -1322,23 +1340,65 @@ class MoeExpertsV41Plan:
         self.swiglu_limit = swiglu_limit
         # Routers emit int32 or int64 expert ids. The combine writes ``out_dtype``.
         self.out_dtype = out_dtype
-        self.dispatch, self.prefill_dispatch = (
-            {
-                dtype: MoeDispatchV41Plan(
-                    num_experts, topk, height, hidden, dtype, out_dtype
-                )
-                for dtype in (torch.int32, torch.int64)
-            }
-            for height in (block_M, prefill_block_M)
+        self.idx_dtypes = tuple(idx_dtypes)
+        self.max_rows = max_rows
+        prefill_min_routes = block_M * num_experts
+        decode_max_routes = (
+            prefill_min_routes - 1 if prefill_block_M != block_M else None
         )
+        if max_rows is not None:
+            max_routes = max_rows * topk
+            decode_max_routes = (
+                max_routes
+                if decode_max_routes is None
+                else min(decode_max_routes, max_routes)
+            )
+        else:
+            max_routes = None
+        self.dispatch = {
+            dtype: MoeDispatchV41Plan(
+                num_experts,
+                topk,
+                block_M,
+                hidden,
+                dtype,
+                out_dtype,
+                max_routes=decode_max_routes,
+            )
+            for dtype in self.idx_dtypes
+        }
+        self.prefill_dispatch = {
+            dtype: MoeDispatchV41Plan(
+                num_experts,
+                topk,
+                prefill_block_M,
+                hidden,
+                dtype,
+                out_dtype,
+                min_routes=prefill_min_routes,
+                max_routes=max_routes,
+            )
+            for dtype in self.idx_dtypes
+        }
         self.tk = _tile_kernels(block_M)
 
+    def _has_prefill_tiles(self) -> bool:
+        return (
+            self.max_rows is None
+            or self.tile_height(self.max_rows) != self.block_M
+        )
+
+    def _dispatches(self) -> tuple[MoeDispatchV41Plan, ...]:
+        if self._has_prefill_tiles():
+            return (*self.dispatch.values(), *self.prefill_dispatch.values())
+        return tuple(self.dispatch.values())
+
     def kernels(self) -> dict:
-        """The grouped GEMMs and the fused SwiGLU at both tile heights, as the calls
-        ``bind`` makes: ``gate_up``, ``down`` and ``swiglu`` at ``block_M``; at the same
-        height ``late_gate_up`` and ``late_down``, which trigger after their K loop
-        (calls of ``LATE_TRIGGER_ROWS`` rows or more); and with a ``prefill_`` prefix
-        at ``prefill_block_M``, whose GEMMs trigger late too."""
+        """The grouped GEMMs and the fused SwiGLU at each reachable tile height, as
+        the calls ``bind`` makes: ``gate_up``, ``down`` and ``swiglu`` at ``block_M``;
+        at the same height ``late_gate_up`` and ``late_down``, which trigger after
+        their K loop (calls of ``LATE_TRIGGER_ROWS`` rows or more); and with a
+        ``prefill_`` prefix at ``prefill_block_M``, whose GEMMs trigger late too."""
         config = dict(
             block_N=self.block_N,
             num_stages=self.num_stages,
@@ -1351,12 +1411,13 @@ class MoeExpertsV41Plan:
             self.hidden,
             self.intermediate,
         )
+        tiers = [("", self.block_M, False)]
+        if self.max_rows is None or self.max_rows >= LATE_TRIGGER_ROWS:
+            tiers.append(("late_", self.block_M, True))
+        if self._has_prefill_tiles():
+            tiers.append(("prefill_", self.prefill_block_M, True))
         kernels = {}
-        for prefix, block_M, late in (
-            ("", self.block_M, False),
-            ("late_", self.block_M, True),
-            ("prefill_", self.prefill_block_M, True),
-        ):
+        for prefix, block_M, late in tiers:
             kernels[f"{prefix}gate_up"] = prepare.call(
                 grouped_fp8_fp4_gemm,
                 num_experts,
@@ -1410,21 +1471,19 @@ class MoeExpertsV41Plan:
         return self.gate_up, self.swiglu, self.down
 
     def declare_kernels(self) -> None:
-        """Declare the grouped GEMMs, the fused SwiGLU and each dispatch plan's
-        kernels, stored on the plans once prepared."""
-
-        dispatches = (*self.dispatch.values(), *self.prefill_dispatch.values())
+        """Declare the grouped GEMMs, the fused SwiGLU and each reachable dispatch
+        plan's kernels, stored on the plans once prepared."""
 
         def calls() -> list[prepare.TileLangCall]:
             out = _calls(self.kernels())
-            for dispatch in dispatches:
+            for dispatch in self._dispatches():
                 out.extend(_calls(dispatch.kernels()))
             return out
 
         def bind() -> None:
             for name, kernel in _launch(self.kernels()).items():
                 setattr(self, name, kernel)
-            for dispatch in dispatches:
+            for dispatch in self._dispatches():
                 dispatch.bind()
 
         prepare.declare(calls, bind=bind)
