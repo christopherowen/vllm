@@ -170,6 +170,8 @@ class DeepseekV4Indexer(nn.Module):
             prefix=f"{prefix}.wq_b",
         )
         _native_linear(self.wq_b)
+        # Indexer Q-B reads the normalized q latent's MXFP8 cast alongside attention Q-B.
+        self.wq_b.tilelang_mxfp8_input = True
         self.weights_proj = ReplicatedLinear(
             hf.hidden_size,
             hf.index_n_heads,
@@ -636,8 +638,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             (self.n_local_heads, self.head_dim, 1, False),  # q
             (1, 512, 1, False),  # kv
         ]
-        if self.indexer is not None:
-            roles.append((self.indexer.heads, 128, 1, False))  # index query
         if self.compressor is not None:
             roles.append((1, 128, self.compress_ratio, False))  # index key
             roles.append((1, 512, self.compress_ratio, False))  # latent
@@ -898,12 +898,26 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 first = split.start if split is not None else 0
                 last = first + split.real_rows if split is not None else rows
                 query = self._index_query(
-                    qr, positions, hidden_states, index_weights, first, last, swa
+                    qr,
+                    positions,
+                    hidden_states,
+                    index_weights,
+                    first,
+                    last,
+                    swa,
+                    q_cast,
                 )
                 reference = None
                 if split is not None and _INDEX_SPLIT_CHECK:
                     reference = self._index_query(
-                        qr, positions, hidden_states, index_weights, 0, rows, swa
+                        qr,
+                        positions,
+                        hidden_states,
+                        index_weights,
+                        0,
+                        rows,
+                        swa,
+                        q_cast,
                     )
                 index_query = (*query, split, reference)
             self.forward_mqa(q, kv, positions, output, index_query=index_query)
@@ -921,17 +935,35 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             l2_prefetch.issue(self._l2pf_comp, rows)
 
     def _index_query(
-        self, qr, positions, hidden_states, index_weights, first, last, swa
+        self,
+        qr,
+        positions,
+        hidden_states,
+        index_weights,
+        first,
+        last,
+        swa,
+        q_cast=None,
     ):
         """MXFP4 index queries and scaled head weights for rows [first, last)."""
         rows = last - first
         h = self.indexer.heads
-        iq = self.indexer.wq_b(qr[first:last]).view(rows, h, 128)
-        iq = self._rope(iq, positions[first:last], "index_query")
+        qr_rows = qr if (first == 0 and last == qr.shape[0]) else qr[first:last]
+        cast_rows = (
+            kernels.cast_mxfp8(qr_rows)
+            if q_cast is None
+            else kernels.slice_mxfp8(q_cast, first, last)
+        )
+        with kernels.mxfp8_inputs(cast_rows):
+            iq = self.indexer.wq_b(qr_rows).view(rows, h, 128)
         iq_data = torch.empty((rows, h, 64), dtype=torch.uint8, device=qr.device)
         iq_scale = torch.empty((rows, h, 4), dtype=torch.uint8, device=qr.device)
         self._quantize_index_query(
-            "decode" if swa.is_decode else "prefill", iq, iq_data, iq_scale
+            "decode" if swa.is_decode else "prefill",
+            iq,
+            iq_data,
+            iq_scale,
+            positions=positions[first:last],
         )
         # The BF16 head-weight projection runs on every row: its GEMV rounds
         # differently at another row count, which would move top-k selections.

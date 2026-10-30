@@ -139,7 +139,12 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
         for args in dict.fromkeys(index.values()):
             calls.extend(_index_calls(*args))
         if self.indexer is not None:
-            calls.append(quantize_call())  # _quantize_index_query
+            calls.append(
+                quantize_call(
+                    rope_heads=self.indexer.heads,
+                    rope_dim=self.rotary_emb.cos_sin_cache.shape[1],
+                )
+            )  # _quantize_index_query
         if self.compressor is not None:
             calls.append(quantize_call(self._index_page))  # _write_index_keys
         return calls
@@ -228,8 +233,16 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
     def _attention_scratch_specs(self, mode: str, rows: int):
         return self._tilelang().mla.scratch_specs(rows)
 
-    def _quantize_index_query(self, mode: str, iq, iq_data, iq_scale) -> None:
-        quantize_mxfp4(iq, iq_data, iq_scale)
+    def _quantize_index_query(
+        self, mode: str, iq, iq_data, iq_scale, positions=None
+    ) -> None:
+        quantize_mxfp4(
+            iq,
+            iq_data,
+            iq_scale,
+            positions=positions,
+            cos_sin=self.rotary_emb.cos_sin_cache if positions is not None else None,
+        )
 
     def _write_index_keys(self, key, slot_mapping) -> None:
         write_index_keys(

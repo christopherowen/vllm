@@ -335,6 +335,42 @@ def test_block32_reads_its_producers_cast(default_vllm_config, n, k):
                 fed(rows)
 
 
+def test_slice_mxfp8_reuses_or_pads_rows(default_vllm_config, n=4096, k=1280):
+    """``slice_mxfp8`` hands a split projection (such as ``indexer.wq_b``) the exact
+    bits of casting the slice on its own, whether the slice is the full batch, an
+    interior SP range with enough trailing rows, or a tail SP range that pads into a
+    decode tile."""
+    from torch import nn
+
+    from vllm.models.deepseek_v4_1.tilelang.linear import (
+        TileLangBlock32Rows,
+        cast_mxfp8,
+        provide_mxfp8,
+        slice_mxfp8,
+    )
+    from vllm.v1.worker.workspace import use_preallocated_workspace
+
+    weight, exps, _ = _block32_weight(n, k, 16)
+    layer = nn.Module()
+    layer.weight, layer.weight_scale_inv = weight, exps
+    casting = TileLangBlock32Rows(layer, 0)
+    casting.declare_kernels()
+    fed = TileLangBlock32Rows(layer, 0)
+    fed.tilelang_mxfp8_input = True
+    fed.declare_kernels()
+    x = torch.randn((200, k), generator=_gen(18), device=DEVICE).bfloat16()
+    scratch = torch.empty(16 << 20, dtype=torch.uint8, device=DEVICE)
+    with use_preallocated_workspace(scratch):
+        full_cast = cast_mxfp8(x)
+        assert slice_mxfp8(full_cast, 0, 200) is full_cast
+        for first, last in ((0, 200), (0, 17), (32, 96), (64, 196), (180, 200)):
+            sub = x[first:last]
+            expected = casting(sub)
+            sliced = slice_mxfp8(full_cast, first, last)
+            with provide_mxfp8(sliced):
+                assert torch.equal(fed(sub), expected), f"slice=({first}, {last})"
+
+
 def test_block32_split_cannot_read_a_producers_cast(default_vllm_config):
     """A split-K projection's decode scratch is its own: marking it is refused."""
     from torch import nn

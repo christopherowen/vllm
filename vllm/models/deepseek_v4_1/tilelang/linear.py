@@ -143,6 +143,27 @@ def cast_mxfp8(rows: torch.Tensor) -> MXFP8Rows:
     return out
 
 
+def slice_mxfp8(rows: MXFP8Rows, first: int, last: int) -> MXFP8Rows:
+    """Rows ``[first, last)`` of ``rows`` as an ``MXFP8Rows`` view when ``rows`` holds
+    enough padded rows past ``first``, else copied into a padded decode tile buffer."""
+    if first == 0 and last == rows.rows.shape[0]:
+        return rows
+    sub = rows.rows[first:last]
+    m = sub.shape[0]
+    needed = mxfp8_rows(m)
+    if rows.values.shape[0] - first >= needed:
+        return MXFP8Rows(
+            sub,
+            rows.values[first : first + needed],
+            rows.scales[first : first + needed],
+        )
+    out = empty_mxfp8(sub)
+    if m:
+        out.values[:m].copy_(rows.values[first:last])
+        out.scales[:m].copy_(rows.scales[first:last])
+    return out
+
+
 # The MXFP8 rows handed to the projections of the calls in progress, innermost last.
 _PROVIDED: list[MXFP8Rows] = []
 
@@ -811,4 +832,5 @@ __all__ = [
     "project_parts",
     "provide_mxfp8",
     "provided_mxfp8",
+    "slice_mxfp8",
 ]

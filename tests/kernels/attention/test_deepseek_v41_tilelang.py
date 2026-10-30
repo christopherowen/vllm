@@ -219,6 +219,33 @@ def test_mxfp4_quantize(n=3000):
     assert torch.equal(q, ref_q)
 
 
+@pytest.mark.parametrize("rows", [1, 7, 37, 128])
+def test_mxfp4_quantize_with_rope(rows):
+    """Fused index-query RoPE + MXFP4 quantize produces the exact bytes of running
+    ``rope_`` then ``quantize_mxfp4``, without mutating the BF16 input."""
+    from vllm.models.deepseek_v4_1.tilelang.rope import rope_
+
+    gen = _gen(rows + 30)
+    iq = _mxfp4_inputs(rows * INDEX_HEADS, rows + 31).view(
+        rows, INDEX_HEADS, INDEX_DIM
+    )
+    iq_orig = iq.clone()
+    iq_ref = iq.clone()
+    positions = torch.randint(0, 4096, (rows,), generator=gen, device=DEVICE)
+    table = rope_table()
+    rope_(iq_ref, positions, table, 1, False)
+    ref_q = torch.empty((rows, INDEX_HEADS, 64), dtype=torch.uint8, device=DEVICE)
+    ref_scales = torch.empty((rows, INDEX_HEADS, 4), dtype=torch.uint8, device=DEVICE)
+    quantize_mxfp4(iq_ref, ref_q, ref_scales)
+
+    q = torch.empty_like(ref_q)
+    scales = torch.empty_like(ref_scales)
+    quantize_mxfp4(iq, q, scales, positions=positions, cos_sin=table)
+    assert torch.equal(iq.view(torch.int16), iq_orig.view(torch.int16))
+    assert torch.equal(scales, ref_scales)
+    assert torch.equal(q, ref_q)
+
+
 def test_write_index_keys(page_size=64, pages=5):
     n = pages * page_size // 2
     x = _mxfp4_inputs(n, 12)

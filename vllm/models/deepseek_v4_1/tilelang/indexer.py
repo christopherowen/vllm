@@ -73,12 +73,21 @@ def _score_call(width, page_size, candidates):
     return prepare.call(indexer_score_v41, width, page_size, candidates)
 
 
-def quantize_call(page_size=None):
+def quantize_call(
+    page_size=None,
+    *,
+    rope_heads: int = 0,
+    rope_dim: int = 0,
+    ratio: int = 1,
+):
     """The MXFP4 quantizer ``quantize_mxfp4`` launches, or with ``page_size`` the
     index-key writer ``write_index_keys`` launches, as a ``prepare.call``."""
+    kwargs = {}
+    if rope_heads > 0:
+        kwargs = dict(rope_heads=rope_heads, rope_dim=rope_dim, ratio=ratio)
     if page_size is None:
-        return prepare.call(mxfp4_quantize_v41)
-    return prepare.call(mxfp4_quantize_v41, True, page_size)
+        return prepare.call(mxfp4_quantize_v41, **kwargs)
+    return prepare.call(mxfp4_quantize_v41, True, page_size, **kwargs)
 
 
 def _row_extent(Lengths, Active, row, width):
@@ -393,43 +402,79 @@ def _e2m1_code(x):
     return code | (sign << 3)
 
 
-def _mxfp4_byte(X, row, first, scale):
-    """Two scaled values ``X[row, first : first + 2]`` packed low nibble first."""
-    lo = _e2m1_code(T.fmul(T.cast(X[row, first], T.float32), scale))
-    hi = _e2m1_code(T.fmul(T.cast(X[row, first + 1], T.float32), scale))
+def _mxfp4_byte(vals, first, scale):
+    """Two scaled values ``vals[first : first + 2]`` packed low nibble first."""
+    lo = _e2m1_code(T.fmul(T.cast(vals[first], T.float32), scale))
+    hi = _e2m1_code(T.fmul(T.cast(vals[first + 1], T.float32), scale))
     return T.cast(lo | (hi << 4), T.uint8)
 
 
 @tilelang.jit
-def mxfp4_quantize_v41(paged: bool = False, page_size: int = 64, threads: int = 128):
+def mxfp4_quantize_v41(
+    paged: bool = False,
+    page_size: int = 64,
+    threads: int = 128,
+    rope_heads: int = 0,
+    rope_dim: int = 0,
+    ratio: int = 1,
+):
     """MXFP4-quantize ``[rows, 128]`` BF16 vectors, one thread per 32-value group.
 
     Each group's UE8M0 scale is ``pow2_ceil(max(amax, 6 * 2^-126) * fp32(1/6))``
     and its values round to nearest even E2M1, as B12X's quantizer does, so
-    both backends see identical index queries and keys. The output is either
-    contiguous (``Q`` ``[rows, 64]`` packed, ``S`` ``[rows, 4]``) or, with
-    ``paged``, written through ``Slots`` (``[rows]`` int64; negative slots
-    skip) into index-cache pages ``Pool`` (``[pages, page bytes]``, any row
-    stride).
+    both backends see identical index queries and keys. With ``rope_heads > 0``,
+    the trailing ``rope_dim`` columns of each head are rotated in registers at
+    ``Positions`` (``rope_kernel``'s GPT-J interleaved ``ieee_fmaf`` arithmetic)
+    before quantization. The output is either contiguous (``Q`` ``[rows, 64]``
+    packed, ``S`` ``[rows, 4]``) or, with ``paged``, written through ``Slots``
+    (``[rows]`` int64; negative slots skip) into index-cache pages ``Pool``
+    (``[pages, page bytes]``, any row stride).
     """
     rows, pool_pages, pool_stride = T.dynamic("rows, pool_pages, pool_stride")
+    tokens, positions_max = T.dynamic("tokens, positions_max")
     groups = INDEX_DIM // SF_BLOCK
     half = SF_BLOCK // 2
+    assert rope_heads == 0 or (rope_dim > 0 and rope_dim % SF_BLOCK == 0)
+    start_group = groups - (rope_dim // SF_BLOCK) if rope_heads > 0 else groups
+    rope_half = rope_dim // 2
 
     @T.macro
-    def body(X, Q, S, Slots, Pool):
+    def body(X, Positions, CosSin, Q, S, Slots, Pool):
         with T.Kernel(T.ceildiv(rows * groups, threads), threads=threads) as bx:
             pdl.chain()
             tx = T.get_thread_binding()
             g = bx * threads + tx
             row, k = g // groups, g % groups
+            vals = T.alloc_local([SF_BLOCK], T.bfloat16)
             amax = T.alloc_var(T.float32)
             if row < rows:
+                for i in T.serial(SF_BLOCK):
+                    vals[i] = X[row, k * SF_BLOCK + i]
+                if rope_heads > 0:
+                    if k >= start_group:
+                        token = row // rope_heads
+                        pos = (
+                            Positions[token] // ratio * ratio
+                            if ratio > 1
+                            else Positions[token]
+                        )
+                        pair_base = (k - start_group) * half
+                        for i in T.unroll(half):
+                            first = T.cast(vals[2 * i], T.float32)
+                            second = T.cast(vals[2 * i + 1], T.float32)
+                            cosine = CosSin[pos, pair_base + i]
+                            sine = CosSin[pos, rope_half + pair_base + i]
+                            vals[2 * i] = T.cast(
+                                T.ieee_fmaf(first, cosine, -(second * sine)),
+                                T.bfloat16,
+                            )
+                            vals[2 * i + 1] = T.cast(
+                                T.ieee_fmaf(first, sine, second * cosine),
+                                T.bfloat16,
+                            )
                 amax = 6.0 * 2.0**-126
                 for i in T.serial(SF_BLOCK):
-                    amax = T.max(
-                        amax, T.abs(T.cast(X[row, k * SF_BLOCK + i], T.float32))
-                    )
+                    amax = T.max(amax, T.abs(T.cast(vals[i], T.float32)))
                 bits = T.reinterpret(T.fmul(amax, T.float32(1.0 / 6.0)), T.uint32)
                 sf = T.cast(T.shift_right(bits, 23) & 0xFF, T.int32) + T.cast(
                     (bits & 0x7FFFFF) != 0, T.int32
@@ -443,19 +488,32 @@ def mxfp4_quantize_v41(paged: bool = False, page_size: int = 64, threads: int = 
                     if (slot >= 0) & (page < pool_pages):
                         for i in T.serial(half):
                             Pool[page, token * (INDEX_DIM // 2) + k * half + i] = (
-                                _mxfp4_byte(X, row, k * SF_BLOCK + 2 * i, scale)
+                                _mxfp4_byte(vals, 2 * i, scale)
                             )
                         Pool[
                             page, page_size * (INDEX_DIM // 2) + token * groups + k
                         ] = T.cast(sf, T.uint8)
                 else:
                     for i in T.serial(half):
-                        Q[row, k * half + i] = _mxfp4_byte(
-                            X, row, k * SF_BLOCK + 2 * i, scale
-                        )
+                        Q[row, k * half + i] = _mxfp4_byte(vals, 2 * i, scale)
                     S[row, k] = T.cast(sf, T.uint8)
 
     if paged:
+        if rope_heads > 0:
+
+            @T.prim_func
+            def indexer_mxfp4_quantize(
+                X: T.Tensor([rows, INDEX_DIM], T.bfloat16),
+                Positions: T.Tensor([tokens], T.int64),
+                CosSin: T.Tensor([positions_max, rope_dim], T.float32),
+                Slots: T.Tensor([rows], T.int64),
+                Pool: T.StridedTensor(
+                    [pool_pages, page_bytes(page_size)], [pool_stride, 1], T.uint8
+                ),
+            ):
+                body(X, Positions, CosSin, None, None, Slots, Pool)
+
+            return indexer_mxfp4_quantize
 
         @T.prim_func
         def indexer_mxfp4_quantize(
@@ -465,7 +523,21 @@ def mxfp4_quantize_v41(paged: bool = False, page_size: int = 64, threads: int = 
                 [pool_pages, page_bytes(page_size)], [pool_stride, 1], T.uint8
             ),
         ):
-            body(X, None, None, Slots, Pool)
+            body(X, None, None, None, None, Slots, Pool)
+
+        return indexer_mxfp4_quantize
+
+    if rope_heads > 0:
+
+        @T.prim_func
+        def indexer_mxfp4_quantize(
+            X: T.Tensor([rows, INDEX_DIM], T.bfloat16),
+            Positions: T.Tensor([tokens], T.int64),
+            CosSin: T.Tensor([positions_max, rope_dim], T.float32),
+            Q: T.Tensor([rows, INDEX_DIM // 2], T.uint8),
+            S: T.Tensor([rows, groups], T.uint8),
+        ):
+            body(X, Positions, CosSin, Q, S, None, None)
 
         return indexer_mxfp4_quantize
 
@@ -475,16 +547,34 @@ def mxfp4_quantize_v41(paged: bool = False, page_size: int = 64, threads: int = 
         Q: T.Tensor([rows, INDEX_DIM // 2], T.uint8),
         S: T.Tensor([rows, groups], T.uint8),
     ):
-        body(X, Q, S, None, None)
+        body(X, None, None, Q, S, None, None)
 
     return indexer_mxfp4_quantize
 
 
-def quantize_mxfp4(x, q, scales):
+def quantize_mxfp4(x, q, scales, *, positions=None, cos_sin=None, ratio: int = 1):
     """MXFP4-quantize ``[..., 128]`` BF16 into ``q`` and ``scales``.
 
-    ``q`` is ``[..., 64]`` packed E2M1; ``scales`` is ``[..., 4]`` UE8M0.
+    ``q`` is ``[..., 64]`` packed E2M1; ``scales`` is ``[..., 4]`` UE8M0. With
+    ``positions`` and ``cos_sin``, rotates the trailing ``cos_sin.shape[1]``
+    columns of each head in registers before quantizing.
     """
+    if x.shape[0] == 0:
+        return q, scales
+    if positions is not None and cos_sin is not None:
+        heads = x.shape[1] if x.ndim == 3 else 1
+        _make(
+            quantize_call(
+                rope_heads=heads, rope_dim=cos_sin.shape[1], ratio=ratio
+            )
+        )(
+            x.reshape(-1, INDEX_DIM),
+            positions,
+            cos_sin,
+            q.view(-1, INDEX_DIM // 2),
+            scales.view(-1, INDEX_DIM // SF_BLOCK),
+        )
+        return q, scales
     _make(quantize_call())(
         x.reshape(-1, INDEX_DIM),
         q.view(-1, INDEX_DIM // 2),

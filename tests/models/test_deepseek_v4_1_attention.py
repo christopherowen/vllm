@@ -180,3 +180,50 @@ def test_decode_front_is_one_kernel_at_decode_rows(monkeypatch):
     metadata = None
     assert module._front(torch.zeros(6, 1792), positions, None) is None
     assert len(launches) == 1
+
+
+def test_index_query_reuses_q_cast_and_fuses_rope_quantize(monkeypatch):
+    """``_index_query`` feeds ``indexer.wq_b`` from ``q_cast`` (no second ``cast_mxfp8``)
+    and passes ``positions[first:last]`` straight into ``_quantize_index_query`` without
+    a separate ``_rope`` call."""
+    from vllm.models.deepseek_v4_1 import kernels
+    from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows
+
+    module = _tilelang_layer(layer_id=3)
+    seen_provided = []
+    quant_calls = []
+
+    def fake_wqb(x):
+        seen_provided.append(x.shape)
+        return torch.zeros((x.shape[0], 32 * 128), dtype=torch.bfloat16)
+
+    module.indexer = SimpleNamespace(
+        heads=32,
+        wq_b=fake_wqb,
+        weights_proj=lambda h: torch.ones((h.shape[0], 32), dtype=torch.bfloat16),
+    )
+    monkeypatch.setattr(
+        kernels,
+        "cast_mxfp8",
+        lambda *args: (_ for _ in ()).throw(AssertionError("unexpected cast_mxfp8")),
+    )
+    module._rope = lambda *args: (_ for _ in ()).throw(
+        AssertionError("unexpected separate _rope")
+    )
+    module._quantize_index_query = (
+        lambda mode, iq, data, scale, positions=None: quant_calls.append(
+            (mode, tuple(iq.shape), positions.tolist())
+        )
+    )
+    qr = torch.zeros((12, 1280), dtype=torch.bfloat16)
+    q_cast = MXFP8Rows(
+        qr,
+        torch.zeros((64, 1280), dtype=torch.float8_e4m3fn),
+        torch.zeros((64, 40), dtype=torch.uint8),
+    )
+    positions = torch.arange(100, 112, dtype=torch.int64)
+    hidden = torch.zeros((12, 5120), dtype=torch.bfloat16)
+    swa = SimpleNamespace(is_decode=False)
+    module._index_query(qr, positions, hidden, None, 4, 9, swa, q_cast)
+    assert seen_provided == [(5, 1280)]
+    assert quant_calls == [("prefill", (5, 32, 128), [104, 105, 106, 107, 108])]
