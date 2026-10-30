@@ -663,3 +663,110 @@ def test_slot_draft_limits_cap_stale_wide_scheduled_drafts():
     assert num_non_draft_tokens == {"low": 1}
     assert draft_budget == 5
     assert tokens == 6
+
+
+def test_mid_prefill_chunks_keep_initial_unit_confidence_until_prefill_completes(
+    monkeypatch,
+):
+    steps = 3
+    manager = make_manager(np.ones((2, steps), dtype=np.float32), row_cost=0.02)
+    manager.req_states.device = torch.device("cpu")
+    manager._confidence_buffer = torch.ones((2, 2, steps), dtype=torch.float32)
+    manager._confidence_probs = manager._confidence_buffer[0]
+    manager._planned_probs = manager._confidence_buffer[-1]
+    manager._pending_resets = []
+    manager._new_rows = []
+
+    class CopyBuffer:
+        def __init__(self):
+            self.np = np.ones((2, steps), dtype=np.float32)
+            self.gpu = torch.ones((2, steps), dtype=torch.float32)
+
+        def copy_to_cpu(self):
+            self.np[:] = self.gpu.numpy()
+
+    manager._stale_confidences = [CopyBuffer(), CopyBuffer()]
+    manager._stale_idx = 0
+    manager._copy_events = [
+        SimpleNamespace(synchronize=lambda: None, record=lambda: None) for _ in range(2)
+    ]
+    manager._copy_stream = SimpleNamespace(wait_stream=lambda _stream: None)
+    monkeypatch.setattr(
+        adaptive_module,
+        "get_tp_group",
+        lambda: SimpleNamespace(world_size=1, broadcast=lambda *_a, **_k: None),
+    )
+    monkeypatch.setattr(adaptive_module, "gpu_sync_allowed", nullcontext)
+    monkeypatch.setattr(adaptive_module.torch.cuda, "current_stream", lambda _: None)
+    monkeypatch.setattr(adaptive_module, "stream", lambda *_: nullcontext())
+    monkeypatch.setattr(
+        adaptive_module.tilelang_inputs,
+        "scatter_rows",
+        lambda idx, src, state, gather=False: state.__setitem__(
+            (idx, slice(None, src.shape[1])), src
+        ),
+    )
+    monkeypatch.setattr(
+        adaptive_module.tilelang_inputs,
+        "fill_rows",
+        lambda rows, state, value: state.__setitem__(rows, value),
+    )
+    monkeypatch.setattr(
+        adaptive_module, "async_tensor_h2d", lambda v, **_: torch.tensor(v)
+    )
+
+    manager.add_request(0)
+    manager.add_request(1)
+    manager.apply_staged_writes()
+
+    # Slot 0 decodes with 0.8 confidence; slot 1 runs two mid-prefill chunks with
+    # garbage 0.01 mid-prompt confidences before completing prefill on chunk 3.
+    mid_probs = torch.tensor([[0.8, 0.8, 0.8], [0.01, 0.01, 0.01]])
+    for computed in (0, 20):
+        batch = SimpleNamespace(
+            num_reqs=2,
+            idx_mapping=torch.tensor([0, 1]),
+            idx_mapping_np=np.array([0, 1], dtype=np.intp),
+            has_prefill=True,
+            num_computed_prefill_tokens_np=np.array([10, computed], dtype=np.int32),
+            num_scheduled_tokens=np.array([1, 20], dtype=np.int32),
+            prefill_len_np=np.array([10, 60], dtype=np.int32),
+        )
+        manager.record_confidences(mid_probs, batch, planned=mid_probs)
+        assert (manager._confidence_buffer[:, 1] == 1.0).all()
+        np.testing.assert_array_equal(
+            manager._stale_confidences[manager._stale_idx].np[1],
+            np.ones(steps, dtype=np.float32),
+        )
+
+    # Chunk 3 completes slot 1's prefill (40 + 20 == 60) and emits its first real
+    # draft confidences (0.7). Slot 1's first decode step still sees 1.0 on the
+    # host, and the next step sees 0.7.
+    final_probs = torch.tensor([[0.8, 0.8, 0.8], [0.7, 0.7, 0.7]])
+    final_batch = SimpleNamespace(
+        num_reqs=2,
+        idx_mapping=torch.tensor([0, 1]),
+        idx_mapping_np=np.array([0, 1], dtype=np.intp),
+        has_prefill=True,
+        num_computed_prefill_tokens_np=np.array([10, 40], dtype=np.int32),
+        num_scheduled_tokens=np.array([1, 20], dtype=np.int32),
+        prefill_len_np=np.array([10, 60], dtype=np.int32),
+    )
+    manager.record_confidences(final_probs, final_batch, planned=final_probs)
+    torch.testing.assert_close(manager._confidence_probs[1], torch.full((steps,), 0.7))
+    np.testing.assert_array_equal(
+        manager._stale_confidences[manager._stale_idx].np[1],
+        np.ones(steps, dtype=np.float32),
+    )
+
+    decode_batch = SimpleNamespace(
+        num_reqs=2,
+        idx_mapping=torch.tensor([0, 1]),
+        idx_mapping_np=np.array([0, 1], dtype=np.intp),
+        has_prefill=False,
+    )
+    manager.record_confidences(final_probs, decode_batch, planned=final_probs)
+    np.testing.assert_allclose(
+        manager._stale_confidences[manager._stale_idx].np[1],
+        np.full(steps, 0.7, dtype=np.float32),
+    )

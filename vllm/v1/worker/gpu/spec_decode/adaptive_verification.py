@@ -261,6 +261,23 @@ class AdaptiveVerificationManager:
             tilelang_inputs.scatter_rows(
                 input_batch.idx_mapping, planned, self._planned_probs
             )
+        if getattr(input_batch, "has_prefill", False):
+            # Requests still mid-prefill after this step have not reached the
+            # end of their prompt; keep their confidences at 1 until their
+            # final prefill chunk emits a real draft proposal.
+            incomplete_prefill_np = (
+                input_batch.num_computed_prefill_tokens_np
+                + input_batch.num_scheduled_tokens
+                < input_batch.prefill_len_np
+            )
+            if incomplete_prefill_np.any():
+                mid_prefill_slots = input_batch.idx_mapping_np[
+                    incomplete_prefill_np
+                ].tolist()
+                self._stale_confidences[self._stale_idx].np[mid_prefill_slots] = 1.0
+                self._pending_resets.extend(mid_prefill_slots)
+                self._new_rows.extend(mid_prefill_slots)
+                self.apply_staged_writes()
         # Replicated projections may differ through unordered floating-point
         # reductions. Both CPU graph selection and GPU request compaction must
         # consume one TP-wide confidence snapshot to issue matching collectives.
