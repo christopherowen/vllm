@@ -49,6 +49,7 @@ CHAIN = {
     "mhc_collapse_column",
     "mhc_finalize",
     "mhc_post",
+    "mhc_post_collapse",
     "mhc_project_streams",
     "moe_combine",
     "moe_dispatch",

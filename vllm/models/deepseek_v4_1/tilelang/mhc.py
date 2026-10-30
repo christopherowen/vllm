@@ -510,6 +510,70 @@ def post_streams(hidden_size: int, threads: int = 128):
     return mhc_post
 
 
+@tilelang.jit(pass_configs=_PASS_CONFIGS)
+def post_collapse_streams(hidden_size: int, threads: int = 128):
+    """The standalone ``post`` followed by the stream ``collapse`` in one launch:
+    each stream is updated and rounded to BF16 with ``post_streams``' exact FMA
+    sequence, then collapsed with ``mix`` and rounded to BF16 with
+    ``collapse_streams``' exact FMA sequence, without allocating, writing or reading
+    the ``[M, MULT, hidden_size]`` intermediate stream tensor."""
+    assert hidden_size % (threads * VEC) == 0
+    blocks = hidden_size // (threads * VEC)
+    M = T.dynamic("M")
+
+    @T.prim_func
+    def mhc_post_collapse(
+        x: T.Tensor((M, hidden_size), T.bfloat16),
+        residual: T.Tensor((M, MULT, hidden_size), T.bfloat16),
+        post: T.Tensor((M, MULT), T.float32),
+        comb: T.Tensor((M, MULT, MULT), T.float32),
+        mix: T.Tensor((M, MULT), T.float32),
+        out: T.Tensor((M, hidden_size), T.bfloat16),
+    ):
+        with T.Kernel(M * blocks, threads=threads) as pid:
+            pdl.chain()
+            token = pid // blocks
+            col = (pid % blocks * threads + T.get_thread_binding()) * VEC
+            xv = T.alloc_local((VEC,), T.bfloat16)
+            rv = T.alloc_local((MULT * VEC,), T.bfloat16)
+            sv = T.alloc_local((MULT * VEC,), T.bfloat16)
+            ov = T.alloc_local((VEC,), T.bfloat16)
+            pm = T.alloc_local((MULT,), T.float32)
+            cm = T.alloc_local((MULT * MULT,), T.float32)
+            mv = T.alloc_local((MULT,), T.float32)
+            acc = T.alloc_var(T.float32)
+            for n in T.vectorized(MULT):
+                pm[n] = post[token, n]
+            for m in T.unroll(MULT):
+                for n in T.vectorized(MULT):
+                    cm[m * MULT + n] = comb[token, m, n]
+            for m in T.vectorized(MULT):
+                mv[m] = mix[token, m]
+            for v in T.vectorized(VEC):
+                xv[v] = x[token, col + v]
+            for m in T.unroll(MULT):
+                for v in T.vectorized(VEC):
+                    rv[m * VEC + v] = residual[token, m, col + v]
+            for n in T.unroll(MULT):
+                for v in T.unroll(VEC):
+                    acc = cm[n] * T.Cast(T.float32, rv[v])
+                    acc = T.fma(pm[n], T.Cast(T.float32, xv[v]), acc)
+                    for m in T.unroll(1, MULT):
+                        acc = T.fma(
+                            cm[m * MULT + n], T.Cast(T.float32, rv[m * VEC + v]), acc
+                        )
+                    sv[n * VEC + v] = T.Cast(T.bfloat16, acc)
+            for v in T.unroll(VEC):
+                acc = T.float32(0)
+                for m in T.unroll(MULT):
+                    acc = T.fma(mv[m], T.Cast(T.float32, sv[m * VEC + v]), acc)
+                ov[v] = T.Cast(T.bfloat16, acc)
+            for v in T.vectorized(VEC):
+                out[token, col + v] = ov[v]
+
+    return mhc_post_collapse
+
+
 # Shared memory each collapse block holds without using it, which caps residency at
 # four blocks an SM. On GB10 the long-prefill collapse reads the four streams faster
 # with fewer blocks resident (TileKernels' kernel is capped by its own shared memory);
@@ -644,6 +708,11 @@ def _post_call(hidden: int) -> prepare.TileLangCall:
     return prepare.call(post_streams, hidden)
 
 
+def _post_collapse_call(hidden: int) -> prepare.TileLangCall:
+    """The fused ``post_collapse``'s call."""
+    return prepare.call(post_collapse_streams, hidden)
+
+
 def _collapse_call(hidden: int, column: int = -1) -> prepare.TileLangCall:
     """The stream collapse's call, and with ``column`` its variant that also writes
     that column of every stream."""
@@ -670,6 +739,11 @@ def _finalize(hidden: int, k: int, rms_eps: float, hc_eps: float, iterations: in
 @cache
 def _post(hidden: int):
     return _make(_post_call(hidden))
+
+
+@cache
+def _post_collapse(hidden: int):
+    return _make(_post_collapse_call(hidden))
 
 
 @cache
@@ -800,6 +874,35 @@ def _mhc_post_fake(x, residual, post, comb, out):
     return None
 
 
+@torch.library.custom_op(
+    "vllm::dsv41_tilelang_mhc_post_collapse", mutates_args=("out",)
+)
+def _mhc_post_collapse(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    mix: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    tokens, hidden = int(residual.shape[0]), int(residual.shape[-1])
+    if tokens == 0:
+        return
+    _post_collapse(hidden)(
+        x.view(tokens, hidden),
+        residual.view(tokens, MULT, hidden),
+        post.view(tokens, MULT),
+        comb.view(tokens, MULT, MULT),
+        mix.view(tokens, MULT),
+        out.view(tokens, hidden),
+    )
+
+
+@_mhc_post_collapse.register_fake
+def _mhc_post_collapse_fake(x, residual, post, comb, mix, out):
+    return None
+
+
 @torch.library.custom_op("vllm::dsv41_tilelang_mhc_collapse", mutates_args=("out",))
 def _mhc_collapse(state: torch.Tensor, mix: torch.Tensor, out: torch.Tensor) -> None:
     tokens, hidden = int(state.shape[0]), int(state.shape[-1])
@@ -906,6 +1009,7 @@ class TileKernelsMHC(nn.Module):
                 *(_finalize_call(hidden, k, *mix) for k in widths),
                 _post_call(hidden),
                 _collapse_call(hidden),
+                _post_collapse_call(hidden),
             ]
 
         def bind() -> None:
@@ -916,6 +1020,7 @@ class TileKernelsMHC(nn.Module):
                 _finalize(hidden, k, *mix)
             _post(hidden)
             _collapse(hidden)
+            _post_collapse(hidden)
             # The constant mixes for the batch limit, before any graph captures.
             _constant_mixes(
                 get_current_vllm_config().scheduler_config.max_num_batched_tokens,
@@ -1002,6 +1107,32 @@ class TileKernelsMHC(nn.Module):
         _mhc_post(x, residual, post, comb, out)
         return out
 
+    def post_collapse(
+        self,
+        x,
+        residual,
+        post,
+        comb,
+        pre: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """The standalone ``post`` followed by ``collapse`` with ``pre`` (or the
+        streams' mean when ``pre`` is None), into ``out`` when given, in one launch
+        without materializing the ``[tokens, MULT, hidden]`` stream buffer."""
+        if isinstance(x, RankOrderParts):
+            x = x.sum()
+        tokens, device = int(residual.shape[0]), residual.device
+        if pre is None:
+            pre = _constant_mixes(tokens, device)[1]
+        if out is None:
+            out = torch.empty(
+                (tokens, self.hidden_size),
+                dtype=residual.dtype,
+                device=device,
+            )
+        _mhc_post_collapse(x, residual, post, comb, pre, out)
+        return out
+
     @staticmethod
     def cast_rows(rows: torch.Tensor) -> MXFP8Rows:
         """The MXFP8 cast of rows regrouped from an entry's ``y`` (a CED boundary's
@@ -1043,6 +1174,7 @@ __all__ = [
     "TileKernelsMHC",
     "collapse_streams",
     "finalize",
+    "post_collapse_streams",
     "post_streams",
     "project_streams",
 ]

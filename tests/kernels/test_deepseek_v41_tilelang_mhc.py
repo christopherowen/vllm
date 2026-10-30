@@ -42,6 +42,7 @@ from vllm.models.deepseek_v4_1.tilelang.mhc import (  # noqa: E402
     MIXES,
     TileKernelsMHC,
     collapse_streams,
+    post_collapse_streams,
     post_streams,
     project_streams,
 )
@@ -629,19 +630,45 @@ def test_no_tokens_launch_nothing(mhc):
     x, residual, post, comb = _post_inputs(0, seed=0)
     assert mhc.post(x, residual, post, comb).shape == (0, 4, HIDDEN)
     assert mhc.collapse(residual).shape == (0, HIDDEN)
+    assert mhc.post_collapse(x, residual, post, comb).shape == (0, HIDDEN)
+
+
+@pytest.mark.parametrize("tokens", SERVING_TOKENS)
+def test_post_collapse_bits_match_post_then_collapse(mhc, tokens):
+    """Fused ``post_collapse`` matches ``collapse(post(...))`` and TileKernels'
+    ``mhc_pre_apply_mix_fwd(mhc_post_fwd(...))`` bit for bit, both for weighted
+    ``pre`` and for the default mean mix."""
+    x, residual, post, comb = _post_inputs(tokens, seed=1100 + tokens)
+    mix = _pre_mix(tokens, seed=1200 + tokens)
+    tk_streams = _tk_post(x, residual, post, comb)
+    expected_mix = _tk_collapse(tk_streams, mix)
+    quarter = torch.full((tokens, 4), 0.25, device=DEVICE)
+    expected_mean = _tk_collapse(tk_streams, quarter)
+    _assert_bits_equal(
+        mhc.post_collapse(x, residual, post, comb, mix), expected_mix, "mix: "
+    )
+    out_buf = torch.empty((tokens, HIDDEN), dtype=torch.bfloat16, device=DEVICE)
+    returned = mhc.post_collapse(x, residual, post, comb, out=out_buf)
+    assert returned is out_buf
+    _assert_bits_equal(out_buf, expected_mean, "mean: ")
 
 
 def test_declared_calls_are_the_forwards(mhc, monkeypatch):
-    """The post and the collapse are declared exactly as the forward launches them,
-    and nothing is left to warm: TileKernels' kernels no longer run."""
+    """The post, the collapse and the fused post_collapse are declared exactly as the
+    forward launches them, and nothing is left to warm: TileKernels' kernels no longer
+    run."""
     registry = JitWarmupRegistry(vllm_config=None)
     with registry.activate():
         mhc.declare_kernels()
     declared = prepare.declared_calls(registry)
     assert prepare.warm_declared(registry) == 0
-    factories = (post_streams, collapse_streams)
+    factories = (post_streams, collapse_streams, post_collapse_streams)
     ours = [call for call in declared if call[0] in factories]
-    assert ours == [(post_streams, (HIDDEN,), {}), (collapse_streams, (HIDDEN,), {})]
+    assert ours == [
+        (post_streams, (HIDDEN,), {}),
+        (collapse_streams, (HIDDEN,), {}),
+        (post_collapse_streams, (HIDDEN,), {}),
+    ]
 
     def by_factory(call):
         # TileLang's JIT objects have no __name__; order by the factory itself.
@@ -650,7 +677,7 @@ def test_declared_calls_are_the_forwards(mhc, monkeypatch):
 
     # The forward's calls, recorded as its cached lookups make them.
     launched = []
-    for name in ("post_streams", "collapse_streams"):
+    for name in ("post_streams", "collapse_streams", "post_collapse_streams"):
         factory = getattr(mhc_module, name)
 
         def record(*args, _factory=factory, **kwargs):
@@ -658,7 +685,7 @@ def test_declared_calls_are_the_forwards(mhc, monkeypatch):
             return _factory(*args, **kwargs)
 
         monkeypatch.setattr(mhc_module, name, record)
-    for name in ("_post", "_collapse"):
+    for name in ("_post", "_collapse", "_post_collapse"):
         lookup = getattr(mhc_module, name)
         monkeypatch.setattr(mhc_module, name, functools.cache(lookup.__wrapped__))
     x, residual, post, comb = _post_inputs(6, seed=71)
@@ -666,4 +693,8 @@ def test_declared_calls_are_the_forwards(mhc, monkeypatch):
     mhc.post(RankOrderParts(torch.stack((x, x))), residual, post, comb)
     mhc.collapse(residual, _pre_mix(6, seed=72))
     mhc.collapse(residual)
+    mhc.post_collapse(x, residual, post, comb)
+    mhc.post_collapse(
+        RankOrderParts(torch.stack((x, x))), residual, post, comb, _pre_mix(6, seed=72)
+    )
     assert sorted(launched, key=by_factory) == ours

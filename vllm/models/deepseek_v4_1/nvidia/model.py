@@ -326,6 +326,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         engram_mask: torch.Tensor | None = None,
         ced_indices: torch.Tensor | None = None,
         sp_rows: sp_prefill.SPRows | None = None,
+        *,
+        ced_positions: torch.Tensor | None = None,
+        ced_input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         previous_output = x if residual is not None else None
         apply_engram = self.engram is not None and engram_hashes is not None
@@ -370,9 +373,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             post_mix = gather_rows(post_mix, ced_indices)
             res_mix = gather_rows(res_mix, ced_indices)
             attn_pre = gather_rows(attn_pre, ced_indices)
-            positions = gather_rows(positions, ced_indices)
+            positions = (
+                gather_rows(positions, ced_indices)
+                if ced_positions is None
+                else ced_positions
+            )
             if input_ids is not None:
-                input_ids = gather_rows(input_ids, ced_indices)
+                input_ids = (
+                    gather_rows(input_ids, ced_indices)
+                    if ced_input_ids is None
+                    else ced_input_ids
+                )
         if sp_rows is None:
             with kernels.mxfp8_inputs(x_q):
                 x = self.attn(positions, x, None, global_kv_ready=global_kv_ready)
@@ -885,6 +896,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     for t in (hidden_states, residual, post_mix, res_mix, pre_mix)
                 )
                 sp = None
+            ced_positions = (
+                gather_rows(positions, boundary_indices)
+                if boundary_indices is not None
+                else None
+            )
+            ced_input_ids = (
+                gather_rows(input_ids, boundary_indices)
+                if boundary_indices is not None and input_ids is not None
+                else None
+            )
             hidden_states, residual, post_mix, res_mix, pre_mix = layer(
                 hidden_states,
                 positions,
@@ -897,11 +918,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 engram_mask,
                 ced_indices=boundary_indices,
                 sp_rows=sp,
+                ced_positions=ced_positions,
+                ced_input_ids=ced_input_ids,
             )
             if boundary_indices is not None:
-                positions = gather_rows(positions, ced_indices)
-                if input_ids is not None:
-                    input_ids = gather_rows(input_ids, ced_indices)
+                assert ced_positions is not None
+                positions = ced_positions
+                input_ids = ced_input_ids
                 if steer_rows is not None:
                     steer_rows = gather_rows(
                         self.glp.step_rows(full_num_tokens), ced_indices
@@ -913,7 +936,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
             if idx + 1 in self.aux_hidden_state_layers:
                 # Reconstruct the aux hidden state for draft models
-                aux_recon = layer.mhc.post(hidden_states, residual, post_mix, res_mix)
                 aux_out = (
                     self._graph_out(len(aux_hidden_states), full_num_tokens)
                     if sp is None
@@ -921,11 +943,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     and not self.use_sequence_parallel
                     else None
                 )
-                aux_hidden_state = (
-                    layer.mhc.collapse(aux_recon)
-                    if aux_out is None
-                    else layer.mhc.collapse(aux_recon, out=aux_out)
-                )
+                if idx + 1 != self.end_layer and hasattr(layer.mhc, "post_collapse"):
+                    aux_hidden_state = layer.mhc.post_collapse(
+                        hidden_states, residual, post_mix, res_mix, out=aux_out
+                    )
+                else:
+                    aux_recon = layer.mhc.post(
+                        hidden_states, residual, post_mix, res_mix
+                    )
+                    aux_hidden_state = (
+                        layer.mhc.collapse(aux_recon)
+                        if aux_out is None
+                        else layer.mhc.collapse(aux_recon, out=aux_out)
+                    )
+                    final_aux_recon = aux_recon
                 if self.use_sequence_parallel:
                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
                 elif sp is not None:
@@ -935,9 +966,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         aux_hidden_state, ced_indices, full_num_tokens
                     )
                 aux_hidden_states.append(aux_hidden_state)
-                final_aux_recon = aux_recon
         l2_prefetch.join()
-        if layer is not None:
+        last_rank = get_pp_group().is_last_rank
+        fused_final_collapse = (
+            layer is not None
+            and last_rank
+            and self.end_layer not in self.aux_hidden_state_layers
+            and self._sink_columns is None
+            and hasattr(layer.mhc, "post_collapse")
+        )
+        if fused_final_collapse:
+            hidden_states = layer.mhc.post_collapse(
+                hidden_states, residual, post_mix, res_mix, pre_mix
+            )
+        elif layer is not None:
             # Reuse if the last layer was captured as an aux hidden state
             if self.end_layer in self.aux_hidden_state_layers:
                 hidden_states = final_aux_recon
@@ -946,7 +988,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     hidden_states, residual, post_mix, res_mix
                 )
 
-        if not get_pp_group().is_last_rank:
+        if not last_rank:
             if decoder_compacted:
                 hidden_states = scatter_rows(
                     hidden_states, ced_indices, full_num_tokens
@@ -974,13 +1016,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # Collapse the hc copies with the pre-mix from the last layer's FFN
         # mixes — the mix the reference applies via
         # ``last_layer.hc_pre(h, pre_mix)`` (v4.1 has no learned hc_head).
-        hidden_states = (
-            layer.mhc.collapse(hidden_states, pre_mix)
-            if columns is None
-            else layer.mhc.collapse(
-                hidden_states, pre_mix, columns=columns, column=self._sink_column
+        if not fused_final_collapse:
+            hidden_states = (
+                layer.mhc.collapse(hidden_states, pre_mix)
+                if columns is None
+                else layer.mhc.collapse(
+                    hidden_states, pre_mix, columns=columns, column=self._sink_column
+                )
             )
-        )
         if columns is not None and not (rows_here and not self.use_sequence_parallel):
             # A gather of hc_mult values per token under sequence parallelism.
             if self.use_sequence_parallel:

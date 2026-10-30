@@ -452,6 +452,11 @@ class DSparkDeepseekV4Model(nn.Module):
                 residual,
             )
         l2_prefetch.join()
+        assert pre_mix is not None
+        if not self.use_sequence_parallel and hasattr(layer.mhc, "post_collapse"):
+            return layer.mhc.post_collapse(
+                hidden_states, residual, post_mix, res_mix, pre_mix
+            )
         hidden_states = layer.mhc.post(hidden_states, residual, post_mix, res_mix)
         if self.use_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
@@ -460,7 +465,6 @@ class DSparkDeepseekV4Model(nn.Module):
         # mixes — the mix the reference forward_head applies (hc_pre with the
         # last block's ffn pre-mix). Return the PRE-norm head hidden;
         # compute_logits applies self.norm.
-        assert pre_mix is not None
         hidden_states = layer.mhc.collapse(hidden_states, pre_mix)
         return hidden_states
 

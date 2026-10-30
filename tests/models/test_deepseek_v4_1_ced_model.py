@@ -153,17 +153,35 @@ def _scatter(source, indices, full_rows):
 
 
 class _Mix:
-    def collapse(self, hidden, mix=None):
-        if mix is None:
-            return hidden.mean(dim=1)
-        return (hidden * mix[:, :, None]).sum(dim=1)
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def collapse(self, hidden, mix=None, out=None):
+        self.calls.append("collapse")
+        res = (
+            hidden.mean(dim=1) if mix is None else (hidden * mix[:, :, None]).sum(dim=1)
+        )
+        if out is not None:
+            out.copy_(res)
+            return out
+        return res
 
     def post(self, x, residual, post, comb):
+        self.calls.append("post")
         return residual + x[:, None, :] * 0.25
+
+    def post_collapse(self, x, residual, post, comb, pre=None, out=None):
+        self.calls.append("post_collapse")
+        recon = residual + x[:, None, :] * 0.25
+        res = recon.mean(dim=1) if pre is None else (recon * pre[:, :, None]).sum(dim=1)
+        if out is not None:
+            out.copy_(res)
+            return out
+        return res
 
     def pre(self, residual, fn, scale, base, norm, pre, **previous):
         if previous.get("previous_output") is not None:
-            residual = self.post(previous["previous_output"], residual, None, None)
+            residual = residual + previous["previous_output"][:, None, :] * 0.25
         if residual.ndim == 2:
             residual = residual[:, None, :].expand(-1, 4, -1).clone()
         rows = residual.shape[0]
@@ -179,7 +197,9 @@ class _Mix:
         )
 
     def post_pre(self, x, residual, post, comb, fn, scale, base, norm, pre):
-        return self.pre(self.post(x, residual, post, comb), fn, scale, base, norm, pre)
+        return self.pre(
+            residual + x[:, None, :] * 0.25, fn, scale, base, norm, pre
+        )
 
     def cast_rows(self, rows):
         return None
@@ -244,7 +264,13 @@ def test_ced_global_context_and_full_row_output_abi(monkeypatch, compact):
         "get_pp_group",
         lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
     )
-    monkeypatch.setattr(native, "gather_rows", _gather)
+    gather_calls: list[int] = []
+
+    def tracked_gather(source, indices):
+        gather_calls.append(source.data_ptr())
+        return _gather(source, indices)
+
+    monkeypatch.setattr(native, "gather_rows", tracked_gather)
     monkeypatch.setattr(native, "scatter_rows", _scatter)
     # L2 prefetch is on by default on GB10; this stand-in model has no prefetcher.
     monkeypatch.setattr(native.l2_prefetch, "ENABLED", False)
@@ -313,3 +339,13 @@ def test_ced_global_context_and_full_row_output_abi(monkeypatch, compact):
         for i in range(4)
         for kind in ("attention", "experts")
     ]
+    # Non-final aux layer (layer 2 -> idx+1 == 3) uses fused post_collapse;
+    # final aux layer (layer 3 -> idx+1 == 4 == end_layer) uses post + collapse
+    # once and reuses final_aux_recon for the head collapse.
+    assert target.layers[2].mhc.calls == ["post_collapse"]
+    assert target.layers[3].mhc.calls == ["post", "collapse", "collapse"]
+    if compact:
+        # At the CED boundary, positions and input_ids are gathered once each,
+        # not twice (once inside layer 2 and once in DeepseekV4Model.forward).
+        assert gather_calls.count(positions.data_ptr()) == 1
+        assert gather_calls.count(ids.data_ptr()) == 1
