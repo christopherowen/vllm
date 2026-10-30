@@ -37,11 +37,6 @@ from vllm.model_executor.models.utils import (
     make_layers,
 )
 from vllm.model_executor.weight_transfer import copy_weight
-from vllm.models.common.ops.sequence_parallel import (
-    sp_all_gather,
-    sp_padding_mask,
-    sp_shard,
-)
 from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MoE
 from vllm.models.deepseek_v41.nvidia.model import (
     DeepseekV4MixtureOfExperts as DeepseekV4MixtureOfExperts,
@@ -80,10 +75,6 @@ def _select_dsv4_attn_cls(vllm_config):
     return DeepseekV41TileLangAttention
 
 
-def _use_sequence_parallel(vllm_config):
-    return False
-
-
 class DeepseekV4DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -97,7 +88,6 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
-        self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
 
         self.engram: Engram | None = None
         if engram_layout is not None:
@@ -108,7 +98,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                     vllm_config.quant_config,
                     engram_layout,
                     engram_layout.layer_ids.index(layer_id),
-                    use_sequence_parallel=self.use_sequence_parallel,
                     prefix=f"{prefix}.engram",
                 )
 
@@ -119,8 +108,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             topk_indices_buffer=topk_indices_buffer,
             aux_stream_list=aux_stream_list,
         )
-        if self.use_sequence_parallel:
-            self.attn.wo_b.reduce_results = False
         if config.scoring_func != "sqrtsoftplus" or not config.norm_topk_prob:
             raise ValueError("V4.1 requires normalized sqrtsoftplus routing")
         if getattr(config, "gate_temp", 1.0) != 1.0:
@@ -149,7 +136,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.ffn = DeepseekV4MoE(
             moe_config,
             prefix=f"{prefix}.ffn",
-            use_sequence_parallel=self.use_sequence_parallel,
+            use_sequence_parallel=False,
             gate=gate,
             image_sentinel_lo=0 if is_draft else 129264,
             image_sentinel_count=1,
@@ -456,12 +443,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.ced_decoder_start = ced_decoder_start(config)
         self.quant_config = quant_config
         self.parallel_config = vllm_config.parallel_config
-        self.use_mega_moe = False
-        self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
         # Per-forward prefill sequence parallelism (0 = off); see sp_prefill.
-        self.prefill_sp_min_rows = sp_prefill.resolve_min_rows(
-            vllm_config, static_sequence_parallel=self.use_sequence_parallel
-        )
+        self.prefill_sp_min_rows = sp_prefill.resolve_min_rows(vllm_config)
         if vllm_config.parallel_config.use_ubatching:
             raise ValueError(
                 "V4.1 fixed native layer buffers require ubatching/DBO disabled"
@@ -793,9 +776,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
-        if self.use_mega_moe:
-            input_ids = input_ids.to(torch.int64)
-
         engram_hashes: torch.Tensor | None = None
         engram_mask: torch.Tensor | None = None
         if self.disk_engram and input_ids is not None:
@@ -838,22 +818,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     engram.prepare_embeddings(engram_hashes[:, engram.layer_hash_index])
 
         full_num_tokens = positions.shape[0]
-        if self.use_sequence_parallel:
-            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
-                forward_context = get_forward_context()
-                forward_context.is_padding = sp_padding_mask(
-                    forward_context.is_padding, hidden_states
-                )
-            hidden_states = sp_shard(hidden_states)
-            input_ids = sp_shard(input_ids)
         # GLP steering's row marks for the rows the layers hold: this rank's under
         # sequence parallelism, the decoder's once CED compacts the step.
         steer_rows: torch.Tensor | None = None
         if self.glp is not None:
             steer_rows = self.glp.step_rows(full_num_tokens)
-            if self.use_sequence_parallel:
-                steer_rows = sp_shard(steer_rows)
-            elif sp is not None:
+            if sp is not None:
                 steer_rows = sp.local_slice(steer_rows)
 
         residual, post_mix, res_mix = None, None, None
@@ -938,9 +908,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 # Reconstruct the aux hidden state for draft models
                 aux_out = (
                     self._graph_out(len(aux_hidden_states), full_num_tokens)
-                    if sp is None
-                    and not decoder_compacted
-                    and not self.use_sequence_parallel
+                    if sp is None and not decoder_compacted
                     else None
                 )
                 if idx + 1 != self.end_layer and hasattr(layer.mhc, "post_collapse"):
@@ -957,9 +925,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         else layer.mhc.collapse(aux_recon, out=aux_out)
                     )
                     final_aux_recon = aux_recon
-                if self.use_sequence_parallel:
-                    aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
-                elif sp is not None:
+                if sp is not None:
                     aux_hidden_state = sp.gather(aux_hidden_state)
                 if decoder_compacted:
                     aux_hidden_state = scatter_rows(
@@ -1006,7 +972,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if self._sink_columns is not None:
             columns = (
                 self._sink_columns[:full_num_tokens]
-                if rows_here and not self.use_sequence_parallel
+                if rows_here
                 else torch.empty(
                     (hidden_states.shape[0], self.hc_mult),
                     dtype=torch.float32,
@@ -1024,26 +990,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     hidden_states, pre_mix, columns=columns, column=self._sink_column
                 )
             )
-        if columns is not None and not (rows_here and not self.use_sequence_parallel):
+        if columns is not None and not rows_here:
             # A gather of hc_mult values per token under sequence parallelism.
-            if self.use_sequence_parallel:
-                columns = sp_all_gather(columns)[:full_num_tokens]
-            elif sp is not None:
+            if sp is not None:
                 columns = sp.gather(columns)
             if decoder_compacted:
                 columns = scatter_rows(columns, ced_indices, full_num_tokens)
             self._sink_columns[:full_num_tokens].copy_(columns)
-        out = (
-            self._graph_out(None, full_num_tokens)
-            if rows_here and not self.use_sequence_parallel
-            else None
-        )
+        out = self._graph_out(None, full_num_tokens) if rows_here else None
         hidden_states = (
             self.norm(hidden_states) if out is None else self.norm(hidden_states, out)
         )
-        if self.use_sequence_parallel:
-            # Gather only the collapsed and normalized hidden states.
-            hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
         if sp is not None:
             hidden_states = sp.gather(hidden_states)
         if decoder_compacted:

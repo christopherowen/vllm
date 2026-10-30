@@ -996,7 +996,6 @@ def test_disk_engram_model_allocates_hash_buffer_from_declared_caps(monkeypatch)
         lora_config=None,
         speculative_config=None,
     )
-    monkeypatch.setattr(model_module, "_use_sequence_parallel", lambda _: False)
     monkeypatch.setattr(
         model_module,
         "get_pp_group",

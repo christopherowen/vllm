@@ -282,8 +282,6 @@ def test_ced_global_context_and_full_row_output_abi(monkeypatch, compact):
     row_work: list[tuple[str, int, int]] = []
     target = SimpleNamespace(
         embed_input_ids=lambda _: inputs,
-        use_mega_moe=False,
-        use_sequence_parallel=False,
         prefill_sp_min_rows=0,
         disk_engram=False,
         engram_hash=None,
