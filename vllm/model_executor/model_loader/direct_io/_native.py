@@ -33,6 +33,7 @@ from pathlib import Path
 _LOCK = threading.Lock()
 _SOURCE = Path(__file__).with_name("_storage.c")
 _NAME = "_direct_io_storage"
+_DEFAULT_PREBUILT_ROOT = Path("/opt/spark-ds41f/native")
 ABI_VERSION = 1
 
 
@@ -40,7 +41,51 @@ def _pkg_config(*args: str) -> str:
     return subprocess.check_output(["pkg-config", *args, "liburing"], text=True).strip()
 
 
-def _build() -> Path:
+def _source_digest() -> str:
+    sources = sorted(_SOURCE.parent.glob("*.[ch]"))
+    return hashlib.sha256(b"".join(path.read_bytes() for path in sources)).hexdigest()[:24]
+
+
+def _prebuilt_target() -> Path | None:
+    if "CC" in os.environ:
+        return None
+    default_cuda = Path("/usr/local/cuda")
+    cuda_env = os.environ.get("CUDA_HOME")
+    if cuda_env and Path(cuda_env).resolve() != default_cuda.resolve():
+        return None
+    cc_path = shutil.which("cc")
+    if cc_path is not None and Path(cc_path).resolve() not in {
+        Path(p).resolve() for p in ("/usr/bin/cc", "/bin/cc") if Path(p).exists()
+    }:
+        return None
+    root = Path(os.environ.get("VLLM_NATIVE_CACHE_DIR", _DEFAULT_PREBUILT_ROOT))
+    target = (
+        root
+        / "direct_io"
+        / _source_digest()
+        / (_NAME + sysconfig.get_config_var("EXT_SUFFIX"))
+    )
+    return target if target.is_file() else None
+
+
+def prebuild(root: Path | str | None = None) -> Path:
+    """Compile the helper and install it under ``root / 'direct_io' / <source_digest>``."""
+    built = _build(ignore_prebuilt=True)
+    dest_dir = Path(
+        root or os.environ.get("VLLM_NATIVE_CACHE_DIR", _DEFAULT_PREBUILT_ROOT)
+    ) / "direct_io" / _source_digest()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / built.name
+    if built.resolve() != dest.resolve():
+        shutil.copy2(built, dest)
+    return dest
+
+
+def _build(*, ignore_prebuilt: bool = False) -> Path:
+    if not ignore_prebuilt:
+        prebuilt = _prebuilt_target()
+        if prebuilt is not None:
+            return prebuilt
     compiler = shlex.split(os.environ.get("CC", "cc"))
     if not compiler or not shutil.which(compiler[0]):
         raise RuntimeError("the direct loader needs a C99 compiler (CC or cc)")
