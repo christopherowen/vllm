@@ -1071,3 +1071,208 @@ def test_declarations_cover_every_launch(monkeypatch):
         for module in (vit, aligner)
         for name in module.kernel_calls()
     }
+
+
+def _build_tp_shards(ref_vit, ref_aligner, tp_size: int):
+    """Build ``tp_size`` sharded ViT and aligner instances and load their shards
+    from ``ref_vit`` and ``ref_aligner`` via each parameter's ``weight_loader``."""
+    config = ref_vit.config
+    ref_vit_params = dict(ref_vit.named_parameters())
+    ref_aligner_params = dict(ref_aligner.named_parameters())
+    vits, aligners = [], []
+    for rank in range(tp_size):
+        with torch.device(DEVICE):
+            vit = tilelang_vision.DeepseekV4ViT(config, tp_size=tp_size, tp_rank=rank)
+            aligner = tilelang_vision.DeepseekV4Aligner(
+                config, tp_size=tp_size, tp_rank=rank
+            )
+        # Fill with NaN first so any unzeroed TP padding is caught immediately.
+        for module, ref_params in ((vit, ref_vit_params), (aligner, ref_aligner_params)):
+            for name, param in module.named_parameters():
+                param.data.fill_(NAN)
+                param.weight_loader(param, ref_params[name])
+                assert bool(torch.isfinite(param).all()), f"rank {rank} {name} has non-finite values"
+        vit.declare_kernels()
+        aligner.declare_kernels()
+        vits.append(vit)
+        aligners.append(aligner)
+    return vits, aligners
+
+
+@pytest.mark.parametrize("tp_size", [3, 4])
+@pytest.mark.parametrize("height, width", [(1, 1), (5, 7), (13, 17), (24, 24)])
+def test_tp_sharded_tower_against_reference(real, monkeypatch, tp_size, height, width):
+    """Tensor-parallel ViT + aligner at TP3 (16 -> 18 heads, 1024 -> 1152 hidden,
+    2816 -> 2880 MLP, 5120 -> 5184 aligner zero-padded) and TP4 (exact 4-way shards)
+    produce bit-for-bit identical BF16 outputs to the unsharded TP1 tower and
+    aligner on every rank."""
+    import threading
+    import vllm.distributed as distributed
+
+    ref_vit, ref_aligner = real
+    vits, aligners = _build_tp_shards(ref_vit, ref_aligner, tp_size)
+    barrier = threading.Barrier(tp_size)
+    partials: list[torch.Tensor | None] = [None] * tp_size
+    local_rank = threading.local()
+
+    def sync_all_gather(tensor: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        r = local_rank.rank
+        partials[r] = tensor.clone()
+        barrier.wait()
+        gathered = torch.cat([partials[i] for i in range(tp_size)], dim=dim)
+        barrier.wait()
+        return gathered
+
+    monkeypatch.setattr(distributed, "tensor_model_parallel_all_gather", sync_all_gather)
+    rows = height * width
+    patches = _patches(REAL, rows, seed=height * 1000 + width)
+    ref_encoded = ref_vit(patches, height, width)
+    ref_aligned = ref_aligner(ref_encoded, height, width)
+    encoded_ranks: list[torch.Tensor | None] = [None] * tp_size
+    aligned_ranks: list[torch.Tensor | None] = [None] * tp_size
+    errors: list[BaseException] = []
+
+    def worker(rank: int) -> None:
+        try:
+            local_rank.rank = rank
+            enc = vits[rank](patches, height, width)
+            aln = aligners[rank](enc, height, width)
+            encoded_ranks[rank] = enc
+            aligned_ranks[rank] = aln
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+            barrier.abort()
+
+    threads = [threading.Thread(target=worker, args=(r,)) for r in range(tp_size)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if errors:
+        raise errors[0]
+
+    for r in range(tp_size):
+        _assert_bits(encoded_ranks[r], ref_encoded, f"TP{tp_size} ViT rank {r} vs TP1")
+        _assert_bits(
+            aligned_ranks[r], ref_aligned, f"TP{tp_size} aligner rank {r} vs TP1"
+        )
+
+
+def test_tp_sharding_weight_padding_and_data_parallel_override(real):
+    """Verify TP3 zero-padding of tail heads/MLP/aligner rows on all 6 column-sharded
+    projections, TP4 exact 4-way memory reduction, contiguous 1-row O_DIRECT arena
+    descriptors via ``bind_weight_arena``, and ``use_data_parallel=True`` replication."""
+    from vllm.model_executor.model_loader.direct_io._checkpoint import (
+        TensorRange,
+        view_offset,
+        view_records,
+    )
+    from vllm.model_executor.model_loader.direct_loader import bind_weight_arena
+    from vllm.model_executor.weight_transfer import weight_transfer
+
+    ref_vit, ref_aligner = real
+    vits3, aligners3 = _build_tp_shards(ref_vit, ref_aligner, 3)
+    # TP3: 16 heads -> 6 heads/rank (384 rows); rank 2 has 4 valid heads (256 rows) + 128 zero rows.
+    assert (
+        vits3[2].local_heads == 6
+        and vits3[2].qkv_width == 384
+        and vits3[2].local_hidden == 384
+    )
+    wqkv2 = vits3[2].blocks[0].attn.wqkv
+    for p in range(3):
+        assert bool((wqkv2.weight[p * 384 + 256 : (p + 1) * 384] == 0).all())
+        assert bool((wqkv2.bias[p * 384 + 256 : (p + 1) * 384] == 0).all())
+    wo2 = vits3[2].blocks[0].attn.wo
+    assert bool((wo2.weight[256:] == 0).all())
+    assert bool((wo2.bias[256:] == 0).all())
+    # TP3 MLP: w1 2816 -> 960/rank (896 valid + 64 zero rows); w2 1024 -> 384/rank (256 valid + 128 zero rows).
+    w1_2 = vits3[2].blocks[0].mlp.w1
+    for p in range(2):
+        assert bool((w1_2.weight[p * 960 + 896 : (p + 1) * 960] == 0).all())
+    assert bool((vits3[2].blocks[0].mlp.w2.weight[256:] == 0).all())
+    # TP3 aligner: w1 & w2 5120 -> 1728/rank; rank 2 has 1664 valid + 64 zero rows.
+    assert bool((aligners3[2].w1.weight[1664:] == 0).all())
+    assert bool((aligners3[2].w1.bias[1664:] == 0).all())
+    assert bool((aligners3[2].w2.weight[1664:] == 0).all())
+    assert bool((aligners3[2].w2.bias[1664:] == 0).all())
+
+    # TP4: exact 1/4 sharding of attention, MLP, and aligner weights.
+    vits4, aligners4 = _build_tp_shards(ref_vit, ref_aligner, 4)
+    assert (
+        vits4[0].local_heads == 4
+        and vits4[0].local_hidden == 256
+        and vits4[0].local_inter == 704
+    )
+    assert aligners4[0].local_out_dim == 1280
+    b0_4, b0_ref = vits4[0].blocks[0], ref_vit.blocks[0]
+    assert b0_4.attn.wqkv.weight.nbytes * 4 == b0_ref.attn.wqkv.weight.nbytes
+    assert b0_4.attn.wo.weight.nbytes * 4 == b0_ref.attn.wo.weight.nbytes
+    assert b0_4.mlp.w1.weight.nbytes * 4 == b0_ref.mlp.w1.weight.nbytes
+    assert b0_4.mlp.w2.weight.nbytes * 4 == b0_ref.mlp.w2.weight.nbytes
+    assert aligners4[0].w1.weight.nbytes * 4 == ref_aligner.w1.weight.nbytes
+    assert aligners4[0].w2.weight.nbytes * 4 == ref_aligner.w2.weight.nbytes
+
+    # Direct weight arena: every TP3 shard records 1-row contiguous O_DIRECT DMA descriptors.
+    class _ArenaTower(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.vision = tilelang_vision.DeepseekV4ViT(REAL, tp_size=3, tp_rank=2)
+            self.aligner = tilelang_vision.DeepseekV4Aligner(REAL, tp_size=3, tp_rank=2)
+
+    with torch.device(DEVICE):
+        arena_model = _ArenaTower()
+    arena = bind_weight_arena(arena_model, torch.device(DEVICE), order13_sponge=False)
+    assert arena is not None
+    arena_start = arena.data_ptr()
+    arena_end = arena_start + arena.nbytes
+    recorded: list[tuple[int, ...]] = []
+
+    class _Recorder:
+        def __init__(self):
+            self.entries: dict[int, TensorRange] = {}
+
+        def make_source(self, name: str, ref_param: torch.Tensor) -> torch.Tensor:
+            meta = torch.empty(ref_param.shape, dtype=ref_param.dtype, device="meta")
+            self.entries[id(meta.untyped_storage())] = TensorRange(
+                name=name,
+                fd=0,
+                offset=4096,
+                nbytes=ref_param.nbytes,
+                shape=tuple(ref_param.shape),
+                dtype=ref_param.dtype,
+            )
+            return meta
+
+        def __call__(self, destination: torch.Tensor, source: torch.Tensor) -> bool:
+            entry = self.entries[id(source.untyped_storage())]
+            offset = view_offset(entry, source, destination)
+            recs = view_records(entry, offset, source, destination, expand=False)
+            recorded.extend(recs)
+            return True
+
+    recorder = _Recorder()
+    ref_all = {
+        **{f"vision.{k}": v for k, v in ref_vit.named_parameters()},
+        **{f"aligner.{k}": v for k, v in ref_aligner.named_parameters()},
+    }
+    with weight_transfer(recorder):
+        for name, param in arena_model.named_parameters():
+            param.data.fill_(NAN)
+            src = recorder.make_source(name, ref_all[name])
+            param.weight_loader(param, src)
+    assert len(recorded) > 0
+    for rec in recorded:
+        _, _, _, dst_ptr, _, rows, src_stride, dst_stride = rec
+        assert rows == 1 and src_stride == 0 and dst_stride == 0
+        assert arena_start <= dst_ptr < arena_end
+
+    # use_data_parallel=True keeps full replicated weights even when tp_size is passed.
+    with torch.device("meta"):
+        dp_vit = tilelang_vision.DeepseekV4ViT(
+            REAL, tp_size=4, tp_rank=2, use_data_parallel=True
+        )
+        dp_aligner = tilelang_vision.DeepseekV4Aligner(
+            REAL, tp_size=4, tp_rank=2, use_data_parallel=True
+        )
+    assert dp_vit.tp_size == 1 and dp_vit.local_heads == 16
+    assert dp_aligner.tp_size == 1 and dp_aligner.local_out_dim == 5120

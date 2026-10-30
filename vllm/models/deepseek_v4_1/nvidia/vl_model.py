@@ -14,6 +14,7 @@ from vllm.model_executor.models.utils import (
     WeightsMapper,
     maybe_prefix,
 )
+from vllm.model_executor.models.vision import is_vit_use_data_parallel
 from vllm.models.deepseek_v41.common.mm_preprocess import (
     IMAGE,
     IMAGE_END,
@@ -86,9 +87,9 @@ class DeepseekV41ForCausalLM(UpstreamDeepseekV41ForCausalLM):
         # (StageMissingLayer, weights skipped) when the image limit is 0.
         vit, aligner, self._run_dp_sharded_vision_tower = _vision_tower()
         with self._mark_tower_model(vllm_config, {"image"}):
-            self.use_data_parallel = True
-            self.vision = vit(config)
-            self.aligner = aligner(config)
+            self.use_data_parallel = is_vit_use_data_parallel()
+            self.vision = vit(config, use_data_parallel=self.use_data_parallel)
+            self.aligner = aligner(config, use_data_parallel=self.use_data_parallel)
             self.image_start = nn.Parameter(
                 torch.empty(config.hidden_size, dtype=torch.float32)
             )
