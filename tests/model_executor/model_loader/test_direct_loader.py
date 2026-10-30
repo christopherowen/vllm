@@ -411,12 +411,42 @@ def test_direct_is_a_registered_load_format():
     loader = model_loader.get_model_loader(config)
     assert isinstance(loader, direct_loader.DirectModelLoader)
     assert loader.io_threads == 8
+    assert loader.weight_arena is True
+    assert loader.order13_sponge is True
     assert loader.load_config.load_format == "safetensors"
     assert config.load_format == "direct"
     custom = LoadConfig(
-        load_format="direct", model_loader_extra_config={"io_threads": 3}
+        load_format="direct",
+        model_loader_extra_config={
+            "io_threads": 3,
+            "weight_arena": False,
+            "order13_sponge": False,
+        },
     )
-    assert model_loader.get_model_loader(custom).io_threads == 3
+    custom_loader = model_loader.get_model_loader(custom)
+    assert custom_loader.io_threads == 3
+    assert custom_loader.weight_arena is False
+    assert custom_loader.order13_sponge is False
+
+
+def test_parse_buddyinfo_order13_counts_sub_and_full_512mib_blocks():
+    buddyinfo = (
+        "Node 0, zone      DMA      0 0 0 0 0 0 0 0 0 0 0 0 2 3\n"
+        "Node 0, zone   Normal      4 0 0 0 0 1 0 0 0 0 0 0 1 190\n"
+        "ignored line\n"
+    )
+    sub_bytes, order13_bytes = direct_loader.parse_buddyinfo_order13(
+        buddyinfo, page_bytes=65536
+    )
+    expected_sub = (
+        4 * 65536
+        + 1 * (65536 << 5)
+        + 3 * (65536 << 12)
+    )
+    expected_order13 = 193 * (65536 << 13)
+    assert sub_bytes == expected_sub
+    assert order13_bytes == expected_order13
+    assert direct_loader.parse_buddyinfo_order13(buddyinfo, page_bytes=4096) == (0, 0)
 
 
 @pytest.mark.parametrize(

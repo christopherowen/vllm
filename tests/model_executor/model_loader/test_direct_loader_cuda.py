@@ -494,6 +494,16 @@ def test_loaded_weights_digest_equal_to_a_torch_copy(tmp_path):
     source = DefaultModelLoader.Source(str(tmp_path), revision=None, prefix="model.")
     with torch.device("cuda"):
         direct, reference = _Tiny(), _Tiny()
+    arena = direct_loader.bind_weight_arena(
+        direct, torch.device("cuda"), order13_sponge=False
+    )
+    assert arena is not None and arena is direct._direct_weight_arena
+    for param in direct.parameters():
+        assert (
+            param.data.untyped_storage().data_ptr()
+            == arena.untyped_storage().data_ptr()
+        )
+        assert (param.data.data_ptr() - arena.data_ptr()) % 256 == 0
     with (
         DirectWeightSession() as session,
         weight_transfer(session),
@@ -508,6 +518,97 @@ def test_loaded_weights_digest_equal_to_a_torch_copy(tmp_path):
     assert stats["payload_bytes"] > 0 and stats["bf16_expansion_bytes"] == 48 * 2
     reference.load_weights((name, tensor) for name, tensor in checkpoint.items())
     assert weight_digest.weight_digest(direct) == weight_digest.weight_digest(reference)
+
+
+def test_bind_weight_arena_preserves_tied_moe_and_load_view_parameters(tmp_path):
+    from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+        FusedMoEMethodBase,
+    )
+    from vllm.model_executor.utils import replace_parameter
+
+    class _DummyMoEMethod(FusedMoEMethodBase):
+        @property
+        def topk_indices_dtype(self):
+            return None
+
+        def create_weights(self, *args, **kwargs):
+            pass
+
+        def get_fused_moe_quant_config(self, layer):
+            return None
+
+        def apply(self, *args, **kwargs):
+            return None
+
+    class _FakeMoE(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.quant_method = _DummyMoEMethod.__new__(_DummyMoEMethod)
+            self.w2_weight = torch.nn.Parameter(
+                torch.empty((8, 64), dtype=torch.uint8), requires_grad=False
+            )
+            self.w13_weight = torch.nn.Parameter(
+                torch.empty((16, 64), dtype=torch.uint8), requires_grad=False
+            )
+
+    class _ArenaModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.wq = torch.nn.Parameter(
+                torch.empty((64, 48), dtype=torch.bfloat16), requires_grad=False
+            )
+            self.tied = torch.nn.Parameter(self.wq.data[32:], requires_grad=False)
+            self.fixed = torch.nn.Parameter(
+                torch.full((4,), 7.0, dtype=torch.float32), requires_grad=False
+            )
+            self.table = torch.nn.Parameter(
+                torch.empty((8, 8), dtype=torch.uint8), requires_grad=False
+            )
+            self.table.load_view = self.table.data
+            self.experts = _FakeMoE()
+
+    with torch.device("cuda"):
+        model = _ArenaModel()
+    table_storage_ptr = model.table.data.untyped_storage().data_ptr()
+    buddyinfo = tmp_path / "buddyinfo"
+    buddyinfo.write_text(
+        "Node 0, zone   Normal      0 0 0 0 0 2 0 0 0 0 0 0 0 8\n"
+    )
+    sponge = direct_loader._allocate_order13_sponge(
+        torch.device("cuda"),
+        required_bytes=4096,
+        buddyinfo_path=buddyinfo,
+        page_bytes=65536,
+        headroom_bytes=0,
+        chunk_bytes=1 << 21,
+    )
+    assert len(sponge) == 2
+    sponge.clear()
+
+    arena = direct_loader.bind_weight_arena(
+        model,
+        torch.device("cuda"),
+        order13_sponge=True,
+        sponge_min_model_bytes=0,
+        buddyinfo_path=buddyinfo,
+        page_bytes=65536,
+    )
+    assert arena is not None
+    arena_ptr = arena.untyped_storage().data_ptr()
+    assert model.wq.data.untyped_storage().data_ptr() == arena_ptr
+    assert model.tied.data.untyped_storage().data_ptr() == arena_ptr
+    assert model.tied.data.data_ptr() == model.wq.data.data_ptr() + 32 * 48 * 2
+    assert model.fixed.data.untyped_storage().data_ptr() == arena_ptr
+    assert torch.equal(model.fixed.cpu(), torch.full((4,), 7.0))
+    assert model.table.data.untyped_storage().data_ptr() == table_storage_ptr
+    assert model.experts.w13_weight.data.untyped_storage().data_ptr() != arena_ptr
+    assert model.experts.w2_weight.data.untyped_storage().data_ptr() != arena_ptr
+    replace_parameter(
+        model.experts,
+        "w13_weight",
+        torch.ones_like(model.experts.w13_weight.data),
+    )
+    assert model.experts.w13_weight.data.untyped_storage().data_ptr() != arena_ptr
 
 
 def test_file_backed_tables_stay_descriptors_beside_routed_weights(tmp_path):
