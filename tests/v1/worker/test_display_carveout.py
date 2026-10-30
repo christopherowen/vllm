@@ -26,7 +26,9 @@ class _Table(torch.nn.Module):
         data = display_carveout.allocate((rows, width), torch.bfloat16, device)
         if data is None:
             data = torch.empty(rows, width, dtype=torch.bfloat16, device=device)
-        data.copy_(torch.randn(rows, width, dtype=torch.bfloat16))  # "loading"
+        data.copy_(
+            torch.randn(width, dtype=torch.bfloat16).expand(rows, width)
+        )  # "loading"
         self.weight = torch.nn.Parameter(data, requires_grad=False)
 
 
