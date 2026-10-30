@@ -1436,6 +1436,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.adaptive_verification.load_draft_budget_kernels()
                     self.kv_connector.reset_capture_state()
 
+            torch.accelerator.empty_cache()
             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
 
         if not profile_only:

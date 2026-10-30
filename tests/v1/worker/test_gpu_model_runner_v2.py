@@ -333,9 +333,14 @@ def test_capture_model_locks_workspace_after_capture(monkeypatch):
     monkeypatch.setattr(
         model_runner_module, "freeze_gc_for_cudagraph_capture", contextlib.nullcontext
     )
-    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    events: list[str] = []
     monkeypatch.setattr(
-        torch.accelerator, "get_memory_info", lambda: (1 << 30, 1 << 30)
+        torch.accelerator, "empty_cache", lambda: events.append("empty_cache")
+    )
+    monkeypatch.setattr(
+        torch.accelerator,
+        "get_memory_info",
+        lambda: (events.append("mem_info") or (1 << 30), 1 << 30),
     )
     lock_calls = []
     monkeypatch.setattr(
@@ -345,6 +350,7 @@ def test_capture_model_locks_workspace_after_capture(monkeypatch):
     runner.capture_model()
 
     assert lock_calls == ["lock"]
+    assert events == ["empty_cache", "mem_info", "empty_cache", "mem_info"]
 
 
 def test_capture_model_skips_lock_when_nothing_captured(monkeypatch):
@@ -793,3 +799,84 @@ def test_pipeline_drafts_do_not_depend_on_boundary_checkpoints(
     else:
         pp.broadcast_drafts.assert_not_called()
         runner.draft_tokens_handler.set_draft_tokens.assert_not_called()
+
+
+def test_moe_output_buffer_is_reused_and_disjoint_from_workspace_scratch(
+    monkeypatch, workspace_init
+):
+    import vllm.config as vllm_config_module
+    import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+    from vllm.v1.worker.workspace import current_workspace_manager
+
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        vllm_config_module,
+        "get_current_vllm_config_or_none",
+        lambda: SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=64)
+        ),
+    )
+    manager = current_workspace_manager()
+    view_small = manager.get_moe_output_buffer((8, 16), torch.bfloat16)
+    view_large = manager.get_moe_output_buffer((32, 16), torch.bfloat16)
+    assert view_small.shape == (8, 16)
+    assert view_large.shape == (32, 16)
+    assert view_small.data_ptr() == view_large.data_ptr()
+
+    (scratch,) = manager.get_simultaneous(((32, 16), torch.bfloat16))
+    view_large.fill_(3.0)
+    scratch.fill_(-5.0)
+    assert torch.all(view_large == 3.0)
+
+    aliases: list[int] = []
+
+    class _DummyPrepareFinalize:
+        def supports_async(self) -> bool:
+            return False
+
+        def prepare(self, hidden_states, topk_weights, topk_ids, *args, **kwargs):
+            return hidden_states, None, None, topk_ids, topk_weights
+
+        def finalize(self, output, fused_out, *args, **kwargs):
+            output.copy_(fused_out)
+
+    class _DummyExperts:
+        output_dtype = torch.bfloat16
+        quant_config = None
+        expects_unquantized_inputs = True
+        a2_scale = None
+
+        def moe_problem_size(self, a1q, w1, w2, topk_ids):
+            return 1, a1q.shape[0], w1.shape[1], a1q.shape[1], topk_ids.shape[1]
+
+        def workspace_dtype(self, in_dtype):
+            return in_dtype
+
+        def workspace_shapes(self, M, N, K, *args):
+            return (M, N), (M, K), (M, K)
+
+        def finalize_weight_and_reduce_impl(self):
+            return None
+
+        def apply(self, *, output, hidden_states, **kwargs):
+            aliases.append(output.data_ptr())
+            output.copy_(hidden_states)
+
+    impl = mk.FusedMoEKernelModularImpl.__new__(mk.FusedMoEKernelModularImpl)
+    impl.prepare_finalize = _DummyPrepareFinalize()
+    impl.fused_experts = _DummyExperts()
+    monkeypatch.setattr(
+        mk, "current_platform", SimpleNamespace(is_cpu=lambda: False, is_rocm=lambda: False)
+    )
+    monkeypatch.setattr(mk, "is_forward_context_available", lambda: True)
+    device = manager._device
+    hidden = torch.ones((12, 16), dtype=torch.bfloat16, device=device)
+    w1 = torch.ones((2, 8, 16), dtype=torch.bfloat16, device=device)
+    w2 = torch.ones((2, 16, 8), dtype=torch.bfloat16, device=device)
+    topk_ids = torch.zeros((12, 2), dtype=torch.int32, device=device)
+    topk_weights = torch.ones((12, 2), dtype=torch.float32, device=device)
+
+    out1 = impl.apply(hidden, w1, w2, topk_ids, topk_weights)
+    out2 = impl.apply(hidden, w1, w2, topk_ids, topk_weights)
+    assert out1.data_ptr() == out2.data_ptr() == view_small.data_ptr()
+    assert aliases == [view_small.data_ptr(), view_small.data_ptr()]

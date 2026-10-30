@@ -782,3 +782,76 @@ def test_serving_thread_count_is_set_before_warmup(monkeypatch):
     assert events[0] == "set_torch_threads_for_runtime"
     assert events.count("set_torch_threads_for_runtime") == 1
     assert "kernel_warmup" in events and "capture_model" in events
+
+
+def test_v2_kernel_warmup_flushes_allocator_cache(monkeypatch):
+    events: list[str] = []
+    compilation = SimpleNamespace(
+        mode=gpu_worker.CompilationMode.NONE,
+        cudagraph_mode=gpu_worker.CUDAGraphMode.FULL_AND_PIECEWISE,
+        compilation_time=0.0,
+        encoder_compilation_time=0.0,
+    )
+    worker = SimpleNamespace(
+        vllm_config=SimpleNamespace(compilation_config=compilation),
+        compilation_config=compilation,
+        model_runner=SimpleNamespace(
+            lora_config=None,
+            maybe_remove_all_loras=lambda config: None,
+            capture_model=lambda: events.append("capture_model") or 0,
+        ),
+        execute_model=None,
+        sample_tokens=None,
+        model_config=SimpleNamespace(enforce_eager=False, seed=0),
+        cache_config=SimpleNamespace(kv_cache_memory_bytes=1),
+        use_v2_model_runner=True,
+        observability_config=SimpleNamespace(
+            jit_monitor_mode="off", jit_monitor_verbose=False
+        ),
+        _startup_rendezvous=lambda stage: events.append(f"rendezvous:{stage}"),
+        _startup_heartbeat=None,
+        _b12x_session=None,
+        _get_cudagraph_capture_context=nullcontext,
+    )
+    monkeypatch.setattr(
+        gpu_worker, "get_pp_group", lambda: SimpleNamespace(is_last_rank=False)
+    )
+    for name in (
+        "set_random_seed",
+        "freeze_gc_heap",
+        "maybe_attach_gc_debug_callback",
+        "enable_gpu_sync_check",
+        "set_torch_threads_for_runtime",
+    ):
+        monkeypatch.setattr(gpu_worker, name, lambda *args: None)
+    monkeypatch.setattr(
+        gpu_worker, "kernel_warmup", lambda *args: events.append("kernel_warmup")
+    )
+    monkeypatch.setattr(
+        gpu_worker, "warmup_kernels", lambda *args: events.append("warmup_kernels")
+    )
+    monkeypatch.setattr(
+        gpu_worker.torch.accelerator,
+        "synchronize",
+        lambda: events.append("synchronize"),
+    )
+    monkeypatch.setattr(
+        gpu_worker.torch.accelerator,
+        "empty_cache",
+        lambda: events.append("empty_cache"),
+    )
+    monkeypatch.setattr("vllm.utils.jit_monitor.activate", lambda **kwargs: None)
+
+    gpu_worker.Worker._compile_or_warm_up_model_after_preparation(worker)
+
+    assert events == [
+        "kernel_warmup",
+        "rendezvous:warm-up",
+        "warmup_kernels",
+        "synchronize",
+        "empty_cache",
+        "capture_model",
+        "warmup_kernels",
+        "synchronize",
+        "empty_cache",
+    ]

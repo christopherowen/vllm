@@ -1046,6 +1046,8 @@ class Worker(WorkerBase):
         if self.use_v2_model_runner:
             # A workspace resize after capture frees what the graphs point at.
             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
+            torch.accelerator.synchronize()
+            torch.accelerator.empty_cache()
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
@@ -1143,6 +1145,8 @@ class Worker(WorkerBase):
                 warmup_kernels(
                     self.model_runner, self.execute_model, self.sample_tokens
                 )
+                torch.accelerator.synchronize()
+                torch.accelerator.empty_cache()
         elif get_pp_group().is_last_rank:
             # V1: Warm up sampler and preallocate memory buffer for logits and other
             # sampling related tensors of max possible shape to avoid memory
