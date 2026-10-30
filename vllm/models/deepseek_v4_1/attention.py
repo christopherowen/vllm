@@ -200,6 +200,8 @@ class DeepseekV4Indexer(nn.Module):
             )
             self.wk.quant_method = kernels.linear_method()
             self.k_norm = kernels.rms_norm(128, hf.rms_norm_eps)
+            # _write_index_keys fuses k_norm with RoPE and MXFP4 quantization.
+            self.k_norm.declare_kernels = lambda: None
         self.ratio = ratio
 
 
@@ -638,15 +640,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             (self.n_local_heads, self.head_dim, 1, False),  # q
             (1, 512, 1, False),  # kv
         ]
-        if self.compressor is not None:
-            roles.append((1, 128, self.compress_ratio, False))  # index key
-            roles.append((1, 512, self.compress_ratio, False))  # latent
         calls.extend(
             rope_call(heads, dim, table_width, ratio, inverse)
             for heads, dim, ratio, inverse in roles
         )
         # _write_v41_cache: SWA records of every layer, indexed records of the
-        # compressor's latents, at the builders' (and compressor's) slot dtype.
+        # compressor's latents (rotated in registers), at the builders' (and
+        # compressor's) slot dtype.
         calls.append(writer_call("swa", self.swa_cache_layer.block_size, SLOT_DTYPE))
         # _front: the decode front's one kernel.
         calls.append(
@@ -657,7 +657,15 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             )
         )
         if self.compressor is not None:
-            calls.append(writer_call("indexed", self._main_page, SLOT_DTYPE))
+            calls.append(
+                writer_call(
+                    "indexed",
+                    self._main_page,
+                    SLOT_DTYPE,
+                    rope_dim=table_width,
+                    ratio=self.compress_ratio,
+                )
+            )
         else:
             # _gather_front: prefill SP's BF16 front, the index head weights beside
             # the normalized halves.
@@ -695,11 +703,25 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         rope_(x, positions, table, self.compress_ratio if compressed else 1, False)
         return x
 
-    def _write_v41_cache(self, x, cache, slots, *, page_size, cache_kind):
+    def _write_v41_cache(
+        self, x, cache, slots, *, page_size, cache_kind, positions=None
+    ):
         """Write ``x``'s V4.1 records (``cache_kind`` swa or indexed) at ``slots``."""
         from .tilelang.cache_writer import write_cache
 
-        write_cache(x, cache, slots, page_size=page_size, cache_kind=cache_kind)
+        if positions is None:
+            write_cache(x, cache, slots, page_size=page_size, cache_kind=cache_kind)
+            return
+        write_cache(
+            x,
+            cache,
+            slots,
+            page_size=page_size,
+            cache_kind=cache_kind,
+            positions=positions,
+            cos_sin=self.rotary_emb.cos_sin_cache,
+            ratio=self.compress_ratio if cache_kind == "indexed" else 1,
+        )
 
     def insert_context_kv(self, kv, positions, slot_mapping):
         if not self._ready:
@@ -752,18 +774,18 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         )
         latent, slots = self.compressor(hidden_states, main, state)
         self._issue_wo_prefetch(rows, after="compressor")
-        # Index K consumes the ordinary-normalized PRE-RoPE latent.
-        key = indexer.k_norm(indexer.wk(latent))
-        key = self._rope(key, positions, "index_key")
+        # Index K consumes the ordinary-normalized PRE-RoPE latent; norm, RoPE
+        # and the paged MXFP4 write run in one kernel.
+        key = indexer.wk(latent)
         index_meta = cast(DeepseekV41B12xMetadata, metadata[indexer.k_cache.prefix])
-        self._write_index_keys(key, index_meta.slot_mapping[:rows])
-        latent = self._rope(latent, positions, "latent")
+        self._write_index_keys(key, index_meta.slot_mapping[:rows], positions=positions)
         self._write_v41_cache(
             latent,
             self.kv_cache,
             slots,
             page_size=self._main_page,
             cache_kind="indexed",
+            positions=positions,
         )
 
     def forward(

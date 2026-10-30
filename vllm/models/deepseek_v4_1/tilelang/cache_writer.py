@@ -72,12 +72,19 @@ __device__ __forceinline__ unsigned short dsv41_e2m1x4(float v0, float v1,
 
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
-def cache_writer_kernel(cache_kind: str, page_size: int, slot_dtype: str = "int64"):
+def cache_writer_kernel(
+    cache_kind: str,
+    page_size: int,
+    slot_dtype: str = "int64",
+    rope_dim: int = 0,
+    ratio: int = 1,
+):
     """One record per token, 128 threads, four values per thread, payload stored in
     whole words through a word view of the pages (scales through the byte view),
     the group's amax shuffled across its lanes. ``swa``: eight lanes per 32-value
     group, one 32-bit word of E4M3 each. ``indexed``: four lanes per 16-value
-    group, one 16-bit word of packed E2M1 each."""
+    group, one 16-bit word of packed E2M1 each. With ``rope_dim > 0``, rotates the
+    trailing ``rope_dim`` columns in registers at ``positions`` before quantizing."""
     threads = 128
     group_size = _GROUP[cache_kind]
     groups = DIM // group_size
@@ -89,16 +96,14 @@ def cache_writer_kernel(cache_kind: str, page_size: int, slot_dtype: str = "int6
     record = RECORD_BYTES[cache_kind]
     payload = DIM if cache_kind == "swa" else DIM // 2  # scale bytes follow
     tokens, kv_stride = T.dynamic("tokens, kv_stride")
+    positions_max = T.dynamic("positions_max")
     pages, page_bytes, page_stride = T.dynamic("pages, page_bytes, page_stride")
     page_words, word_stride = T.dynamic("page_words, word_stride")
+    rope_start = DIM - rope_dim
+    rope_half = rope_dim // 2
 
-    @T.prim_func
-    def cache_writer(
-        kv: T.StridedTensor((tokens, DIM), (kv_stride, 1), T.bfloat16),
-        cache: T.StridedTensor((pages, page_bytes), (page_stride, 1), T.uint8),
-        words: T.StridedTensor((pages, page_words), (word_stride, 1), word_dtype),
-        slots: T.Tensor((tokens,), slot_dtype),
-    ):
+    @T.macro
+    def body(kv, positions, cos_sin, cache, words, slots):
         with T.Kernel(T.ceildiv(tokens, tokens_per_block), threads=threads) as bx:
             T.import_source(_CVT_HEADER)
             pdl.chain()
@@ -114,6 +119,34 @@ def cache_writer_kernel(cache_kind: str, page_size: int, slot_dtype: str = "int6
             if token < tokens:
                 for i in T.unroll(per_thread):
                     values[i] = T.cast(kv[token, col + i], T.float32)
+                if rope_dim > 0:
+                    if col >= rope_start:
+                        pos = (
+                            positions[token] // ratio * ratio
+                            if ratio > 1
+                            else positions[token]
+                        )
+                        pair_base = (col - rope_start) // 2
+                        for p in T.unroll(per_thread // 2):
+                            first = values[2 * p]
+                            second = values[2 * p + 1]
+                            cosine = cos_sin[pos, pair_base + p]
+                            sine = cos_sin[pos, rope_half + pair_base + p]
+                            values[2 * p] = T.cast(
+                                T.cast(
+                                    T.ieee_fmaf(first, cosine, -(second * sine)),
+                                    T.bfloat16,
+                                ),
+                                T.float32,
+                            )
+                            values[2 * p + 1] = T.cast(
+                                T.cast(
+                                    T.ieee_fmaf(first, sine, second * cosine),
+                                    T.bfloat16,
+                                ),
+                                T.float32,
+                            )
+                for i in T.unroll(per_thread):
                     amax = T.max(amax, T.abs(values[i]))
             amax = T.max(amax, T.shfl_xor(amax, 1))
             amax = T.max(amax, T.shfl_xor(amax, 2))
@@ -170,6 +203,30 @@ def cache_writer_kernel(cache_kind: str, page_size: int, slot_dtype: str = "int6
                                 scale_code, T.uint8
                             )
 
+    if rope_dim > 0:
+
+        @T.prim_func
+        def cache_writer(
+            kv: T.StridedTensor((tokens, DIM), (kv_stride, 1), T.bfloat16),
+            positions: T.Tensor((tokens,), T.int64),
+            cos_sin: T.Tensor((positions_max, rope_dim), T.float32),
+            cache: T.StridedTensor((pages, page_bytes), (page_stride, 1), T.uint8),
+            words: T.StridedTensor((pages, page_words), (word_stride, 1), word_dtype),
+            slots: T.Tensor((tokens,), slot_dtype),
+        ):
+            body(kv, positions, cos_sin, cache, words, slots)
+
+        return cache_writer
+
+    @T.prim_func
+    def cache_writer(
+        kv: T.StridedTensor((tokens, DIM), (kv_stride, 1), T.bfloat16),
+        cache: T.StridedTensor((pages, page_bytes), (page_stride, 1), T.uint8),
+        words: T.StridedTensor((pages, page_words), (word_stride, 1), word_dtype),
+        slots: T.Tensor((tokens,), slot_dtype),
+    ):
+        body(kv, None, None, cache, words, slots)
+
     return cache_writer
 
 
@@ -180,10 +237,14 @@ def write_cache(
     *,
     page_size: int,
     cache_kind: str,
+    positions: torch.Tensor | None = None,
+    cos_sin: torch.Tensor | None = None,
+    ratio: int = 1,
 ) -> None:
     """Write ``kv`` ([T, 512] BF16, unit column stride) into ``cache`` (``[pages,
     page bytes]`` or ``[pages, records, record bytes]`` bytes, any page stride) at
-    ``slot_mapping`` ([T] int32 or int64)."""
+    ``slot_mapping`` ([T] int32 or int64). With ``positions`` and ``cos_sin``,
+    rotates the trailing ``cos_sin.shape[1]`` columns in registers first."""
     if kv.shape[0] == 0:
         return
     if kv.dtype != torch.bfloat16 or kv.shape[1] != DIM or kv.stride(1) != 1:
@@ -198,19 +259,41 @@ def write_cache(
     word_bytes, _, word_torch = _WORD[cache_kind]
     if pages.stride(0) % word_bytes or pages.shape[1] % word_bytes:
         raise ValueError(f"cache pages are not whole {word_bytes}-byte words")
+    if positions is not None and cos_sin is not None:
+        function, args, kwargs = writer_call(
+            cache_kind,
+            page_size,
+            slot_mapping.dtype,
+            rope_dim=cos_sin.shape[1],
+            ratio=ratio,
+        )
+        kernel = function(*args, **kwargs)
+        kernel(kv, positions, cos_sin, pages, pages.view(word_torch), slot_mapping)
+        return
     function, args, kwargs = writer_call(cache_kind, page_size, slot_mapping.dtype)
     kernel = function(*args, **kwargs)
     kernel(kv, pages, pages.view(word_torch), slot_mapping)
 
 
-def writer_call(cache_kind: str, page_size: int, slot_dtype: torch.dtype):
+def writer_call(
+    cache_kind: str,
+    page_size: int,
+    slot_dtype: torch.dtype,
+    *,
+    rope_dim: int = 0,
+    ratio: int = 1,
+):
     """The kernel ``write_cache`` launches for ``slot_dtype`` slots, as a
     ``prepare.call``."""
+    kwargs = {}
+    if rope_dim > 0:
+        kwargs = dict(rope_dim=rope_dim, ratio=ratio)
     return prepare.call(
         cache_writer_kernel,
         cache_kind,
         page_size,
         str(slot_dtype).removeprefix("torch."),
+        **kwargs,
     )
 
 

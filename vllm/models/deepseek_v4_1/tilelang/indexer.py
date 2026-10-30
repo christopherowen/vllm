@@ -90,6 +90,20 @@ def quantize_call(
     return prepare.call(mxfp4_quantize_v41, True, page_size, **kwargs)
 
 
+def norm_quantize_call(
+    eps: float, page_size: int, ratio: int = 1, slot_dtype: torch.dtype = torch.int64
+):
+    """The fused ``k_norm + rope + write_index_keys`` kernel ``norm_rope_write_index_keys``
+    launches, as a ``prepare.call``."""
+    return prepare.call(
+        mxfp4_norm_rope_quantize_v41,
+        eps,
+        page_size,
+        ratio,
+        str(slot_dtype).removeprefix("torch."),
+    )
+
+
 def _row_extent(Lengths, Active, row, width):
     """Positions a row selects from: ``min(Lengths, Active, width)``, at least zero.
 
@@ -587,6 +601,199 @@ def write_index_keys(keys, pool, slots, page_size):
     """Quantize ``[rows, 128]`` keys into index-cache pages at ``slots`` (-1 skips)."""
     kernel = _make(quantize_call(page_size))
     kernel(keys, slots.to(torch.int64), pool[:, : page_bytes(page_size)])
+
+
+@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+def mxfp4_norm_rope_quantize_v41(
+    eps: float,
+    page_size: int = 64,
+    ratio: int = 1,
+    slot_dtype: str = "int64",
+):
+    """Fused 128-column RMSNorm (TileKernels' ``norm_forward`` reduction), trailing
+    64-column GPT-J RoPE (``rope_kernel``) and paged MXFP4 key write
+    (``mxfp4_quantize_v41(paged=True)``) in one launch, bit for bit."""
+    from .front import ROPE_DIM, _THREADS, _VEC, _row_split
+
+    k = _row_split(INDEX_DIM)
+    assert (
+        k["num_row_warps"] == 1
+        and k["row_threads"] == 8
+        and k["num_thread_vec"] == 2
+        and ROPE_DIM == 64
+    )
+    kb, kt = k["block_m"], k["row_threads"]
+    half = ROPE_DIM // 2
+    pairs = _VEC // 2
+    out_scale = 1.0
+    rows, positions_max = T.dynamic("rows, positions_max")
+    pool_pages, pool_stride = T.dynamic("pool_pages, pool_stride")
+
+    @T.prim_func
+    def indexer_mxfp4_quantize(
+        X: T.Tensor([rows, INDEX_DIM], T.bfloat16),
+        Weight: T.Tensor([INDEX_DIM], T.bfloat16),
+        Positions: T.Tensor([rows], T.int64),
+        CosSin: T.Tensor([positions_max, ROPE_DIM], T.float32),
+        Slots: T.Tensor([rows], slot_dtype),
+        Pool: T.StridedTensor(
+            [pool_pages, page_bytes(page_size)], [pool_stride, 1], T.uint8
+        ),
+    ):
+        with T.Kernel(T.ceildiv(rows, kb), threads=_THREADS) as bx:
+            pdl.chain()
+            tid = T.get_thread_binding()
+            k_sum_partial = T.alloc_fragment((kb, kt), T.float32)
+            k_warp_reducer = T.alloc_reducer((kb, 1), T.float32, op="sum")
+            k_warp_fragment = T.alloc_fragment((kb, 1), T.float32)
+            k_sum_shared = T.alloc_shared((kb, 1), T.float32)
+            k_row_partial = T.alloc_fragment((kb, kt, 1), T.float32)
+            k_sum_reducer = T.alloc_reducer((kb, kt), T.float32, op="sum")
+            k_sum_fragment = T.alloc_fragment((kb, kt), T.float32)
+            T.annotate_layout(
+                {
+                    k_sum_partial: k["row_layout"],
+                    k_warp_fragment: k["warp_layout"],
+                    k_row_partial: k["row_reduce_layout"],
+                    k_sum_fragment: k["row_layout"],
+                }
+            )
+            k_x = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
+            k_y = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
+            y_fp32_local = T.alloc_local((_VEC,), T.float32)
+            sum_local = T.alloc_local((2,), T.float32)
+            weight_local = T.alloc_local((_VEC,), T.bfloat16)
+            cs = T.alloc_local((_VEC,), T.float32)
+
+            row_id = tid // kt
+            lane = tid % kt
+            token_id = bx * kb + row_id
+            T.clear(sum_local)
+            for vi in T.unroll(k["num_thread_vec"]):
+                token_offset = (vi * kt + lane) * _VEC
+                if token_id < rows:
+                    for j in T.vectorized(_VEC):
+                        k_x[vi, j] = X[token_id, token_offset + j]
+                else:
+                    T.clear(k_x[vi, :])
+                for j in T.vectorized(_VEC):
+                    sum_local[j % 2] += T.float32(k_x[vi, j]) * T.float32(k_x[vi, j])
+            k_sum_partial[row_id, lane] = sum_local[0] + sum_local[1]
+            T.reducer_init(k_warp_reducer)
+            for i, w, j in T.Parallel(
+                kb, 1, kt, loop_layout=k["warp_reduce_layout"]
+            ):
+                T.reducer_update(k_warp_reducer[i, w], k_sum_partial[i, w * kt + j])
+            T.finalize_reducer(k_warp_reducer, k_warp_fragment)
+            if lane == 0:
+                k_sum_shared[row_id, 0] = k_warp_fragment[row_id, 0]
+            T.sync_threads()
+            for i, j, w in T.Parallel(kb, kt, 1, loop_layout=k["row_reduce_layout"]):
+                k_row_partial[i, j, w] = k_sum_shared[i, w]
+            T.reducer_init(k_sum_reducer)
+            for i, j, w in T.Parallel(kb, kt, 1, loop_layout=k["row_reduce_layout"]):
+                T.reducer_update(k_sum_reducer[i, j], k_row_partial[i, j, w])
+            T.finalize_reducer(k_sum_reducer, k_sum_fragment)
+
+            rstd_value = T.alloc_var(
+                T.float32,
+                init=T.rsqrt(k_sum_fragment[row_id, lane] / INDEX_DIM + eps),
+            )
+            for vi in T.unroll(k["num_thread_vec"]):
+                token_offset = (vi * kt + lane) * _VEC
+                for j in T.vectorized(_VEC):
+                    weight_local[j] = Weight[token_offset + j]
+                for j in T.vectorized(_VEC):
+                    y_fp32_local[j] = (
+                        T.float32(k_x[vi, j])
+                        * rstd_value
+                        * (T.float32(weight_local[j]) * out_scale)
+                    )
+                for j in T.vectorized(_VEC):
+                    k_y[vi, j] = y_fp32_local[j]
+
+            if token_id < rows:
+                pos = (
+                    Positions[token_id] // ratio * ratio
+                    if ratio > 1
+                    else Positions[token_id]
+                )
+                for i in T.vectorized(pairs):
+                    cs[i] = CosSin[pos, lane * pairs + i]
+                for i in T.vectorized(pairs):
+                    cs[pairs + i] = CosSin[pos, half + lane * pairs + i]
+                for j in T.unroll(pairs):
+                    first = T.cast(k_y[1, 2 * j], T.float32)
+                    second = T.cast(k_y[1, 2 * j + 1], T.float32)
+                    cosine = cs[j]
+                    sine = cs[pairs + j]
+                    k_y[1, 2 * j] = T.cast(
+                        T.ieee_fmaf(first, cosine, -(second * sine)), T.bfloat16
+                    )
+                    k_y[1, 2 * j + 1] = T.cast(
+                        T.ieee_fmaf(first, sine, second * cosine), T.bfloat16
+                    )
+
+            for vi in T.unroll(k["num_thread_vec"]):
+                group = vi * 2 + (lane // 4)
+                group_lane = lane % 4
+                amax = T.alloc_var(T.float32, init=6.0 * 2.0**-126)
+                for j in T.unroll(_VEC):
+                    amax = T.max(amax, T.abs(T.cast(k_y[vi, j], T.float32)))
+                amax = T.max(amax, T.shfl_xor(amax, 1))
+                amax = T.max(amax, T.shfl_xor(amax, 2))
+                if token_id < rows:
+                    slot = T.cast(Slots[token_id], T.int64)
+                    page = slot // page_size
+                    tok = slot % page_size
+                    if (slot >= 0) & (page < pool_pages):
+                        bits = T.reinterpret(
+                            T.fmul(amax, T.float32(1.0 / 6.0)), T.uint32
+                        )
+                        sf = T.cast(T.shift_right(bits, 23) & 0xFF, T.int32) + T.cast(
+                            (bits & 0x7FFFFF) != 0, T.int32
+                        )
+                        scale = T.reinterpret(
+                            T.cast(T.shift_left(254 - sf, 23), T.uint32), T.float32
+                        )
+                        for i in T.unroll(pairs):
+                            lo = _e2m1_code(
+                                T.fmul(T.cast(k_y[vi, 2 * i], T.float32), scale)
+                            )
+                            hi = _e2m1_code(
+                                T.fmul(T.cast(k_y[vi, 2 * i + 1], T.float32), scale)
+                            )
+                            Pool[
+                                page,
+                                tok * (INDEX_DIM // 2)
+                                + group * 16
+                                + group_lane * pairs
+                                + i,
+                            ] = T.cast(lo | (hi << 4), T.uint8)
+                        if group_lane == 0:
+                            Pool[
+                                page,
+                                page_size * (INDEX_DIM // 2) + tok * 4 + group,
+                            ] = T.cast(sf, T.uint8)
+
+    return indexer_mxfp4_quantize
+
+
+def norm_rope_write_index_keys(
+    raw_keys, weight, eps: float, positions, cos_sin, pool, slots, page_size: int, ratio: int = 1
+):
+    """Fused RMSNorm + RoPE + paged MXFP4 quantize/write of ``[rows, 128]`` keys."""
+    if raw_keys.shape[0] == 0:
+        return
+    kernel = _make(norm_quantize_call(eps, page_size, ratio, slots.dtype))
+    kernel(
+        raw_keys,
+        weight,
+        positions,
+        cos_sin,
+        slots,
+        pool[:, : page_bytes(page_size)],
+    )
 
 
 def _key16(x):

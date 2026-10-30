@@ -45,6 +45,7 @@ from vllm.models.deepseek_v4_1.tilelang.indexer import (  # noqa: E402
     INDEX_TOPK,
     IndexerTopK,
     IndexerV41Plan,
+    norm_rope_write_index_keys,
     page_bytes,
     quantize_mxfp4,
     write_index_keys,
@@ -268,6 +269,38 @@ def test_write_index_keys(page_size=64, pages=5):
     expected[:, page_size * 64 : page_size * 68] = scale_rows.reshape(pages, -1)
     assert torch.equal(pool, expected)
     # Neither the other layers' pages nor the padding were written.
+    assert bool((pool._base[:, [0, 2]] == 0xAB).all())
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("slot_dtype", [torch.int64, torch.int32])
+def test_norm_rope_write_index_keys(ratio, slot_dtype, page_size=64, pages=5):
+    from vllm.models.deepseek_v4_1.tilelang import pdl
+    from vllm.models.deepseek_v4_1.tilelang.rope import rope_
+
+    n = pages * page_size // 2
+    x = _mxfp4_inputs(n, 14)
+    gen = _gen(15)
+    weight = torch.randn((INDEX_DIM,), generator=gen, device=DEVICE).bfloat16()
+    eps = 1e-6
+    positions = torch.randint(
+        0, 512, (n,), generator=gen, device=DEVICE, dtype=torch.int64
+    )
+    table = rope_table(512)
+    slots = torch.randperm(pages * page_size, generator=gen, device=DEVICE)[:n].to(
+        slot_dtype
+    )
+    slots[:3] = -1
+    pool = _page_buffer(pages, page_bytes(page_size))
+    expected = pool.clone()
+    norm_rope_write_index_keys(
+        x, weight, eps, positions, table, pool, slots, page_size, ratio
+    )
+    ref = torch.empty_like(x)
+    pdl.norm_forward(x, weight, eps, out=ref)
+    rope_(ref, positions, table, ratio, False)
+    write_index_keys(ref, expected, slots, page_size)
+    assert torch.equal(pool, expected)
     assert bool((pool._base[:, [0, 2]] == 0xAB).all())
 
 

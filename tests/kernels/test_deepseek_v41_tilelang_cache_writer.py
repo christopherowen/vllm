@@ -98,3 +98,47 @@ def test_strided_rows():
     write_cache(kv, cache, slots, page_size=page_size, cache_kind=kind)
     got = cache.view(-1, RECORD_BYTES[kind])[:70].cpu()
     assert torch.equal(got, _records(kv.cpu(), kind))
+
+
+@pytest.mark.parametrize("kind", ["swa", "indexed"])
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("slot_dtype", [torch.int64, torch.int32])
+def test_fused_rope_records_match_separate(kind, ratio, slot_dtype):
+    from vllm.models.deepseek_v4_1.tilelang.rope import rope_
+
+    page_size, pages, tokens = 64, 4, 150
+    record = RECORD_BYTES[kind]
+    kv = _kv(tokens, 7).to(DEVICE)
+    gen = torch.Generator().manual_seed(8)
+    slots = torch.randperm(pages * page_size, generator=gen)[:tokens].to(
+        dtype=slot_dtype, device=DEVICE
+    )
+    slots[4] = -1
+    positions = torch.randint(0, 512, (tokens,), generator=gen).to(
+        dtype=torch.int64, device=DEVICE
+    )
+    cos_sin = torch.randn(512, 64, generator=gen).to(dtype=torch.float32, device=DEVICE)
+    cache_fused = torch.full(
+        (pages, page_size * record + 32), 0x5A, dtype=torch.uint8, device=DEVICE
+    )
+    cache_ref = cache_fused.clone()
+    write_cache(
+        kv,
+        cache_fused[:, : page_size * record],
+        slots,
+        page_size=page_size,
+        cache_kind=kind,
+        positions=positions,
+        cos_sin=cos_sin,
+        ratio=ratio,
+    )
+    kv_rot = kv.clone()
+    rope_(kv_rot, positions, cos_sin, ratio, False)
+    write_cache(
+        kv_rot,
+        cache_ref[:, : page_size * record],
+        slots,
+        page_size=page_size,
+        cache_kind=kind,
+    )
+    assert torch.equal(cache_fused, cache_ref)

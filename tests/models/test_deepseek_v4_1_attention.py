@@ -227,3 +227,57 @@ def test_index_query_reuses_q_cast_and_fuses_rope_quantize(monkeypatch):
     module._index_query(qr, positions, hidden, None, 4, 9, swa, q_cast)
     assert seen_provided == [(5, 1280)]
     assert quant_calls == [("prefill", (5, 32, 128), [104, 105, 106, 107, 108])]
+
+
+def test_prepare_global_kv_fuses_index_key_and_latent_writes(monkeypatch):
+    from vllm.models.deepseek_v4_1 import attention
+    from vllm.models.deepseek_v4_1.tilelang import attention as tl_attention
+    from vllm.models.deepseek_v4_1.tilelang import cache_writer
+
+    module = _tilelang_layer(layer_id=0)
+    module._ready = True
+    module._owner = lambda: module
+    module.kv_cache = torch.empty(2, 8, dtype=torch.uint8)
+    latent = torch.zeros(4, 512, dtype=torch.bfloat16)
+    slots = torch.arange(4, dtype=torch.int64)
+    module.compressor = lambda hidden, main, state: (latent, slots)
+    module.compressor.state_cache = None
+    raw_key = torch.zeros(4, 128, dtype=torch.bfloat16)
+    module.indexer = SimpleNamespace(
+        heads=32,
+        wk=lambda x: raw_key,
+        k_norm=SimpleNamespace(weight=torch.ones(128), variance_epsilon=1e-6),
+        k_cache=SimpleNamespace(
+            prefix="k_cache", kv_cache=torch.empty(2, 8, dtype=torch.uint8)
+        ),
+    )
+    idx_slots = torch.arange(10, 14, dtype=torch.int64)
+    metadata = {
+        module.prefix: SimpleNamespace(),
+        "k_cache": SimpleNamespace(slot_mapping=idx_slots),
+    }
+    monkeypatch.setattr(
+        attention,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=metadata),
+    )
+    key_writes, cache_writes = [], []
+    monkeypatch.setattr(
+        tl_attention,
+        "norm_rope_write_index_keys",
+        lambda *args: key_writes.append(args),
+    )
+    monkeypatch.setattr(
+        cache_writer,
+        "write_cache",
+        lambda *args, **kwargs: cache_writes.append((args, kwargs)),
+    )
+    positions = torch.arange(4, dtype=torch.int64)
+    module._prepare_global_kv(positions, torch.zeros(4, 5120, dtype=torch.bfloat16))
+    assert len(key_writes) == 1
+    assert key_writes[0][0] is raw_key and key_writes[0][3] is positions
+    assert key_writes[0][6].tolist() == [10, 11, 12, 13]
+    assert len(cache_writes) == 1
+    assert cache_writes[0][0][0] is latent
+    assert cache_writes[0][1]["positions"] is positions
+    assert cache_writes[0][1]["cache_kind"] == "indexed"

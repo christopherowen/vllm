@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import torch
 
 from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention
-from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xBackend
+from vllm.models.deepseek_v4_1.sparse_mla import SLOT_DTYPE, DeepseekV41B12xBackend
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
     retain_cuda_graph_capture_resource,
@@ -29,6 +29,8 @@ from .indexer import (
     CANDIDATE_BLOCK,
     CANDIDATE_BLOCKS,
     IndexerV41Plan,
+    norm_quantize_call,
+    norm_rope_write_index_keys,
     page_bytes,
     quantize_call,
     quantize_mxfp4,
@@ -146,7 +148,14 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
                 )
             )  # _quantize_index_query
         if self.compressor is not None:
-            calls.append(quantize_call(self._index_page))  # _write_index_keys
+            calls.append(
+                norm_quantize_call(
+                    self.indexer.k_norm.variance_epsilon,
+                    self._index_page,
+                    self.compress_ratio,
+                    SLOT_DTYPE,
+                )
+            )  # _write_index_keys
         return calls
 
     def _bind_plans(self) -> None:
@@ -244,7 +253,20 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
             cos_sin=self.rotary_emb.cos_sin_cache if positions is not None else None,
         )
 
-    def _write_index_keys(self, key, slot_mapping) -> None:
+    def _write_index_keys(self, key, slot_mapping, positions=None) -> None:
+        if positions is not None:
+            norm_rope_write_index_keys(
+                key,
+                self.indexer.k_norm.weight,
+                self.indexer.k_norm.variance_epsilon,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.indexer.k_cache.kv_cache,
+                slot_mapping,
+                self._index_page,
+                self.compress_ratio,
+            )
+            return
         write_index_keys(
             key, self.indexer.k_cache.kv_cache, slot_mapping, self._index_page
         )
