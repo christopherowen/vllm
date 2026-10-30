@@ -10,6 +10,7 @@ from typing import final
 import torch
 
 import vllm.envs as envs
+from vllm.forward_context import is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
     ApplyMoEActivationConfig,
@@ -41,7 +42,10 @@ from vllm.v1.worker.ubatching import (
     dbo_register_recv_hook,
     dbo_yield,
 )
-from vllm.v1.worker.workspace import current_workspace_manager
+from vllm.v1.worker.workspace import (
+    current_workspace_manager,
+    is_workspace_manager_initialized,
+)
 
 logger = init_logger(__name__)
 
@@ -1568,8 +1572,21 @@ class FusedMoEKernelModularImpl:
         # arena: the arena's views are valid only until its next lease, and the next
         # consumer leases scratch from the same bytes (at TP1, where no all-reduce
         # copies the output, the next decoder layer's mHC entry overwrote it as it
-        # read it). The experts still write it directly (``output_alias``).
-        output = torch.empty_like(hidden_states, dtype=self.fused_experts.output_dtype)
+        # read it). In a model forward pass, lease a dedicated MoE output buffer
+        # separate from ``get_simultaneous`` so sequential MoE layers reuse one
+        # buffer without ping-ponging two allocations.
+        if (
+            not current_platform.is_cpu()
+            and is_workspace_manager_initialized()
+            and is_forward_context_available()
+        ):
+            output = current_workspace_manager().get_moe_output_buffer(
+                tuple(hidden_states.shape), self.fused_experts.output_dtype
+            )
+        else:
+            output = torch.empty_like(
+                hidden_states, dtype=self.fused_experts.output_dtype
+            )
 
         local_num_experts = w1.shape[0]
         if global_num_experts == -1:

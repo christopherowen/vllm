@@ -131,6 +131,9 @@ class WorkspaceManager:
         self._current_workspaces: list[torch.Tensor | None] = [None] * (
             self._num_ubatches * self._num_lanes
         )
+        self._moe_output_buffers: list[torch.Tensor | None] = [None] * (
+            self._num_ubatches * self._num_lanes
+        )
         self._locked: bool = False
 
     @staticmethod
@@ -222,6 +225,53 @@ class WorkspaceManager:
             for i in range(len(shapes_and_dtypes))
         ]
 
+    def get_moe_output_buffer(
+        self, shape: tuple[int, ...], dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Return a reusable MoE output tensor view for the active ``(ubatch, lane)``.
+
+        Unlike :meth:`get_simultaneous`, this buffer is separate from the scratch
+        workspace arena so consumers that run between two MoE layers (such as
+        ``mHC`` and attention) never overwrite the previous MoE layer's output.
+        """
+        ubatch_id = dbo_current_ubatch_id()
+        lane = _workspace_lane.get()
+        if lane >= self._num_lanes:
+            raise RuntimeError(
+                f"Workspace lane {lane} is not configured; manager has "
+                f"{self._num_lanes} lane(s)."
+            )
+        workspace_id = ubatch_id * self._num_lanes + lane
+        actual_bytes = _compute_bytes(shape, dtype)
+        buf = self._moe_output_buffers[workspace_id]
+        current_size = self._workspace_size_bytes(buf)
+        if current_size < actual_bytes:
+            if self._locked or (
+                self._device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+            ):
+                return torch.empty(shape, dtype=dtype, device=self._device)
+            alloc_bytes = actual_bytes
+            from vllm.config import get_current_vllm_config_or_none
+
+            vllm_config = get_current_vllm_config_or_none()
+            sched_cfg = getattr(vllm_config, "scheduler_config", None)
+            max_tokens = getattr(sched_cfg, "max_num_batched_tokens", None)
+            if isinstance(max_tokens, int) and max_tokens > 0 and len(shape) >= 1:
+                alloc_rows = max(shape[0], max_tokens)
+                alloc_bytes = max(
+                    alloc_bytes,
+                    alloc_rows * prod(shape[1:]) * dtype.itemsize,
+                )
+            if self._device.type == "cuda" and buf is not None:
+                torch.accelerator.synchronize(self._device)
+            self._moe_output_buffers[workspace_id] = None
+            del buf
+            torch.accelerator.empty_cache()
+            buf = torch.empty((alloc_bytes,), dtype=torch.uint8, device=self._device)
+            self._moe_output_buffers[workspace_id] = buf
+        assert buf is not None
+        return buf[:actual_bytes].view(dtype).reshape(shape)
+
     def reserve_all(
         self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]
     ) -> None:
@@ -269,6 +319,29 @@ class WorkspaceManager:
         self._reserve_slots(
             lane_bytes * self._num_ubatches, operation="reserve_by_lane"
         )
+        moe_lane_bytes = [
+            max(
+                map(
+                    self._workspace_size_bytes,
+                    self._moe_output_buffers[lane :: self._num_lanes],
+                ),
+                default=0,
+            )
+            for lane in range(self._num_lanes)
+        ]
+        for workspace_id, required in enumerate(moe_lane_bytes * self._num_ubatches):
+            if (
+                not self._locked
+                and self._workspace_size_bytes(self._moe_output_buffers[workspace_id])
+                < required
+            ):
+                current_buf = self._moe_output_buffers[workspace_id]
+                self._moe_output_buffers[workspace_id] = None
+                del current_buf
+                torch.accelerator.empty_cache()
+                self._moe_output_buffers[workspace_id] = torch.empty(
+                    (required,), dtype=torch.uint8, device=self._device
+                )
 
     def _reserve_slots(self, sizes: list[int], *, operation: str) -> None:
         undersized = [
