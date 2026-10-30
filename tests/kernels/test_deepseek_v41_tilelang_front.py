@@ -27,6 +27,7 @@ from vllm.models.deepseek_v4_1.tilelang.front import (  # noqa: E402
     Q_LATENT,
     ROPE_DIM,
     attention_front,
+    context_kv_front,
 )
 from vllm.models.deepseek_v4_1.tilelang.gemm import scale_words  # noqa: E402
 from vllm.models.deepseek_v4_1.tilelang.pdl import (  # noqa: E402
@@ -126,3 +127,37 @@ def test_front_gives_the_five_kernels_bits(rows, slot_dtype):
     _assert_bytes_equal(scales, scales_ref, "q scales")
     _assert_bytes_equal(kv, kv_ref, "rotated kv latent")
     _assert_bytes_equal(pages, pages_ref, "cache pages")
+
+
+@pytest.mark.parametrize("slot_dtype", [torch.int64, torch.int32])
+@pytest.mark.parametrize("rows", [1, 6, 16, 24, 64, 96, 256])
+def test_context_kv_front_gives_the_three_kernels_bits(rows, slot_dtype):
+    """``context_kv_front`` matches ``norm_forward`` + ``rope_`` + ``write_cache``
+    on ``[rows, 512]`` BF16 context KV rows bit for bit."""
+    gen = torch.Generator(device=DEVICE).manual_seed(rows + 100)
+    kv_raw = (
+        torch.randn((rows, KV_LATENT), generator=gen, device=DEVICE) * 3
+    ).bfloat16()
+    kv_raw[0, :64] = 0.0
+    kv_weight = (
+        torch.randn(KV_LATENT, generator=gen, device=DEVICE) * 0.3 + 1
+    ).bfloat16()
+    positions = torch.randint(0, POSITIONS, (rows,), generator=gen, device=DEVICE)
+    slots = torch.randperm(PAGES * PAGE_SIZE, generator=gen, device=DEVICE)[:rows]
+    slots[rows // 2] = -1
+    slots = slots.to(slot_dtype)
+    table = _table()
+    page_bytes = PAGE_SIZE * RECORD_BYTES["swa"]
+    pages = torch.empty((PAGES, page_bytes), dtype=torch.uint8, device=DEVICE)
+    pages.random_(generator=gen)
+    pages_ref = pages.clone()
+
+    kv_ref = torch.empty((rows, KV_LATENT), dtype=torch.bfloat16, device=DEVICE)
+    norm_forward(kv_raw, kv_weight, EPS, out=kv_ref)
+    rope_(kv_ref, positions, table, 1, False)
+    write_cache(kv_ref, pages_ref, slots, page_size=PAGE_SIZE, cache_kind="swa")
+
+    context_kv_front(
+        kv_raw, kv_weight, EPS, positions, table, pages, slots, PAGE_SIZE
+    )
+    _assert_bytes_equal(pages, pages_ref, "context kv cache pages")

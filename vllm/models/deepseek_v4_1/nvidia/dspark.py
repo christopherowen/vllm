@@ -79,7 +79,9 @@ def _context_kv_projection(attn: nn.Module):
     """The KV rows of ``attn``'s fused Q-A/KV weight as one projection."""
     from ..tilelang.linear import TileLangBlock32Rows
 
-    return TileLangBlock32Rows(attn.fused_wqa_wkv, attn.q_lora_rank)
+    projection = TileLangBlock32Rows(attn.fused_wqa_wkv, attn.q_lora_rank)
+    projection.tilelang_mxfp8_input = True
+    return projection
 
 
 class DSparkContextCudaGraphs:
@@ -333,8 +335,12 @@ class DSparkDeepseekV4Model(nn.Module):
         The draft layers' modules declare their own kernels, WO included, and the
         Markov head's are declared by the logits processor it is registered with.
         """
+        from ..tilelang.linear import _warm_casts
+
         for projection in self._context_kv_projections:
             projection.declare_kernels()
+        if self._context_kv_projections:
+            prepare.declare(warm=lambda: _warm_casts(self.hidden_size))
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         assert self.embed_tokens is not None
@@ -381,18 +387,34 @@ class DSparkDeepseekV4Model(nn.Module):
         ``None`` (or a ``None`` entry) runs the projection to reserve workspace
         but writes nothing (profiling).
         """
-        for i, layer in enumerate(self.layers):
-            slot_mapping = (
-                context_slot_mappings
-                if context_slot_mappings is None
-                or isinstance(context_slot_mappings, torch.Tensor)
-                else context_slot_mappings[i]
+        main_cast = (
+            kernels.cast_mxfp8(main_x)
+            if any(
+                getattr(proj, "tilelang_mxfp8_input", False)
+                for proj in self._context_kv_projections
             )
-            attn = layer.attn
-            kv = attn.kv_norm(self._context_kv_projections[i](main_x))
-            if slot_mapping is None:
-                continue
-            _insert_context_kv(attn, kv, context_positions, slot_mapping)
+            else None
+        )
+        with kernels.mxfp8_inputs(main_cast):
+            for i, layer in enumerate(self.layers):
+                slot_mapping = (
+                    context_slot_mappings
+                    if context_slot_mappings is None
+                    or isinstance(context_slot_mappings, torch.Tensor)
+                    else context_slot_mappings[i]
+                )
+                attn = layer.attn
+                kv_raw = self._context_kv_projections[i](main_x)
+                if slot_mapping is None:
+                    continue
+                if hasattr(attn, "insert_raw_context_kv"):
+                    attn.insert_raw_context_kv(
+                        kv_raw, context_positions, slot_mapping
+                    )
+                else:
+                    _insert_context_kv(
+                        attn, attn.kv_norm(kv_raw), context_positions, slot_mapping
+                    )
 
     def forward(
         self,

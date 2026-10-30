@@ -583,7 +583,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         in its call site's call form."""
         from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
         from vllm.models.deepseek_v4_1.tilelang.cache_writer import writer_call
-        from vllm.models.deepseek_v4_1.tilelang.front import front_call
+        from vllm.models.deepseek_v4_1.tilelang.front import (
+            context_kv_front_call,
+            front_call,
+        )
         from vllm.models.deepseek_v4_1.tilelang.rope import rope_call
 
         calls = []
@@ -656,6 +659,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 SLOT_DTYPE,
             )
         )
+        if self.is_draft:
+            calls.append(
+                context_kv_front_call(
+                    self.kv_norm.variance_epsilon,
+                    self.swa_cache_layer.block_size,
+                    SLOT_DTYPE,
+                )
+            )
         if self.compressor is not None:
             calls.append(
                 writer_call(
@@ -733,6 +744,22 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             slot_mapping,
             page_size=self.swa_cache_layer.block_size,
             cache_kind="swa",
+        )
+
+    def insert_raw_context_kv(self, kv_raw, positions, slot_mapping):
+        if not self._ready:
+            raise RuntimeError("V4.1 attention metadata is not prepared")
+        from vllm.models.deepseek_v4_1.tilelang.front import context_kv_front
+
+        context_kv_front(
+            kv_raw,
+            self.kv_norm.weight,
+            self.kv_norm.variance_epsilon,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            self.swa_cache_layer.kv_cache,
+            slot_mapping,
+            self.swa_cache_layer.block_size,
         )
 
     def _query_metadata(self, metadata):

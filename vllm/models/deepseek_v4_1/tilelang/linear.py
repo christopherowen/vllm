@@ -260,7 +260,14 @@ def _block32_linear(
     rows = x.shape[0]
     if layer.tilelang_mxfp8_input:
         provided = provided_mxfp8(x)
-        _block32_gemm(layer, provided.values, provided.scales, out.view(rows, n), rows)
+        if layer.tilelang_shards > 1 and rows <= layer.tilelang_split_rows:
+            _block32_split_mxfp8(
+                layer, provided.values, provided.scales, out.view(rows, n), scratch
+            )
+        else:
+            _block32_gemm(
+                layer, provided.values, provided.scales, out.view(rows, n), rows
+            )
         return
     if layer.tilelang_shards > 1 and rows <= layer.tilelang_split_rows:
         _block32_split(layer, x, out.view(rows, n), scratch)
@@ -321,6 +328,25 @@ def _block32_split(layer, x: torch.Tensor, out: torch.Tensor, scratch) -> None:
     )
     layer.tilelang_partials[split_bucket(rows)](
         xq, layer.weight, sf.view(torch.uint32), layer.tilelang_weight_sf, partials
+    )
+    layer.tilelang_reduce(partials, out)
+
+
+def _block32_split_mxfp8(
+    layer, xq: torch.Tensor, sf: torch.Tensor, out: torch.Tensor, scratch
+) -> None:
+    rows, n = out.shape
+    tile = split_row_tile(rows)
+    padded = -(-rows // tile) * tile
+    (partials,) = _scratch(
+        (((layer.tilelang_shards, rows, n), torch.float32),), scratch
+    )
+    layer.tilelang_partials[split_bucket(rows)](
+        xq[:padded],
+        layer.weight,
+        sf[:padded].view(torch.uint32),
+        layer.tilelang_weight_sf,
+        partials,
     )
     layer.tilelang_reduce(partials, out)
 
@@ -474,8 +500,16 @@ def _declare_block32(layer, groups: int = 1, cast: bool = True) -> None:
         layer.tilelang_split_rows = split["rows"]
     layer.tilelang_mxfp8_input = getattr(layer, "tilelang_mxfp8_input", False)
     if layer.tilelang_mxfp8_input:
-        heights = {*DECODE_TILE_ROWS, *layer.tilelang_wide.values()}
-        if split or groups != 1 or any(DECODE_ROWS % height for height in heights):
+        heights = (
+            {min(bucket, 64) for bucket in split["decode"]}
+            if split
+            else {*DECODE_TILE_ROWS, *layer.tilelang_wide.values()}
+        )
+        if (
+            groups != 1
+            or (split and split["rows"] > MXFP8_DECODE_ROWS)
+            or any(DECODE_ROWS % height for height in heights)
+        ):
             # A producer pads to whole DECODE_ROWS tiles (mxfp8_rows) for one GEMM.
             raise ValueError(
                 f"the ({n}, {k}) projection cannot read a producer's MXFP8 rows"

@@ -154,3 +154,54 @@ def test_context_graph_norm_writes_the_context_buffer(monkeypatch, capacity):
     assert torch.equal(
         hidden_states[capacity:].view(torch.int16), before[capacity:].view(torch.int16)
     )
+
+
+def test_precompute_and_store_context_kv_casts_once_and_fuses_front(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm.models.deepseek_v4_1 import kernels
+    from vllm.models.deepseek_v4_1.nvidia.dspark import DSparkDeepseekV4Model
+
+    casts = []
+    orig_cast = kernels.cast_mxfp8
+
+    def record_cast(x):
+        out = orig_cast(x)
+        casts.append(out)
+        return out
+
+    monkeypatch.setattr(kernels, "cast_mxfp8", record_cast)
+    inserts = []
+
+    class Proj:
+        tilelang_mxfp8_input = True
+
+        def __init__(self, idx):
+            self.idx = idx
+
+        def __call__(self, x):
+            return x[:, :512] + self.idx
+
+    model = DSparkDeepseekV4Model.__new__(DSparkDeepseekV4Model)
+    torch.nn.Module.__init__(model)
+    model._context_kv_projections = [Proj(i) for i in range(3)]
+    model.layers = [
+        SimpleNamespace(
+            attn=SimpleNamespace(
+                insert_raw_context_kv=lambda kv_raw, pos, slots, i=i: inserts.append(
+                    (i, kv_raw, pos, slots)
+                )
+            )
+        )
+        for i in range(3)
+    ]
+    main_x = torch.randn(6, WIDTH, dtype=torch.bfloat16, device=DEVICE)
+    positions = torch.arange(6, dtype=torch.int64, device=DEVICE)
+    slots = [torch.arange(6, dtype=torch.int64, device=DEVICE) + i * 10 for i in range(3)]
+    model.precompute_and_store_context_kv(main_x, positions, slots)
+    assert len(casts) == 1
+    assert len(inserts) == 3
+    for i, (layer_idx, kv_raw, pos, slot) in enumerate(inserts):
+        assert layer_idx == i
+        assert torch.equal(kv_raw, main_x[:, :512] + i)
+        assert pos is positions and slot is slots[i]
