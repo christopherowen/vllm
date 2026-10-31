@@ -25,7 +25,7 @@ import torch
 from torch import nn
 
 from . import prepare
-from .gemm import bf16_gemm
+from .gemm import bf16_gemm, bf16_gemm_decode
 
 GROUP = 128  # columns per code group
 HALF = GROUP // 2  # one code byte holds a column of each half
@@ -566,12 +566,13 @@ def _bf16_head_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dict:
         config = dict(BF16_HEAD_CONFIGS[block_M])
         if k % config["block_K"]:
             config["block_K"] = 64
+        single_k_block = k <= config["block_K"]
         kernels[block_M] = prepare.call(
-            bf16_gemm,
+            bf16_gemm_decode if single_k_block else bf16_gemm,
             n,
             k,
             block_M=block_M,
-            num_stages=2,
+            num_stages=1 if single_k_block else 2,
             out_dtype=_OUT[out_dtype],
             **config,
         )

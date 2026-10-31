@@ -14,17 +14,23 @@ from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
 )
 
 
+@pytest.mark.parametrize("sample_from_anchor", [False, True])
 @pytest.mark.parametrize("needs_distribution", [False, True])
 def test_sequential_sharded_sampling_preserves_each_token(
-    needs_distribution, monkeypatch
+    sample_from_anchor, needs_distribution, monkeypatch
 ):
     from vllm.v1.worker.gpu import tilelang_inputs
     from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 
+    gather_calls = 0
+
+    def gather(source, indices):
+        nonlocal gather_calls
+        gather_calls += 1
+        return source[indices]
+
     # The heads' TileLang row gather (its own GPU test) as torch, on the host.
-    monkeypatch.setattr(
-        tilelang_inputs, "gather_hidden_rows", lambda source, indices: source[indices]
-    )
+    monkeypatch.setattr(tilelang_inputs, "gather_hidden_rows", gather)
 
     shared = torch.zeros(2, dtype=torch.int64)
     seen_anchors = []
@@ -49,6 +55,7 @@ def test_sequential_sharded_sampling_preserves_each_token(
     spec = SimpleNamespace(
         _draft_topk=None,
         num_speculative_steps=2,
+        sample_from_anchor=sample_from_anchor,
         model=model,
         sample_indices=torch.arange(4),
         sample_idx_mapping=torch.tensor([0, 0, 1, 1]),
@@ -64,7 +71,10 @@ def test_sequential_sharded_sampling_preserves_each_token(
     spec._vocab_parallel_greedy = MethodType(
         DSparkSpeculator._vocab_parallel_greedy, spec
     )
-    DSparkSpeculator._sample_sequential(spec, 2, torch.zeros(4, 8))
+    hidden = torch.arange(48, dtype=torch.float32).reshape(6, 8)
+    DSparkSpeculator._sample_sequential(spec, 2, hidden)
+    assert gather_calls == (0 if sample_from_anchor else 1)
+    assert torch.equal(model.compute_local_draft_logits.call_args.args[0], hidden[:4])
     assert spec.draft_tokens.tolist() == [[0, 1], [0, 1]]
     assert [ids.tolist() for ids in seen_anchors] == [[5, 9], [0, 0]]
     assert model.sample_local_draft_logits.call_count == (

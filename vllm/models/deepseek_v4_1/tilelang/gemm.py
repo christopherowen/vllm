@@ -554,8 +554,7 @@ def splitk_reduce_cast(N: int, shards: int, block_M: int = 4, threads: int = 128
     return gemm_splitk_reduce_cast
 
 
-@tilelang.jit
-def bf16_gemm(
+def _bf16_gemm(
     N: int,
     K: int,
     block_M: int = 64,
@@ -626,6 +625,12 @@ def bf16_gemm(
                 T.copy(C_local, C[by * block_M, bx * block_N])
 
     return gemm_bf16
+
+
+bf16_gemm = tilelang.jit(_bf16_gemm)
+bf16_gemm_decode = tilelang.jit(
+    pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
+)(_bf16_gemm)
 
 
 # Not warp-specialized: a producer warp's scale stores would reach the consumers only

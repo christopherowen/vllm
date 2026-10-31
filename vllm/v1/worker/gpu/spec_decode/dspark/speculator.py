@@ -293,11 +293,12 @@ class DSparkSpeculator(DFlashSpeculator):
                 output_stride=self.draft_tokens.stride(0),
                 output_aligned=i * self.draft_tokens.element_size() % 16 == 0,
             )
-        tilelang_inputs.declare(
-            lambda: tilelang_inputs.gather_hidden_rows_calls(
-                self.hidden_states.dtype, self.hidden_states.shape[1]
+        if not getattr(self, "sample_from_anchor", False):
+            tilelang_inputs.declare(
+                lambda: tilelang_inputs.gather_hidden_rows_calls(
+                    self.hidden_states.dtype, self.hidden_states.shape[1]
+                )
             )
-        )
         table = self._markov_table()
         if table is not None:
             from vllm.v1.worker.gpu.sample import tilelang_sampling
@@ -333,9 +334,16 @@ class DSparkSpeculator(DFlashSpeculator):
         # Sequential Markov sampling over the backbone's output hidden states.
         n_spec = self.num_speculative_steps
         num_sample = num_reqs * n_spec
-        # Per-(req, position) head hidden, ordered (req, step).
-        sample_hidden = tilelang_inputs.gather_hidden_rows(
-            head_hidden, self.sample_indices[:num_sample]
+        # Per-(req, position) head hidden, ordered (req, step). When
+        # sample_from_anchor is True, each request's query block has exactly
+        # n_spec rows and head_hidden[:num_sample] is already contiguous in
+        # (req, step) order.
+        sample_hidden = (
+            head_hidden[:num_sample]
+            if getattr(self, "sample_from_anchor", False)
+            else tilelang_inputs.gather_hidden_rows(
+                head_hidden, self.sample_indices[:num_sample]
+            )
         )
         # Draft-vocab logits; sampled ids are remapped to target vocab below.
         local_head = getattr(self.model, "supports_local_draft_argmax", lambda: False)()
@@ -468,8 +476,12 @@ class DSparkSpeculator(DFlashSpeculator):
         assert self._draft_topk is not None
         n_spec = self.num_speculative_steps
         num_sample = num_reqs * n_spec
-        sample_hidden = tilelang_inputs.gather_hidden_rows(
-            head_hidden, self.sample_indices[:num_sample]
+        sample_hidden = (
+            head_hidden[:num_sample]
+            if getattr(self, "sample_from_anchor", False)
+            else tilelang_inputs.gather_hidden_rows(
+                head_hidden, self.sample_indices[:num_sample]
+            )
         )
         base_logits = self.model.compute_draft_logits(sample_hidden)
         base_logits = base_logits.view(num_reqs, n_spec, -1)
