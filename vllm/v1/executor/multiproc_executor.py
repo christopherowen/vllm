@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import ctypes
+import gc
 import multiprocessing
 import os
 import pickle
 import queue
 import signal
+import sys
 import threading
 import time
 import traceback
@@ -83,6 +86,15 @@ logger = init_logger(__name__)
 # How long a gather parks on one queue's notification before checking every
 # other queue it waits on again.
 RESPONSE_WAIT_SLICE_MS = 50
+
+
+def _trim_host_heap() -> None:
+    """Release unreachable Python objects and return free glibc heap pages to the OS."""
+    gc.collect()
+    if sys.platform != "linux":
+        return
+    with suppress(Exception):
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
 
 
 def _check_response(rank: int, status: Any, result: Any) -> Any:
@@ -298,6 +310,31 @@ class MultiprocExecutor(Executor):
         # Create workers
         context = get_mp_context()
         shared_worker_lock = context.Lock()
+        self._inline_worker_kwargs: dict[str, Any] | None = None
+        if self._use_inline_headless_worker():
+            global_rank = (
+                self.local_world_size * self.parallel_config.node_rank_within_dp
+            )
+            self._inline_worker_kwargs = {
+                "vllm_config": self.vllm_config,
+                "local_rank": 0,
+                "rank": global_rank,
+                "distributed_init_method": distributed_init_method,
+                "input_shm_handle": scheduler_output_handle,
+                "ready_pipe": None,
+                "death_pipe": None,
+                "shared_worker_lock": shared_worker_lock,
+                "is_driver_worker": self._is_driver_worker(global_rank),
+                "inherited_fds": [],
+            }
+            self.workers = []
+            self.response_mqs = []
+            self.futures_queue = deque[FutureWrapper]()
+            self.held_replies: dict[int, deque[tuple[Any, Any]]] = {}
+            self._post_init_executor()
+            self.output_rank = self._get_output_rank()
+            return
+
         unready_workers: list[UnreadyWorkerProcHandle] = []
         success = False
         try:
@@ -380,6 +417,7 @@ class MultiprocExecutor(Executor):
             self.held_replies: dict[int, deque[tuple[Any, Any]]] = {}
 
             self._post_init_executor()
+            _trim_host_heap()
 
             success = True
         finally:
@@ -393,6 +431,15 @@ class MultiprocExecutor(Executor):
                 self._ensure_worker_termination([uw.proc for uw in unready_workers])
 
         self.output_rank = self._get_output_rank()
+
+    def _use_inline_headless_worker(self) -> bool:
+        return (
+            not self.monitor_workers
+            and self.parallel_config.node_rank_within_dp > 0
+            and self.local_world_size == 1
+            and not getattr(self.parallel_config, "numa_bind", False)
+            and not current_platform.is_cpu()
+        )
 
     def get_response_mqs(self, unique_reply_rank: int = -1) -> list[MessageQueue]:
         assert unique_reply_rank >= -1 and unique_reply_rank < self.world_size, (
@@ -425,6 +472,12 @@ class MultiprocExecutor(Executor):
         return rank % self.parallel_config.tensor_parallel_size == 0
 
     def start_worker_monitor(self, inline=False) -> None:
+        if inline and getattr(self, "_inline_worker_kwargs", None) is not None:
+            inline_kwargs = self._inline_worker_kwargs
+            self._inline_worker_kwargs = None
+            WorkerProc.worker_main(**inline_kwargs)
+            return
+
         workers = self.workers
         self_ref = weakref.ref(self)
 
@@ -1015,7 +1068,8 @@ class WorkerProc:
         set_worker_net_device(kwargs.get("local_rank", 0), kwargs["vllm_config"])
 
         worker = None
-        ready_writer = kwargs.pop("ready_pipe")
+        ready_writer = kwargs.pop("ready_pipe", None)
+        inline_worker = ready_writer is None
         death_pipe = kwargs.pop("death_pipe", None)
 
         # Close inherited pipes from parent (incl. other worker pipes)
@@ -1044,23 +1098,26 @@ class WorkerProc:
 
             worker.monitor_death_pipe(death_pipe, shutdown_requested)
 
-            # Send READY once we know everything is loaded
-            ready_writer.send(
-                {
-                    "status": WorkerProc.READY_STR,
-                    "handle": worker.worker_response_mq.export_handle(),
-                    "peer_response_handles": worker.peer_response_handles,
-                }
-            )
+            if ready_writer is not None:
+                # Send READY once we know everything is loaded
+                ready_writer.send(
+                    {
+                        "status": WorkerProc.READY_STR,
+                        "handle": worker.worker_response_mq.export_handle(),
+                        "peer_response_handles": worker.peer_response_handles,
+                    }
+                )
 
             # Ensure message queues are ready. Will deadlock if re-ordered.
             # Must be kept consistent with the Executor
             if worker.rpc_broadcast_mq is not None:
                 worker.rpc_broadcast_mq.wait_until_ready()
             worker.worker_response_mq.wait_until_ready()
-            ready_writer.close()
-            ready_writer = None
+            if ready_writer is not None:
+                ready_writer.close()
+                ready_writer = None
 
+            _trim_host_heap()
             worker.worker_busy_loop()
 
         except Exception:
@@ -1068,10 +1125,10 @@ class WorkerProc:
             # a FAILURE message over the MQ RPC to notify the Executor,
             # which triggers system shutdown.
             # TODO(rob): handle case where the MQ itself breaks.
-
+            was_shutdown_requested = shutdown_requested.is_set()
             if ready_writer is not None:
                 logger.exception("WorkerProc failed to start.")
-            elif shutdown_requested.is_set():
+            elif was_shutdown_requested:
                 logger.debug_once(
                     "[shutdown] WorkerProc: exiting after shutdown request"
                 )
@@ -1082,6 +1139,8 @@ class WorkerProc:
             # any worker dies. Set this value so we don't re-throw
             # SystemExit() to avoid zmq exceptions in __del__.
             shutdown_requested.set()
+            if inline_worker and not was_shutdown_requested:
+                raise
 
         except SystemExit as e:
             # SystemExit is raised on SIGTERM or SIGKILL, which usually indicates that
