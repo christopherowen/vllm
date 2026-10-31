@@ -534,11 +534,17 @@ def test_varlen_decode_captures_dense_low_concurrency_product(monkeypatch):
     )
 
     full_descs = manager._capture_descs[CUDAGraphMode.FULL]
-    assert len(full_descs) == 21
+    assert len(full_descs) == 30
     dense_shapes = {
-        (num_reqs, num_reqs * query_len)
-        for num_reqs in (1, 2)
-        for query_len in range(1, decode_query_len + 1)
+        *(
+            (num_reqs, num_tokens)
+            for num_reqs in (1, 2)
+            for num_tokens in range(num_reqs, num_reqs * decode_query_len + 1)
+        ),
+        *(
+            (num_reqs, num_reqs * decode_query_len)
+            for num_reqs in (3, 4)
+        ),
     }
     captured_shapes = {(desc.num_reqs, desc.num_tokens) for desc in full_descs}
     assert dense_shapes <= captured_shapes
@@ -558,11 +564,49 @@ def test_varlen_decode_captures_dense_low_concurrency_product(monkeypatch):
     assert any(desc.num_reqs == 8 and desc.num_tokens == 8 for desc in full_descs)
 
 
+def test_varlen_decode_covers_odd_c2_and_non_divisor_uniform_batches(monkeypatch):
+    decode_query_len = 6
+    capture_sizes = [1, 2, 3, 4, 6, 8, 12, 16, 20, 24, 28, 32, 40, 48]
+    manager = _make_spec_decode_manager(
+        monkeypatch,
+        decode_query_len=decode_query_len,
+        capture_sizes=capture_sizes,
+        num_speculative_tokens=5,
+        max_num_seqs=8,
+        varlen_decode=True,
+    )
+
+    for num_reqs in (1, 2):
+        for num_tokens in range(num_reqs, num_reqs * decode_query_len + 1):
+            desc = manager.dispatch(
+                num_reqs=num_reqs,
+                num_tokens=num_tokens,
+                uniform_token_count=None,
+                num_active_loras=0,
+                max_query_len=decode_query_len,
+            )
+            assert desc.cg_mode == CUDAGraphMode.FULL
+            assert (desc.num_reqs, desc.num_tokens) == (num_reqs, num_tokens)
+
+    for num_reqs in range(1, 9):
+        num_tokens = num_reqs * decode_query_len
+        desc = manager.dispatch(
+            num_reqs=num_reqs,
+            num_tokens=num_tokens,
+            uniform_token_count=decode_query_len,
+            num_active_loras=0,
+            max_query_len=decode_query_len,
+        )
+        assert desc.cg_mode == CUDAGraphMode.FULL
+        assert (desc.num_reqs, desc.num_tokens) == (num_reqs, num_tokens)
+
+
 @pytest.mark.parametrize(
     ("num_reqs", "num_tokens", "expected_shape"),
     [
-        (2, 3, (2, 4)),
+        (3, 3, (4, 4)),
         (3, 6, (8, 8)),
+        (5, 24, (8, 24)),
     ],
 )
 def test_varlen_dense_rejection_keeps_larger_full_fallback(

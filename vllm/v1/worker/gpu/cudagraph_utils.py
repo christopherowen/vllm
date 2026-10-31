@@ -62,13 +62,26 @@ _DENSE_VARLEN_DECODE_MAX_REQS = 2
 def dense_varlen_decode_shapes(
     max_num_reqs: int, decode_query_len: int, max_capture_tokens: int
 ) -> tuple[tuple[int, int], ...]:
-    """Return request and token counts of exact variable-length decode graphs."""
-    return tuple(
-        (num_reqs, num_reqs * query_len)
-        for num_reqs in range(1, min(_DENSE_VARLEN_DECODE_MAX_REQS, max_num_reqs) + 1)
-        for query_len in range(1, decode_query_len + 1)
-        if num_reqs * query_len <= max_capture_tokens
+    """Return request and token counts of exact variable-length decode graphs.
+
+    Covers every valid token total for low-concurrency batches (``1`` to
+    ``_DENSE_VARLEN_DECODE_MAX_REQS`` requests, including odd heterogeneous and
+    adaptively trimmed totals) and the full-depth speculative batch for each
+    higher request count up to ``max_num_reqs``.
+    """
+    dense_reqs = min(_DENSE_VARLEN_DECODE_MAX_REQS, max_num_reqs)
+    dense = (
+        (num_reqs, num_tokens)
+        for num_reqs in range(1, dense_reqs + 1)
+        for num_tokens in range(num_reqs, num_reqs * decode_query_len + 1)
+        if num_tokens <= max_capture_tokens
     )
+    uniform = (
+        (num_reqs, num_reqs * decode_query_len)
+        for num_reqs in range(dense_reqs + 1, max_num_reqs + 1)
+        if decode_query_len > 1 and num_reqs * decode_query_len <= max_capture_tokens
+    )
+    return (*dense, *uniform)
 
 
 _DEBUG_GRAPH_MEMORY_ACCOUNTING = (
@@ -606,7 +619,7 @@ class CudaGraphManager:
             )
 
         for mode, descs in descs_by_mode.items():
-            descs.sort(key=lambda d: d.num_tokens, reverse=True)
+            descs.sort(key=lambda d: (d.num_tokens, d.num_reqs or 0), reverse=True)
             self._capture_descs[mode] = descs
 
         for mode in (CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE):
