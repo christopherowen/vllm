@@ -799,10 +799,11 @@ def grouped_fp8_fp4_gemm(
     @T.macro
     def body(A, SFA, B, BT, SFB, SFBase, Order, TileExpert, C, SFB8=None, Narrow=None):
         with T.Kernel(T.ceildiv(N, block_N), tiles, threads=threads) as (bx, t):
-            if trigger_after_loop:
-                pdl.wait()
-            else:
-                pdl.chain()
+            if gather or trigger_after_loop:
+                if trigger_after_loop:
+                    pdl.wait()
+                else:
+                    pdl.chain()
             A_shared = T.alloc_shared((stages, block_M, block_K), T.float8_e4m3fn)
             B_shared = T.alloc_shared(
                 (stages, block_N, block_K), T.float4_e2m1_unpacked
@@ -831,14 +832,41 @@ def grouped_fp8_fp4_gemm(
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
             tx = T.get_thread_binding()
 
+            route_reg = T.alloc_var(T.int32)
             expert = TileExpert[t]
-            if expert < 0:
+            if (gather or trigger_after_loop) and expert < 0:
                 T.thread_return()
-            for i in T.Parallel(block_M):
-                route = Order[t * block_M + i]
-                rows_shared[i] = T.if_then_else(
-                    route >= 0, route // topk if gather else t * block_M + i, -1
-                )
+            if not gather and not trigger_after_loop:
+                if expert >= 0:
+                    if tx < block_M:
+                        route_reg = Order[t * block_M + tx]
+                    if coded_scales:
+                        for c in T.unroll(sfb_copies):
+                            j = c * threads + tx
+                            if j < block_N:
+                                base_words[c] = T.cast(
+                                    SFBase[expert, bx * block_N + j], T.uint32
+                                ) * T.uint32(0x01010101)
+                        if narrow_codes:
+                            code_base = T.cast(Narrow[expert], T.int32)
+                            Narrow_flag = code_base & 1
+                            code_base = (
+                                (code_base >> 1) * n_blocks
+                                + bx * (2 - Narrow_flag)
+                            ) * k_blocks
+                pdl.chain()
+                if expert < 0:
+                    T.thread_return()
+                if tx < block_M:
+                    rows_shared[tx] = T.if_then_else(
+                        route_reg >= 0, t * block_M + tx, -1
+                    )
+            else:
+                for i in T.Parallel(block_M):
+                    route = Order[t * block_M + i]
+                    rows_shared[i] = T.if_then_else(
+                        route >= 0, route // topk if gather else t * block_M + i, -1
+                    )
             T.sync_threads()
             # Each thread copies the same rows at every K block.
             for c in T.unroll(a_copies):
@@ -847,20 +875,21 @@ def grouped_fp8_fp4_gemm(
                 ]
             for c in T.unroll(sfa_copies):
                 sfa_row[c] = rows_shared[T.min(c * threads + tx, block_M - 1)]
-            if coded_scales:
-                for c in T.unroll(sfb_copies):
-                    j = c * threads + tx
-                    if j < block_N:
-                        base_words[c] = T.cast(
-                            SFBase[expert, bx * block_N + j], T.uint32
-                        ) * T.uint32(0x01010101)
-                if narrow_codes:
-                    narrow_entry = T.cast(Narrow[expert], T.int32)
-                    Narrow_flag = narrow_entry & 1
-                    code_base = (
-                        (narrow_entry >> 1) * n_blocks
-                        + bx * (2 - Narrow_flag)
-                    ) * k_blocks
+            if gather or trigger_after_loop:
+                if coded_scales:
+                    for c in T.unroll(sfb_copies):
+                        j = c * threads + tx
+                        if j < block_N:
+                            base_words[c] = T.cast(
+                                SFBase[expert, bx * block_N + j], T.uint32
+                            ) * T.uint32(0x01010101)
+                    if narrow_codes:
+                        code_base = T.cast(Narrow[expert], T.int32)
+                        Narrow_flag = code_base & 1
+                        code_base = (
+                            (code_base >> 1) * n_blocks
+                            + bx * (2 - Narrow_flag)
+                        ) * k_blocks
             sf_dest = SFC_shared if coded_scales else SFB_shared
 
             T.clear(C_local)
@@ -1164,7 +1193,6 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
         TileExpert: T.Tensor((tiles,), T.int32),
     ):
         with T.Kernel(block_M // rows_per_cta, tiles, threads=threads) as (slab, t):
-            pdl.chain()
             tid = T.get_thread_binding()
             col = (tid // warp) * chunk + (tid % warp) * vec
             orders = T.alloc_local((rows_per_cta,), T.int32)
@@ -1179,15 +1207,17 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
             cert_min_l = T.alloc_local((2,), T.float32)
             weight = T.alloc_var(T.float32)
             base = t * block_M + slab * rows_per_cta
-            # Every row's loads issue before any row's arithmetic, so a cold call
-            # waits once for the layout words and once for its rows. ``Order`` is
-            # read in bounds for unused tiles too; their stale words are not used.
-            for r in T.unroll(rows_per_cta):
-                orders[r] = Order[base + r]
-            if TileExpert[t] >= 0:
+            expert = TileExpert[t]
+            if expert >= 0:
+                for r in T.unroll(rows_per_cta):
+                    orders[r] = Order[base + r]
                 for r in T.unroll(rows_per_cta):
                     if orders[r] >= 0:
                         weights[r] = Weights[base + r]
+            pdl.chain()
+            if expert >= 0:
+                for r in T.unroll(rows_per_cta):
+                    if orders[r] >= 0:
                         for j in T.vectorized(vec):
                             xl[r, j] = H[base + r, col + j]
                         for j in T.vectorized(vec):
