@@ -1488,6 +1488,19 @@ class MoeExpertsV41Plan:
 
         prepare.declare(calls, bind=bind)
 
+    def prepare_weight(self, w, scale):
+        """One GEMM's ``(tiles, tails, codes, codes_2bit, narrow, base)``."""
+        packed = pack_expert_scale_codes(scale)
+        narrow, base = packed.narrow, packed.base
+        codes, codes_2bit = overlay_byte_codes(
+            tile_codes(packed.codes, self.block_N),
+            tile_byte_codes(packed.codes_2bit, self.block_N),
+            narrow,
+        )
+        del packed
+        tiles, tails = tile_expert_weights(w.view(torch.int8), self.block_N)
+        return tiles, tails, codes, codes_2bit, narrow, base
+
     def prepare_weights(self, w13, w13_scale, w2, w2_scale):
         """Per GEMM ``(tiles, tails, codes, codes_2bit, narrow, base)``.
 
@@ -1501,24 +1514,10 @@ class MoeExpertsV41Plan:
         expert's GEMM loads ``codes_2bit``; a wide expert loads ``codes``. No
         expert holds both forms, so the codes take the 4-bit codes' bytes.
         """
-        prepared = []
-        for w, scale in ((w13, w13_scale), (w2, w2_scale)):
-            packed = pack_expert_scale_codes(scale)
-            codes, codes_2bit = overlay_byte_codes(
-                tile_codes(packed.codes, self.block_N),
-                tile_byte_codes(packed.codes_2bit, self.block_N),
-                packed.narrow,
-            )
-            prepared.append(
-                (
-                    *tile_expert_weights(w.view(torch.int8), self.block_N),
-                    codes,
-                    codes_2bit,
-                    packed.narrow,
-                    packed.base,
-                )
-            )
-        return tuple(prepared)
+        return (
+            self.prepare_weight(w13, w13_scale),
+            self.prepare_weight(w2, w2_scale),
+        )
 
     def workspace_specs(self, rows, idx_dtype=torch.int64):
         """One call's scratch, laid out for the call's tile height (``tile_height``):

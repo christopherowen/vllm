@@ -29,6 +29,37 @@ class ExpertScaleCodes(NamedTuple):
     codes_2bit: torch.Tensor
 
 
+def _row_deltas(
+    exponents: torch.Tensor, max_delta: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Row minimum ``base`` and padded 4-tuples of uint8 deltas ``e - base``."""
+    e = exponents.view(torch.uint8)
+    base = e.amin(dim=-1).contiguous()
+    deltas = e - base.unsqueeze(-1)
+    span = int(deltas.max()) if deltas.numel() else 0
+    if span > max_delta:
+        bits = 2 if max_delta == 3 else 4
+        raise ValueError(
+            f"a row's scale exponents span {span + 1} values; {bits}-bit codes hold {max_delta + 1}"
+        )
+    pad = -e.shape[-1] % 4
+    if pad:
+        deltas = torch.nn.functional.pad(deltas, (0, pad), value=0)
+    return deltas.view(*deltas.shape[:-1], -1, 4), base
+
+
+def _pack_nibbles(d: torch.Tensor) -> torch.Tensor:
+    lo = (d[..., 0] | (d[..., 1] << 4)).to(torch.int16)
+    hi = (d[..., 2] | (d[..., 3] << 4)).to(torch.int16)
+    return (lo | (hi << 8)).view(torch.uint16).contiguous()
+
+
+def _pack_crumbs(d: torch.Tensor) -> torch.Tensor:
+    return (
+        d[..., 0] | (d[..., 1] << 2) | (d[..., 2] << 4) | (d[..., 3] << 6)
+    ).contiguous()
+
+
 def pack_scale_codes(exponents: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """``[..., K / 32]`` UE8M0 bytes as a base exponent per row and 4-bit codes.
 
@@ -41,20 +72,8 @@ def pack_scale_codes(exponents: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
     in a row (DeepSeek-V4.1-Flash, both checkpoints sampled), so the codes are exact;
     a row spanning more than 16 is refused rather than approximated.
     """
-    e = exponents.view(torch.uint8)
-    base = e.amin(dim=-1)
-    deltas = e.to(torch.int32) - base.unsqueeze(-1).to(torch.int32)
-    span = int(deltas.max()) if deltas.numel() else 0
-    if span > 15:
-        raise ValueError(
-            f"a row's scale exponents span {span + 1} values; 4-bit codes hold 16"
-        )
-    pad = -e.shape[-1] % 4
-    if pad:
-        deltas = torch.nn.functional.pad(deltas, (0, pad), value=0)
-    d = deltas.view(*deltas.shape[:-1], -1, 4)
-    codes = d[..., 0] | (d[..., 1] << 4) | (d[..., 2] << 8) | (d[..., 3] << 12)
-    return codes.to(torch.int16).view(torch.uint16).contiguous(), base.contiguous()
+    d, base = _row_deltas(exponents, 15)
+    return _pack_nibbles(d), base
 
 
 def expand_scale_codes(codes: torch.Tensor, base: torch.Tensor) -> torch.Tensor:
@@ -78,20 +97,8 @@ def pack_scale_codes_2bit(exponents: torch.Tensor) -> tuple[torch.Tensor, torch.
     A row whose delta exceeds 3 is refused, not clipped. Padding deltas (a count not
     a multiple of four) are 0, so those bytes expand to ``base``.
     """
-    e = exponents.view(torch.uint8)
-    base = e.amin(dim=-1)
-    deltas = e.to(torch.int32) - base.unsqueeze(-1).to(torch.int32)
-    span = int(deltas.max()) if deltas.numel() else 0
-    if span > 3:
-        raise ValueError(
-            f"a row's scale exponents span {span + 1} values; 2-bit codes hold 4"
-        )
-    pad = -e.shape[-1] % 4
-    if pad:
-        deltas = torch.nn.functional.pad(deltas, (0, pad), value=0)
-    d = deltas.view(*deltas.shape[:-1], -1, 4)
-    codes = d[..., 0] | (d[..., 1] << 2) | (d[..., 2] << 4) | (d[..., 3] << 6)
-    return codes.to(torch.uint8).contiguous(), base.contiguous()
+    d, base = _row_deltas(exponents, 3)
+    return _pack_crumbs(d), base
 
 
 def expand_scale_codes_2bit(codes: torch.Tensor, base: torch.Tensor) -> torch.Tensor:
@@ -122,21 +129,16 @@ def pack_expert_scale_codes(exponents: torch.Tensor) -> ExpertScaleCodes:
     e = exponents.view(torch.uint8)
     if e.ndim < 2:
         raise ValueError("scale exponents must be [experts, rows, K / 32]")
-    codes, base = pack_scale_codes(e)
-    deltas = e.to(torch.int32) - base.unsqueeze(-1).to(torch.int32)
-    row_delta = deltas.amax(dim=-1)
-    if row_delta.ndim == 1:
-        expert_delta = row_delta
-    else:
-        expert_delta = row_delta.reshape(row_delta.shape[0], -1).amax(dim=1)
-    narrow = (expert_delta <= 3).to(torch.uint8)
+    d, base = _row_deltas(e, 15)
+    expert_delta = d.reshape(d.shape[0], -1).amax(dim=1)
+    narrow = (expert_delta <= 3).to(torch.uint8).contiguous()
+    codes = _pack_nibbles(d)
     codes_2bit = torch.zeros(codes.shape, dtype=torch.uint8, device=codes.device)
     mask = narrow.bool()
     if mask.any().item():
-        packed, _packed_base = pack_scale_codes_2bit(e[mask])
-        codes_2bit[mask] = packed
+        codes_2bit[mask] = _pack_crumbs(d[mask])
     return ExpertScaleCodes(
-        narrow.contiguous(),
+        narrow,
         base,
         codes,
         codes_2bit.contiguous(),

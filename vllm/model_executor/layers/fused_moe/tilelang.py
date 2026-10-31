@@ -220,19 +220,20 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
         # same buffer as uint8, holding the narrow experts' 2-bit codes in their
         # rows; ``narrow`` is 1 for those experts. The GEMM loads ``byte`` when
         # the flag is 1.
-        (
-            (t13, tail13, codes13, byte13, narrow13, base13),
-            (t2, tail2, codes2, byte2, narrow2, base2),
-        ) = self._plan.prepare_weights(
-            w13, layer.w13_weight_scale, w2, layer.w2_weight_scale
+        t13, tail13, codes13, byte13, narrow13, base13 = self._plan.prepare_weight(
+            w13, layer.w13_weight_scale
         )
-        for name, tensor in (
-            ("w13_weight", t13),
-            ("w13_weight_scale", codes13),
-            ("w2_weight", t2),
-            ("w2_weight_scale", codes2),
-        ):
-            replace_parameter(layer, name, tensor)
+        del w13
+        replace_parameter(layer, "w13_weight", t13)
+        replace_parameter(layer, "w13_weight_scale", codes13)
+        del t13, codes13
+        t2, tail2, codes2, byte2, narrow2, base2 = self._plan.prepare_weight(
+            w2, layer.w2_weight_scale
+        )
+        del w2
+        replace_parameter(layer, "w2_weight", t2)
+        replace_parameter(layer, "w2_weight_scale", codes2)
+        del t2, codes2
         self._tails = (tail13, tail2)
         self._bases = (base13, base2)
         self._codes_2bit = (byte13, byte2)

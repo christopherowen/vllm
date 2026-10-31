@@ -567,3 +567,64 @@ def test_the_narrow_scale_store_is_inside_the_device_branch():
         assert all("code8" in ast.unparse(store.value) for store in stores)
         found = True
     assert found
+
+
+def test_process_weights_replaces_w13_before_preparing_w2(monkeypatch):
+    """``TileLangExperts.process_weights_after_loading`` releases ``w13_weight``
+    and ``w13_weight_scale`` before preparing ``w2_weight`` so both raw and tiled
+    projections are never held live simultaneously."""
+    import weakref
+    from types import SimpleNamespace
+    from vllm.model_executor.layers.fused_moe import tilelang as tl_moe
+
+    refs = {}
+    w13 = torch.ones((2, 8, 4), dtype=torch.int8)
+    s13 = torch.ones((2, 8, 2), dtype=torch.uint8)
+    w2 = torch.ones((2, 4, 4), dtype=torch.int8)
+    s2 = torch.ones((2, 4, 2), dtype=torch.uint8)
+    refs["w13"] = weakref.ref(w13)
+    refs["s13"] = weakref.ref(s13)
+    calls = []
+
+    class _Plan:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def prepare_weight(self, w, scale):
+            calls.append(len(calls))
+            if len(calls) == 2:
+                # Raw w13_weight and w13_weight_scale must already be released
+                # before w2_weight is prepared.
+                assert refs["w13"]() is None
+                assert refs["s13"]() is None
+            return (
+                torch.zeros_like(w),
+                None,
+                torch.zeros((2, 2), dtype=torch.uint16),
+                torch.zeros((2, 4), dtype=torch.uint8),
+                torch.ones((2,), dtype=torch.uint8),
+                torch.zeros((2, 2), dtype=torch.uint8),
+            )
+
+    monkeypatch.setattr(tl_moe, "_kernels", lambda: SimpleNamespace(MoeExpertsV41Plan=_Plan))
+    monkeypatch.setattr(tl_moe, "replace_parameter", lambda layer, name, t: setattr(layer, name, t))
+    layer = SimpleNamespace(
+        apply_router_weight_on_input=False,
+        w13_weight=w13,
+        w13_weight_scale=s13,
+        w2_weight=w2,
+        w2_weight_scale=s2,
+    )
+    del w13, s13, w2, s2
+    experts = tl_moe.TileLangExperts.__new__(tl_moe.TileLangExperts)
+    experts.quant_config = SimpleNamespace(
+        gemm1_clamp_limit=None,
+        _w1=SimpleNamespace(scale=None),
+        _w2=SimpleNamespace(scale=None),
+    )
+    experts.moe_config = SimpleNamespace(
+        experts_per_token=2, swiglu_limit=7.0, in_dtype=torch.bfloat16
+    )
+    experts.fold_shared = True
+    experts.process_weights_after_loading(layer)
+    assert calls == [0, 1]
