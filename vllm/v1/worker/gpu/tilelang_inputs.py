@@ -2143,18 +2143,23 @@ _DFLASH_PAD_BLOCKS = 8
 
 @tilelang.jit(pass_configs=_PASS)
 def prepare_dflash_inputs_kernel(
-    sample_from_anchor: bool, cp_size: int, cp_interleave: int, idx_dtype: str
+    sample_from_anchor: bool,
+    cp_size: int,
+    cp_interleave: int,
+    idx_dtype: str,
+    multi_group: bool = False,
 ):
     """``num_blocks`` blocks of 256 rows a request: the accepted context's
     positions and slots (rejected rows PAD), the 1 + N query rows' ids, positions
     and slots, and their sampling rows; the first block of each request its query
     start, sequence length and sampling state, and the first block of the last
-    request pads every per-request buffer to the captured sizes."""
+    request pads every per-request buffer to the captured sizes. With
+    ``multi_group=True``, writes all draft KV-cache groups' context and query slot
+    mappings in one launch."""
     ids_len = T.dynamic("ids_len")
     query_positions_len = T.dynamic("query_positions_len")
     query_starts_len = T.dynamic("query_starts_len")
     seq_lens_len = T.dynamic("seq_lens_len")
-    query_slots_len = T.dynamic("query_slots_len")
     context_positions_len = T.dynamic("context_positions_len")
     context_slots_len = T.dynamic("context_slots_len")
     sample_indices_len = T.dynamic("sample_indices_len")
@@ -2171,10 +2176,285 @@ def prepare_dflash_inputs_kernel(
     num_rejected_len = T.dynamic("num_rejected_len")
     temperature_len = T.dynamic("temperature_len")
     seeds_len = T.dynamic("seeds_len")
+    sample_offset = 0 if sample_from_anchor else 1
+
+    if multi_group:
+        groups = T.dynamic("groups")
+        context_slots_stride = T.dynamic("context_slots_stride")
+
+        @T.prim_func
+        def prepare_dflash_inputs(
+            out_input_ids: T.Tensor((ids_len,), T.int32),
+            out_query_positions: T.Tensor((query_positions_len,), T.int64),
+            out_query_start_loc: T.Tensor((query_starts_len,), T.int32),
+            out_seq_lens: T.Tensor((seq_lens_len,), T.int32),
+            out_query_slot_ptrs: T.Tensor((groups,), T.ptr),
+            out_context_positions: T.Tensor((context_positions_len,), T.int64),
+            out_context_slot_mappings: T.StridedTensor(
+                (groups, context_slots_len), (context_slots_stride, 1), T.int64
+            ),
+            out_sample_indices: T.Tensor((sample_indices_len,), T.int64),
+            out_sample_pos: T.Tensor((sample_pos_len,), T.int64),
+            out_sample_idx_mapping: T.Tensor((sample_map_len,), T.int32),
+            out_temperature: T.Tensor((temperature_out_len,), T.float32),
+            out_seeds: T.Tensor((seeds_out_len,), T.int64),
+            target_positions: T.Tensor((target_positions_len,), T.int64),
+            target_query_start_loc: T.Tensor((target_starts_len,), T.int32),
+            idx_mapping: T.Tensor((idx_len,), idx_dtype),
+            last_sampled: T.Tensor((last_len,), T.int64),
+            next_prefill_tokens: T.Tensor((next_len,), T.int32),
+            num_sampled: T.Tensor((num_sampled_len,), T.int32),
+            num_rejected: T.Tensor((num_rejected_len,), T.int32),
+            temperature: T.Tensor((temperature_len,), T.float32),
+            seeds: T.Tensor((seeds_len,), T.int64),
+            table_ptrs: T.Tensor((groups,), T.ptr),
+            table_strides: T.Tensor((groups,), T.int64),
+            block_sizes: T.Tensor((groups,), T.int32),
+            parallel_drafting_token_id: T.int32,
+            num_query_per_req: T.int32,
+            num_speculative_steps: T.int32,
+            max_num_reqs: T.int32,
+            max_num_tokens: T.int32,
+            max_model_len: T.int32,
+            cp_rank: T.int32,
+            num_reqs: T.int32,
+            num_blocks: T.int32,
+        ):
+            with T.Kernel(
+                num_blocks + _DFLASH_PAD_BLOCKS, num_reqs, threads=_DFLASH_THREADS
+            ) as (bk, r):
+                T.import_source(_STORE_IF)
+                tx = T.get_thread_binding()
+                if bk >= num_blocks:
+                    if r == num_reqs - 1:
+                        query_end = num_reqs * num_query_per_req
+                        chunk = T.ceildiv(max_num_tokens - query_end, _DFLASH_PAD_BLOCKS)
+                        first = query_end + (bk - num_blocks) * chunk
+                        for g in T.serial(groups):
+                            out_query_slot = T.make_tensor(
+                                out_query_slot_ptrs[g], (_SPAN,), T.int64
+                            )
+                            for it in T.serial(T.ceildiv(chunk, _DFLASH_THREADS)):
+                                i = first + it * _DFLASH_THREADS + tx
+                                if (i < first + chunk) and (i < max_num_tokens):
+                                    out_query_slot[i] = T.int64(_PAD)
+                else:
+                    req = T.alloc_var(T.int64, init=T.cast(idx_mapping[r], T.int64))
+                    context_start = T.alloc_var(T.int32, init=target_query_start_loc[r])
+                    context_end = T.alloc_var(
+                        T.int32, init=target_query_start_loc[r + 1]
+                    )
+                    rejected = T.alloc_var(T.int32, init=num_rejected[r])
+                    sampled = T.alloc_var(T.int32, init=num_sampled[r])
+                    j = bk * _DFLASH_THREADS + tx
+                    rows = context_end - context_start
+                    valid_end = context_end - rejected
+                    num_valid = valid_end - context_start
+                    anchor = T.alloc_var(
+                        T.int64,
+                        init=target_positions[T.max(valid_end - 1, context_start)],
+                    )
+                    first = T.alloc_var(T.int64, init=target_positions[context_start])
+                    row_position = T.alloc_var(
+                        T.int64,
+                        init=target_positions[
+                            context_start + T.min(j, T.max(rows - 1, 0))
+                        ],
+                    )
+                    last_token = T.alloc_var(T.int64, init=last_sampled[req])
+                    next_token = T.alloc_var(T.int32, init=next_prefill_tokens[req])
+                    temp = T.alloc_var(T.float32, init=temperature[req])
+                    seed = T.alloc_var(T.int64, init=seeds[req])
+                    last_valid = T.if_then_else(num_valid > 0, anchor, first - 1)
+                    in_context = j < rows
+                    live = j < num_valid
+                    position = T.if_then_else(live, row_position, T.int64(0))
+                    offset = j - num_valid
+                    is_query = (j >= num_valid) & (j < num_valid + num_query_per_req)
+                    query_position = last_valid + 1 + offset
+                    query = r * num_query_per_req + offset
+                    input_id = T.if_then_else(
+                        offset == 0,
+                        T.if_then_else(
+                            sampled > 0, T.cast(last_token, T.int32), next_token
+                        ),
+                        parallel_drafting_token_id,
+                    )
+                    T.call_extern(
+                        "handle",
+                        "vllm_store_if_b64",
+                        T.address_of(out_context_positions[context_start + j]),
+                        position,
+                        in_context,
+                    )
+                    T.call_extern(
+                        "handle",
+                        "vllm_store_if_b32",
+                        T.address_of(out_input_ids[query]),
+                        input_id,
+                        is_query,
+                    )
+                    T.call_extern(
+                        "handle",
+                        "vllm_store_if_b64",
+                        T.address_of(out_query_positions[query]),
+                        T.min(query_position, T.cast(max_model_len - 1, T.int64)),
+                        is_query,
+                    )
+                    for g in T.serial(groups):
+                        g_block_size = block_sizes[g]
+                        g_span = g_block_size * cp_size
+                        g_stride = table_strides[g]
+                        g_last_col = g_stride - 1
+                        g_table = T.make_tensor(table_ptrs[g], (_SPAN,), T.int32)
+                        g_out_query_slot = T.make_tensor(
+                            out_query_slot_ptrs[g], (_SPAN,), T.int64
+                        )
+                        g_row = T.cast(r, T.int64) * g_stride
+                        g_context_block = T.cast(
+                            g_table[
+                                g_row + T.min(T.truncdiv(position, g_span), g_last_col)
+                            ],
+                            T.int64,
+                        )
+                        g_query_block = T.cast(
+                            g_table[
+                                g_row
+                                + T.min(
+                                    T.truncdiv(
+                                        T.max(query_position, T.int64(0)), g_span
+                                    ),
+                                    g_last_col,
+                                )
+                            ],
+                            T.int64,
+                        )
+                        g_context_slot = T.if_then_else(
+                            live and g_context_block != 0,
+                            _local_slot(
+                                position,
+                                g_context_block,
+                                g_block_size,
+                                cp_rank,
+                                cp_size,
+                                cp_interleave,
+                            ),
+                            T.int64(_PAD),
+                        )
+                        T.call_extern(
+                            "handle",
+                            "vllm_store_if_b64",
+                            T.address_of(
+                                out_context_slot_mappings[g, context_start + j]
+                            ),
+                            g_context_slot,
+                            in_context,
+                        )
+                        g_query_slot = T.if_then_else(
+                            g_query_block != 0,
+                            _local_slot(
+                                query_position,
+                                g_query_block,
+                                g_block_size,
+                                cp_rank,
+                                cp_size,
+                                cp_interleave,
+                            ),
+                            T.int64(_PAD),
+                        )
+                        T.call_extern(
+                            "handle",
+                            "vllm_store_if_b64",
+                            T.address_of(g_out_query_slot[query]),
+                            g_query_slot,
+                            is_query,
+                        )
+                    is_sample = is_query and offset >= sample_offset
+                    sample = r * num_speculative_steps + offset - sample_offset
+                    T.call_extern(
+                        "handle",
+                        "vllm_store_if_b64",
+                        T.address_of(out_sample_indices[sample]),
+                        T.cast(query, T.int64),
+                        is_sample,
+                    )
+                    T.call_extern(
+                        "handle",
+                        "vllm_store_if_b64",
+                        T.address_of(out_sample_pos[sample]),
+                        query_position + 1 - sample_offset,
+                        is_sample,
+                    )
+                    T.call_extern(
+                        "handle",
+                        "vllm_store_if_b32",
+                        T.address_of(out_sample_idx_mapping[sample]),
+                        T.cast(req, T.int32),
+                        is_sample,
+                    )
+                    if bk == 0:
+                        lead = tx == 0
+                        T.call_extern(
+                            "handle",
+                            "vllm_store_if_b32",
+                            T.address_of(out_query_start_loc[r]),
+                            r * num_query_per_req,
+                            lead,
+                        )
+                        T.call_extern(
+                            "handle",
+                            "vllm_store_if_b32",
+                            T.address_of(out_seq_lens[r]),
+                            T.cast(
+                                T.min(
+                                    last_valid + 1 + num_query_per_req,
+                                    T.cast(max_model_len, T.int64),
+                                ),
+                                T.int32,
+                            ),
+                            lead,
+                        )
+                        T.call_extern(
+                            "handle",
+                            "vllm_store_if_f32",
+                            T.address_of(out_temperature[req]),
+                            temp,
+                            lead,
+                        )
+                        T.call_extern(
+                            "handle",
+                            "vllm_store_if_b64",
+                            T.address_of(out_seeds[req]),
+                            seed,
+                            lead,
+                        )
+                        if r == num_reqs - 1:
+                            last_query_end = num_reqs * num_query_per_req
+                            for it in T.serial(
+                                T.ceildiv(max_num_reqs + 1 - num_reqs, _DFLASH_THREADS)
+                            ):
+                                i = num_reqs + it * _DFLASH_THREADS + tx
+                                if i < max_num_reqs + 1:
+                                    out_query_start_loc[i] = last_query_end
+                                if i < max_num_reqs:
+                                    out_seq_lens[i] = 0
+                            pad_start = num_reqs * num_speculative_steps
+                            pad_end = max_num_reqs * num_speculative_steps
+                            for it in T.serial(
+                                T.ceildiv(pad_end - pad_start, _DFLASH_THREADS)
+                            ):
+                                i = pad_start + it * _DFLASH_THREADS + tx
+                                if i < pad_end:
+                                    out_sample_indices[i] = T.int64(0)
+                                    out_sample_pos[i] = T.int64(0)
+                                    out_sample_idx_mapping[i] = -1
+
+        return prepare_dflash_inputs
+
+    query_slots_len = T.dynamic("query_slots_len")
     table_rows = T.dynamic("table_rows")
     table_cols = T.dynamic("table_cols")
     table_stride = T.dynamic("table_stride")
-    sample_offset = 0 if sample_from_anchor else 1
 
     @T.prim_func
     def prepare_dflash_inputs(
@@ -2412,9 +2692,19 @@ def prepare_dflash_inputs_kernel(
 
 
 def prepare_dflash_inputs_key(
-    sample_from_anchor: bool, cp_size: int, cp_interleave: int, idx_dtype: str
+    sample_from_anchor: bool,
+    cp_size: int,
+    cp_interleave: int,
+    idx_dtype: str,
+    multi_group: bool = False,
 ) -> tuple:
-    return (sample_from_anchor, cp_size, cp_interleave if cp_size > 1 else 1, idx_dtype)
+    base = (
+        sample_from_anchor,
+        cp_size,
+        cp_interleave if cp_size > 1 else 1,
+        idx_dtype,
+    )
+    return (*base, True) if multi_group else base
 
 
 def prepare_dflash_inputs(
@@ -2487,6 +2777,93 @@ def prepare_dflash_inputs(
         _as(block_table, torch.int32),
         parallel_drafting_token_id,
         block_size,
+        num_query_per_req,
+        num_speculative_steps,
+        max_num_reqs,
+        max_num_tokens,
+        max_model_len,
+        cp_rank,
+        num_reqs,
+        num_blocks,
+    )
+
+
+def prepare_dflash_inputs_multi_group(
+    out_input_ids: torch.Tensor,
+    out_query_positions: torch.Tensor,
+    out_query_start_loc: torch.Tensor,
+    out_seq_lens: torch.Tensor,
+    out_query_slot_ptrs: torch.Tensor,
+    out_context_positions: torch.Tensor,
+    out_context_slot_mappings: torch.Tensor,
+    out_sample_indices: torch.Tensor,
+    out_sample_pos: torch.Tensor,
+    out_sample_idx_mapping: torch.Tensor,
+    out_temperature: torch.Tensor,
+    out_seeds: torch.Tensor,
+    target_positions: torch.Tensor,
+    target_query_start_loc: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    last_sampled: torch.Tensor,
+    next_prefill_tokens: torch.Tensor,
+    num_sampled: torch.Tensor,
+    num_rejected: torch.Tensor,
+    temperature: torch.Tensor,
+    seeds: torch.Tensor,
+    table_ptrs: torch.Tensor,
+    table_strides: torch.Tensor,
+    block_sizes: torch.Tensor,
+    parallel_drafting_token_id: int,
+    num_query_per_req: int,
+    num_speculative_steps: int,
+    max_num_reqs: int,
+    max_num_tokens: int,
+    max_model_len: int,
+    cp_rank: int,
+    cp_size: int,
+    cp_interleave: int,
+    sample_from_anchor: bool,
+    num_reqs: int,
+    max_rows: int,
+) -> None:
+    """Single-launch multi-group ``prepare_dflash_inputs`` for all draft KV-cache
+    groups sharing a DCP layout."""
+    num_blocks = _ceil(max_rows, _DFLASH_THREADS)
+    if num_reqs == 0 or num_blocks == 0 or out_query_slot_ptrs.shape[0] == 0:
+        return
+    key = prepare_dflash_inputs_key(
+        sample_from_anchor,
+        cp_size,
+        cp_interleave,
+        _DTYPES[idx_mapping.dtype],
+        multi_group=True,
+    )
+    _kernel(prepare_dflash_inputs_kernel, *key)(
+        out_input_ids,
+        out_query_positions,
+        out_query_start_loc,
+        out_seq_lens,
+        out_query_slot_ptrs,
+        out_context_positions,
+        out_context_slot_mappings,
+        out_sample_indices,
+        out_sample_pos,
+        out_sample_idx_mapping,
+        out_temperature,
+        out_seeds,
+        _as(target_positions, torch.int64),
+        _as(target_query_start_loc, torch.int32),
+        idx_mapping,
+        _as(last_sampled, torch.int64).view(-1),
+        _as(next_prefill_tokens, torch.int32).view(-1),
+        _as(num_sampled, torch.int32),
+        _as(num_rejected, torch.int32),
+        _as(temperature, torch.float32),
+        _as(seeds, torch.int64),
+        table_ptrs,
+        table_strides,
+        _as(block_sizes, torch.int32),
+        parallel_drafting_token_id,
         num_query_per_req,
         num_speculative_steps,
         max_num_reqs,
@@ -2617,12 +2994,18 @@ def dflash_calls(
     sample_from_anchor: bool, cp_layouts: Sequence[tuple[int, int]]
 ) -> list:
     """The DFlash input preparation for each draft group's ``(cp_size,
-    cp_interleave)``."""
+    cp_interleave)`` (or the fused multi-group kernel when multiple groups
+    share one layout)."""
+    multi_group = len(cp_layouts) > 1 and len(dict.fromkeys(cp_layouts)) == 1
     return [
         _call(
             prepare_dflash_inputs_kernel,
             *prepare_dflash_inputs_key(
-                sample_from_anchor, cp_size, cp_interleave, RUNNER_IDX_DTYPE
+                sample_from_anchor,
+                cp_size,
+                cp_interleave,
+                RUNNER_IDX_DTYPE,
+                multi_group=multi_group,
             ),
         )
         for cp_size, cp_interleave in dict.fromkeys(cp_layouts)

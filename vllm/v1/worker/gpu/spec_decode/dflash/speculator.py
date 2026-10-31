@@ -404,6 +404,38 @@ class DFlashSpeculator(DraftModelSpeculator):
             dtype=torch.int64,
             device=self.device,
         )
+        self._draft_query_slot_ptrs = torch.tensor(
+            [
+                block_tables.slot_mappings[gid].data_ptr()
+                for gid in self.draft_kv_cache_group_ids
+            ],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self._draft_table_ptrs = torch.tensor(
+            [
+                block_tables.input_block_tables[gid].data_ptr()
+                for gid in self.draft_kv_cache_group_ids
+            ],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self._draft_table_strides = torch.tensor(
+            [
+                block_tables.input_block_tables[gid].stride(0)
+                for gid in self.draft_kv_cache_group_ids
+            ],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self._draft_block_sizes = torch.tensor(
+            [
+                block_tables.kernel_block_sizes[gid]
+                for gid in self.draft_kv_cache_group_ids
+            ],
+            dtype=torch.int32,
+            device=self.device,
+        )
 
         # Map each draft decoder layer to the index (within draft_kv_cache_group_ids)
         # of the kv-cache group its cache belongs to. Models that share a single group
@@ -471,6 +503,10 @@ class DFlashSpeculator(DraftModelSpeculator):
             "draft_cp_size",
             "draft_cp_interleave",
             "_context_slot_mappings",
+            "_draft_query_slot_ptrs",
+            "_draft_table_ptrs",
+            "_draft_table_strides",
+            "_draft_block_sizes",
             "_layer_group_idx",
             "_group_causal",
             "_full_cg_needs_attn_metadata_build",
@@ -701,16 +737,26 @@ class DFlashSpeculator(DraftModelSpeculator):
         # The query slot mapping is written into the shared BlockTables slot_mappings.
         # That buffer's address is what the captured CUDA graph reads from at replay.
         assert self.draft_kv_cache_group_id >= 0
-        # Support multiple draft KV cache groups by preparing inputs once for each
-        for i, gid in enumerate(self.draft_kv_cache_group_ids):
-            cp_rank, cp_size, cp_interleave = self.block_tables.get_group_cp_parameters(
-                gid
+        max_query_slot_tokens = min(
+            self.max_num_tokens, self.max_num_reqs * self.num_query_per_req
+        )
+        if hasattr(self, "draft_cp_rank"):
+            cp_rank = self.draft_cp_rank
+            cp_size = self.draft_cp_size
+            cp_interleave = self.draft_cp_interleave
+        else:
+            cp_rank, cp_size, cp_interleave = (
+                self.block_tables.get_group_cp_parameters(
+                    self.draft_kv_cache_group_id
+                )
             )
+        if len(self.draft_kv_cache_group_ids) == 1:
+            gid = self.draft_kv_cache_group_ids[0]
             prepare_dflash_inputs(
                 self.input_buffers,
                 self.block_tables.slot_mappings[gid],
                 self.context_positions,
-                self._context_slot_mappings[i],
+                self._context_slot_mappings[0],
                 self.sample_indices,
                 self.sample_pos,
                 self.sample_idx_mapping,
@@ -732,7 +778,39 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.num_query_per_req,
                 self.num_speculative_steps,
                 self.max_num_reqs,
-                min(self.max_num_tokens, self.max_num_reqs * self.num_query_per_req),
+                max_query_slot_tokens,
+                self.max_model_len,
+                self.sample_from_anchor,
+            )
+        else:
+            prepare_dflash_inputs_multi_group(
+                self.input_buffers,
+                self._draft_query_slot_ptrs,
+                self.context_positions,
+                self._context_slot_mappings,
+                self.sample_indices,
+                self.sample_pos,
+                self.sample_idx_mapping,
+                self.temperature,
+                self.seeds,
+                input_batch,
+                num_sampled,
+                num_rejected,
+                last_sampled,
+                next_prefill_tokens,
+                temperature,
+                seeds,
+                self._draft_table_ptrs,
+                self._draft_table_strides,
+                self._draft_block_sizes,
+                cp_rank,
+                cp_size,
+                cp_interleave,
+                self.parallel_drafting_token_id,
+                self.num_query_per_req,
+                self.num_speculative_steps,
+                self.max_num_reqs,
+                max_query_slot_tokens,
                 self.max_model_len,
                 self.sample_from_anchor,
             )
@@ -1141,6 +1219,83 @@ def prepare_dflash_inputs(
         block_table,
         parallel_drafting_token_id,
         block_size,
+        num_query_per_req,
+        num_speculative_steps,
+        max_num_reqs,
+        max_num_tokens,
+        max_model_len,
+        cp_rank,
+        cp_size,
+        cp_interleave,
+        sample_from_anchor,
+        num_reqs,
+        max_tokens_per_req,
+    )
+
+
+def prepare_dflash_inputs_multi_group(
+    input_buffers: InputBuffers,
+    query_slot_ptrs: torch.Tensor,
+    context_positions: torch.Tensor,
+    context_slot_mappings: torch.Tensor,
+    sample_indices: torch.Tensor,
+    sample_pos: torch.Tensor,
+    sample_idx_mapping: torch.Tensor,
+    temperature: torch.Tensor,
+    seeds: torch.Tensor,
+    input_batch: InputBatch,
+    num_sampled: torch.Tensor,
+    num_rejected: torch.Tensor,
+    last_sampled: torch.Tensor,
+    next_prefill_tokens: torch.Tensor,
+    input_temperature: torch.Tensor,
+    input_seeds: torch.Tensor,
+    table_ptrs: torch.Tensor,
+    table_strides: torch.Tensor,
+    block_sizes: torch.Tensor,
+    cp_rank: int,
+    cp_size: int,
+    cp_interleave: int,
+    parallel_drafting_token_id: int,
+    num_query_per_req: int,
+    num_speculative_steps: int,
+    max_num_reqs: int,
+    max_num_tokens: int,
+    max_model_len: int,
+    sample_from_anchor: bool = False,
+) -> None:
+    num_reqs = input_batch.num_reqs
+    assert num_reqs > 0
+    max_target_query_len = int(input_batch.num_scheduled_tokens.max())
+    max_tokens_per_req = max_target_query_len + num_query_per_req
+    from vllm.v1.worker.gpu import tilelang_inputs
+
+    tilelang_inputs.prepare_dflash_inputs_multi_group(
+        input_buffers.input_ids,
+        input_buffers.positions,
+        input_buffers.query_start_loc,
+        input_buffers.seq_lens,
+        query_slot_ptrs,
+        context_positions,
+        context_slot_mappings,
+        sample_indices,
+        sample_pos,
+        sample_idx_mapping,
+        temperature,
+        seeds,
+        input_batch.positions,
+        input_batch.query_start_loc,
+        input_batch.idx_mapping,
+        last_sampled,
+        next_prefill_tokens,
+        num_sampled,
+        num_rejected,
+        input_temperature,
+        input_seeds,
+        table_ptrs,
+        table_strides,
+        block_sizes,
+        parallel_drafting_token_id,
         num_query_per_req,
         num_speculative_steps,
         max_num_reqs,

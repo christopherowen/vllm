@@ -10,6 +10,7 @@ import torch
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
     prepare_dflash_inputs,
+    prepare_dflash_inputs_multi_group,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -282,3 +283,149 @@ def test_dflash_build_uniform_attn_metadata_forwards_max_query_len(monkeypatch):
     assert captured["num_tokens"] == 20
     assert captured["query_start_loc_cpu"].tolist() == [0, 5, 10, 10, 10]
     assert captured["seq_lens_cpu_upper_bound"].tolist() == [15, 25, 0, 0]
+
+def test_prepare_dflash_inputs_multi_group_matches_per_group():
+    device = torch.device("cuda")
+    max_num_reqs = 4
+    max_num_tokens = 16
+    num_speculative_steps = 3
+    num_groups = 3
+
+    target_positions = [10, 11, 12, 13]
+    group_tables = [
+        torch.tensor([[0, 0, 7, 8, 9, 10, 11, 12]], dtype=torch.int32, device=device),
+        torch.tensor([[0, 3, 4, 5, 6, 7, 8, 9]], dtype=torch.int32, device=device),
+        torch.tensor([[0, 0, 0, 11, 12, 13, 14, 15]], dtype=torch.int32, device=device),
+    ]
+    group_block_sizes = [4, 8, 4]
+
+    ref_outs = [
+        _run_prepare(
+            target_positions=target_positions,
+            block_table_values=group_tables[g][0].tolist(),
+        )
+        for g in range(num_groups)
+    ]
+
+    input_buffers = SimpleNamespace(
+        input_ids=torch.full((max_num_tokens,), -1, dtype=torch.int32, device=device),
+        positions=torch.full((max_num_tokens,), -1, dtype=torch.int64, device=device),
+        query_start_loc=torch.full(
+            (max_num_reqs + 1,), -1, dtype=torch.int32, device=device
+        ),
+        seq_lens=torch.full((max_num_reqs,), -1, dtype=torch.int32, device=device),
+    )
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        num_scheduled_tokens=np.array([4], dtype=np.int32),
+        positions=torch.tensor(target_positions, dtype=torch.int64, device=device),
+        query_start_loc=torch.tensor([0, 4], dtype=torch.int32, device=device),
+        idx_mapping=torch.tensor([2], dtype=torch.int32, device=device),
+    )
+    query_slot_mappings = torch.full(
+        (num_groups, max_num_tokens), -2, dtype=torch.int64, device=device
+    )
+    query_slot_ptrs = torch.tensor(
+        [query_slot_mappings[g].data_ptr() for g in range(num_groups)],
+        dtype=torch.int64,
+        device=device,
+    )
+    context_positions = torch.full(
+        (max_num_tokens,), -1, dtype=torch.int64, device=device
+    )
+    context_slot_mappings = torch.full(
+        (num_groups, max_num_tokens), -2, dtype=torch.int64, device=device
+    )
+    sample_indices = torch.full(
+        (max_num_reqs * num_speculative_steps,),
+        -1,
+        dtype=torch.int64,
+        device=device,
+    )
+    sample_pos = torch.full_like(sample_indices, -1)
+    sample_idx_mapping = torch.full(
+        sample_indices.shape, -1, dtype=torch.int32, device=device
+    )
+    temperature = torch.zeros(max_num_reqs, dtype=torch.float32, device=device)
+    seeds = torch.zeros(max_num_reqs, dtype=torch.int64, device=device)
+    input_temperature = torch.tensor(
+        [0.0, 0.0, 1.0, 0.0], dtype=torch.float32, device=device
+    )
+    input_seeds = torch.tensor([0, 0, 17, 0], dtype=torch.int64, device=device)
+    last_sampled = torch.tensor([0, 0, 99, 0], dtype=torch.int64, device=device)
+    next_prefill_tokens = torch.zeros_like(last_sampled)
+    table_ptrs = torch.tensor(
+        [t.data_ptr() for t in group_tables], dtype=torch.int64, device=device
+    )
+    table_strides = torch.tensor(
+        [t.stride(0) for t in group_tables], dtype=torch.int64, device=device
+    )
+    block_sizes = torch.tensor(group_block_sizes, dtype=torch.int32, device=device)
+
+    prepare_dflash_inputs_multi_group(
+        input_buffers,
+        query_slot_ptrs,
+        context_positions,
+        context_slot_mappings,
+        sample_indices,
+        sample_pos,
+        sample_idx_mapping,
+        temperature,
+        seeds,
+        input_batch,
+        torch.tensor([1], dtype=torch.int32, device=device),
+        torch.tensor([2], dtype=torch.int32, device=device),
+        last_sampled,
+        next_prefill_tokens,
+        input_temperature,
+        input_seeds,
+        table_ptrs,
+        table_strides,
+        block_sizes,
+        0,
+        1,
+        1,
+        123,
+        num_speculative_steps,
+        num_speculative_steps,
+        max_num_reqs,
+        max_num_tokens,
+        128,
+        sample_from_anchor=True,
+    )
+    torch.accelerator.synchronize()
+
+    assert torch.equal(
+        input_buffers.input_ids.cpu(), ref_outs[0].input_buffers.input_ids.cpu()
+    )
+    assert torch.equal(
+        input_buffers.positions.cpu(), ref_outs[0].input_buffers.positions.cpu()
+    )
+    assert torch.equal(
+        input_buffers.query_start_loc.cpu(),
+        ref_outs[0].input_buffers.query_start_loc.cpu(),
+    )
+    assert torch.equal(
+        input_buffers.seq_lens.cpu(), ref_outs[0].input_buffers.seq_lens.cpu()
+    )
+    assert torch.equal(context_positions.cpu(), ref_outs[0].context_positions)
+    assert torch.equal(sample_indices.cpu(), ref_outs[0].sample_indices)
+    assert torch.equal(sample_pos.cpu(), ref_outs[0].sample_pos)
+    assert torch.equal(sample_idx_mapping.cpu(), ref_outs[0].sample_idx_mapping)
+    assert torch.equal(temperature.cpu(), ref_outs[0].temperature)
+    assert torch.equal(seeds.cpu(), ref_outs[0].seeds)
+    for g in (0, 2):
+        assert torch.equal(
+            query_slot_mappings[g].cpu(), ref_outs[g].query_slot_mapping
+        )
+        assert torch.equal(
+            context_slot_mappings[g].cpu(), ref_outs[g].context_slot_mapping
+        )
+    assert context_slot_mappings[1, :4].cpu().tolist() == [
+        26,
+        27,
+        PAD_SLOT_ID,
+        PAD_SLOT_ID,
+    ]
+    assert query_slot_mappings[1, :3].cpu().tolist() == [28, 29, 30]
+    assert (query_slot_mappings[1, 3:].cpu() == PAD_SLOT_ID).all()
