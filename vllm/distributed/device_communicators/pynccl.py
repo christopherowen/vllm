@@ -4,6 +4,8 @@
 
 # ===================== import region =====================
 import contextlib
+import functools
+import os
 import threading
 
 import torch
@@ -28,6 +30,17 @@ from vllm.utils.torch_utils import current_stream
 logger = init_logger(__name__)
 
 _warmup_tls = threading.local()
+
+
+@functools.cache
+def ring4_relay() -> bool:
+    """Whether a four-rank exchange relays the opposite rank's rows through a
+    neighbour, as a switchless four-node ring needs (ranks two apart share no
+    cable). Only a fabric that reaches every peer in one hop says so: sparknet's
+    ``direct`` topology (``SPARKNET_ROCE_TOPOLOGY=direct``: every rank behind one
+    switch) exchanges straight with every peer. Any other value, or none, keeps
+    the relay, which works on every fabric."""
+    return os.environ.get("SPARKNET_ROCE_TOPOLOGY") != "direct"
 
 
 def _warmup_deferred() -> bool:
@@ -569,7 +582,7 @@ class PyNcclCommunicator:
         ``input_`` has fewer rows; ``output[s, :n]`` receives rank s's block for this
         rank (n its real rows, the same from every rank), and later rows are not
         written. One grouped send/recv per peer; at four ranks, neighbours only
-        (``_all_to_all_rows_ring``)."""
+        (``_all_to_all_rows_ring``) unless the fabric is ``direct`` (``ring4_relay``)."""
         if self.disabled:
             return
         world, me, total = self.world_size, self.rank, input_.shape[0]
@@ -587,7 +600,7 @@ class PyNcclCommunicator:
         mine = real(me)
         if mine:
             output[me, :mine].copy_(input_[me * rows : me * rows + mine])
-        if world == 4:
+        if world == 4 and ring4_relay():
             self._all_to_all_rows_ring(output, input_, rows, real, stream)
             return
         self.group_start()

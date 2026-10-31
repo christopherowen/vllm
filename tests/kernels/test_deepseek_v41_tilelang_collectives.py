@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The rank-order reduce-scatter: the exchange (simulated ranks on the host, the
-neighbour relay at four ranks) and the TileLang sum (GPU)."""
+neighbour relay at four ranks on a ring, direct behind a switch) and the TileLang
+sum (GPU)."""
 
 import threading
 from collections import defaultdict, deque
@@ -23,15 +24,19 @@ assert WORLDS[-1] == MAX_RANK_ORDER_WORLD
 
 
 class _Fabric:
-    """Point-to-point links between simulated ranks. At four ranks only the ring
-    neighbours are cabled, as on ring4: a send to the opposite rank fails."""
+    """Point-to-point links between simulated ranks. At four ranks on a ring only
+    the neighbours are cabled, as on ring4: a send to the opposite rank fails.
+    Behind a switch (``switched``) every pair is linked. ``pairs`` records the
+    linked pairs that carried a send, ``groups`` each rank's send/recv groups."""
 
-    def __init__(self, world: int):
-        self.world = world
+    def __init__(self, world: int, switched: bool = False):
+        self.world, self.switched = world, switched
         self.barrier = threading.Barrier(world)
         self.queues = defaultdict(deque)
         self.gathered = {}
         self.lock = threading.Lock()
+        self.pairs: set[frozenset] = set()
+        self.groups = defaultdict(int)
 
 
 class _Comm:
@@ -44,10 +49,15 @@ class _Comm:
 
     def group_start(self):
         self.sends, self.recvs = [], []
+        with self.fabric.lock:
+            self.fabric.groups[self.rank] += 1
 
     def send(self, tensor, peer):
-        if self.fabric.world == 4 and (peer - self.rank) % 4 == 2:
+        fabric = self.fabric
+        if fabric.world == 4 and not fabric.switched and (peer - self.rank) % 4 == 2:
             raise AssertionError(f"rank {self.rank} sent to its opposite rank {peer}")
+        with fabric.lock:
+            fabric.pairs.add(frozenset((self.rank, peer)))
         self.sends.append((peer, tensor.clone()))
 
     def recv(self, tensor, peer):
@@ -87,9 +97,29 @@ def _host_zero_fill(monkeypatch):
     )
 
 
-def _run(inputs, collective=None):
+@pytest.fixture(autouse=True)
+def topology(monkeypatch):
+    """``SPARKNET_ROCE_TOPOLOGY`` for one test, unset unless the test sets it (None
+    unsets): the exchange reads it through ``ring4_relay``, which caches its answer,
+    so the cache is cleared around every setting."""
+    from vllm.distributed.device_communicators.pynccl import ring4_relay
+
+    def set_topology(value):
+        if value is None:
+            monkeypatch.delenv("SPARKNET_ROCE_TOPOLOGY", raising=False)
+        else:
+            monkeypatch.setenv("SPARKNET_ROCE_TOPOLOGY", value)
+        ring4_relay.cache_clear()
+
+    set_topology(None)
+    yield set_topology
+    ring4_relay.cache_clear()
+
+
+
+def _run(inputs, collective=None, fabric=None):
     world = len(inputs)
-    fabric = _Fabric(world)
+    fabric = fabric or _Fabric(world)
     out, errors = [None] * world, []
     if collective is None:
         collective = reduce_scatter_rank_order
@@ -165,6 +195,54 @@ def test_sliced_exchange_into_parts_sums_alike(world, bounds):
         for r in range(world):
             assert torch.equal(sliced[rank].packed[r], inputs[r][rows])
         assert torch.equal(sliced[rank].sum(), whole[rank])
+
+
+@pytest.mark.parametrize("bounds", [(0, 7), (0, 3, 7), (0, 1, 2, 7)])
+def test_switched_four_ranks_exchange_directly_with_the_same_bits(topology, bounds):
+    """Behind a switch (``SPARKNET_ROCE_TOPOLOGY=direct``) four ranks send to every
+    peer, opposite rank included, in one group per exchange instead of the ring
+    relay's two; every part and every rank-order sum is the relay's, bit for bit."""
+    world, local, width = 4, bounds[-1], 24
+    torch.manual_seed(400 + len(bounds))
+    inputs = [
+        torch.randn(world * local, width).to(torch.bfloat16) for _ in range(world)
+    ]
+    ring = _Fabric(world)
+    relayed = _run(inputs, _exchange_in_slices(bounds), ring)
+    whole_relayed = _run(inputs)
+    topology("direct")
+    switch = _Fabric(world, switched=True)
+    direct = _run(inputs, _exchange_in_slices(bounds), switch)
+    whole_direct = _run(inputs, fabric=_Fabric(world, switched=True))
+    exchanges = len(bounds) - 1
+    assert switch.pairs == {frozenset((a, b)) for a in range(4) for b in range(a)}
+    assert dict(switch.groups) == {rank: exchanges for rank in range(world)}
+    assert all(ring.groups[rank] > exchanges for rank in range(world))
+    for rank in range(world):
+        for r in range(world):
+            assert torch.equal(direct[rank].packed[r], relayed[rank].packed[r])
+        assert torch.equal(direct[rank].sum(), relayed[rank].sum())
+        assert torch.equal(whole_direct[rank], whole_relayed[rank])
+
+
+@pytest.mark.parametrize("value", [None, "", "ring4", "switched", "DIRECT"])
+def test_every_other_topology_keeps_the_ring_relay(topology, value):
+    """Only ``direct`` drops the relay: with any other value, or none, four ranks
+    exchange over the ring neighbours only (the ring fabric refuses the opposite
+    rank) and sum as before."""
+    topology(value)
+    world, local, width = 4, 5, 16
+    torch.manual_seed(4)
+    inputs = [
+        torch.randn(world * local, width).to(torch.bfloat16) for _ in range(world)
+    ]
+    ring = _Fabric(world)
+    out = _run(inputs, fabric=ring)
+    assert ring.pairs == {frozenset((r, (r + 1) % 4)) for r in range(4)}
+    for rank in range(world):
+        rows = slice(rank * local, (rank + 1) * local)
+        assert torch.equal(out[rank], _reference([x[rows] for x in inputs]))
+
 
 
 @pytest.mark.parametrize("world", WORLDS)

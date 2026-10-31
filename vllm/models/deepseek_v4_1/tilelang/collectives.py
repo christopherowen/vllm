@@ -11,9 +11,13 @@ the step's row count. ``reduce_scatter_rank_order`` exchanges the chunks unreduc
 (NCCL send/recv on the same communicator, the same bytes) and adds them as the
 one-shot all-reduce does, so a row reduces to the same bits on every path.
 
-At four ranks only the neighbours (rank +-1, the ring4 cable order sparknet and
-NCCL use) exchange: each half of the opposite rank's chunk is relayed through one
-neighbour, so the four links carry equal bytes. Other world sizes exchange directly.
+At four ranks only the neighbours (rank +-1, the cable order sparknet and NCCL use)
+exchange, as sparknet's switchless four-node ring needs: each half of the opposite
+rank's chunk is relayed through one neighbour, so the four links carry equal bytes.
+On a fabric that reaches every peer in one hop (``SPARKNET_ROCE_TOPOLOGY=direct``: a
+switch) every rank exchanges with every other directly, in one group
+(``ring4_relay``); the bytes and the rank-order sum are the same. Other world sizes
+exchange directly.
 """
 
 # No `from __future__ import annotations`: TileLang reads the prim_func
@@ -25,6 +29,7 @@ import tilelang
 import tilelang.language as T
 import torch
 
+from vllm.distributed.device_communicators.pynccl import ring4_relay
 from vllm.models.deepseek_v4_1.tilelang import prepare
 
 _VEC = 8  # BF16 per thread: one 16-byte access
@@ -298,7 +303,7 @@ def exchange_into(
     ``chunks`` and ``parts`` are ``(world, L, ...)``, each ``[r]`` contiguous (a
     row range of a larger buffer will do). ``comm`` is the group's PyNCCL
     communicator (``send``, ``recv``, ``group_start``, ``group_end``)."""
-    if world == 4:
+    if world == 4 and ring4_relay():
         nxt, prv, opp = (rank + 1) % 4, (rank + 3) % 4, (rank + 2) % 4
         half = -(-chunks.shape[1] // 2)
         # Halves of the opposite rank's chunks, in transit: from the previous rank

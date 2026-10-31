@@ -355,13 +355,29 @@ class _Fabric:
         self.barrier.wait()
 
 
+@pytest.fixture(params=[None, "direct"])
+def topology(request, monkeypatch):
+    """``SPARKNET_ROCE_TOPOLOGY`` unset (a ring, or any fabric) or ``direct`` (a
+    switch); ``ring4_relay`` caches its reading, so the cache is cleared around it."""
+    from vllm.distributed.device_communicators.pynccl import ring4_relay
+
+    if request.param is None:
+        monkeypatch.delenv("SPARKNET_ROCE_TOPOLOGY", raising=False)
+    else:
+        monkeypatch.setenv("SPARKNET_ROCE_TOPOLOGY", request.param)
+    ring4_relay.cache_clear()
+    yield request.param
+    ring4_relay.cache_clear()
+
+
 @pytest.mark.parametrize("world", [3, 4, 5, 6, 7, 8])
 @pytest.mark.parametrize("short", [0, 3, 9, 10, 25])
-def test_row_all_to_all_over_cabled_pairs(world, short, rows=10):
+def test_row_all_to_all_over_cabled_pairs(topology, world, short, rows=10):
     """PyNCCL's ``all_to_all_rows``, every rank a thread: each rank receives every
     rank's block of its real rows bit for bit and later rows stay unwritten, with the
-    last blocks short or empty; at four ranks (the switchless ring) only neighbours
-    exchange, since ranks two apart share no cable."""
+    last blocks short or empty; at four ranks on the switchless ring only neighbours
+    exchange, since ranks two apart share no cable, and behind a switch
+    (``SPARKNET_ROCE_TOPOLOGY=direct``) ranks two apart exchange directly."""
     total = max(1, world * rows - short)
     fabric = _Fabric(world)
     inputs = [torch.randn(total, 6) for _ in range(world)]
@@ -391,4 +407,7 @@ def test_row_all_to_all_over_cabled_pairs(world, short, rows=10):
             assert got[real:].isnan().all(), (me, source)
     if world == 4:
         ring = {frozenset((r, (r + 1) % 4)) for r in range(4)}
-        assert fabric.pairs <= ring, sorted(map(sorted, fabric.pairs - ring))
+        if topology is None:
+            assert fabric.pairs <= ring, sorted(map(sorted, fabric.pairs - ring))
+        else:
+            assert fabric.pairs - ring, "no pair two apart exchanged directly"
