@@ -69,6 +69,8 @@ EXEMPT = {"pdl_early_reader"}
 # before cudaGridDependencySynchronize().
 EARLY_PARAMETERS: dict[str, set[str]] = {
     "attention_front": {"cos_sin", "kv_weight", "positions", "q_weight", "slots"},
+    "compress": {"counts", "positions", "slots", "starts", "state_slots", "weight"},
+    "compress_gather_partial_state": {"counts", "positions", "starts", "table"},
     "indexer_mxfp4_quantize": {"CosSin", "Positions", "Slots", "Weight"},
     "mhc_post": {"comb", "post", "residual"},
     "moe_grouped_fp8_fp4_gemm": {"Narrow", "Order", "SFBase", "TileExpert"},
