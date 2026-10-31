@@ -210,10 +210,10 @@ def _chained(kernel: str) -> bool:
 
 
 def test_tile_kernels_chained_through_pdl_only():
-    """TileKernels' cast is chained when the deployment calls it through ``pdl``
+    """The native cast is chained when the deployment calls it through ``pdl``
     (a programmatic edge from the torch kernel before it) and not when called
-    directly; its switch is off again after the call."""
-    import tile_kernels
+    directly with ``use_pdl=False``."""
+    from vllm.models.deepseek_v4_1.tilelang import quant_common
 
     x = torch.randn((64, 5120), device=DEVICE)
 
@@ -222,8 +222,8 @@ def test_tile_kernels_chained_through_pdl_only():
         if through_pdl:
             pdl.per_token_cast(y, "e4m3", 32, round_sf=True, use_packed_ue8m0=True)
         else:
-            tile_kernels.quant.per_token_cast(
-                y, "e4m3", 32, round_sf=True, use_packed_ue8m0=True
+            quant_common.per_token_cast(
+                y, "e4m3", 32, round_sf=True, use_packed_ue8m0=True, use_pdl=False
             )
 
     for through_pdl in (True, False):
@@ -235,7 +235,53 @@ def test_tile_kernels_chained_through_pdl_only():
         ]
         assert len(edges) == 1 and edges[0][0] is not None, edges
         assert (edges[0][1] == PROGRAMMATIC) == through_pdl, (through_pdl, edges)
-        assert not tile_kernels.get_pdl()
+
+
+def test_native_cast_norm_gate_match_tile_kernels():
+    """Native TileLang per_token_cast, norm_forward, and moe_topk_gate_forward
+    match TileKernels bit for bit."""
+    import tile_kernels
+
+    gen = torch.Generator(device=DEVICE).manual_seed(42)
+    x = torch.randn((33, 5120), generator=gen, device=DEVICE).bfloat16()
+    weight = (torch.randn(5120, generator=gen, device=DEVICE) * 0.2 + 1.0).bfloat16()
+
+    xq_ours, sf_ours = pdl.per_token_cast(
+        x, "e4m3", 32, round_sf=True, use_packed_ue8m0=True
+    )
+    xq_ref, sf_ref = tile_kernels.quant.per_token_cast(
+        x, "e4m3", 32, round_sf=True, use_packed_ue8m0=True
+    )
+    assert torch.equal(xq_ours.view(torch.uint8), xq_ref.view(torch.uint8))
+    assert torch.equal(sf_ours, sf_ref)
+
+    norm_ours, rstd_ours, _ = pdl.norm_forward(x, weight, 1e-6)
+    norm_ref, rstd_ref, _ = tile_kernels.quant.norm_forward(x, weight, 1e-6)
+    assert torch.equal(norm_ours.view(torch.uint16), norm_ref.view(torch.uint16))
+    assert torch.equal(rstd_ours.view(torch.uint32), rstd_ref.view(torch.uint32))
+
+    logits = torch.randn((33, 384), generator=gen, device=DEVICE, dtype=torch.float32)
+    bias = torch.randn(384, generator=gen, device=DEVICE, dtype=torch.float32) * 0.1
+    ids_ours, w_ours = pdl.moe_topk_gate_forward(
+        logits,
+        6,
+        use_shared_as_routed=False,
+        num_shared_experts=0,
+        routed_scaling_factor=1.5,
+        ep_rank=0,
+        bias=bias,
+    )
+    ids_ref, w_ref = tile_kernels.moe.moe_topk_gate_forward(
+        logits,
+        6,
+        use_shared_as_routed=False,
+        num_shared_experts=0,
+        routed_scaling_factor=1.5,
+        ep_rank=0,
+        bias=bias,
+    )
+    assert torch.equal(ids_ours, ids_ref)
+    assert torch.equal(w_ours.view(torch.uint32), w_ref.view(torch.uint32))
 
 
 @pytest.mark.parametrize("launch", ["graph", "eager"])

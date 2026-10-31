@@ -69,39 +69,35 @@ def trigger():
     T.pdl_trigger()
 
 
-@contextlib.contextmanager
-def _tile_kernels():
-    """TileKernels with its PDL switch on inside the block (each call compiles and
-    launches with it; the kernel cache keys on the switch)."""
-    import tile_kernels
-
-    previous = tile_kernels.get_pdl()
-    tile_kernels.set_pdl(True)
-    try:
-        yield tile_kernels
-    finally:
-        tile_kernels.set_pdl(previous)
-
-
 def per_token_cast(*args, **kwargs):
-    """TileKernels' ``quant.per_token_cast``, chained."""
-    with _tile_kernels() as tk:
-        return tk.quant.per_token_cast(*args, **kwargs)
+    """Native TileLang ``quant_common.per_token_cast``, chained."""
+    from vllm.models.deepseek_v4_1.tilelang.quant_common import (
+        per_token_cast as _per_token_cast,
+    )
+
+    return _per_token_cast(*args, **kwargs, use_pdl=True)
 
 
 def norm_forward(*args, **kwargs):
-    """TileKernels' ``quant.norm_forward``, chained."""
-    with _tile_kernels() as tk:
-        return tk.quant.norm_forward(*args, **kwargs)
+    """Native TileLang ``norm.norm_forward``, chained."""
+    from vllm.models.deepseek_v4_1.tilelang.norm import norm_forward as _norm_forward
+
+    return _norm_forward(*args, **kwargs, use_pdl=True)
 
 
 def norm_forward_and_per_token_cast(*args, **kwargs):
-    """TileKernels' ``quant.norm_forward_and_per_token_cast``, chained."""
-    with _tile_kernels() as tk:
-        return tk.quant.norm_forward_and_per_token_cast(*args, **kwargs)
+    """Native TileLang ``norm.norm_forward_and_per_token_cast``, chained."""
+    from vllm.models.deepseek_v4_1.tilelang.norm import (
+        norm_forward_and_per_token_cast as _norm_forward_and_per_token_cast,
+    )
+
+    return _norm_forward_and_per_token_cast(*args, **kwargs, use_pdl=True)
 
 
 def moe_topk_gate_forward(*args, **kwargs):
-    """TileKernels' ``moe.moe_topk_gate_forward``, chained."""
-    with _tile_kernels() as tk:
-        return tk.moe.moe_topk_gate_forward(*args, **kwargs)
+    """Native TileLang ``router.moe_topk_gate_forward``, chained."""
+    from vllm.models.deepseek_v4_1.tilelang.router import (
+        moe_topk_gate_forward as _moe_topk_gate_forward,
+    )
+
+    return _moe_topk_gate_forward(*args, **kwargs, use_pdl=True)

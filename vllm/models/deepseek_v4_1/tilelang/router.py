@@ -265,6 +265,502 @@ def _routing_mask_variants(vllm_config) -> tuple[bool, ...]:
     return (False, True)
 
 
+def _topk_gate_align(x: int, y: int) -> int:
+    return ((x + y - 1) // y) * y
+
+
+@T.macro
+def sqrt_softplus_forward_cuda(x: T.Ref):
+    return T.sqrt(T.Select(x > 20.0, x, T.log1p(T.exp(x))))
+
+
+@T.macro
+def warp_reduce_sum(x: T.Ref):
+    for i in T.unroll(0, 5):
+        x += T.shfl_xor(x, 1 << (4 - i))
+
+
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_DISABLE_OUT_OF_BOUND_WARNING: True,
+        tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
+    },
+)
+def get_moe_topk_gate_forward_kernel_cuda(
+    num_topk: int,
+    num_routed_experts: int,
+    mask_exists: bool,
+    fix_routing_mask_exists: bool,
+    unmapped_topk_idx_exists: bool,
+    to_physical_map_exists: bool,
+    bias_exists: bool,
+    image_token_mask_exists: bool,
+    force_random_exists: bool,
+    scores_exists: bool,
+    use_pdl: bool = False,
+):
+    warp_size = 32
+    num_warps = 2
+    num_threads = warp_size * num_warps
+    assert (
+        num_topk <= warp_size
+    ), f"num_topk must be less than or equal to {warp_size}"
+
+    num_tokens_per_block = num_threads // warp_size
+
+    large_prime_number = 23333
+    num_vectorize = 4
+    assert num_routed_experts % num_vectorize == 0, (
+        f"`num_routed_experts` must be divisible by {num_vectorize}, "
+        f"but got {num_routed_experts}"
+    )
+
+    num_tokens = T.dynamic("num_tokens")
+    unmapped_topk_idx_stride = T.dynamic("unmapped_topk_idx_stride")
+    num_physical_topk = T.dynamic("num_physical_topk")
+    num_logical_experts = T.dynamic("num_logical_experts")
+    num_duplicate_experts = T.dynamic("num_duplicate_experts")
+
+    num_routed_experts_per_thread = _topk_gate_align(
+        (num_routed_experts + warp_size - 1) // warp_size, num_vectorize
+    )
+    assert num_routed_experts_per_thread % num_vectorize == 0
+
+    @T.prim_func
+    def moe_topk_gate_forward_kernel(
+        logits: T.Tensor[(num_tokens, num_routed_experts), T.float32],
+        bias: T.Tensor[(num_routed_experts), T.float32],
+        image_bias: T.Tensor[(num_routed_experts), T.float32],
+        image_token_mask: T.Tensor[(num_tokens,), T.bool],
+        mask: T.Tensor[(num_tokens,), T.bool],
+        fix_routing_mask: T.Tensor[(num_tokens,), T.bool],
+        to_physical_map: T.Tensor[
+            (num_logical_experts, num_duplicate_experts), T.int32
+        ],
+        logical_count: T.Tensor[(num_logical_experts), T.int32],
+        topk_idx: T.Tensor[(num_tokens, num_physical_topk), T.int64],
+        unmapped_topk_idx: T.StridedTensor[
+            (num_tokens, num_topk), (unmapped_topk_idx_stride, 1), T.int64
+        ],
+        topk_weights: T.Tensor[(num_tokens, num_physical_topk), T.float32],
+        scores: T.Tensor[(num_tokens, num_routed_experts), T.float32],
+        force_random: T.Tensor[(num_tokens,), T.bool],
+        num_shared_experts: T.int32,
+        routed_scaling_factor: T.float32,
+        ep_rank: T.int32,
+    ):
+        with T.Kernel(
+            T.ceildiv(num_tokens, num_tokens_per_block), threads=num_threads
+        ) as pid:
+            if use_pdl:
+                T.pdl_sync()
+
+            thread_idx = T.get_thread_binding()
+            token_idx = thread_idx // 32
+            global_token_idx = token_idx + pid * num_tokens_per_block
+            lane_idx = thread_idx % 32
+
+            if global_token_idx >= num_tokens:
+                if use_pdl:
+                    T.pdl_trigger()
+                T.thread_return()
+
+            scores_wo_bias_shared = T.alloc_shared(
+                (num_tokens_per_block, num_routed_experts), dtype=T.float32
+            )
+
+            bias_local = T.alloc_local(
+                (num_routed_experts_per_thread,), dtype=T.float32
+            )
+            scores_local = T.alloc_local(
+                (num_routed_experts_per_thread,), dtype=T.float32
+            )
+            idx_local = T.alloc_local(
+                (num_routed_experts_per_thread,), dtype=T.int32
+            )
+            winner_score = T.alloc_var(dtype=T.float32)
+            winner_idx = T.alloc_var(dtype=T.int32, init=-1)
+            previous_winner_idx = T.alloc_var(dtype=T.int32, init=-1)
+
+            is_image_token = T.alloc_var(dtype=T.bool)
+            other_idx = T.alloc_var(dtype=T.int32)
+            topk_score_var = T.alloc_var(dtype=T.float32)
+            topk_idx_var = T.alloc_var(dtype=T.int64)
+            topk_sum_var = T.alloc_var(dtype=T.float32)
+
+            is_masked_token = mask_exists and not mask[global_token_idx]
+            if is_masked_token:
+                if lane_idx < num_topk and unmapped_topk_idx_exists:
+                    unmapped_topk_idx[global_token_idx, lane_idx] = -1
+                if lane_idx < num_physical_topk:
+                    topk_idx[global_token_idx, lane_idx] = -1
+                    topk_weights[global_token_idx, lane_idx] = 0.0
+                if scores_exists:
+                    for i in T.serial(lane_idx, num_routed_experts, warp_size):
+                        scores[global_token_idx, i] = 0.0
+                if use_pdl:
+                    T.pdl_trigger()
+                T.thread_return()
+
+            is_image_token = (
+                image_token_mask[global_token_idx]
+                if image_token_mask_exists
+                else False
+            )
+
+            T.fill(idx_local, -1)
+            T.fill(scores_local, -T.infinity(T.float32))
+            T.fill(bias_local, 0.0)
+
+            T.device_assert(num_physical_topk <= warp_size)
+
+            is_force_random_token = (
+                force_random_exists and force_random[global_token_idx]
+            )
+            if is_force_random_token:
+                rand_topk_idx_var = T.alloc_var(T.int32)
+                rand_topk_idx_tmp_var = T.alloc_var(T.int32)
+                rand_topk_weight_var = T.alloc_var(T.float32)
+                min_lane_idx = T.alloc_var(T.int32)
+
+                seed = ep_rank
+                seq_offset = global_token_idx
+                num_physical_experts = T.alloc_var(T.int32, init=0)
+                if to_physical_map_exists:
+                    for i in T.serial(lane_idx, num_logical_experts, warp_size):
+                        num_physical_experts += logical_count[i]
+                    num_physical_experts = T.warp_reduce_sum(num_physical_experts)
+                else:
+                    num_physical_experts = num_routed_experts + num_shared_experts
+
+                T.rng_init(seed, seq_offset * warp_size + lane_idx, 0)
+                rand_topk_weight_var = T.rng_rand_float()
+
+                if lane_idx < num_physical_topk:
+                    rand_topk_idx_tmp_var = T.rng_rand() % (
+                        num_physical_experts - lane_idx
+                    )
+                    rand_topk_idx_var = -1
+                else:
+                    rand_topk_idx_tmp_var = T.max_value(T.int32)
+                    rand_topk_idx_var = T.max_value(T.int32)
+                for _ in T.serial(num_physical_topk):
+                    min_topk_idx = T.warp_reduce_min(rand_topk_idx_tmp_var)
+                    min_lane_idx = T.Select(
+                        min_topk_idx == rand_topk_idx_tmp_var,
+                        lane_idx,
+                        T.max_value(T.int32),
+                    )
+                    min_lane_idx = T.warp_reduce_min(min_lane_idx)
+                    if rand_topk_idx_var == -1:
+                        if (
+                            rand_topk_idx_tmp_var >= min_topk_idx
+                            and min_lane_idx < lane_idx
+                        ):
+                            rand_topk_idx_tmp_var += 1
+                        elif min_lane_idx == lane_idx:
+                            rand_topk_idx_var = rand_topk_idx_tmp_var
+                            rand_topk_idx_tmp_var = T.max_value(T.int32)
+
+                T.device_assert(
+                    lane_idx >= num_physical_topk
+                    or T.match_any_sync(rand_topk_idx_var) ^ (1 << lane_idx) == 0
+                )
+
+                if lane_idx < num_physical_topk:
+                    topk_idx[global_token_idx, lane_idx] = rand_topk_idx_var
+                    topk_weights[global_token_idx, lane_idx] = rand_topk_weight_var
+                    if unmapped_topk_idx_exists and lane_idx < num_topk:
+                        unmapped_topk_idx[global_token_idx, lane_idx] = -1
+                if scores_exists:
+                    for i in T.serial(lane_idx, num_routed_experts, warp_size):
+                        scores[global_token_idx, i] = 0.0
+                if use_pdl:
+                    T.pdl_trigger()
+                T.thread_return()
+
+            for i in T.unroll(0, num_routed_experts_per_thread // num_vectorize):
+                start_expert_idx = (
+                    i * num_vectorize * warp_size + lane_idx * num_vectorize
+                )
+                if start_expert_idx < num_routed_experts:
+                    for j in T.vectorized(num_vectorize):
+                        expert_idx = start_expert_idx + j
+                        scores_local[i * num_vectorize + j] = logits[
+                            global_token_idx, expert_idx
+                        ]
+                        bias_local[i * num_vectorize + j] = (
+                            image_bias[expert_idx]
+                            if (image_token_mask_exists and is_image_token)
+                            else bias[expert_idx]
+                            if bias_exists
+                            else 0
+                        )
+
+                    for j in T.unroll(num_vectorize):
+                        is_finite = T.isfinite(scores_local[i * num_vectorize + j])
+                        T.device_assert(
+                            is_finite,
+                            msg="moe_topk_gate_forward input contains nan or inf!",
+                        )
+
+            for i in T.unroll(
+                0, T.ceildiv(num_routed_experts, num_vectorize * warp_size)
+            ):
+                start_expert_idx = (
+                    i * num_vectorize * warp_size + lane_idx * num_vectorize
+                )
+                if start_expert_idx < num_routed_experts:
+                    for j in T.unroll(num_vectorize):
+                        local_idx = i * num_vectorize + j
+                        scores_local[local_idx] = sqrt_softplus_forward_cuda(
+                            scores_local[local_idx]
+                        )
+
+                    for j in T.vectorized(num_vectorize):
+                        expert_idx = start_expert_idx + j
+                        local_idx = i * num_vectorize + j
+                        scores_wo_bias_shared[token_idx, expert_idx] = scores_local[
+                            local_idx
+                        ]
+                        if scores_exists:
+                            scores[global_token_idx, expert_idx] = scores_local[
+                                local_idx
+                            ]
+                        scores_local[local_idx] += bias_local[local_idx]
+                        idx_local[local_idx] = expert_idx
+
+            T.sync_warp()
+
+            if not fix_routing_mask_exists or not fix_routing_mask[global_token_idx]:
+                for k in T.unroll(num_topk):
+                    winner_score = -T.infinity(T.float32)
+                    winner_idx = -1
+                    for i in T.unroll(0, num_routed_experts_per_thread):
+                        if k != 0 and previous_winner_idx == idx_local[i]:
+                            scores_local[i] = -T.infinity(T.float32)
+                        elif scores_local[i] > winner_score:
+                            winner_score = scores_local[i]
+                            winner_idx = idx_local[i]
+
+                    for i in T.unroll(5):
+                        other_score = T.shfl_xor(winner_score, 1 << i)
+                        other_idx = T.shfl_xor(winner_idx, 1 << i)
+                        if other_score > winner_score or (
+                            other_score == winner_score and other_idx < winner_idx
+                        ):
+                            winner_score = other_score
+                            winner_idx = other_idx
+
+                    previous_winner_idx = winner_idx
+                    if lane_idx == k:
+                        topk_idx_var = winner_idx
+
+                topk_score_var = 0.0
+                if lane_idx < num_topk:
+                    topk_score_var = scores_wo_bias_shared[token_idx, topk_idx_var]
+
+            else:
+                topk_score_var = 0.0
+                if lane_idx < num_topk:
+                    topk_idx_var = unmapped_topk_idx[global_token_idx, lane_idx]
+                    topk_score_var = scores_wo_bias_shared[token_idx, topk_idx_var]
+
+            topk_sum_var = topk_score_var
+            warp_reduce_sum(topk_sum_var)
+            topk_sum_var += 1e-20
+
+            if lane_idx < num_topk:
+                T.device_assert(topk_idx_var >= 0)
+                topk_score_var = (
+                    topk_score_var / topk_sum_var * routed_scaling_factor
+                )
+                if unmapped_topk_idx_exists:
+                    unmapped_topk_idx[global_token_idx, lane_idx] = topk_idx_var
+            elif lane_idx < num_physical_topk:
+                topk_score_var = 1.0
+                topk_idx_var = lane_idx + (num_routed_experts - num_topk)
+
+            if to_physical_map_exists and lane_idx < num_physical_topk:
+                logical_expert_idx = topk_idx_var
+                num_duplicates = logical_count[logical_expert_idx]
+                duplicate_idx = (
+                    ep_rank + global_token_idx * large_prime_number
+                ) % num_duplicates
+                topk_idx_var = to_physical_map[logical_expert_idx, duplicate_idx]
+
+            if lane_idx < num_physical_topk:
+                topk_idx[global_token_idx, lane_idx] = topk_idx_var
+                topk_weights[global_token_idx, lane_idx] = topk_score_var
+
+            if use_pdl:
+                T.pdl_trigger()
+
+    return moe_topk_gate_forward_kernel
+
+
+def moe_topk_gate_forward(
+    logits: torch.Tensor,
+    num_topk: int,
+    use_shared_as_routed: bool,
+    num_shared_experts: int,
+    routed_scaling_factor: float,
+    ep_rank: int,
+    scoring_func: str = "sqrtsoftplus",
+    mask: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    image_bias: torch.Tensor | None = None,
+    image_token_mask: torch.Tensor | None = None,
+    fix_routing_mask: torch.Tensor | None = None,
+    to_physical_map: torch.Tensor | None = None,
+    logical_count: torch.Tensor | None = None,
+    unmapped_topk_idx: torch.Tensor | None = None,
+    force_random: torch.Tensor | None = None,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
+    scores: torch.Tensor | None = None,
+    *,
+    use_pdl: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute top-k expert routing for Mixture of Experts (MoE) models."""
+    assert (
+        scoring_func == "sqrtsoftplus"
+    ), f"moe_topk_gate_forward only supports sqrtsoftplus scoring, got {scoring_func!r}"
+    assert logits.dim() == 2 and logits.is_contiguous() and logits.dtype == torch.float32
+    bias_exists = bias is not None
+    if bias_exists:
+        assert bias.dim() == 1 and bias.is_contiguous() and bias.dtype == torch.float32
+        assert logits.size(1) == bias.size(0)
+
+    image_token_mask_exists = image_token_mask is not None
+    assert image_token_mask_exists == (
+        image_bias is not None
+    ), "image_bias and image_token_mask must be both provided or both None"
+    if image_token_mask_exists:
+        assert (
+            image_bias.dim() == 1
+            and image_bias.is_contiguous()
+            and image_bias.dtype == torch.float32
+        )
+        assert (
+            image_token_mask.dim() == 1
+            and image_token_mask.is_contiguous()
+            and image_token_mask.dtype == torch.bool
+        )
+        assert logits.size(1) == image_bias.size(0)
+        assert logits.size(0) == image_token_mask.size(0)
+
+    if mask is not None:
+        assert mask.numel() == logits.size(0) and mask.dtype == torch.bool
+    assert (to_physical_map is None) == (logical_count is None)
+
+    num_tokens = logits.size(0)
+    num_routed_experts = logits.size(1)
+    assert num_topk <= num_routed_experts, (
+        f"num_topk ({num_topk}) must be less than or equal to "
+        f"num_routed_experts ({num_routed_experts})."
+    )
+
+    if not use_shared_as_routed:
+        num_shared_experts = 0
+
+    assert num_shared_experts in {1, 2} or (
+        num_shared_experts == 0 and not use_shared_as_routed
+    )
+
+    if out is None:
+        topk_idx = torch.empty(
+            num_tokens,
+            num_topk + num_shared_experts,
+            dtype=torch.int64,
+            layout=logits.layout,
+            device=logits.device,
+        )
+        topk_weights = torch.empty(
+            num_tokens,
+            num_topk + num_shared_experts,
+            dtype=torch.float32,
+            layout=logits.layout,
+            device=logits.device,
+        )
+    else:
+        topk_idx, topk_weights = out
+        assert (
+            topk_idx.size() == (num_tokens, num_topk + num_shared_experts)
+            and topk_idx.dtype == torch.int64
+        )
+        assert (
+            topk_weights.size() == (num_tokens, num_topk + num_shared_experts)
+            and topk_weights.dtype == torch.float32
+        )
+
+    if scores is not None:
+        assert scores.size() == logits.size() and scores.dtype == torch.float32
+        assert scores.is_contiguous() and scores.device == logits.device
+    if num_tokens == 0:
+        return topk_idx, topk_weights
+
+    num_logical_experts = num_shared_experts + num_routed_experts
+    if to_physical_map is not None:
+        assert to_physical_map.is_contiguous()
+        assert to_physical_map.dim() == 2 and to_physical_map.dtype == torch.int32
+        assert to_physical_map.size(0) == num_logical_experts
+        assert logical_count is not None and logical_count.is_contiguous()
+        assert logical_count.dim() == 1 and logical_count.dtype == torch.int32
+        assert logical_count.size(0) == num_logical_experts
+
+    if unmapped_topk_idx is not None:
+        assert (
+            unmapped_topk_idx.dim() == 2 and unmapped_topk_idx.dtype == torch.int64
+        )
+        assert (
+            unmapped_topk_idx.size(0) == num_tokens
+            and unmapped_topk_idx.size(1) == num_topk
+        )
+        assert unmapped_topk_idx.stride(1) == 1
+
+    if fix_routing_mask is not None:
+        assert unmapped_topk_idx is not None
+        assert fix_routing_mask.is_contiguous()
+        assert fix_routing_mask.dtype == torch.bool
+        assert fix_routing_mask.dim() == 1 and fix_routing_mask.size(0) == num_tokens
+
+    kernel = get_moe_topk_gate_forward_kernel_cuda(
+        num_topk,
+        num_routed_experts,
+        mask is not None,
+        fix_routing_mask is not None,
+        unmapped_topk_idx is not None,
+        to_physical_map is not None,
+        bias_exists,
+        image_token_mask_exists,
+        force_random is not None,
+        scores is not None,
+        use_pdl=use_pdl,
+    )
+
+    kernel(
+        logits,
+        bias,
+        image_bias,
+        image_token_mask,
+        mask,
+        fix_routing_mask,
+        to_physical_map,
+        logical_count,
+        topk_idx,
+        unmapped_topk_idx,
+        topk_weights,
+        scores,
+        force_random,
+        num_shared_experts,
+        routed_scaling_factor,
+        ep_rank,
+    )
+
+    return topk_idx, topk_weights
+
+
 def _topk_gate(
     logits: torch.Tensor,
     num_topk: int,
@@ -274,7 +770,7 @@ def _topk_gate(
     image_bias: torch.Tensor | None,
     image_token_mask: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """TileKernels' top-k gate as V4.1 routes: sqrtsoftplus with a correction
+    """Native TileLang top-k gate as V4.1 routes: sqrtsoftplus with a correction
     bias and no shared experts."""
     return pdl.moe_topk_gate_forward(
         logits,

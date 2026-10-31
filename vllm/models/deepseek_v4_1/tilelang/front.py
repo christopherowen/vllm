@@ -89,7 +89,7 @@ def _row_split(hidden: int) -> dict:
 def attention_front_kernel(eps: float, page_size: int, slot_dtype: str = "int64"):
     """q CTAs (two rows each) then kv CTAs (eight rows each); see the module
     docstring. ``qa_kv`` is the fused projection's output, q columns first."""
-    from tile_kernels.quant.common import (
+    from vllm.models.deepseek_v4_1.tilelang.quant_common import (
         get_cast_output_config,
         get_sf_and_inv,
         get_sf_index,

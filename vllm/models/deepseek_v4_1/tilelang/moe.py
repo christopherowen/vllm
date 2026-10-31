@@ -1158,7 +1158,7 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
     expert at a time, about 22 us a call at any decode size (spark-ds41f
     ``experiments/2026-10-14-moe-swiglu``).
     """
-    from tile_kernels.quant.common import (
+    from vllm.models.deepseek_v4_1.tilelang.quant_common import (
         get_best_vectorize_size,
         get_cast_output_config,
         get_sf_and_inv,
@@ -1443,7 +1443,6 @@ class MoeExpertsV41Plan:
             )
             for dtype in self.idx_dtypes
         }
-        self.tk = _tile_kernels(block_M)
 
     def _has_prefill_tiles(self) -> bool:
         return (
@@ -1668,11 +1667,3 @@ def _present(weights):
     ``codes`` otherwise.
     """
     return tuple(w for w in weights if w is not None)
-
-
-def _tile_kernels(block_M):
-    import tile_kernels
-
-    # Expert segments in the dispatch layout start on block_M rows.
-    tile_kernels.config.set_token_alignment(block_M)
-    return tile_kernels
