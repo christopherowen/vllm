@@ -24,6 +24,7 @@ from vllm.models.deepseek_v4_1.tilelang.vocab import (  # noqa: E402
     prepare_bf16_head,
     prepare_packed_head,
     project_head,
+    project_head_greedy_pairs,
     row_tile,
     tile_config,
 )
@@ -85,11 +86,11 @@ def test_packed_head_matches_fp32_reference(n, k, rows):
 def test_packed_head_rows_independent_of_batch_and_tile(n, k):
     weight = _head(n, k, seed=7)
     packed = packed_format.pack(weight.clone())
-    x = (torch.randn(64, k, device=DEVICE) * 0.5).bfloat16()
+    x = (torch.randn(128, k, device=DEVICE) * 0.5).bfloat16()
     full = _project(packed, n, k, x, 64)
     for block_M in ROW_TILES:
         assert torch.equal(_project(packed, n, k, x, block_M), full), block_M
-    for rows in (1, 2, 6, 17, 40):
+    for rows in (1, 2, 6, 17, 40, 65, 96, 128):
         part = _project(packed, n, k, x[:rows].contiguous(), row_tile(rows))
         assert torch.equal(part, full[:rows]), rows
     assert torch.equal(_project(packed, n, k, x[13:14].contiguous(), 16), full[13:14])
@@ -231,3 +232,34 @@ def test_logits_processor_projects_fp32_heads():
     assert logits.dtype == torch.float32
     expected = project_head(layer, hidden.reshape(-1, k)).reshape(2, 3, n)
     assert torch.equal(logits, expected)
+
+
+@pytest.mark.parametrize("n,k", SHAPES)
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+def test_packed_head_greedy_pairs_match_greedy_shard_pair(n, k, out_dtype):
+    from vllm.v1.worker.gpu.spec_decode.greedy_verification import (
+        vocab_parallel_pairs,
+        vocab_parallel_pairs_from_head,
+    )
+
+    weight = _head(n, k, seed=n + 19)
+    # Include identical rows inside and across vocabulary tiles to exercise tie-breaking.
+    weight[100] = weight[5]
+    weight[500] = weight[5]
+    layer = _packed_layer(weight)
+    prepare_packed_head(layer, out_dtype)
+    assert set(layer.tilelang_vocab_greedy) == set(ROW_TILES)
+    x = (torch.randn(130, k, device=DEVICE) * 0.5).bfloat16()
+    for vocab, vocab_start in ((n, 0), (n - 37, 32320)):
+        for rows in (1, 6, 24, 48, 65, 96, 128, 130):
+            part = x[:rows].contiguous()
+            logits = project_head(layer, part)
+            expected = vocab_parallel_pairs(logits, vocab, vocab_start, tp_size=1)
+            actual = project_head_greedy_pairs(
+                layer, part, vocab=vocab, vocab_start=vocab_start
+            )
+            from_head = vocab_parallel_pairs_from_head(
+                layer, part, vocab, vocab_start, tp_size=1
+            )
+            assert torch.equal(actual[:, :2], expected[:, :2]), (rows, vocab)
+            assert torch.equal(from_head[:, :2], expected[:, :2]), (rows, vocab)

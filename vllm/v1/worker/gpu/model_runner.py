@@ -210,6 +210,7 @@ from vllm.v1.worker.gpu.spec_decode.greedy_verification import (
     greedy_rejection_sample,
     register_greedy_verification_warmups,
     vocab_parallel_pairs,
+    vocab_parallel_pairs_from_head,
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     RejectionSampler,
@@ -1229,13 +1230,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Compile the greedy verification kernels before readiness, with the
             # live path's dtypes and strides.
             assert self.rejection_sampler is not None
-            shard = self._language_model().lm_head.shard_indices
+            head = self._language_model().lm_head
+            shard = head.shard_indices
+            tp_size = get_tensor_model_parallel_world_size()
             pairs = vocab_parallel_pairs(
                 self.model.compute_logits_local(hidden_states),
                 shard.num_org_elements,
                 shard.org_vocab_start_index,
-                get_tensor_model_parallel_world_size(),
+                tp_size,
             )
+            if hasattr(head, "tilelang_vocab_greedy"):
+                pairs = vocab_parallel_pairs_from_head(
+                    head,
+                    hidden_states,
+                    shard.num_org_elements,
+                    shard.org_vocab_start_index,
+                    tp_size,
+                )
             for steps in dict.fromkeys(
                 (self.num_draft_steps, self.rejection_sampler.num_speculative_steps)
                 if self.num_draft_steps > 0
@@ -2487,29 +2498,40 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """The rejection sampler's output for an all-greedy step, without the
         logits all-gather: the same committed tokens, bit for bit."""
         assert self.rejection_sampler is not None and self.sampler is not None
-        shard = self._language_model().lm_head.shard_indices
+        head = self._language_model().lm_head
+        shard = head.shard_indices
         tp_size = get_tensor_model_parallel_world_size()
-        local_logits = self.model.compute_logits_local(sample_hidden_states)
         drafts = logits_rows(input_batch)[0]
         rejection = self.sink is not None and self.sink.rejection
-        if rejection:
-            assert self.sink is not None and sink_flags is not None
-            # The rank that holds a sunk draft's column masks it.
-            self.sink.cut(
-                local_logits,
-                sink_flags,
-                drafts,
-                input_batch.cu_num_logits,
-                input_batch.num_reqs,
-                shard.org_vocab_start_index,
+        local_logits: torch.Tensor | None = None
+        if not rejection and hasattr(head, "tilelang_vocab_greedy"):
+            pairs = vocab_parallel_pairs_from_head(
+                head,
+                sample_hidden_states,
                 shard.num_org_elements,
+                shard.org_vocab_start_index,
+                tp_size,
             )
-        pairs = vocab_parallel_pairs(
-            local_logits,
-            shard.num_org_elements,
-            shard.org_vocab_start_index,
-            tp_size,
-        )
+        else:
+            local_logits = self.model.compute_logits_local(sample_hidden_states)
+            if rejection:
+                assert self.sink is not None and sink_flags is not None
+                # The rank that holds a sunk draft's column masks it.
+                self.sink.cut(
+                    local_logits,
+                    sink_flags,
+                    drafts,
+                    input_batch.cu_num_logits,
+                    input_batch.num_reqs,
+                    shard.org_vocab_start_index,
+                    shard.num_org_elements,
+                )
+            pairs = vocab_parallel_pairs(
+                local_logits,
+                shard.num_org_elements,
+                shard.org_vocab_start_index,
+                tp_size,
+            )
         greedy_steps = min(
             getattr(
                 self,
@@ -2540,7 +2562,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_rejected=num_rejected,
         )
         if rejection:
-            assert self.sink is not None
+            assert self.sink is not None and local_logits is not None
             output.sink_alternates = SinkAlternates(
                 self.sink.alternates_of_greedy_shards(
                     local_logits,

@@ -49,6 +49,31 @@ def vocab_parallel_pairs(
     return pairs
 
 
+def vocab_parallel_pairs_from_head(
+    head: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    vocab: int,
+    vocab_start: int,
+    tp_size: int,
+) -> torch.Tensor:
+    """Every rank's ``(max, global index)`` pair of each row, all-gathered
+    ([rows, PAIR_WIDTH * tp_size] FP32, in rank order), projected and reduced
+    directly from a prepared packed vocabulary head without materializing the
+    shard's logits."""
+    from vllm.models.deepseek_v4_1.tilelang.vocab import project_head_greedy_pairs
+
+    pairs = project_head_greedy_pairs(
+        head,
+        hidden_states,
+        vocab=vocab,
+        vocab_start=vocab_start,
+        pair_width=PAIR_WIDTH,
+    )
+    if tp_size > 1:
+        pairs = tensor_model_parallel_all_gather(pairs, dim=-1)
+    return pairs
+
+
 # Reference for ``tilelang_sampling`` (after dspark.greedy._select_first_argmax);
 # the runner no longer launches it.
 @triton.jit
