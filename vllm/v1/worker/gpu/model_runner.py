@@ -1491,7 +1491,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     if self.speculator is not None:
                         with use_workspace_lane(self._draft_workspace_lane):
                             self.speculator.capture()
-                    if self.adaptive_verification is not None:
+                    if self.adaptive_verification is not None and not profile_only:
                         self.adaptive_verification.warm_tail_shapes(
                             self._dummy_run,
                             self.cudagraph_manager.captured_token_counts(),

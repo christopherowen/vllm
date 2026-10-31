@@ -388,6 +388,54 @@ def test_capture_model_profile_only_skips_lock(monkeypatch):
     assert lock_calls == []
 
 
+@pytest.mark.parametrize("profile_only", [False, True])
+def test_capture_model_excludes_adaptive_verification_warmup_in_profile_only(
+    monkeypatch, profile_only
+):
+    """Adaptive verification's tail-shape warmup and budget-kernel loading
+    execute inside capture_model's free-memory window. The activations they
+    leave in the allocator cache must not be counted as CUDA graph memory, and
+    the memory-profiling pass must skip them entirely since it runs on a
+    throwaway KV cache before real capture."""
+    runner = _make_capture_runner(captured=True)
+    monkeypatch.setattr(
+        runner.cudagraph_manager, "captured_token_counts", lambda: [1, 2], raising=False
+    )
+    total, cached = 16 << 30, [0]
+    calls: list[tuple[str, object]] = []
+
+    def _warm_tail_shapes(dummy_run, token_counts):
+        cached[0] = 2 << 30
+        calls.append(("warm_tail_shapes", list(token_counts)))
+
+    runner.adaptive_verification = SimpleNamespace(
+        warm_tail_shapes=_warm_tail_shapes,
+        load_draft_budget_kernels=lambda: calls.append(
+            ("load_draft_budget_kernels", None)
+        ),
+    )
+    monkeypatch.setattr(
+        model_runner_module, "freeze_gc_for_cudagraph_capture", contextlib.nullcontext
+    )
+    monkeypatch.setattr(
+        torch.accelerator, "empty_cache", lambda: cached.__setitem__(0, 0)
+    )
+    monkeypatch.setattr(
+        torch.accelerator, "get_memory_info", lambda: (total - cached[0], total)
+    )
+    monkeypatch.setattr(model_runner_module, "lock_workspace", lambda: None)
+
+    assert runner.capture_model(profile_only=profile_only) == 0
+    assert calls == (
+        []
+        if profile_only
+        else [
+            ("warm_tail_shapes", [1, 2]),
+            ("load_draft_budget_kernels", None),
+        ]
+    )
+
+
 @pytest.mark.parametrize("cudagraph_metrics", [False, True])
 def test_boundary_logits_only_dispatches_pending_cache_tasks(
     monkeypatch, cudagraph_metrics
