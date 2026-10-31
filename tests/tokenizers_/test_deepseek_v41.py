@@ -26,16 +26,33 @@ def render(messages, **kwargs):
     )
 
 
-@pytest.mark.parametrize("case_id", [1, 2])
+@pytest.mark.parametrize("case_id", [1, 2, 3, 4, 5])
 def test_reference_encoder_fixtures(case_id):
-    # Expected prompts come from the DeepSeek V4.1 reference encoder.
+    # Copied from DeepSeek-V4.1-Flash-1017 encoding/tests.
     data = json.loads(
-        (FIXTURES / "deepseek_v4" / f"test_input_{case_id}.json").read_text()
+        (FIXTURES / "deepseek_v41" / f"test_input_{case_id}.json").read_text()
     )
-    messages = data["messages"] if isinstance(data, dict) else data
-    tools = data.get("tools") if isinstance(data, dict) else None
+    case = data if isinstance(data, dict) else {"messages": data}
+    messages = case["messages"]
+    thinking_mode = case.get("thinking_mode") or "chat"
     expected = (FIXTURES / "deepseek_v41" / f"test_output_{case_id}.txt").read_text()
-    assert render(messages, tools=tools, reasoning_effort=50) == expected
+
+    if any(m["role"] == "latest_reminder" for m in messages):
+        # latest_reminder is not an API role.
+        assert case.get("tools") is None
+        prompt = encode_messages(
+            messages,
+            thinking_mode=thinking_mode,
+            reasoning_effort=case.get("reasoning_effort"),
+        )
+    else:
+        prompt = render(
+            messages,
+            tools=case.get("tools"),
+            thinking=thinking_mode == "thinking",
+            reasoning_effort=case.get("reasoning_effort"),
+        )
+    assert prompt == expected
 
 
 @pytest.mark.parametrize(
