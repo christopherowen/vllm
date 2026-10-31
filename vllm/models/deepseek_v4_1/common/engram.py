@@ -642,7 +642,7 @@ class ParallelEngramEmbedding(nn.Module):
         on ``stream``) and the IDs the host hashed (``early`` [tokens, 24] int64 on the
         host, or None). Returns at once; the forward's ``gather_rows`` waits for the
         rows."""
-        if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
+        if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Disk Engram staging must run outside compile/capture")
         self.disk_rows.stage(stream, self.hashes, tokens * 24, early)
 
@@ -903,13 +903,8 @@ class Engram(nn.Module):
         column-parallel projection each rank receives only its own rows of the
         product (an all-to-all instead of an all-gather of every row).
         """
-        if (
-            self.embed_tokens.table_memory == "disk"
-            and not torch.compiler.is_compiling()
-            and (
-                not self._disk_prepared
-                or self._disk_prepared_tokens < hash_ids.shape[0]
-            )
+        if self.embed_tokens.table_memory == "disk" and (
+            not self._disk_prepared or self._disk_prepared_tokens < hash_ids.shape[0]
         ):
             raise RuntimeError("Disk Engram output is not prepared")
         if self.embed_tokens.table_memory == "disk":

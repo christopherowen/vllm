@@ -86,7 +86,6 @@ def rope_kernel(heads: int, dim: int, rope_dim: int, ratio: int, inverse: bool):
     return rope
 
 
-@torch.library.custom_op("vllm::dsv41_tilelang_rope", mutates_args=("x",))
 def rope_(
     x: torch.Tensor,
     positions: torch.Tensor,
@@ -107,11 +106,6 @@ def rope_(
     )
     kernel = function(*args, **kwargs)
     kernel(x.view(rows, heads, x.shape[-1]), positions, cos_sin_cache)
-
-
-@rope_.register_fake
-def _rope_fake(x, positions, cos_sin_cache, ratio, inverse):
-    return None
 
 
 def rope_call(heads: int, dim: int, rope_dim: int, ratio: int, inverse: bool):

@@ -848,7 +848,7 @@ class _Attention(nn.Module):
         super().__init__()
         self.index, self.world, self.local_rows = index, world, local_rows
 
-    def forward(self, positions, hidden, scaling, *, global_kv_ready=None):
+    def forward(self, positions, hidden, scaling):
         rows = sp_prefill.current()
         if rows is not None:
             self.local_rows.append(hidden.shape[0])

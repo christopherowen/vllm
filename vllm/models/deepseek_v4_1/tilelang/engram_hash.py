@@ -112,9 +112,6 @@ def engram_hash_kernel(
     return engram_hash
 
 
-@torch.library.custom_op(
-    "vllm::dsv41_tilelang_engram_hash", mutates_args=("out", "num_seqs", "num_tokens")
-)
 def engram_hash(
     ids: torch.Tensor,
     starts: torch.Tensor,
@@ -152,22 +149,6 @@ def engram_hash(
         num_seqs,
         num_tokens,
     )
-
-
-@engram_hash.register_fake
-def _engram_hash_fake(
-    ids,
-    starts,
-    history,
-    token_map,
-    multipliers,
-    primes,
-    offsets,
-    out,
-    num_seqs,
-    num_tokens,
-):
-    return None
 
 
 def geometry_tensors(geometry, device) -> tuple[torch.Tensor, ...]:

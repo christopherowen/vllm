@@ -35,7 +35,6 @@ def ced_decoder_start(hf_config: Any) -> int | None:
     return None
 
 
-@torch.library.custom_op("vllm::dsv41_gather_rows", mutates_args=())
 def gather_rows(source: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
     """Gather first-axis rows, zeroing invalid indices (including graph padding)."""
     output = source.new_empty((indices.numel(), *source.shape[1:]))
@@ -44,12 +43,6 @@ def gather_rows(source: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
     return output
 
 
-@gather_rows.register_fake
-def _gather_rows_fake(source, indices):
-    return source.new_empty((indices.numel(), *source.shape[1:]))
-
-
-@torch.library.custom_op("vllm::dsv41_scatter_rows", mutates_args=())
 def scatter_rows(
     source: torch.Tensor, indices: torch.Tensor, full_rows: int
 ) -> torch.Tensor:
@@ -58,11 +51,6 @@ def scatter_rows(
     if source.numel():
         ced_kernels.copy_rows(source, indices, output, scatter=True)
     return output
-
-
-@scatter_rows.register_fake
-def _scatter_rows_fake(source, indices, full_rows):
-    return source.new_empty((full_rows, *source.shape[1:]))
 
 
 @dataclass(frozen=True)

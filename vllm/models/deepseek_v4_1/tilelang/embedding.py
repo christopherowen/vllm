@@ -173,7 +173,6 @@ def declare(words: int) -> None:
     )
 
 
-@torch.library.custom_op("vllm::dsv41_tilelang_vocab_embedding", mutates_args=("out",))
 def vocab_embedding(
     input_ids: torch.Tensor,
     weight: torch.Tensor,
@@ -226,20 +225,6 @@ def vocab_embedding(
         added_vocab_end_index,
         added_offset,
     )
-
-
-@vocab_embedding.register_fake
-def _vocab_embedding_fake(
-    input_ids,
-    weight,
-    out,
-    org_vocab_start_index,
-    org_vocab_end_index,
-    num_org_vocab_padding,
-    added_vocab_start_index,
-    added_vocab_end_index,
-):
-    return None
 
 
 class TileLangEmbeddingMethod(UnquantizedEmbeddingMethod):

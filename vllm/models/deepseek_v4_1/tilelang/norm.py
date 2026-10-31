@@ -10,16 +10,10 @@ from torch import nn
 from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
 
 
-@torch.library.custom_op("vllm::dsv41_tilelang_rmsnorm", mutates_args=("out",))
 def _rmsnorm(
     x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor, eps: float
 ) -> None:
     pdl.norm_forward(x, weight, eps, out=out)
-
-
-@_rmsnorm.register_fake
-def _rmsnorm_fake(x, weight, out, eps):
-    return None
 
 
 @functools.cache
@@ -56,9 +50,14 @@ class TileLangRMSNorm(nn.Module):
         # TileKernels reads each row by its stride (a contiguous last dimension, rows
         # 16 elements apart): the q and kv halves of the fused projection's output are
         # normalized where they lie, with no copy.
+        if x.ndim == 2 and (out is None or out.ndim == 2):
+            if out is None:
+                out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+            pdl.norm_forward(x, self.weight, self.variance_epsilon, out=out)
+            return out
         shape = x.shape
         x = x.reshape(-1, shape[-1])
         if out is None:
             out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
-        _rmsnorm(x, self.weight, out.view(x.shape), self.variance_epsilon)
+        pdl.norm_forward(x, self.weight, self.variance_epsilon, out=out.view(x.shape))
         return out.view(shape)

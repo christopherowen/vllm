@@ -488,7 +488,6 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
 
     with pytest.raises(RuntimeError, match="not prepared"):
         consume()
-    compiled_consume = torch.compile(consume, backend="eager", fullgraph=True)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.inference_mode(), torch.cuda.stream(stream):
@@ -500,10 +499,10 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
             capture_guard.setattr(native, "run_lookup", forbid_lookup)
             state.prepare_dummy_inputs(2, 4)
             for _ in range(3):
-                compiled_consume()
+                consume()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=stream):
-                actual = compiled_consume()
+                actual = consume()
             graph.replay()
             for output in actual:
                 torch.testing.assert_close(output, hidden, rtol=0, atol=0)
@@ -900,16 +899,15 @@ def test_engram_graphs_gate_text_rows_and_pass_the_image_sentinel_rows(dist_init
         session.prepare(requests)
         session.freeze()
         module.prepare_embeddings(ids)
-        launch = torch.compile(module.forward, fullgraph=True)
         for rows in (1, capacity):
             for with_images in (False, True):
                 token_mask = mask[:rows] if with_images else None
                 fill_ids(with_images)
-                launch(residual[:rows], ids[:rows], token_ids[:rows])
+                module(residual[:rows], ids[:rows], token_ids[:rows])
                 graph = torch.cuda.CUDAGraph()
                 try:
                     with session.capture(), torch.cuda.graph(graph):
-                        actual = launch(residual[:rows], ids[:rows], token_ids[:rows])
+                        actual = module(residual[:rows], ids[:rows], token_ids[:rows])
                     pointer = actual.data_ptr()
                     allocated = torch.cuda.memory_allocated(device)
                     residual.mul_(-0.5)

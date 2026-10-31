@@ -124,7 +124,6 @@ def _dtype(ids: torch.Tensor) -> str:
     return str(ids.dtype).removeprefix("torch.")
 
 
-@torch.library.custom_op("vllm::dsv41_tilelang_engram_gate", mutates_args=("out",))
 def engram_gate(
     x: torch.Tensor,
     kv: torch.Tensor,
@@ -150,11 +149,6 @@ def engram_gate(
         ids,
         out.view(tokens, hc_mult, hidden),
     )
-
-
-@engram_gate.register_fake
-def _engram_gate_fake(x, kv, weight, ids, out, eps, hc_mult):
-    return None
 
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
@@ -255,9 +249,6 @@ def engram_gate_blocked_kernel(
     return engram_gate_blocked
 
 
-@torch.library.custom_op(
-    "vllm::dsv41_tilelang_engram_gate_blocked", mutates_args=("out",)
-)
 def engram_gate_blocked(
     x: torch.Tensor,
     kv: torch.Tensor,
@@ -286,11 +277,6 @@ def engram_gate_blocked(
         ids,
         out.view(tokens, hc_mult, hidden),
     )
-
-
-@engram_gate_blocked.register_fake
-def _engram_gate_blocked_fake(x, kv, weight, ids, out, eps, hc_mult):
-    return None
 
 
 __all__ = [

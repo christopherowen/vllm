@@ -122,7 +122,7 @@ def test_context_kv_write_uses_the_tilelang_writer(monkeypatch):
     assert writes == [dict(page_size=64, cache_kind="swa")]
 
 
-def test_global_preparation_dependency_survives_functionalization(monkeypatch):
+def test_global_preparation_populates_caches_before_forward():
     from vllm.models.deepseek_v4_1 import attention
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -136,7 +136,7 @@ def test_global_preparation_dependency_survives_functionalization(monkeypatch):
 
         def __init__(self):
             super().__init__()
-            self.prefix = "functionalized_ced"
+            self.prefix = "ced_cache_consumer"
             self.compressor = SimpleNamespace(state_cache=None)
             self.kv_cache = backing[:4]
             self.indexer = SimpleNamespace(
@@ -151,20 +151,15 @@ def test_global_preparation_dependency_survives_functionalization(monkeypatch):
             return self.kv_cache + self.indexer.k_cache.kv_cache
 
     layer = CacheConsumer()
-    context = SimpleNamespace(no_compile_layers={layer.prefix: layer})
-    monkeypatch.setattr(attention, "get_forward_context", lambda: context)
 
     def run(hidden):
-        ready = layer.prepare_global_kv(positions, hidden)
-        return layer(positions, hidden, global_kv_ready=ready)
+        layer.prepare_global_kv(positions, hidden)
+        return layer(positions, hidden)
 
-    compiled = torch.compile(run, backend="aot_eager", fullgraph=True)
     for factor in (1, -2):
         hidden = source * factor
-        output = compiled(hidden)
+        output = run(hidden)
         torch.testing.assert_close(output, hidden * 5)
-        # Preparation must remain visible to later consumers as well; mutable
-        # alias-list functionalization used to copy stale clones back here.
         torch.testing.assert_close(backing, torch.cat((hidden * 2, hidden * 3)))
 
 

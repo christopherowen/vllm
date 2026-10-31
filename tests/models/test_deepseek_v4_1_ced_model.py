@@ -43,8 +43,8 @@ def test_piecewise_capture_refreshes_compacted_indices_after_metadata_staging():
 
 @pytest.mark.parametrize("rows", [1, 8, 19])
 @pytest.mark.parametrize("strided", [False, True])
-def test_attention_returns_owned_projection_without_copy(monkeypatch, rows, strided):
-    """The opaque wrapper preserves result ownership and reads each live input."""
+def test_attention_returns_owned_projection_without_copy(rows, strided):
+    """The attention forward preserves result ownership and reads each live input."""
     from vllm.models.deepseek_v4_1 import attention
 
     results = []
@@ -55,28 +55,18 @@ def test_attention_returns_owned_projection_without_copy(monkeypatch, rows, stri
         return output
 
     layer = SimpleNamespace(prefix="owned_projection", _forward=project)
-    monkeypatch.setattr(
-        attention,
-        "get_forward_context",
-        lambda: SimpleNamespace(no_compile_layers={layer.prefix: layer}),
-    )
     hidden = torch.arange(rows * 32, dtype=torch.bfloat16).reshape(rows, 32)
     if strided:
         hidden = hidden[:, ::2]
     positions = torch.arange(rows, dtype=torch.int64)
-    ready = torch.ones(1, dtype=torch.uint8)
     saved_hidden = hidden.clone()
-    first = attention.DeepseekV4Attention.forward(
-        layer, positions, hidden, global_kv_ready=ready
-    )
+    first = attention.DeepseekV4Attention.forward(layer, positions, hidden)
     assert first.data_ptr() == results[-1].data_ptr()
     assert first.data_ptr() != hidden.data_ptr()
     torch.testing.assert_close(hidden, saved_hidden, rtol=0, atol=0)
     saved_first = first.clone()
     hidden.add_(4)
-    second = attention.DeepseekV4Attention.forward(
-        layer, positions, hidden, global_kv_ready=ready
-    )
+    second = attention.DeepseekV4Attention.forward(layer, positions, hidden)
     assert second.data_ptr() == results[-1].data_ptr()
     assert second.data_ptr() != first.data_ptr()
     torch.testing.assert_close(first, saved_first, rtol=0, atol=0)
@@ -86,10 +76,6 @@ def test_attention_returns_owned_projection_without_copy(monkeypatch, rows, stri
         rtol=0,
         atol=0,
     )
-    checks = torch.library.opcheck(
-        attention._attention, (hidden, positions, layer.prefix, ready)
-    )
-    assert all(value == "SUCCESS" for value in checks.values()), checks
 
 
 def test_attention_empty_batch_does_not_enter_cache_or_collectives():
@@ -104,18 +90,13 @@ def test_attention_empty_batch_does_not_enter_cache_or_collectives():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph requires a GPU")
-def test_attention_owned_output_graph_reads_live_inputs(monkeypatch):
+def test_attention_owned_output_graph_reads_live_inputs():
     from vllm.models.deepseek_v4_1 import attention
 
     def project(positions, hidden):
         return (hidden.float() * 0.25 + positions[:, None] * 0.5).to(hidden.dtype)
 
     layer = SimpleNamespace(prefix="graph_projection", _forward=project)
-    monkeypatch.setattr(
-        attention,
-        "get_forward_context",
-        lambda: SimpleNamespace(no_compile_layers={layer.prefix: layer}),
-    )
     for rows in (1, 8, 19):
         hidden = torch.arange(rows * 32, dtype=torch.bfloat16, device="cuda").reshape(
             rows, 32
@@ -214,7 +195,7 @@ class _Attention(nn.Module):
         self.shared["global"] = hidden.mean(dim=0)
         self.shared["global_rows"] = hidden.shape[0]
 
-    def forward(self, positions, hidden, scaling, *, global_kv_ready=None):
+    def forward(self, positions, hidden, scaling):
         if self.index == 2 and "global" not in self.shared:
             self.prepare_global_kv(positions, hidden)
         self.rows.append(("attention", self.index, hidden.shape[0]))

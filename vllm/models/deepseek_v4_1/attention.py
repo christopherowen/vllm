@@ -205,43 +205,6 @@ class DeepseekV4Indexer(nn.Module):
         self.ratio = ratio
 
 
-@torch.library.custom_op("vllm::dsv41_b12x_attention", mutates_args=())
-def _attention(
-    hidden: torch.Tensor,
-    positions: torch.Tensor,
-    prefix: str,
-    global_kv_ready: torch.Tensor | None,
-) -> torch.Tensor:
-    context = get_forward_context()
-    layer = context.no_compile_layers[prefix]
-    # WO projection and TP reduction own this result; it cannot alias the
-    # borrowed attention scratch or the operation's input tensors.
-    return layer._forward(positions, hidden)
-
-
-@_attention.register_fake
-def _attention_fake(hidden, positions, prefix, global_kv_ready):
-    return torch.empty_like(hidden, memory_format=torch.contiguous_format)
-
-
-@torch.library.custom_op("vllm::dsv41_b12x_prepare_global_kv", mutates_args=())
-def _prepare_global_kv(
-    hidden: torch.Tensor,
-    positions: torch.Tensor,
-    prefix: str,
-) -> torch.Tensor:
-    context = get_forward_context()
-    context.no_compile_layers[prefix]._prepare_global_kv(positions, hidden)
-    # A small explicit data dependency orders the following opaque attention
-    # call without asking functionalization to clone the aliased KV pool.
-    return torch.empty(1, dtype=torch.uint8, device=hidden.device)
-
-
-@_prepare_global_kv.register_fake
-def _prepare_global_kv_fake(hidden, positions, prefix):
-    return torch.empty(1, dtype=torch.uint8, device=hidden.device)
-
-
 class DeepseekV4Attention(nn.Module, AttentionLayerBase):
     """The V4.1 attention layer: caches, metadata, projections and ownership. Its
     kernels are the TileLang layer's (``DeepseekV41TileLangAttention``), which
@@ -788,7 +751,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         """Build full-row global KV before the CED boundary gathers decoder rows."""
         if self.compressor is None or hidden_states.shape[0] == 0:
             return
-        return _prepare_global_kv(hidden_states, positions, self.prefix)
+        self._prepare_global_kv(positions, hidden_states)
 
     @eager_break_during_capture
     def _prepare_global_kv(self, positions, hidden_states):
@@ -824,12 +787,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             positions=positions,
         )
 
-    def forward(
-        self, positions, hidden_states, llama_4_scaling=None, *, global_kv_ready=None
-    ):
+    def forward(self, positions, hidden_states, llama_4_scaling=None):
         if hidden_states.shape[0] == 0:
             return torch.empty_like(hidden_states)
-        return _attention(hidden_states, positions, self.prefix, global_kv_ready)
+        return self._forward(positions, hidden_states)
 
     def _gather_front(self, sp_rows, hidden_states, qr, kv):
         """Sequence-parallel prefill's row-wise front of every row, as contiguous

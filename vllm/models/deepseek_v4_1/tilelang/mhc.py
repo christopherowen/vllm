@@ -1148,10 +1148,6 @@ def _counters(tiles: int, device: torch.device) -> torch.Tensor:
     return built[-1][:tiles]
 
 
-@torch.library.custom_op(
-    "vllm::dsv41_tilelang_mhc_pre",
-    mutates_args=("residual_out", "y", "y_q", "y_sf", "post", "comb", "pre_out"),
-)
 def _mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -1248,32 +1244,6 @@ def _mhc_pre(
     )
 
 
-@_mhc_pre.register_fake
-def _mhc_pre_fake(
-    residual,
-    fn,
-    scale,
-    base,
-    norm,
-    pre,
-    residual_out,
-    y,
-    y_q,
-    y_sf,
-    post,
-    comb,
-    pre_out,
-    rms_eps,
-    hc_eps,
-    iterations,
-    previous_output=None,
-    previous_post=None,
-    previous_comb=None,
-):
-    return None
-
-
-@torch.library.custom_op("vllm::dsv41_tilelang_mhc_post", mutates_args=("out",))
 def _mhc_post(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -1293,14 +1263,6 @@ def _mhc_post(
     )
 
 
-@_mhc_post.register_fake
-def _mhc_post_fake(x, residual, post, comb, out):
-    return None
-
-
-@torch.library.custom_op(
-    "vllm::dsv41_tilelang_mhc_post_collapse", mutates_args=("out",)
-)
 def _mhc_post_collapse(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -1322,12 +1284,6 @@ def _mhc_post_collapse(
     )
 
 
-@_mhc_post_collapse.register_fake
-def _mhc_post_collapse_fake(x, residual, post, comb, mix, out):
-    return None
-
-
-@torch.library.custom_op("vllm::dsv41_tilelang_mhc_collapse", mutates_args=("out",))
 def _mhc_collapse(state: torch.Tensor, mix: torch.Tensor, out: torch.Tensor) -> None:
     tokens, hidden = int(state.shape[0]), int(state.shape[-1])
     if tokens == 0:
@@ -1339,14 +1295,6 @@ def _mhc_collapse(state: torch.Tensor, mix: torch.Tensor, out: torch.Tensor) -> 
     )
 
 
-@_mhc_collapse.register_fake
-def _mhc_collapse_fake(state, mix, out):
-    return None
-
-
-@torch.library.custom_op(
-    "vllm::dsv41_tilelang_mhc_collapse_column", mutates_args=("out", "columns")
-)
 def _mhc_collapse_column(
     state: torch.Tensor,
     mix: torch.Tensor,
@@ -1363,11 +1311,6 @@ def _mhc_collapse_column(
         out.view(tokens, hidden),
         columns.view(tokens, MULT),
     )
-
-
-@_mhc_collapse_column.register_fake
-def _mhc_collapse_column_fake(state, mix, out, columns, column):
-    return None
 
 
 # Every layer's constant mixes, by device: (first sublayer's pre-mix, the collapse's

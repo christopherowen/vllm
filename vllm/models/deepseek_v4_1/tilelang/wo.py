@@ -183,9 +183,7 @@ class TileLangWOProjection:
         rows = o.shape[0]
         if not rows:
             return out
-        scratch = (
-            None if torch.compiler.is_compiling() else current_preallocated_workspace()
-        )
+        scratch = current_preallocated_workspace()
         # One borrow for everything live at once: WO-A's partials, then WO-B's MXFP8
         # input in whole decode tiles.
         partial_specs = self.a.partial_specs(rows)

@@ -229,7 +229,6 @@ def row_kernel_calls(
     ]
 
 
-@torch.library.custom_op("vllm::dsv41_engram_rows_gather", mutates_args=("out",))
 def engram_rows_gather(
     ids: torch.Tensor,
     num_tokens: torch.Tensor,
@@ -255,18 +254,3 @@ def engram_rows_gather(
         )
         kernel(ids[:tokens], num_tokens, rows, scales, out)
     engram_rows_release_kernel()(control)
-
-
-@engram_rows_gather.register_fake
-def _engram_rows_gather_fake(
-    ids,
-    num_tokens,
-    rows,
-    scales,
-    control,
-    out,
-    shard_start,
-    shard_end,
-    columns=(1 << HEADS) - 1,
-):
-    return None

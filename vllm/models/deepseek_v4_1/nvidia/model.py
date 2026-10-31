@@ -362,11 +362,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             previous_comb=res_mix if previous_output is not None else None,
         )
         del previous_output, pre_mix
-        global_kv_ready = None
         if ced_indices is not None:
             # Decoder global KV needs every encoder row, but decoder queries,
             # residual updates and experts only need the selected replay rows.
-            global_kv_ready = self.attn.prepare_global_kv(positions, x)
+            self.attn.prepare_global_kv(positions, x)
             del x_q
             x = gather_rows(x, ced_indices)
             x_q = self.mhc.cast_rows(x)
@@ -387,11 +386,11 @@ class DeepseekV4DecoderLayer(nn.Module):
                 )
         if sp_rows is None:
             with kernels.mxfp8_inputs(x_q):
-                x = self.attn(positions, x, None, global_kv_ready=global_kv_ready)
+                x = self.attn(positions, x, None)
         else:
             # SP: attention gathers every row and reduce-scatters its output.
             with sp_prefill.activate(sp_rows), kernels.mxfp8_inputs(x_q):
-                x = self.attn(positions, x, None, global_kv_ready=global_kv_ready)
+                x = self.attn(positions, x, None)
             if sp_rows.unreduced:
                 x = sp_prefill.unreduced_parts(x)
         del x_q
@@ -655,7 +654,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         the host, or None) holds the row IDs the host hashed for the tokens it knows,
         ``host_hash.UNKNOWN`` elsewhere: the reader reads those rows before the GPU
         reaches the step."""
-        if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
+        if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "Disk Engram preparation must run outside compile/capture"
             )
@@ -684,7 +683,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
 
     def prepare_dummy_engram(self, num_tokens):
-        if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
+        if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "Disk Engram preparation must run outside compile/capture"
             )

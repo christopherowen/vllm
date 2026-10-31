@@ -148,9 +148,6 @@ def _kernel(hc_mult: int, hidden: int, world: int):
     return glp_steer_kernel(hc_mult, hidden, world)
 
 
-@torch.library.custom_op(
-    "vllm::dsv41_tilelang_glp_steer", mutates_args=("residual", "post", "comb")
-)
 def glp_steer(
     parts: torch.Tensor,
     residual: torch.Tensor,
@@ -172,11 +169,6 @@ def glp_steer(
     _kernel(residual.shape[1], hidden, world)(
         parts, residual, post, comb, rows, direction, alpha
     )
-
-
-@glp_steer.register_fake
-def _glp_steer_fake(parts, residual, post, comb, rows, direction, alpha):
-    return None
 
 
 def declare(hc_mult: int, hidden: int, worlds: tuple[int, ...]) -> None:

@@ -137,9 +137,6 @@ def declare(hidden: int, rank: int) -> None:
     )
 
 
-@torch.library.custom_op(
-    "vllm::dsv41_tilelang_dspark_confidence", mutates_args=("out",)
-)
 def dspark_confidence(
     hidden: torch.Tensor,
     markov_embed: torch.Tensor,
@@ -173,11 +170,6 @@ def dspark_confidence(
     if rows == 0:
         return
     _kernel(width, rank)(hidden, markov_embed, weight, out)
-
-
-@dspark_confidence.register_fake
-def _dspark_confidence_fake(hidden, markov_embed, weight, out):
-    return None
 
 
 class TileLangConfidenceHead(DSparkConfidenceHead):
