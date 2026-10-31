@@ -1017,6 +1017,46 @@ def test_disk_engram_model_allocates_hash_buffer_from_declared_caps(monkeypatch)
     assert "prepared_engram_hashes" not in model.state_dict()
 
 
+def test_disk_engram_shares_staged_rows_and_skips_throwaway_hash_buffers(monkeypatch):
+    import vllm.models.deepseek_v4_1.common.engram as engram_module
+
+    monkeypatch.setattr(
+        engram_module,
+        "ReplicatedLinear",
+        lambda *args, **kwargs: nn.Identity(),
+    )
+    caps = SimpleNamespace(
+        max_tokens=8,
+        max_seqs=2,
+        max_requests=2,
+        vocab_size=32,
+        layer_id=1,
+        tp_size=1,
+        tp_rank=0,
+        device=torch.device("cpu"),
+    )
+    caps_next = SimpleNamespace(**{**vars(caps), "layer_id": 14})
+    geometry = native.build_geometry(base_table_size=19, compressed_vocab_size=32)
+    config = SimpleNamespace(hidden_size=64, hc_mult=4, rms_norm_eps=1e-3)
+    disk_layout = SimpleNamespace(
+        caps=(caps, caps_next),
+        lookup_plans=(None, None),
+        geometry=geometry,
+        table_memory="disk",
+        projection_tp=False,
+    )
+    first = Engram(config, None, disk_layout, 0, False, "engram_0")
+    second = Engram(config, None, disk_layout, 1, False, "engram_1")
+    assert first.staged_rows.data_ptr() == second.staged_rows.data_ptr()
+    assert first.embed_tokens._buffers["hashes"] is None
+    assert first.embed_tokens._buffers["num_tokens"] is None
+    shared_hashes = torch.full((8, 24), -1, dtype=torch.int64)
+    shared_num_tokens = torch.zeros((1,), dtype=torch.int32)
+    first.embed_tokens.share_hashes(shared_hashes, shared_num_tokens)
+    assert first.embed_tokens.hashes.data_ptr() == shared_hashes.data_ptr()
+    assert first.embed_tokens.num_tokens.data_ptr() == shared_num_tokens.data_ptr()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("tp_rank", [0, 3])
 @torch.inference_mode()

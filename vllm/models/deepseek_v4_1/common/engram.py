@@ -506,18 +506,41 @@ class ParallelEngramEmbedding(nn.Module):
                         "shard_start": self.shard_start,
                     },
                 )
-        self.register_buffer(
-            "hashes",
-            torch.full(
-                (caps.max_tokens, 24), DEAD_ID, dtype=torch.int64, device=caps.device
-            ),
-            persistent=False,
-        )
-        self.register_buffer(
-            "num_tokens",
-            torch.empty((1,), dtype=torch.int32, device=caps.device),
-            persistent=False,
-        )
+        if table_memory == "disk":
+            self.register_buffer("hashes", None, persistent=False)
+            self.register_buffer("num_tokens", None, persistent=False)
+        else:
+            self.register_buffer(
+                "hashes",
+                torch.full(
+                    (caps.max_tokens, 24),
+                    DEAD_ID,
+                    dtype=torch.int64,
+                    device=caps.device,
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                "num_tokens",
+                torch.empty((1,), dtype=torch.int32, device=caps.device),
+                persistent=False,
+            )
+
+    def __getattr__(self, name: str):
+        if name in ("hashes", "num_tokens"):
+            value = self._buffers.get(name)
+            if value is None:
+                self._buffers["hashes"] = torch.full(
+                    (self.caps.max_tokens, 24),
+                    DEAD_ID,
+                    dtype=torch.int64,
+                    device=self.caps.device,
+                )
+                self._buffers["num_tokens"] = torch.empty(
+                    (1,), dtype=torch.int32, device=self.caps.device
+                )
+                return self._buffers[name]
+        return super().__getattr__(name)
 
     def close(self):
         """Release file-backed staging only after graph consumers are gone."""
@@ -608,7 +631,7 @@ class ParallelEngramEmbedding(nn.Module):
         """Read each step's row IDs (``hashes`` [max_tokens, 24], contiguous) and live
         token count from the model's buffers, which its hash writes in place, instead
         of this table's own."""
-        if hashes.shape != self.hashes.shape or not hashes.is_contiguous():
+        if hashes.shape != (self.caps.max_tokens, 24) or not hashes.is_contiguous():
             raise ValueError("Engram row IDs must be a contiguous [max_tokens, 24]")
         self.hashes = hashes
         self.num_tokens = num_tokens
@@ -712,16 +735,34 @@ class Engram(nn.Module):
             persistent=False,
         )
         # Zeroed: a gather writes only its own step's rows. A disk table sharded on
-        # hash columns gathers only its own columns, side by side.
+        # hash columns gathers only its own columns, side by side. Disk-backed layers
+        # gather and immediately project within their own forward, so they share one
+        # staged_rows buffer across layers on the layout.
         columns = self.embed_tokens.columns
-        self.register_buffer(
-            "staged_rows",
-            torch.zeros(
-                caps.max_tokens,
-                6144 if columns is None else len(columns) * 256,
+        staged_rows_shape = (
+            caps.max_tokens,
+            6144 if columns is None else len(columns) * 256,
+        )
+        shared_staged_rows = (
+            getattr(layout, "_shared_disk_staged_rows", None)
+            if layout.table_memory == "disk"
+            else None
+        )
+        if (
+            shared_staged_rows is None
+            or shared_staged_rows.shape != staged_rows_shape
+            or shared_staged_rows.device != torch.device(caps.device)
+        ):
+            shared_staged_rows = torch.zeros(
+                *staged_rows_shape,
                 dtype=torch.bfloat16,
                 device=caps.device,
-            ),
+            )
+            if layout.table_memory == "disk":
+                layout._shared_disk_staged_rows = shared_staged_rows
+        self.register_buffer(
+            "staged_rows",
+            shared_staged_rows,
             persistent=False,
         )
         # A resident table's lookup is prepared through B12X (the lookup unit).
@@ -886,10 +927,14 @@ class Engram(nn.Module):
             self.wkv, _PaddedColumnParallelLinear
         )
         if blocked:
-            kv = sp_rows.exchange_rows(self.wkv.local_product(rows))
+            local_kv = self.wkv.local_product(rows)
+            del rows
+            kv = sp_rows.exchange_rows(local_kv)
+            del local_kv
             kv_start = 0
         else:
             kv = project_rows(self.wkv, rows, self.l2_prefetch_after_projection)
+            del rows
             kv_start = 0 if sp_rows is None else sp_rows.start
         state = hidden_states.flatten(1)
         out = torch.empty_like(state)
