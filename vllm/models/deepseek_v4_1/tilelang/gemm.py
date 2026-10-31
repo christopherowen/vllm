@@ -993,7 +993,7 @@ def bf16_gemm_two(
     return gemm_bf16_two
 
 
-@tilelang.jit
+@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
 def bf16_gemm_partials(
     N: int,
     K: int,
@@ -1020,6 +1020,7 @@ def bf16_gemm_partials(
         with T.Kernel(
             T.ceildiv(N, block_N), shards, T.ceildiv(M, block_M), threads=threads
         ) as (bx, s, by):
+            pdl.chain()
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_N, block_K), dtype)
             C_local = T.alloc_fragment((block_M, block_N), T.float32)

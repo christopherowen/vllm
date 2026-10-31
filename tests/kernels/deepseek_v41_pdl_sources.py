@@ -28,6 +28,7 @@ CHAIN = {
     "cache_writer",
     "compress",
     "compress_gather_partial_state",
+    "gemm_bf16_partials",
     "gemm_bf16_splitk",
     "gemm_fp8w_bf16",
     "gemm_fp8w_bf16_cast",
@@ -61,7 +62,7 @@ CHAIN = {
     "routing_masks",
     "sparse_mla",
 }
-WARP_SPECIALIZED = {"gemm_bf16", "gemm_bf16_partials", "gemm_bf16_two"}
+WARP_SPECIALIZED = {"gemm_bf16", "gemm_bf16_two"}
 # test_deepseek_v41_tilelang_pdl's reader that loads before its wait on purpose
 EXEMPT = {"pdl_early_reader"}
 WAIT = "cudaGridDependencySynchronize()"

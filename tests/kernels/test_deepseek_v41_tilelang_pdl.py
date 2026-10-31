@@ -341,3 +341,46 @@ def test_layer_chain_edges_are_programmatic():
           f"ordinary edges at joins: {joins}")  # fmt: skip
     assert programmatic > 0
     assert not plain, f"chain kernels with an ordinary edge from their kernel: {plain}"
+
+
+def test_bf16_partials_edges_are_programmatic():
+    """The BF16 split-K partials kernel (the router's gate and the indexer's head
+    weights) chains programmatically from the mHC entry before it and into both
+    route_partials and splitk_reduce after it."""
+    from tests.kernels.deepseek_v41_pdl_chains import _Entry
+    from vllm.models.deepseek_v4_1.tilelang.gemm import (
+        bf16_gemm_partials,
+        splitk_reduce,
+    )
+    from vllm.models.deepseek_v4_1.tilelang.router import route_partials
+
+    rows = ROWS["c1"]
+    gen = torch.Generator(device=DEVICE).manual_seed(0)
+    entry = _Entry(rows, gen)
+    x = torch.randn((rows, 5120), generator=gen, device=DEVICE).bfloat16()
+    streams = torch.randn((rows, 4 * 5120), generator=gen, device=DEVICE).bfloat16()
+    post_in = torch.rand((rows, 4), generator=gen, device=DEVICE) * 2
+    comb_in = torch.softmax(torch.randn((rows, 4, 4), generator=gen, device=DEVICE), dim=-1)
+    pre_in = torch.softmax(torch.randn((rows, 4), generator=gen, device=DEVICE), dim=-1) + 1e-6
+    w_router = (torch.randn((384, 5120), generator=gen, device=DEVICE) * 0.02).bfloat16()
+    p_router = torch.empty((8, rows, 384), dtype=torch.float32, device=DEVICE)
+    bias = torch.randn((384,), generator=gen, device=DEVICE, dtype=torch.float32) * 0.1
+    dummy = torch.zeros((rows,), dtype=torch.bool, device=DEVICE)
+    rw = torch.empty((rows, 6), dtype=torch.float32, device=DEVICE)
+    rids = torch.empty((rows, 6), dtype=torch.int64, device=DEVICE)
+    reduced = torch.empty((rows, 384), dtype=torch.float32, device=DEVICE)
+    k_part = bf16_gemm_partials(384, 5120, 8, block_M=16)
+    k_route = route_partials(6, 384, 8, False, False)
+    k_red = splitk_reduce(384, 8, out_dtype="float32")
+
+    def router_chain():
+        entry(x, streams, post_in, comb_in, pre_in)
+        k_part(entry.y, w_router, p_router)
+        k_route(p_router, bias, bias, dummy, dummy, rids, rw, 2.5)
+        k_red(p_router, reduced)
+
+    edges = _edges(_graph(router_chain, keep=True))
+    for source, target, kind in edges:
+        if target is None or source is None:
+            continue
+        assert kind == PROGRAMMATIC, f"expected programmatic edge {source} -> {target}, got {kind}"
