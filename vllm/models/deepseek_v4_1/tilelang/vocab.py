@@ -19,10 +19,18 @@ BF16 GEMM with the same token tiles. Every head declares one kernel per token
 tile; its owner declares it when the worker prepares kernels, after loading.
 """
 
+from math import prod
+
 import tilelang
 import tilelang.language as T
 import torch
 from torch import nn
+
+from vllm.utils.math_utils import round_up
+from vllm.v1.worker.workspace import (
+    current_workspace_manager,
+    is_workspace_manager_initialized,
+)
 
 from . import prepare
 from .gemm import bf16_gemm, bf16_gemm_decode
@@ -658,18 +666,77 @@ def project_head(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _vocab_greedy_buffers(
+    layer: nn.Module,
+    rows: int,
+    num_tiles: int,
+    pair_width: int,
+    device: torch.device,
+    *,
+    scratch_pairs: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    val_shape = (rows, num_tiles)
+    pair_shape = (rows, pair_width)
+    specs: list[tuple[tuple[int, ...], torch.dtype]] = [
+        (val_shape, torch.float32),
+        (val_shape, torch.int32),
+    ]
+    if scratch_pairs:
+        specs.append((pair_shape, torch.float32))
+    if is_workspace_manager_initialized():
+        manager = current_workspace_manager()
+        required_bytes = sum(round_up(prod(s) * d.itemsize, 256) for s, d in specs)
+        if (
+            manager._device.type == device.type
+            and manager._device.index in (None, device.index)
+            and (not manager.is_locked() or manager.available_bytes() >= required_bytes)
+        ):
+            buffers = manager.get_simultaneous(*specs)
+            if scratch_pairs:
+                return buffers[0], buffers[1], buffers[2]
+            pairs = torch.empty(pair_shape, dtype=torch.float32, device=device)
+            return buffers[0], buffers[1], pairs
+    part_elems = rows * num_tiles
+    pair_elems = rows * pair_width
+    scratch = getattr(layer, "_tilelang_vocab_greedy_scratch", None)
+    if (
+        scratch is None
+        or scratch[0].device != device
+        or scratch[0].numel() < part_elems
+        or scratch[2].numel() < pair_elems
+    ):
+        cap_parts = max(part_elems, scratch[0].numel() if scratch is not None else 0)
+        cap_pairs = max(pair_elems, scratch[2].numel() if scratch is not None else 0)
+        scratch = (
+            torch.empty(cap_parts, dtype=torch.float32, device=device),
+            torch.empty(cap_parts, dtype=torch.int32, device=device),
+            torch.empty(cap_pairs, dtype=torch.float32, device=device),
+        )
+        layer._tilelang_vocab_greedy_scratch = scratch
+    partial_vals = scratch[0][:part_elems].view(rows, num_tiles)
+    partial_idxs = scratch[1][:part_elems].view(rows, num_tiles)
+    if scratch_pairs:
+        pairs = scratch[2][:pair_elems].view(rows, pair_width)
+    else:
+        pairs = torch.empty(pair_shape, dtype=torch.float32, device=device)
+    return partial_vals, partial_idxs, pairs
+
+
 def project_head_greedy_pairs(
     layer: nn.Module,
     x: torch.Tensor,
     vocab: int | None = None,
     vocab_start: int = 0,
     pair_width: int = 4,
+    *,
+    scratch_pairs: bool = False,
 ) -> torch.Tensor:
     """Each row's ``(max, global index)`` pair of ``x[rows, K]`` through a prepared
     packed head over its ``vocab`` real columns starting at ``vocab_start``, written
     into the first two columns of ``[rows, pair_width]`` FP32 without materializing
     the shard's logits."""
-    x = x.contiguous()
+    if not x.is_contiguous():
+        x = x.contiguous()
     rows = x.shape[0]
     n = int(layer.weight.shape[0])
     if vocab is None:
@@ -677,9 +744,14 @@ def project_head_greedy_pairs(
     partials_kernel, finish_kernel, num_tiles = layer.tilelang_vocab_greedy[
         row_tile(rows)
     ]
-    partial_vals = torch.empty((rows, num_tiles), dtype=torch.float32, device=x.device)
-    partial_idxs = torch.empty((rows, num_tiles), dtype=torch.int32, device=x.device)
-    pairs = torch.empty((rows, pair_width), dtype=torch.float32, device=x.device)
+    partial_vals, partial_idxs, pairs = _vocab_greedy_buffers(
+        layer,
+        rows,
+        num_tiles,
+        pair_width,
+        x.device,
+        scratch_pairs=scratch_pairs,
+    )
     partials_kernel(
         x,
         layer.weight,

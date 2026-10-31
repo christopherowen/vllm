@@ -85,6 +85,60 @@ def test_vocab_parallel_pairs_on_one_rank():
     assert torch.equal(pairs[:, 1].long(), logits[:, :4000].argmax(-1))
 
 
+def test_vocab_parallel_pairs_borrows_workspace_scratch(monkeypatch):
+    import vllm.v1.worker.gpu.spec_decode.greedy_verification as gv
+    import vllm.v1.worker.workspace as ws_mod
+    from vllm.v1.worker.workspace import init_workspace_manager
+
+    torch.manual_seed(11)
+    logits = torch.randn((12, 32320), dtype=torch.bfloat16, device=DEVICE)
+    monkeypatch.setattr(ws_mod, "_manager", None)
+    expected = vocab_parallel_pairs(logits, 32320, 0, 1)
+
+    init_workspace_manager(torch.device(DEVICE), num_ubatches=1)
+    manager = ws_mod.current_workspace_manager()
+
+    captured_ptrs: list[tuple[int, int, int]] = []
+    orig_greedy_shard_pair = gv.greedy_shard_pair
+
+    def spy_greedy_shard_pair(
+        local_logits, vocab, vocab_start, pairs, values, indices
+    ):
+        captured_ptrs.append(
+            (values.data_ptr(), indices.data_ptr(), pairs.data_ptr())
+        )
+        return orig_greedy_shard_pair(
+            local_logits, vocab, vocab_start, pairs, values, indices
+        )
+
+    monkeypatch.setattr(gv, "greedy_shard_pair", spy_greedy_shard_pair)
+    monkeypatch.setattr(
+        gv,
+        "tensor_model_parallel_all_gather",
+        lambda t, dim=-1: t.repeat(1, 4),
+    )
+
+    pairs_tp1_a = vocab_parallel_pairs(logits, 32320, 0, 1)
+    manager.lock()
+    pairs_tp1_b = vocab_parallel_pairs(logits, 32320, 0, 1)
+    assert torch.equal(pairs_tp1_a[:, :2], expected[:, :2])
+    assert torch.equal(pairs_tp1_b[:, :2], expected[:, :2])
+    assert captured_ptrs[0][0] == captured_ptrs[1][0]
+    assert captured_ptrs[0][1] == captured_ptrs[1][1]
+
+    manager.unlock()
+    pairs_tp4 = vocab_parallel_pairs(logits, 32320, 0, 4)
+    assert pairs_tp4.shape == (12, PAIR_WIDTH * 4)
+    assert torch.equal(pairs_tp4[:, :2], expected[:, :2])
+    ws_base = manager._current_workspaces[0].data_ptr()
+    ws_end = ws_base + manager.available_bytes()
+    val_ptr, idx_ptr, local_pair_ptr = captured_ptrs[2]
+    assert ws_base <= val_ptr < ws_end
+    assert ws_base <= idx_ptr < ws_end
+    assert ws_base <= local_pair_ptr < ws_end
+    assert pairs_tp4.data_ptr() != local_pair_ptr
+
+
 @pytest.mark.parametrize("ranks", [1, 3, 4])
 @pytest.mark.parametrize("block_verification", [True, False])
 def test_greedy_rejection_matches_rejection_sample(ranks, block_verification):

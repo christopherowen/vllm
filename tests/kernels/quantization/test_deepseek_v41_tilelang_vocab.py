@@ -263,3 +263,62 @@ def test_packed_head_greedy_pairs_match_greedy_shard_pair(n, k, out_dtype):
             )
             assert torch.equal(actual[:, :2], expected[:, :2]), (rows, vocab)
             assert torch.equal(from_head[:, :2], expected[:, :2]), (rows, vocab)
+
+
+def test_project_head_greedy_pairs_borrows_workspace_and_reuses_layer_scratch(
+    monkeypatch,
+):
+    import vllm.v1.worker.gpu.spec_decode.greedy_verification as gv
+    import vllm.v1.worker.workspace as ws_mod
+    from vllm.v1.worker.gpu.spec_decode.greedy_verification import (
+        PAIR_WIDTH,
+        vocab_parallel_pairs,
+        vocab_parallel_pairs_from_head,
+    )
+    from vllm.v1.worker.workspace import init_workspace_manager
+
+    n, k = 1000, 512
+    weight = _head(n, k, seed=77)
+    layer = _packed_layer(weight)
+    prepare_packed_head(layer)
+    x = (torch.randn(24, k, device=DEVICE) * 0.5).bfloat16()
+    logits = project_head(layer, x)
+    expected = vocab_parallel_pairs(logits, n, 0, tp_size=1)
+
+    # 1. Without WorkspaceManager initialized: persistent layer scratch is reused
+    # across tile sizes (16 -> 24 -> 6) and when scratch_pairs=True.
+    monkeypatch.setattr(ws_mod, "_manager", None)
+    p6_a = project_head_greedy_pairs(layer, x[:6], vocab=n, vocab_start=0)
+    scratch_6 = layer._tilelang_vocab_greedy_scratch
+    assert scratch_6 is not None
+    p6_b = project_head_greedy_pairs(layer, x[:6], vocab=n, vocab_start=0)
+    assert layer._tilelang_vocab_greedy_scratch[0].data_ptr() == scratch_6[0].data_ptr()
+    assert p6_a.data_ptr() != p6_b.data_ptr()
+    assert torch.equal(p6_a[:, :2], expected[:6, :2])
+    assert torch.equal(p6_b[:, :2], expected[:6, :2])
+
+    p24 = project_head_greedy_pairs(
+        layer, x, vocab=n, vocab_start=0, scratch_pairs=True
+    )
+    assert p24.data_ptr() == layer._tilelang_vocab_greedy_scratch[2].data_ptr()
+    assert torch.equal(p24[:, :2], expected[:, :2])
+
+    # 2. With WorkspaceManager initialized: partial_vals, partial_idxs, and
+    # TP>1 local pairs are borrowed directly from the active workspace.
+    init_workspace_manager(torch.device(DEVICE), num_ubatches=1)
+    manager = ws_mod.current_workspace_manager()
+    monkeypatch.setattr(
+        gv,
+        "tensor_model_parallel_all_gather",
+        lambda t, dim=-1: t.repeat(1, 3),
+    )
+    tp3_pairs = vocab_parallel_pairs_from_head(layer, x[:6], n, 0, tp_size=3)
+    assert tp3_pairs.shape == (6, PAIR_WIDTH * 3)
+    assert torch.equal(tp3_pairs[:, :2], expected[:6, :2])
+    ws_base = manager._current_workspaces[0].data_ptr()
+    ws_end = ws_base + manager.available_bytes()
+    p6_ws = project_head_greedy_pairs(
+        layer, x[:6], vocab=n, vocab_start=0, scratch_pairs=True
+    )
+    assert ws_base <= p6_ws.data_ptr() < ws_end
+    assert torch.equal(p6_ws[:, :2], expected[:6, :2])
