@@ -254,6 +254,8 @@ class DSparkDeepseekV4Model(nn.Module):
             **({"gather_output": True} if main_proj_tp else {}),
         )
         self.main_norm = kernels.rms_norm(config.hidden_size, eps=config.rms_norm_eps)
+        if hasattr(self.main_norm, "with_cast"):
+            self.main_norm.with_cast = True
 
         current_vllm_config = get_current_vllm_config()
         self._l2pf_ready = False
@@ -325,6 +327,8 @@ class DSparkDeepseekV4Model(nn.Module):
         for projection in self._context_kv_projections:
             projection.declare_kernels()
         if self._context_kv_projections:
+            if hasattr(self.main_norm, "with_cast"):
+                self.main_norm.with_cast = True
             prepare.declare(warm=lambda: _warm_casts(self.hidden_size))
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -337,9 +341,19 @@ class DSparkDeepseekV4Model(nn.Module):
         """main_x = main_norm(main_proj(concat of target aux hidden states)).
 
         ``aux_hidden_states`` is [T, hidden_size * len(target_layer_ids)]. With
-        ``out`` (contiguous, [T, hidden_size]), the norm writes main_x there.
+        ``out`` (contiguous, [T, hidden_size]), the norm writes main_x there; when
+        the context KV projections read a producer's MXFP8 cast, ``main_norm``
+        also emits ``main_x``'s MXFP8 cast in the same launch.
         """
-        return self.main_norm(self.main_proj(aux_hidden_states), out=out)
+        projected = self.main_proj(aux_hidden_states)
+        if _casts_context_main_x(self) and hasattr(
+            self.main_norm, "forward_with_cast"
+        ):
+            cast = self.main_norm.forward_with_cast(projected, out=out)
+            self._context_main_cast = cast
+            return cast.rows
+        self._context_main_cast = None
+        return self.main_norm(projected, out=out)
 
     def combine_aux_hidden_states_into(
         self, aux_hidden_states: list[torch.Tensor], out: torch.Tensor
@@ -351,7 +365,7 @@ class DSparkDeepseekV4Model(nn.Module):
         rows = out.shape[0]
         joined = out.new_empty(rows, len(aux_hidden_states) * self.hidden_size)
         columns.join_columns([aux[:rows] for aux in aux_hidden_states], joined)
-        self.main_norm(self.main_proj(joined), out=out)
+        self.combine_hidden_states(joined, out=out)
 
     @torch.inference_mode()
     def precompute_and_store_context_kv(
@@ -372,14 +386,18 @@ class DSparkDeepseekV4Model(nn.Module):
         ``None`` (or a ``None`` entry) runs the projection to reserve workspace
         but writes nothing (profiling).
         """
-        main_cast = (
-            kernels.cast_mxfp8(main_x)
-            if any(
-                getattr(proj, "tilelang_mxfp8_input", False)
-                for proj in self._context_kv_projections
-            )
-            else None
-        )
+        cached_cast = getattr(self, "_context_main_cast", None)
+        self._context_main_cast = None
+        if (
+            cached_cast is not None
+            and cached_cast.rows.data_ptr() == main_x.data_ptr()
+            and cached_cast.rows.shape == main_x.shape
+        ):
+            main_cast = cached_cast
+        elif _casts_context_main_x(self):
+            main_cast = kernels.cast_mxfp8(main_x)
+        else:
+            main_cast = None
         with kernels.mxfp8_inputs(main_cast):
             for i, layer in enumerate(self.layers):
                 slot_mapping = (
@@ -440,6 +458,13 @@ class DSparkDeepseekV4Model(nn.Module):
         # compute_logits applies self.norm.
         hidden_states = layer.mhc.collapse(hidden_states, pre_mix)
         return hidden_states
+
+
+def _casts_context_main_x(model: object) -> bool:
+    return any(
+        getattr(proj, "tilelang_mxfp8_input", False)
+        for proj in getattr(model, "_context_kv_projections", ())
+    )
 
 
 def _insert_context_kv(

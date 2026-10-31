@@ -205,3 +205,101 @@ def test_precompute_and_store_context_kv_casts_once_and_fuses_front(monkeypatch)
         assert layer_idx == i
         assert torch.equal(kv_raw, main_x[:, :512] + i)
         assert pos is positions and slot is slots[i]
+
+
+@pytest.mark.parametrize("rows", [1, 6, 32, LIMIT])
+def test_rmsnorm_forward_with_cast_matches_separate_cast(rows):
+    from vllm.models.deepseek_v4_1 import kernels
+    from vllm.models.deepseek_v4_1.tilelang.norm import TileLangRMSNorm
+
+    gen = torch.Generator(device=DEVICE).manual_seed(rows * 97 + 3)
+    norm = TileLangRMSNorm(WIDTH, 1e-6).to(DEVICE)
+    norm.weight.data.copy_(torch.rand(WIDTH, generator=gen, device=DEVICE) + 0.5)
+    x = torch.randn(rows, WIDTH, generator=gen, device=DEVICE).to(torch.bfloat16)
+    ref_out = torch.empty_like(x)
+    norm(x, out=ref_out)
+    ref_cast = kernels.cast_mxfp8(ref_out)
+
+    fused_out = torch.empty_like(x)
+    fused_cast = norm.forward_with_cast(x, out=fused_out)
+    torch.accelerator.synchronize()
+
+    assert fused_cast.rows.data_ptr() == fused_out.data_ptr()
+    assert torch.equal(fused_out.view(torch.int16), ref_out.view(torch.int16))
+    assert torch.equal(
+        fused_cast.values[:rows].view(torch.uint8),
+        ref_cast.values[:rows].view(torch.uint8),
+    )
+    assert torch.equal(
+        fused_cast.scales[:rows].view(torch.uint8),
+        ref_cast.scales[:rows].view(torch.uint8),
+    )
+
+
+def test_combine_and_precompute_context_kv_fuses_cast_into_main_norm(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm.models.deepseek_v4_1 import kernels
+    from vllm.models.deepseek_v4_1.nvidia.dspark import DSparkDeepseekV4Model
+    from vllm.models.deepseek_v4_1.tilelang.linear import provided_mxfp8
+    from vllm.models.deepseek_v4_1.tilelang.norm import TileLangRMSNorm
+
+    def forbid_cast(x):
+        raise AssertionError("standalone cast_mxfp8 should not run after main_norm")
+
+    monkeypatch.setattr(kernels, "cast_mxfp8", forbid_cast)
+    seen_casts = []
+    inserts = []
+
+    class Proj:
+        tilelang_mxfp8_input = True
+
+        def __init__(self, idx):
+            self.idx = idx
+
+        def __call__(self, x):
+            seen_casts.append(provided_mxfp8(x))
+            return x[:, :512] + self.idx
+
+    gen = torch.Generator(device=DEVICE).manual_seed(42)
+    norm = TileLangRMSNorm(WIDTH, 1e-6).to(DEVICE)
+    norm.weight.data.copy_(torch.rand(WIDTH, generator=gen, device=DEVICE) + 0.5)
+    joined = dspark_context.NUM_SOURCES * WIDTH
+
+    model = DSparkDeepseekV4Model.__new__(DSparkDeepseekV4Model)
+    torch.nn.Module.__init__(model)
+    model.hidden_size = WIDTH
+    model.main_proj = lambda x: x[:, :WIDTH] * 2 + x[:, WIDTH : 2 * WIDTH]
+    model.main_norm = norm
+    model._context_kv_projections = [Proj(i) for i in range(3)]
+    model.layers = [
+        SimpleNamespace(
+            attn=SimpleNamespace(
+                insert_raw_context_kv=lambda kv_raw, pos, slots, i=i: inserts.append(
+                    (i, kv_raw, pos, slots)
+                )
+            )
+        )
+        for i in range(3)
+    ]
+
+    aux = torch.randn(6, joined, generator=gen, device=DEVICE).to(torch.bfloat16)
+    out = torch.empty(6, WIDTH, dtype=torch.bfloat16, device=DEVICE)
+    main_x = model.combine_hidden_states(aux, out=out)
+    expected_norm = norm(model.main_proj(aux))
+    positions = torch.arange(6, dtype=torch.int64, device=DEVICE)
+    slots = [
+        torch.arange(6, dtype=torch.int64, device=DEVICE) + i * 10 for i in range(3)
+    ]
+    model.precompute_and_store_context_kv(main_x, positions, slots)
+    torch.accelerator.synchronize()
+
+    assert main_x.data_ptr() == out.data_ptr()
+    assert torch.equal(main_x.view(torch.int16), expected_norm.view(torch.int16))
+    assert len(seen_casts) == 3
+    assert all(c is not None and c is seen_casts[0] for c in seen_casts)
+    assert len(inserts) == 3
+    for i, (layer_idx, kv_raw, pos, slot) in enumerate(inserts):
+        assert layer_idx == i
+        assert torch.equal(kv_raw, main_x[:, :512] + i)
+        assert pos is positions and slot is slots[i]

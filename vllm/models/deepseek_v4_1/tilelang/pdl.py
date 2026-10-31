@@ -95,6 +95,12 @@ def norm_forward(*args, **kwargs):
         return tk.quant.norm_forward(*args, **kwargs)
 
 
+def norm_forward_and_per_token_cast(*args, **kwargs):
+    """TileKernels' ``quant.norm_forward_and_per_token_cast``, chained."""
+    with _tile_kernels() as tk:
+        return tk.quant.norm_forward_and_per_token_cast(*args, **kwargs)
+
+
 def moe_topk_gate_forward(*args, **kwargs):
     """TileKernels' ``moe.moe_topk_gate_forward``, chained."""
     with _tile_kernels() as tk:
