@@ -1700,14 +1700,15 @@ class TestSafeArgPrefix:
         ],
     )
     def test_safe_arg_prefix(self, json_str, expected):
-        assert ParserEngine._safe_arg_prefix(json_str) == expected
+        assert ParserEngine._safe_arg_prefix(json_str)[0] == expected
 
     def test_schema_typed_trailing_string_is_withheld_with_its_key(self):
         # ``count`` may be coerced to a number, so its value cannot stream and
         # the separator must not be left dangling either.
         json_str = '{"path": "README.md", "count": "1'
         assert (
-            ParserEngine._safe_arg_prefix(json_str, {"path"}) == '{"path": "README.md"'
+            ParserEngine._safe_arg_prefix(json_str, {"path"})[0]
+            == '{"path": "README.md"'
         )
 
 

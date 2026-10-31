@@ -25,7 +25,11 @@ from vllm.entrypoints.generate.base.protocol import (
 from vllm.logger import init_logger
 from vllm.parser.abstract_parser import Parser, StreamState
 from vllm.parser.engine.events import EventType, SemanticEvent
-from vllm.parser.engine.parser_engine_config import ParserEngineConfig, ParserState
+from vllm.parser.engine.parser_engine_config import (
+    ArgValueExtender,
+    ParserEngineConfig,
+    ParserState,
+)
 from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
 from vllm.tool_parsers.utils import (
     coerce_to_schema_type,
@@ -53,7 +57,10 @@ class ToolCallSlot:
         "_args_joined",
         "name_sent",
         "string_keys",
-        "streamed_json",
+        "_streamed_parts",
+        "_streamed_joined",
+        "extend_open_value",
+        "open_value_streams",
     )
 
     def __init__(self) -> None:
@@ -63,7 +70,10 @@ class ToolCallSlot:
         self._args_joined: str | None = ""
         self.name_sent: bool = False
         self.string_keys: set[str] | None = None
-        self.streamed_json: str = ""
+        self._streamed_parts: list[str] = []
+        self._streamed_joined: str | None = ""
+        self.extend_open_value: ArgValueExtender | None = None
+        self.open_value_streams: bool = False
 
     @property
     def args(self) -> str:
@@ -74,6 +84,21 @@ class ToolCallSlot:
     def append_args(self, value: str) -> None:
         self._args_parts.append(value)
         self._args_joined = None
+
+    @property
+    def streamed_json(self) -> str:
+        if self._streamed_joined is None:
+            self._streamed_joined = "".join(self._streamed_parts)
+        return self._streamed_joined
+
+    @streamed_json.setter
+    def streamed_json(self, value: str) -> None:
+        self._streamed_parts = [value]
+        self._streamed_joined = value
+
+    def append_streamed(self, value: str) -> None:
+        self._streamed_parts.append(value)
+        self._streamed_joined = None
 
 
 class ParserEngine(Parser):
@@ -126,6 +151,7 @@ class ParserEngine(Parser):
 
         self._arg_converter = parser_engine_config.arg_converter
         self._arg_structural_chars = parser_engine_config.arg_structural_chars
+        self._arg_value_extender = parser_engine_config.arg_value_extender
         self._stream_arg_deltas = parser_engine_config.stream_arg_deltas
         self._strip_trailing_reasoning_ws = (
             parser_engine_config.strip_trailing_reasoning_whitespace
@@ -296,7 +322,9 @@ class ParserEngine(Parser):
         return args, changed
 
     @staticmethod
-    def _safe_arg_prefix(json_str: str, string_keys: set[str] | None = None) -> str:
+    def _safe_arg_prefix(
+        json_str: str, string_keys: set[str] | None = None
+    ) -> tuple[str, bool]:
         """Return the prefix of *json_str* up to the last top-level value.
 
         Middle values (followed by a comma) are stable across streaming
@@ -306,6 +334,11 @@ class ParserEngine(Parser):
         String values for keys in ``string_keys`` are prefix-stable, so stream
         their unterminated content instead of buffering long arguments until
         the closing tag arrives.
+
+        Also returns whether the returned prefix stops inside that trailing
+        string, so streamed text may be appended to it.  This holds even when
+        *json_str* closes the string: converters serialise an open raw value
+        as a closed JSON string.
         """
         last_colon = -1
         last_comma = -1
@@ -341,7 +374,7 @@ class ParserEngine(Parser):
             elif c == "," and depth == 1:
                 last_comma = i
         if last_colon < 0:
-            return ""
+            return "", False
         end = last_colon + 1
         while end < len(json_str) and json_str[end] in (" ", "\t", "\n", "\r"):
             end += 1
@@ -354,7 +387,7 @@ class ParserEngine(Parser):
             # top-level value rather than after ``"key": ``: the flush can
             # drop an unfinished parameter, and a prefix that ends on the
             # separator then has no valid completion.
-            return json_str[:last_comma] if last_comma >= 0 else ""
+            return (json_str[:last_comma] if last_comma >= 0 else ""), False
 
         escape = False
         escape_start = -1
@@ -378,11 +411,11 @@ class ParserEngine(Parser):
                 escape_start = i
                 continue
             if c == '"':
-                return json_str[:i]
+                return json_str[:i], True
         if escape_start >= 0:
             # Never end on a partial escape: ``\u12`` has no valid completion.
-            return json_str[:escape_start]
-        return json_str
+            return json_str[:escape_start], True
+        return json_str, True
 
     @staticmethod
     def _streamable_string_keys(properties: dict) -> set[str] | None:
@@ -1034,11 +1067,19 @@ class ParserEngine(Parser):
         if not self._stream_arg_deltas:
             return None
 
+        slot = self._tool_slots[idx]
         structural = self._arg_structural_chars
-        if structural is not None and structural.isdisjoint(raw_delta):
+        if slot.extend_open_value is not None:
+            diff = slot.extend_open_value(raw_delta)
+            if diff is not None:
+                if not diff or not slot.open_value_streams:
+                    return None
+                slot.append_streamed(diff)
+                return diff
+            slot.extend_open_value = None
+        elif structural is not None and structural.isdisjoint(raw_delta):
             return None
 
-        slot = self._tool_slots[idx]
         try:
             current_json = converter(slot.args, True)
         except (json.JSONDecodeError, ValueError, TypeError):
@@ -1052,22 +1093,24 @@ class ParserEngine(Parser):
             current_json = self._fix_arg_types(current_json, slot.name)
 
         prev = slot.streamed_json
-        safe_json = self._safe_arg_prefix(current_json, slot.string_keys)
+        safe_json, value_streams = self._safe_arg_prefix(current_json, slot.string_keys)
 
-        if not safe_json or safe_json == prev:
+        if not safe_json:
+            return None
+        if prev and not safe_json.startswith(prev):
+            if self._arg_value_extender is not None:
+                # A repeated key replaced a streamed value. Deltas that only
+                # extend the new value skip the conversion until it closes.
+                slot.extend_open_value = self._arg_value_extender(slot.args)
+                slot.open_value_streams = False
             return None
 
-        if prev:
-            if not safe_json.startswith(prev):
-                return None
-            diff = safe_json[len(prev) :]
-        else:
-            diff = safe_json
-
-        if diff:
-            slot.streamed_json = safe_json
-            return diff
-        return None
+        slot.streamed_json = safe_json
+        if self._arg_value_extender is not None:
+            # Deltas that only extend the open value skip the conversion above.
+            slot.extend_open_value = self._arg_value_extender(slot.args)
+            slot.open_value_streams = value_streams
+        return safe_json[len(prev) :] or None
 
     def _flush_arg_converter(self, idx: int) -> str | None:
         converter = self._arg_converter
