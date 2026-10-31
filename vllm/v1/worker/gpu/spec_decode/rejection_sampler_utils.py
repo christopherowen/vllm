@@ -979,73 +979,6 @@ def _resample_kernel(
     )
 
 
-@triton.jit
-def _insert_resampled_kernel(
-    # [num_reqs, num_speculative_steps + 1]
-    sampled_ptr,
-    sampled_stride,
-    # [num_reqs]
-    num_sampled_ptr,
-    # [num_reqs, num_blocks]
-    resampled_local_argmax_ptr,
-    resampled_local_argmax_stride,
-    # [num_reqs, num_blocks]
-    resampled_local_max_ptr,
-    resampled_local_max_stride,
-    resample_num_blocks,
-    # [num_reqs + 1]
-    cu_num_logits_ptr,
-    # [num_reqs]
-    expanded_idx_mapping_ptr,
-    # [max_num_reqs]
-    temp_ptr,
-    PADDED_RESAMPLE_NUM_BLOCKS: tl.constexpr,
-):
-    req_idx = tl.program_id(0)
-    num_sampled = tl.load(num_sampled_ptr + req_idx)
-    start_idx = tl.load(cu_num_logits_ptr + req_idx)
-    end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
-    resample_token_idx = start_idx + num_sampled
-    req_state_idx = tl.load(expanded_idx_mapping_ptr + resample_token_idx)
-
-    # Increment the number of sampled tokens.
-    tl.store(num_sampled_ptr + req_idx, num_sampled + 1)
-
-    temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
-    is_bonus = resample_token_idx == end_idx - 1
-    if temp == 0.0 and not is_bonus:
-        # Greedy + non-bonus token. The target argmax is already
-        # in the sampled tensor.
-        return
-
-    # Insert the resampled token.
-    block = tl.arange(0, PADDED_RESAMPLE_NUM_BLOCKS)
-    mask = block < resample_num_blocks
-    resampled_local_max = tl.load(
-        resampled_local_max_ptr + req_idx * resampled_local_max_stride + block,
-        mask=mask,
-        other=float("-inf"),
-    )
-    # NaN max values (from NaN target logits) make tl.argmax return an
-    # out-of-range block index (into the padded region), causing an OOB read
-    # of resampled_local_argmax. Map NaN to -inf so argmax stays in range.
-    resampled_local_max = tl.where(
-        resampled_local_max != resampled_local_max,
-        float("-inf"),
-        resampled_local_max,
-    )
-    resampled_max_block_idx = tl.argmax(resampled_local_max, axis=0)
-    resampled = tl.load(
-        resampled_local_argmax_ptr
-        + req_idx * resampled_local_argmax_stride
-        + resampled_max_block_idx,
-    )
-    tl.store(
-        sampled_ptr + req_idx * sampled_stride + num_sampled,
-        resampled,
-    )
-
-
 _VOCAB_BLOCK_SIZE = 8192
 _RESAMPLE_BLOCK_SIZE = 1024
 
@@ -1695,3 +1628,14 @@ def rejection_sample(
         dead_row_cut,
     )
     return sampled, num_sampled
+
+
+_TRITON_REFS = frozenset(("_insert_resampled_kernel",))
+
+
+def __getattr__(name: str):
+    if name in _TRITON_REFS:
+        from vllm.v1.worker.gpu import _triton_refs
+
+        return getattr(_triton_refs, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

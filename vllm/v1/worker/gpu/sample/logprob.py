@@ -7,84 +7,12 @@ import numpy as np
 import torch
 
 from vllm.sampling_params import MAX_LOGPROB_TOKEN_IDS, SamplingParams
-from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
 from vllm.v1.worker.gpu.sample import tilelang_auxiliary, tilelang_topk_ids
 
 # Upper bound on the topk kernel's per-iteration gather width.
 _MAX_TOPK_BLOCK = 1024
-
-
-# The arithmetic the TileLang log-softmax (``tilelang_logprob.topk_log_softmax``)
-# fixed, which its tests measure it against, launched as production launched it
-# (BLOCK_SIZE=1024, TOPK_BLOCK_SIZE=_MAX_TOPK_BLOCK, four warps); the sampler no
-# longer launches it.
-@triton.jit(do_not_specialize=["topk"])
-def _topk_log_softmax_kernel(
-    output_ptr,
-    logits_ptr,
-    logits_stride,
-    topk_ids_ptr,
-    topk,
-    vocab_size,
-    BLOCK_SIZE: tl.constexpr,
-    TOPK_BLOCK_SIZE: tl.constexpr,
-):
-    req_idx = tl.program_id(0).to(tl.int64)
-    row_ptr = logits_ptr + req_idx * logits_stride
-
-    max_val = float("-inf")
-    for i in range(0, vocab_size, BLOCK_SIZE):
-        block = i + tl.arange(0, BLOCK_SIZE)
-        logits = tl.load(row_ptr + block, mask=block < vocab_size, other=float("-inf"))
-        max_val = tl.max(tl.maximum(logits, max_val))
-    max_val = max_val.to(tl.float32)  # type: ignore
-
-    se = 0.0
-    for i in range(0, vocab_size, BLOCK_SIZE):
-        block = i + tl.arange(0, BLOCK_SIZE)
-        logits = tl.load(row_ptr + block, mask=block < vocab_size, other=0.0)
-        # NOTE(woosuk): Make sure that logits and all following operations use FP32.
-        logits = logits.to(tl.float32)
-        e = tl.exp(logits - max_val)
-        e = tl.where(block < vocab_size, e, 0.0)
-        se += tl.sum(e)
-    lse = tl.log(se)
-
-    for j in range(0, topk, TOPK_BLOCK_SIZE):
-        k_offset = j + tl.arange(0, TOPK_BLOCK_SIZE)
-        k_mask = k_offset < topk
-        topk_ids = tl.load(
-            topk_ids_ptr + req_idx * topk + k_offset, mask=k_mask, other=0
-        )
-        logits = tl.load(row_ptr + topk_ids, mask=k_mask)
-        logits = logits.to(tl.float32)
-        o = logits - max_val - lse
-        tl.store(output_ptr + req_idx * topk + k_offset, o, mask=k_mask)
-
-
-@triton.jit
-def _ranks_kernel(
-    output_ptr,
-    logits_ptr,
-    logits_stride,
-    token_ids_ptr,
-    vocab_size,
-    BLOCK_SIZE: tl.constexpr,
-):
-    req_idx = tl.program_id(0).to(tl.int64)
-    row_ptr = logits_ptr + req_idx * logits_stride
-
-    token_id = tl.load(token_ids_ptr + req_idx)
-    x = tl.load(row_ptr + token_id)
-
-    n = 0
-    for i in range(0, vocab_size, BLOCK_SIZE):
-        block = i + tl.arange(0, BLOCK_SIZE)
-        logits = tl.load(row_ptr + block, mask=block < vocab_size, other=float("-inf"))
-        n += tl.sum((logits >= x).to(tl.int32))
-    tl.store(output_ptr + req_idx, n)
 
 
 def register_topk_scores_warmup(
@@ -210,54 +138,6 @@ def compute_topk_scores(
     )
 
 
-# The reference the TileLang fill (``tilelang_auxiliary.fill_ids_kernel``) is tested
-# against; the sampler no longer launches it.
-@triton.jit
-def _fill_logprob_token_ids_kernel(
-    # [batch_size, 1 + num_cols]
-    out_token_ids_ptr,
-    out_token_ids_stride,
-    # [batch_size, 1 + num_cols]
-    out_valid_mask_ptr,
-    out_valid_mask_stride,
-    sampled_token_ids_ptr,  # [batch_size]
-    topk_indices_ptr,  # [batch_size, NUM_TOPK] (unused when NUM_TOPK == 0)
-    topk_indices_stride,
-    expanded_idx_mapping_ptr,  # [batch_size] -> req_state_idx
-    num_per_req_token_ids_ptr,  # [max_num_reqs]
-    per_req_token_ids_ptr,  # [max_num_reqs, MAX_LOGPROB_TOKEN_IDS]
-    per_req_token_ids_stride,
-    NUM_TOPK: tl.constexpr,
-    PADDED_COLS: tl.constexpr,
-):
-    batch_idx = tl.program_id(0)
-
-    # Column 0: always the sampled token, always valid.
-    sampled = tl.load(sampled_token_ids_ptr + batch_idx)
-    tl.store(out_token_ids_ptr + batch_idx * out_token_ids_stride, sampled)
-    tl.store(out_valid_mask_ptr + batch_idx * out_valid_mask_stride, 1)
-
-    req_state_idx = tl.load(expanded_idx_mapping_ptr + batch_idx)
-    num_custom = tl.load(num_per_req_token_ids_ptr + req_state_idx)
-
-    col = tl.arange(0, PADDED_COLS)
-    tid_base = out_token_ids_ptr + batch_idx * out_token_ids_stride + 1
-    mask_base = out_valid_mask_ptr + batch_idx * out_valid_mask_stride + 1
-
-    if num_custom > 0:
-        # Override topk with per-request custom tokens.
-        src = per_req_token_ids_ptr + req_state_idx * per_req_token_ids_stride
-        valid = col < num_custom
-    else:
-        # Fill with topk indices (no-op when NUM_TOPK == 0).
-        src = topk_indices_ptr + batch_idx * topk_indices_stride
-        valid = col < NUM_TOPK
-
-    tokens = tl.load(src + col, mask=valid, other=0).to(tl.int64)
-    tl.store(tid_base + col, tokens, mask=valid)
-    tl.store(mask_base + col, tl.full([PADDED_COLS], 1, tl.int1), mask=valid)
-
-
 class LogprobTokenIdsState:
     """Per-request override of which token ids' logprobs to return.
 
@@ -296,3 +176,20 @@ class LogprobTokenIdsState:
 
     def max_num_token_ids(self, idx_mapping_np: np.ndarray) -> int:
         return int(self.num_token_ids.np[idx_mapping_np].max(initial=0))
+
+
+_TRITON_REFS = frozenset(
+    (
+        "_topk_log_softmax_kernel",
+        "_ranks_kernel",
+        "_fill_logprob_token_ids_kernel",
+    )
+)
+
+
+def __getattr__(name: str):
+    if name in _TRITON_REFS:
+        from vllm.v1.worker.gpu import _triton_refs
+
+        return getattr(_triton_refs, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

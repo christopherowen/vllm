@@ -23,264 +23,13 @@ import torch
 
 from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.logger import init_logger
-from vllm.triton_utils import tl, triton
 from vllm.v1.sample.sink import NUM_SINK_EVENT_FIELDS, SinkConfig, SinkRow
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_scores
 
 logger = init_logger(__name__)
 
 # Vocabulary block of the candidates kernel; each block contributes
 # max_retries + 1 candidates to the merge.
 _CANDIDATE_BLOCK_SIZE = 1024
-
-
-# Reference for ``tilelang_sampling``; the runner no longer launches it.
-@triton.jit
-def _sink_candidates_kernel(
-    # [num_reqs, num_blocks * NUM_CANDIDATES]
-    values_ptr,
-    indices_ptr,
-    candidates_stride,
-    # [num_logits, logits_stride]: the scores' logits, after sampling params
-    logits_ptr,
-    logits_stride,
-    vocab_size,
-    # [num_reqs + 1]
-    cu_num_logits_ptr,
-    # [num_reqs]
-    num_sampled_ptr,
-    # [num_reqs, sampled_stride]
-    sampled_ptr,
-    sampled_stride,
-    # [num_logits]: each row's input token
-    draft_ptr,
-    # [num_reqs]
-    idx_mapping_ptr,
-    # [max_num_reqs]
-    temp_ptr,
-    seeds_ptr,
-    # [num_logits]
-    pos_ptr,
-    BLOCK_SIZE: tl.constexpr,
-    NUM_CANDIDATES: tl.constexpr,
-    USE_FP64: tl.constexpr,
-    MASK_REJECTED_DRAFT: tl.constexpr,
-):
-    req = tl.program_id(0)
-    block_idx = tl.program_id(1)
-    start = tl.load(cu_num_logits_ptr + req)
-    end = tl.load(cu_num_logits_ptr + req + 1)
-    local = tl.maximum(tl.load(num_sampled_ptr + req) - 1, 0)
-    # The row that produced the request's last sampled token.
-    row = (start + local).to(tl.int64)
-    req_state_idx = tl.load(idx_mapping_ptr + req).to(tl.int64)
-    temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
-
-    block = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = block < vocab_size
-    scores = tl.load(
-        logits_ptr + row * logits_stride + block, mask=mask, other=float("-inf")
-    ).to(tl.float32)
-    if MASK_REJECTED_DRAFT:
-        # A random row that rejected its draft resampled the residual, which
-        # for one-hot drafts is the target without the draft.
-        is_bonus = row == end - 1
-        verified = tl.load(draft_ptr + row + 1, mask=not is_bonus, other=-1)
-        emitted = tl.load(sampled_ptr + req * sampled_stride + local)
-        rejected = (
-            (not is_bonus) & (verified >= 0) & (verified != emitted) & (temp != 0.0)
-        )
-        scores = tl.where(rejected & (block == verified), float("-inf"), scores)
-    seed = tl.load(seeds_ptr + req_state_idx)
-    pos = tl.load(pos_ptr + row)
-    scores = gumbel_noised_scores(
-        scores,
-        block,
-        mask,
-        seed,
-        pos,
-        temp,
-        IS_DRAFTING=False,
-        USE_FP64=USE_FP64,
-        APPLY_TEMPERATURE=False,
-    )
-    offsets = tl.arange(0, BLOCK_SIZE)
-    out = req * candidates_stride + block_idx * NUM_CANDIDATES
-    for i in tl.static_range(NUM_CANDIDATES):
-        value, idx = tl.max(scores, axis=0, return_indices=True)
-        tl.store(values_ptr + out + i, value)
-        tl.store(indices_ptr + out + i, block_idx * BLOCK_SIZE + idx)
-        scores = tl.where(offsets == idx, float("-inf"), scores)
-
-
-# Reference for ``tilelang_sampling``; the runner no longer launches it.
-@triton.jit
-def _sink_policy_kernel(
-    # Verification results, updated in place for rejected draft zeros.
-    # [num_reqs, SAMPLED_WIDTH] int64, [num_reqs] int32, [num_reqs] int32
-    sampled_ptr,
-    num_sampled_ptr,
-    num_rejected_ptr,
-    # Host outputs: [num_reqs, SAMPLED_WIDTH + 1] int64, [num_reqs] int32,
-    # [num_reqs, NUM_EVENT_FIELDS] int32, [num_reqs] float32 / int64
-    out_tokens_ptr,
-    num_out_ptr,
-    events_ptr,
-    recovered_logprobs_ptr,
-    recovered_ranks_ptr,
-    # Batch.
-    cu_num_logits_ptr,
-    idx_mapping_ptr,
-    # [num_reqs] int8: the request was decoding (row 0's input is draft zero)
-    decoding_ptr,
-    # [num_logits] int8, [num_logits] float32 (each row's largest |column|),
-    # [num_logits]
-    flags_ptr,
-    values_ptr,
-    draft_ptr,
-    # This step's alternates: [num_reqs, NUM_ALTERNATES]
-    new_alternates_ptr,
-    new_alternate_logprobs_ptr,
-    new_alternate_ranks_ptr,
-    # Per-slot state: [max_num_reqs, NUM_ALTERNATES], [max_num_reqs]
-    alternates_ptr,
-    alternate_logprobs_ptr,
-    alternate_ranks_ptr,
-    tries_ptr,
-    # [max_num_reqs] int32, [max_num_reqs, vocab] int32
-    total_len_ptr,
-    bin_counts_ptr,
-    bin_counts_stride,
-    # [3] int64: this rank's flagged rows per SinkRow
-    counts_ptr,
-    NUM_ALTERNATES: tl.constexpr,
-    REJECTION: tl.constexpr,
-    LOGPROBS: tl.constexpr,
-    SAMPLED_WIDTH: tl.constexpr,
-    PADDED_WIDTH: tl.constexpr,
-    PADDED_ALTERNATES: tl.constexpr,
-    NUM_EVENT_FIELDS: tl.constexpr,
-):
-    req = tl.program_id(0)
-    start = tl.load(cu_num_logits_ptr + req)
-    num_logits = tl.load(cu_num_logits_ptr + req + 1) - start
-    num_sampled = tl.load(num_sampled_ptr + req)
-    events = events_ptr + req * NUM_EVENT_FIELDS
-    if num_sampled == 0:
-        # A prefill chunk: its row is not sampled.
-        tl.store(num_out_ptr + req, 0)
-        tl.store(events + 0, 0)
-        tl.store(events + 1, 2)
-        tl.store(events + 2, 0)
-        tl.store(events + 3, -1)
-        tl.store(events + 4, 0)
-        tl.store(events + 5, -1)
-        return
-
-    req_state_idx = tl.load(idx_mapping_ptr + req).to(tl.int64)
-    decoding = tl.load(decoding_ptr + req) != 0
-    row0_flag = tl.load(flags_ptr + start) != 0
-    rows = tl.arange(0, PADDED_WIDTH)
-    row_flags = tl.load(flags_ptr + start + rows, mask=rows < num_logits, other=0) != 0
-    # Drafter rows whose inputs were accepted (1 .. num_sampled - 1), and the
-    # row of the first rejected draft.
-    accepted_flags = tl.sum(
-        (row_flags & (rows >= 1) & (rows < num_sampled)).to(tl.int32), axis=0
-    )
-    cut = (tl.sum((row_flags & (rows == num_sampled)).to(tl.int32), axis=0) > 0) & (
-        num_sampled < num_logits
-    )
-    draft_zero_flag = decoding & row0_flag
-    # Prompt row flagged: FLAGGED; it cannot be replaced.
-    outcome = tl.where((not decoding) & row0_flag, 1, 0)
-    out_row = out_tokens_ptr + req * (SAMPLED_WIDTH + 1)
-    sampled_row = sampled_ptr + req * SAMPLED_WIDTH
-    if REJECTION:
-        tries = tl.load(tries_ptr + req_state_idx)
-        slot = tl.minimum(tries, NUM_ALTERNATES - 1)
-        state = req_state_idx * NUM_ALTERNATES
-        alternate = tl.load(alternates_ptr + state + slot)
-        rejected = draft_zero_flag & (tries < NUM_ALTERNATES) & (alternate >= 0)
-        outcome = tl.where(rejected, 2, tl.where(draft_zero_flag, 3, outcome))
-        drafter_flags = tl.where(rejected, 0, accepted_flags + cut.to(tl.int32))
-        cut_row = tl.where(cut & (not rejected), num_sampled, -1)
-        if rejected:
-            # Draft zero is replaced by its next alternate; the request's
-            # position does not advance (all of its rows are rejected).
-            draft_zero = tl.load(draft_ptr + start).to(tl.int64)
-            tl.store(sampled_row, alternate)
-            tl.store(num_sampled_ptr + req, 1)
-            tl.store(num_rejected_ptr + req, num_logits)
-            tl.store(tries_ptr + req_state_idx, tries + 1)
-            if LOGPROBS:
-                tl.store(
-                    recovered_logprobs_ptr + req,
-                    tl.load(alternate_logprobs_ptr + state + slot),
-                )
-                tl.store(
-                    recovered_ranks_ptr + req,
-                    tl.load(alternate_ranks_ptr + state + slot),
-                )
-            # The request state already holds draft zero as its last token:
-            # take it out, so the update appends the alternate in its place.
-            tl.store(
-                total_len_ptr + req_state_idx,
-                tl.load(total_len_ptr + req_state_idx) - 1,
-            )
-            count_ptr = bin_counts_ptr + req_state_idx * bin_counts_stride + draft_zero
-            tl.store(count_ptr, tl.load(count_ptr) - 1)
-            tl.store(out_row, alternate)
-            tl.store(num_out_ptr + req, 1)
-        else:
-            # The last sampled token's draw provides the next alternates.
-            a = tl.arange(0, PADDED_ALTERNATES)
-            in_range = a < NUM_ALTERNATES
-            new = req * NUM_ALTERNATES + a
-            tl.store(
-                alternates_ptr + state + a,
-                tl.load(new_alternates_ptr + new, mask=in_range),
-                mask=in_range,
-            )
-            if LOGPROBS:
-                tl.store(
-                    alternate_logprobs_ptr + state + a,
-                    tl.load(new_alternate_logprobs_ptr + new, mask=in_range),
-                    mask=in_range,
-                )
-                tl.store(
-                    alternate_ranks_ptr + state + a,
-                    tl.load(new_alternate_ranks_ptr + new, mask=in_range),
-                    mask=in_range,
-                )
-            tl.store(tries_ptr + req_state_idx, 0)
-            # Draft zero first, then the step's sampled tokens.
-            shift = decoding.to(tl.int32)
-            tokens = tl.load(sampled_row + rows, mask=rows < num_sampled)
-            tl.store(out_row + shift + rows, tokens, mask=rows < num_sampled)
-            if decoding:
-                tl.store(out_row, tl.load(draft_ptr + start).to(tl.int64))
-            tl.store(num_out_ptr + req, num_sampled + shift)
-    else:
-        outcome = tl.where(draft_zero_flag, 1, outcome)
-        drafter_flags = accepted_flags
-        cut_row = -1
-    # The largest flagged value among the rows the step judged (up to the
-    # first rejected draft) and its row, for the log line.
-    judged = row_flags & (rows <= num_sampled)
-    row_values = tl.load(values_ptr + start + rows, mask=rows < num_logits, other=0.0)
-    value, value_row = tl.max(
-        tl.where(judged, row_values, -1.0), axis=0, return_indices=True
-    )
-    flagged_any = value >= 0.0
-    tl.store(events + 0, outcome)
-    tl.store(events + 1, tl.where(decoding, 0, 2))
-    tl.store(events + 2, drafter_flags)
-    tl.store(events + 3, cut_row)
-    tl.store(events + 4, tl.where(flagged_any, value, 0.0).to(tl.int32))
-    tl.store(events + 5, tl.where(flagged_any, value_row, -1))
-    tl.atomic_add(counts_ptr + 0, draft_zero_flag.to(tl.int64))
-    tl.atomic_add(counts_ptr + 1, drafter_flags.to(tl.int64))
-    tl.atomic_add(counts_ptr + 2, ((not decoding) & row0_flag).to(tl.int64))
 
 
 @dataclass
@@ -724,3 +473,14 @@ class SinkSampler:
                 logits_strides=logits_strides,
             )
         )
+
+
+_TRITON_REFS = frozenset(("_sink_candidates_kernel", "_sink_policy_kernel"))
+
+
+def __getattr__(name: str):
+    if name in _TRITON_REFS:
+        from vllm.v1.worker.gpu import _triton_refs
+
+        return getattr(_triton_refs, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

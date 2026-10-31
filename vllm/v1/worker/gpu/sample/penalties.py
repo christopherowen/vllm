@@ -4,7 +4,6 @@ import numpy as np
 import torch
 
 from vllm.sampling_params import SamplingParams
-from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
@@ -120,88 +119,6 @@ class PenaltiesState:
         )
 
 
-# The reference the TileLang penalties (``tilelang_controls.penalties_kernel``) are
-# tested against; the sampler no longer launches it.
-@triton.jit
-def _penalties_kernel(
-    logits_ptr,
-    logits_stride,
-    expanded_idx_mapping_ptr,
-    token_ids_ptr,
-    expanded_local_pos_ptr,
-    repetition_penalty_ptr,
-    frequency_penalty_ptr,
-    presence_penalty_ptr,
-    prompt_bin_mask_ptr,
-    prompt_bin_mask_stride,
-    output_bin_counts_ptr,
-    output_bin_counts_stride,
-    vocab_size,
-    BLOCK_SIZE: tl.constexpr,
-):
-    token_idx = tl.program_id(0).to(tl.int64)
-    req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
-    rep_penalty = tl.load(repetition_penalty_ptr + req_state_idx)
-    freq_penalty = tl.load(frequency_penalty_ptr + req_state_idx)
-    pres_penalty = tl.load(presence_penalty_ptr + req_state_idx)
-
-    use_rep_penalty = rep_penalty != 1.0
-    use_freq_penalty = freq_penalty != 0.0
-    use_pres_penalty = pres_penalty != 0.0
-    use_penalty = use_rep_penalty or use_freq_penalty or use_pres_penalty
-    if not use_penalty:
-        # Early return to avoid loading logits.
-        return
-
-    block_idx = tl.program_id(1)
-    block = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = block < vocab_size
-    logits = tl.load(logits_ptr + token_idx * logits_stride + block, mask=mask)
-    logits = logits.to(tl.float32)
-
-    base_output_counts = tl.load(
-        output_bin_counts_ptr + req_state_idx * output_bin_counts_stride + block,
-        mask=mask,
-        other=0,
-    )
-
-    # Accumulate draft token counts from previous positions directly into
-    # output_bin_counts (preserves its native tensor layout, avoiding an
-    # expensive shared-memory layout conversion after the loop).
-    pos = tl.load(expanded_local_pos_ptr + token_idx)
-    start_idx = token_idx - pos
-    output_bin_counts = base_output_counts
-    for prev_pos in tl.range(pos):
-        prev_token = tl.load(token_ids_ptr + start_idx + prev_pos + 1)
-        token_match = block == prev_token
-        output_bin_counts = output_bin_counts + token_match.to(tl.int32)
-    output_bin_mask = output_bin_counts > 0
-
-    # Apply repetition penalties.
-    if use_rep_penalty:
-        packed_block = block_idx * BLOCK_SIZE // 32 + tl.arange(0, BLOCK_SIZE // 32)
-        packed_mask = tl.load(
-            prompt_bin_mask_ptr + req_state_idx * prompt_bin_mask_stride + packed_block,
-            mask=packed_block < tl.cdiv(vocab_size, 32),
-            other=0,
-        )
-        prompt_bin_mask = (packed_mask[:, None] >> (tl.arange(0, 32)[None, :])) & 1
-        prompt_bin_mask = prompt_bin_mask.to(tl.int1)
-        prompt_bin_mask = prompt_bin_mask.reshape(BLOCK_SIZE)
-
-        # If token appears in prompt or output, apply, otherwise use 1.0 for no-op.
-        scale = tl.where(prompt_bin_mask | output_bin_mask, rep_penalty, 1.0)
-        # If logits are positive, divide by penalty, otherwise multiply by penalty.
-        logits *= tl.where(logits > 0, 1.0 / scale, scale)
-
-    # Apply frequency penalties.
-    logits -= freq_penalty * output_bin_counts
-    # Apply presence penalties.
-    logits -= pres_penalty * output_bin_mask
-    # Store back to logits.
-    tl.store(logits_ptr + token_idx * logits_stride + block, logits, mask=mask)
-
-
 def apply_penalties(
     logits: torch.Tensor,
     expanded_idx_mapping: torch.Tensor,
@@ -224,60 +141,6 @@ def apply_penalties(
         prompt_bin_mask,
         output_bin_counts,
     )
-
-
-# The reference the TileLang accumulation (``tilelang_controls.bincount_kernel``) is
-# tested against; the runner no longer launches it.
-@triton.jit
-def _bincount_kernel(
-    expanded_idx_mapping_ptr,
-    all_token_ids_ptr,
-    all_token_ids_stride,
-    prompt_len_ptr,
-    prefill_len_ptr,
-    prompt_bin_mask_ptr,
-    prompt_bin_mask_stride,
-    output_bin_counts_ptr,
-    output_bin_counts_stride,
-    BLOCK_SIZE: tl.constexpr,
-):
-    token_idx = tl.program_id(0)
-    block_idx = tl.program_id(1)
-    req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
-
-    prefill_len = tl.load(prefill_len_ptr + req_state_idx)
-    if block_idx * BLOCK_SIZE >= prefill_len:
-        return
-
-    prompt_len = tl.load(prompt_len_ptr + req_state_idx)
-    block = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    if block_idx * BLOCK_SIZE < prompt_len:
-        mask = block < prompt_len
-        prompt_tokens = tl.load(
-            all_token_ids_ptr + req_state_idx * all_token_ids_stride + block, mask=mask
-        )
-        idx = prompt_tokens // 32
-        bit_idx = prompt_tokens % 32
-        bit = tl.full((BLOCK_SIZE,), 1, tl.int32) << bit_idx
-        tl.atomic_or(
-            prompt_bin_mask_ptr + req_state_idx * prompt_bin_mask_stride + idx,
-            bit,
-            mask=mask,
-        )
-
-    if (block_idx + 1) * BLOCK_SIZE >= prompt_len:
-        mask = block < prefill_len
-        mask &= block >= prompt_len
-        output_tokens = tl.load(
-            all_token_ids_ptr + req_state_idx * all_token_ids_stride + block, mask=mask
-        )
-        tl.atomic_add(
-            output_bin_counts_ptr
-            + req_state_idx * output_bin_counts_stride
-            + output_tokens,
-            1,
-            mask=mask,
-        )
 
 
 def bincount(
@@ -311,3 +174,14 @@ def use_penalty(sampling_params: SamplingParams) -> bool:
         or sampling_params.frequency_penalty != 0.0
         or sampling_params.presence_penalty != 0.0
     )
+
+
+_TRITON_REFS = frozenset(("_penalties_kernel", "_bincount_kernel"))
+
+
+def __getattr__(name: str):
+    if name in _TRITON_REFS:
+        from vllm.v1.worker.gpu import _triton_refs
+
+        return getattr(_triton_refs, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

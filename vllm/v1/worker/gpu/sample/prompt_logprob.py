@@ -7,7 +7,6 @@ import torch
 
 from vllm.config.model import LogprobsMode
 from vllm.sampling_params import SamplingParams
-from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample import tilelang_auxiliary
@@ -164,41 +163,6 @@ class PromptLogprobsWorker:
         return prompt_logprobs_dict
 
 
-# The reference the TileLang gather (``tilelang_auxiliary.prompt_ids_kernel``) is
-# tested against; the runner no longer launches it.
-@triton.jit
-def _prompt_logprobs_token_ids_kernel(
-    prompt_logprobs_token_ids_ptr,
-    query_start_loc_ptr,
-    idx_mapping_ptr,
-    num_computed_tokens_ptr,
-    all_token_ids_ptr,
-    all_token_ids_stride,
-    BLOCK_SIZE: tl.constexpr,
-):
-    batch_idx = tl.program_id(0)
-    req_state_idx = tl.load(idx_mapping_ptr + batch_idx)
-
-    query_start = tl.load(query_start_loc_ptr + batch_idx)
-    query_end = tl.load(query_start_loc_ptr + batch_idx + 1)
-    query_len = query_end - query_start
-
-    num_computed_tokens = tl.load(num_computed_tokens_ptr + req_state_idx)
-    for i in range(0, query_len, BLOCK_SIZE):
-        block = i + tl.arange(0, BLOCK_SIZE)
-        mask = block < query_len
-        # NOTE(woosuk): We should shift the pos by one
-        # because the logprob is computed for the next token.
-        target_pos = num_computed_tokens + 1 + block
-        token_ids = tl.load(
-            all_token_ids_ptr + req_state_idx * all_token_ids_stride + target_pos,
-            mask=mask,
-        )
-        tl.store(
-            prompt_logprobs_token_ids_ptr + query_start + block, token_ids, mask=mask
-        )
-
-
 def get_prompt_logprobs_token_ids(
     num_tokens: int,
     query_start_loc: torch.Tensor,
@@ -251,3 +215,14 @@ def compute_prompt_logprobs_with_chunking(
     scores = torch.cat(scores, dim=0) if len(scores) > 1 else scores[0]
     ranks = torch.cat(ranks, dim=0) if len(ranks) > 1 else ranks[0]
     return token_ids, scores, ranks
+
+
+_TRITON_REFS = frozenset(("_prompt_logprobs_token_ids_kernel",))
+
+
+def __getattr__(name: str):
+    if name in _TRITON_REFS:
+        from vllm.v1.worker.gpu import _triton_refs
+
+        return getattr(_triton_refs, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

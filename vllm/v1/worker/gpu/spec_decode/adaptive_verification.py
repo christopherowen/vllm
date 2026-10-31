@@ -61,37 +61,6 @@ def resolve_adaptive_cudagraph_mode(
     return CUDAGraphMode.FULL_AND_PIECEWISE
 
 
-# The reference ``tilelang_inputs.assign_draft_budget`` is tested against; the
-# manager no longer launches it.
-def _assign_draft_token_budget(
-    confidence_probs: torch.Tensor,
-    idx_mapping: torch.Tensor,
-    capacities: torch.Tensor,
-    draft_budget: int,
-    num_steps: int,
-) -> None:
-    """Admit the globally best `draft_budget` draft slots, in place.
-
-    Every (request, step) slot is scored by its survival probability, the running
-    product of that request's per-position confidences, and the highest scores win.
-    Survival only decreases along a request, so a global top-k always admits
-    continuously along steps with a request.
-
-    `capacities` enters holding each request's scheduled draft count (which bounds its
-    eligible slots) and leaves holding the admitted count. The caller only calls this
-    when `draft_budget < capacities.sum()`, so every winner is a real draft slot.
-    """
-    survival = confidence_probs[idx_mapping].cumprod(dim=1)
-    steps = torch.arange(num_steps, device=survival.device)
-    # Out-of-range slots score -inf so they never outrank a real draft.
-    out_of_range = steps[None, :] >= capacities[:, None]
-    survival = survival.masked_fill(out_of_range, -float("inf"))
-    flat = survival.flatten()
-    winners = flat.topk(draft_budget).indices
-    admitted = torch.zeros_like(flat, dtype=torch.bool).index_fill_(0, winners, True)
-    torch.sum(admitted.view_as(survival), dim=1, dtype=capacities.dtype, out=capacities)
-
-
 def preparation_tail_sizes(
     capture_sizes: Iterable[int], max_num_tokens: int
 ) -> tuple[int, ...]:
@@ -626,3 +595,14 @@ def maybe_create_adaptive_verification_manager(
         slot_draft_limits=slot_draft_limits,
         tp_invariant_confidence=tp_invariant_confidence,
     )
+
+
+_TRITON_REFS = frozenset(("_assign_draft_token_budget",))
+
+
+def __getattr__(name: str):
+    if name in _TRITON_REFS:
+        from vllm.v1.worker.gpu import _triton_refs
+
+        return getattr(_triton_refs, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

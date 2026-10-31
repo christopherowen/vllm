@@ -7,7 +7,6 @@ import numpy as np
 import torch
 
 from vllm.logger import init_logger
-from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import (
     async_tensor_h2d,
@@ -320,53 +319,6 @@ class FusedStagedWriter:
             t.clear_staged_writes()
 
 
-# The reference the TileLang write (``tilelang_inputs.apply_write_kernel``) is
-# tested against; the runner no longer launches it.
-@triton.jit
-def _apply_write_kernel(
-    output_ptr,  # MULTI_GROUP: ptr-to-ptrs [num_groups]; else: data ptr
-    output_stride,  # MULTI_GROUP: ptr-to-strides [num_groups]; else: row stride
-    write_indices_ptr,
-    write_starts_ptr,
-    write_contents_ptr,
-    write_cu_lens_ptr,
-    write_group_ids_ptr,  # [num_writes], used only when MULTI_GROUP
-    BLOCK_SIZE: tl.constexpr,
-    MULTI_GROUP: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    row_idx = tl.load(write_indices_ptr + pid)
-    start_idx = tl.load(write_starts_ptr + pid)
-
-    cu_start = tl.load(write_cu_lens_ptr + pid - 1) if pid > 0 else 0
-    cu_end = tl.load(write_cu_lens_ptr + pid)
-    content_len = cu_end - cu_start
-
-    if MULTI_GROUP:
-        # Each write targets a different output tensor (KV cache group);
-        # resolve its base pointer and row stride per write.
-        group_id = tl.load(write_group_ids_ptr + pid)
-        row_ptr = _load_ptr(output_ptr + group_id, tl.int32)
-        row_stride = tl.load(output_stride + group_id)
-    else:
-        row_ptr = output_ptr
-        row_stride = output_stride
-    row_ptr += row_idx * row_stride + start_idx
-
-    for i in range(0, content_len, BLOCK_SIZE):
-        block = i + tl.arange(0, BLOCK_SIZE)
-        mask = block < content_len
-        content = tl.load(write_contents_ptr + cu_start + block, mask=mask)
-        tl.store(row_ptr + block, content, mask=mask)
-
-
-@triton.jit
-def _load_ptr(ptr_to_ptr, elem_dtype):
-    ptr = tl.load(ptr_to_ptr)
-    ptr = tl.cast(ptr, tl.pointer_type(elem_dtype))
-    return tl.multiple_of(ptr, 16)
-
-
 def declare_staged_write_kernels() -> None:
     """Declare the write of every element type a ``StagedWriteTensor`` may have and
     ``FusedStagedWriter``'s: keyed by element type alone, they cover the request
@@ -374,3 +326,14 @@ def declare_staged_write_kernels() -> None:
     from vllm.v1.worker.gpu import tilelang_inputs
 
     tilelang_inputs.declare(tilelang_inputs.staged_write_calls)
+
+
+_TRITON_REFS = frozenset(("_apply_write_kernel", "_load_ptr"))
+
+
+def __getattr__(name: str):
+    if name in _TRITON_REFS:
+        from vllm.v1.worker.gpu import _triton_refs
+
+        return getattr(_triton_refs, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -19,7 +19,6 @@ from math import prod
 import torch
 
 from vllm.distributed import tensor_model_parallel_all_gather
-from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import round_up
 from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
     greedy_shard_pair,
@@ -109,44 +108,6 @@ def vocab_parallel_pairs_from_head(
     return pairs
 
 
-# Reference for ``tilelang_sampling`` (after dspark.greedy._select_first_argmax);
-# the runner no longer launches it.
-@triton.jit
-def _greedy_rejection_kernel(
-    sampled_ptr,
-    sampled_stride,
-    num_sampled_ptr,
-    target_ids_ptr,
-    draft_sampled_ptr,
-    cu_num_logits_ptr,
-):
-    req_idx = tl.program_id(0)
-    start_idx = tl.load(cu_num_logits_ptr + req_idx).to(tl.int64)
-    end_idx = tl.load(cu_num_logits_ptr + req_idx + 1).to(tl.int64)
-    num_draft_tokens = end_idx - start_idx - 1
-    accepted_length = tl.zeros((), tl.int64)
-    verifying = True
-    for i in range(num_draft_tokens):
-        if verifying:
-            draft = tl.load(draft_sampled_ptr + start_idx + i + 1).to(tl.int64)
-            target = tl.load(target_ids_ptr + start_idx + i)
-            # -1 is a placeholder draft that is always rejected.
-            accepted = (target == draft) & (draft >= 0)
-            tl.store(
-                sampled_ptr + req_idx * sampled_stride + i,
-                tl.where(accepted, draft, target),
-            )
-            verifying = accepted
-            accepted_length += accepted.to(tl.int64)
-    if accepted_length == num_draft_tokens:
-        # Every draft accepted: the bonus position's argmax.
-        tl.store(
-            sampled_ptr + req_idx * sampled_stride + num_draft_tokens,
-            tl.load(target_ids_ptr + start_idx + num_draft_tokens),
-        )
-    tl.store(num_sampled_ptr + req_idx, (accepted_length + 1).to(tl.int32))
-
-
 def register_greedy_verification_warmups(
     *,
     logits_dtype: torch.dtype,
@@ -196,3 +157,14 @@ def greedy_rejection_sample(
     return tilelang_sampling.greedy_rejection_sample(
         pairs, draft_sampled, cu_num_logits, num_speculative_steps, PAIR_WIDTH
     )
+
+
+_TRITON_REFS = frozenset(("_greedy_rejection_kernel",))
+
+
+def __getattr__(name: str):
+    if name in _TRITON_REFS:
+        from vllm.v1.worker.gpu import _triton_refs
+
+        return getattr(_triton_refs, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -22,33 +22,6 @@ _TL_RAND_MIN = tl.constexpr(4.6566127342e-10) if HAS_TRITON else 4.6566127342e-1
 _DRAFT_NOISE_SALT = tl.constexpr(1 << 30) if HAS_TRITON else (1 << 30)
 
 
-# Reference for ``tilelang_sampling``; the runner no longer launches it.
-@triton.jit
-def _temperature_kernel(
-    logits_ptr,
-    logits_stride,
-    expanded_idx_mapping_ptr,
-    temperature_ptr,
-    vocab_size,
-    BLOCK_SIZE: tl.constexpr,
-):
-    token_idx = tl.program_id(0).to(tl.int64)
-    req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
-    temperature = tl.load(temperature_ptr + req_state_idx).to(tl.float32)
-    if temperature == 0.0 or temperature == 1.0:
-        # Early return to avoid loading logits.
-        return
-
-    block_idx = tl.program_id(1)
-    block = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = block < vocab_size
-
-    logits = tl.load(logits_ptr + token_idx * logits_stride + block, mask=mask)
-    logits = logits.to(tl.float32)
-    logits = logits / temperature
-    tl.store(logits_ptr + token_idx * logits_stride + block, logits, mask=mask)
-
-
 def apply_temperature(
     logits: torch.Tensor,
     expanded_idx_mapping: torch.Tensor,
@@ -220,66 +193,6 @@ def gumbel_block_argmax(
     )
 
 
-# Reference for ``tilelang_sampling``; the runner no longer launches it.
-@triton.jit
-def _gumbel_sample_kernel(
-    local_argmax_ptr,
-    local_argmax_stride,
-    local_max_ptr,
-    local_max_stride,
-    # [max_num_reqs, num_cols, vocab_size]
-    logits_cache_ptr,
-    logits_cache_stride_0,
-    logits_cache_stride_1,
-    logits_cache_col_ptr,
-    logits_ptr,
-    logits_stride,
-    expanded_idx_mapping_ptr,
-    seeds_ptr,
-    pos_ptr,
-    temp_ptr,
-    vocab_size,
-    BLOCK_SIZE: tl.constexpr,
-    IS_DRAFTING: tl.constexpr,
-    APPLY_TEMPERATURE: tl.constexpr,
-    USE_FP64: tl.constexpr,
-    PER_TOKEN_COL: tl.constexpr,
-):
-    token_idx = tl.program_id(0).to(tl.int64)
-    block_idx = tl.program_id(1)
-    block = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = block < vocab_size
-    logits = tl.load(
-        logits_ptr + token_idx * logits_stride + block,
-        mask=mask,
-        other=float("-inf"),
-    )
-    logits = logits.to(tl.float32)
-
-    value, idx = gumbel_block_argmax(
-        logits,
-        block,
-        mask,
-        token_idx,
-        expanded_idx_mapping_ptr,
-        temp_ptr,
-        seeds_ptr,
-        pos_ptr,
-        logits_cache_ptr,
-        logits_cache_stride_0,
-        logits_cache_stride_1,
-        logits_cache_col_ptr,
-        vocab_size,
-        IS_DRAFTING=IS_DRAFTING,
-        APPLY_TEMPERATURE=APPLY_TEMPERATURE,
-        USE_FP64=USE_FP64,
-        PER_TOKEN_COL=PER_TOKEN_COL,
-    )
-    token_id = block_idx * BLOCK_SIZE + idx
-    tl.store(local_argmax_ptr + token_idx * local_argmax_stride + block_idx, token_id)
-    tl.store(local_max_ptr + token_idx * local_max_stride + block_idx, value)
-
-
 def register_sampling_warmups(
     *,
     logits: Sequence[tuple[torch.dtype, int]],
@@ -391,3 +304,14 @@ def warmup_processed_gumbel(
         is_drafting=False,
         use_fp64=use_fp64,
     )
+
+
+_TRITON_REFS = frozenset(("_temperature_kernel", "_gumbel_sample_kernel"))
+
+
+def __getattr__(name: str):
+    if name in _TRITON_REFS:
+        from vllm.v1.worker.gpu import _triton_refs
+
+        return getattr(_triton_refs, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

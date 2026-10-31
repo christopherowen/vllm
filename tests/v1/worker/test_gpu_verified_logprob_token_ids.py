@@ -72,16 +72,6 @@ class HostStagedTensor:
         self.writes.clear()
 
 
-class HostKernel:
-    """A Triton launch, ``kernel[grid](*args)``, by a torch reference."""
-
-    def __init__(self, fn):
-        self.fn = fn
-
-    def __getitem__(self, grid):
-        return self.fn
-
-
 def _fill_logprob_token_ids(
     out_ids,
     _ids_stride,
@@ -173,15 +163,6 @@ def host_runner(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     monkeypatch.setattr(tilelang_logprob, "token_ranks", _token_ranks)
     monkeypatch.setattr(logprob, "compute_token_logprobs", _compute_token_logprobs)
-    monkeypatch.setattr(
-        logprob.triton,
-        "next_power_of_2",
-        lambda n: 1 << (n - 1).bit_length(),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        rejection_sampler, "_flatten_sampled_launcher", HostKernel(_flatten_sampled)
-    )
     # The TileLang launches the samplers reach, as torch on the host.
     monkeypatch.setattr(tilelang_inputs, "flatten_sampled", _flatten_sampled_rows)
     monkeypatch.setattr(
@@ -408,3 +389,123 @@ def test_greedy_verification_only_without_logprobs(neighbour, greedy):
         num_reqs=2, num_draft_tokens=4, idx_mapping_np=np.array([2, 6])
     )
     assert runner._verifies_greedily(batch, None) is greedy
+
+
+def test_tilelang_worker_modules_hold_no_live_triton_reference_kernels(monkeypatch):
+    """V2 GPU worker modules whose kernels have moved to TileLang do not hold
+    live Triton reference kernels, Triton dispatchers, or Triton module imports
+    in their runtime globals, while lazy attribute access still resolves the
+    parity-test reference kernels from ``vllm.v1.worker.gpu._triton_refs``."""
+    import importlib
+    import sys
+
+    monkeypatch.delitem(sys.modules, "vllm.v1.worker.gpu._triton_refs", raising=False)
+    triton_free_modules = (
+        "vllm.v1.worker.gpu.block_table",
+        "vllm.v1.worker.gpu.buffer_utils",
+        "vllm.v1.worker.gpu.input_batch",
+        "vllm.v1.worker.gpu.metrics.logits",
+        "vllm.v1.worker.gpu.sample.bad_words",
+        "vllm.v1.worker.gpu.sample.logit_bias",
+        "vllm.v1.worker.gpu.sample.logprob",
+        "vllm.v1.worker.gpu.sample.min_p",
+        "vllm.v1.worker.gpu.sample.penalties",
+        "vllm.v1.worker.gpu.sample.prompt_logprob",
+        "vllm.v1.worker.gpu.sample.sink",
+        "vllm.v1.worker.gpu.sample.thinking_budget",
+        "vllm.v1.worker.gpu.spec_decode.dflash.speculator",
+        "vllm.v1.worker.gpu.spec_decode.dspark.greedy",
+        "vllm.v1.worker.gpu.spec_decode.greedy_verification",
+        "vllm.v1.worker.gpu.spec_decode.rejection_sampler",
+        "vllm.v1.worker.gpu.structured_outputs",
+    )
+    for mod_name in triton_free_modules:
+        mod = importlib.import_module(mod_name)
+        assert "triton" not in mod.__dict__, mod_name
+        assert "tl" not in mod.__dict__, mod_name
+        with pytest.raises(AttributeError):
+            getattr(mod, "_nonexistent_triton_ref_attr")
+
+    assert "vllm.v1.worker.gpu._triton_refs" not in sys.modules
+    assert "_flatten_sampled_launcher" not in rejection_sampler.__dict__
+
+    lazy_refs = {
+        "vllm.v1.worker.gpu.block_table": (
+            "_gather_block_tables_kernel",
+            "_compute_slot_mappings_kernel",
+        ),
+        "vllm.v1.worker.gpu.boundary_checkpoint": ("prepare_boundary_capture",),
+        "vllm.v1.worker.gpu.buffer_utils": ("_apply_write_kernel", "_load_ptr"),
+        "vllm.v1.worker.gpu.cp_utils": ("cp_local_slot",),
+        "vllm.v1.worker.gpu.input_batch": (
+            "_prepare_prefill_inputs_kernel",
+            "_prepare_pos_seq_lens_kernel",
+            "_combine_sampled_and_draft_tokens_kernel",
+            "_get_num_sampled_and_rejected_kernel",
+            "_post_update_kernel",
+            "_post_update_num_computed_tokens_kernel",
+            "_expand_idx_mapping_kernel",
+        ),
+        "vllm.v1.worker.gpu.metrics.logits": ("_num_nans_kernel",),
+        "vllm.v1.worker.gpu.sample.bad_words": ("_bad_words_kernel",),
+        "vllm.v1.worker.gpu.sample.gumbel": (
+            "_temperature_kernel",
+            "_gumbel_sample_kernel",
+        ),
+        "vllm.v1.worker.gpu.sample.logit_bias": ("_bias_kernel",),
+        "vllm.v1.worker.gpu.sample.logprob": (
+            "_topk_log_softmax_kernel",
+            "_ranks_kernel",
+            "_fill_logprob_token_ids_kernel",
+        ),
+        "vllm.v1.worker.gpu.sample.min_p": ("_min_p_kernel",),
+        "vllm.v1.worker.gpu.sample.penalties": (
+            "_penalties_kernel",
+            "_bincount_kernel",
+        ),
+        "vllm.v1.worker.gpu.sample.prompt_logprob": (
+            "_prompt_logprobs_token_ids_kernel",
+        ),
+        "vllm.v1.worker.gpu.sample.sink": (
+            "_sink_candidates_kernel",
+            "_sink_policy_kernel",
+        ),
+        "vllm.v1.worker.gpu.sample.thinking_budget": (
+            "_load_effective_token",
+            "_update_committed_marker_cache_kernel",
+            "_thinking_budget_kernel",
+        ),
+        "vllm.v1.worker.gpu.spec_decode.adaptive_verification": (
+            "_assign_draft_token_budget",
+        ),
+        "vllm.v1.worker.gpu.spec_decode.dflash.speculator": (
+            "_prepare_dflash_inputs_kernel",
+        ),
+        "vllm.v1.worker.gpu.spec_decode.dspark.greedy": (
+            "_first_argmax",
+            "_partial_argmax",
+            "_partial_argmax_logits",
+            "_finish_argmax",
+            "_finish_argmax_pair",
+            "_select_first_argmax",
+        ),
+        "vllm.v1.worker.gpu.spec_decode.greedy_verification": (
+            "_greedy_rejection_kernel",
+        ),
+        "vllm.v1.worker.gpu.spec_decode.rejection_sampler": (
+            "_flatten_sampled_kernel",
+        ),
+        "vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils": (
+            "_insert_resampled_kernel",
+        ),
+        "vllm.v1.worker.gpu.structured_outputs": ("_apply_grammar_bitmask_kernel",),
+    }
+    from vllm.v1.worker.gpu import _triton_refs
+
+    for mod_name, names in lazy_refs.items():
+        mod = importlib.import_module(mod_name)
+        for name in names:
+            assert name not in mod.__dict__, f"{mod_name}.{name} should be lazy"
+            assert getattr(mod, name) is getattr(_triton_refs, name)
+        with pytest.raises(AttributeError):
+            getattr(mod, "_nonexistent_triton_ref_attr")

@@ -9,12 +9,7 @@ import torch
 
 from vllm.config import SpeculativeConfig, get_current_vllm_config
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
-from vllm.model_executor.warmup.jit_warmup_triton_helper import (
-    TritonWarmupTensor,
-    triton_kernel_dispatcher_with_warmup,
-    triton_warmup_inputs,
-)
-from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
@@ -67,48 +62,6 @@ def _iter_request_chunks(
         end = min(num_reqs, max(start + 1, end))
         yield start, end
         start = end
-
-
-@triton.jit
-def _flatten_sampled_kernel(
-    # [num_logits]
-    flat_sampled_ptr,
-    # [num_reqs, num_speculative_steps + 1]
-    sampled_ptr,
-    sampled_stride,
-    # [num_reqs]
-    num_sampled_ptr,
-    # [num_reqs + 1]
-    cu_num_logits_ptr,
-):
-    req_idx = tl.program_id(0)
-    start_idx = tl.load(cu_num_logits_ptr + req_idx)
-    num_sampled = tl.load(num_sampled_ptr + req_idx)
-    for i in range(num_sampled):
-        token_id = tl.load(sampled_ptr + req_idx * sampled_stride + i)
-        tl.store(flat_sampled_ptr + start_idx + i, token_id)
-
-
-def _flatten_sampled_warmup_inputs(*, sampled_stride: int) -> dict[str, Any]:
-    int64 = TritonWarmupTensor(torch.int64)
-    int32 = TritonWarmupTensor(torch.int32)
-    return triton_warmup_inputs(
-        _flatten_sampled_kernel,
-        int64,
-        int64,
-        sampled_stride,
-        int32,
-        int32,
-        grid=(1,),
-        num_warps=1,
-    )
-
-
-# The reference ``tilelang_inputs.flatten_sampled_kernel`` is tested against; the
-# rejection sampler no longer launches it.
-_flatten_sampled_launcher = triton_kernel_dispatcher_with_warmup(
-    warmup_inputs=_flatten_sampled_warmup_inputs
-)(_flatten_sampled_kernel)
 
 
 @dataclass
@@ -189,7 +142,7 @@ class RejectionSampler:
             (False, True) if dead_rows and not self.use_block_verification else (False,)
         )
         register_insert(
-            triton.cdiv(vocab_size, _RESAMPLE_BLOCK_SIZE),
+            cdiv(vocab_size, _RESAMPLE_BLOCK_SIZE),
             self.sampler.use_fp64_gumbel,
             self.num_speculative_steps + 1,
             limits,
@@ -562,3 +515,14 @@ class RejectionSampler:
             num_rejected=num_rejected,
             sink_alternates=alternates,
         )
+
+
+_TRITON_REFS = frozenset(("_flatten_sampled_kernel",))
+
+
+def __getattr__(name: str):
+    if name in _TRITON_REFS:
+        from vllm.v1.worker.gpu import _triton_refs
+
+        return getattr(_triton_refs, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

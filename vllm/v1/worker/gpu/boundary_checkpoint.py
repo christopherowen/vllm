@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
-from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.triton_utils import tl, triton
 from vllm.v1.core.boundary_checkpoint import (
     INSTRUCTION_CHECKPOINT_SLOT,
     MAX_BOUNDARY_STOP_TOKENS,
@@ -26,162 +26,6 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
     from vllm.v1.worker.gpu.model_states.interface import ModelState
     from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
-
-_PROMPT_CHECKPOINT_SLOT = (
-    tl.constexpr(PROMPT_CHECKPOINT_SLOT) if HAS_TRITON else PROMPT_CHECKPOINT_SLOT
-)
-_RESPONSE_CHECKPOINT_SLOT = (
-    tl.constexpr(RESPONSE_CHECKPOINT_SLOT) if HAS_TRITON else RESPONSE_CHECKPOINT_SLOT
-)
-_INSTRUCTION_CHECKPOINT_SLOT = (
-    tl.constexpr(INSTRUCTION_CHECKPOINT_SLOT)
-    if HAS_TRITON
-    else INSTRUCTION_CHECKPOINT_SLOT
-)
-_PREFILL_TAIL_CHECKPOINT_SLOT = (
-    tl.constexpr(PREFILL_TAIL_CHECKPOINT_SLOT)
-    if HAS_TRITON
-    else PREFILL_TAIL_CHECKPOINT_SLOT
-)
-
-
-@triton.jit
-def prepare_boundary_capture(
-    req_idx,
-    batch_idx,
-    num_computed,
-    total_len,
-    query_start,
-    query_len,
-    num_sampled,
-    num_rejected,
-    sampled_tokens_ptr,
-    sampled_stride,
-    metadata_ptr,
-    stop_tokens_ptr,
-    seen_ptr,
-    capture_tokens_ptr,
-    capture_bias_ptr,
-    capture_rows_ptr,
-    STOP_CAPACITY: tl.constexpr,
-    NUM_CAPTURES: tl.constexpr,
-    METADATA_WIDTH: tl.constexpr,
-):
-    metadata_offset = req_idx * METADATA_WIDTH
-    enabled = tl.load(metadata_ptr + metadata_offset)
-    prompt_capture = 0
-    response_capture = 0
-    instruction_capture = 0
-    prefill_tail_capture = 0
-    if enabled:
-        prompt_len = tl.load(metadata_ptr + metadata_offset + 1)
-        instruction_len = tl.load(metadata_ptr + metadata_offset + 2)
-        min_len = tl.load(metadata_ptr + metadata_offset + 3)
-        max_len = tl.load(metadata_ptr + metadata_offset + 4)
-        num_stops = tl.load(metadata_ptr + metadata_offset + 5)
-        prefill_tail_len = tl.load(metadata_ptr + metadata_offset + 6)
-        offsets = tl.arange(0, STOP_CAPACITY)
-        stops = tl.load(
-            stop_tokens_ptr + req_idx * STOP_CAPACITY + offsets,
-            offsets < num_stops,
-            other=-1,
-        )
-        stopped = False
-        valid = num_sampled
-        for i in range(num_sampled):
-            token = tl.load(sampled_tokens_ptr + batch_idx * sampled_stride + i)
-            length = total_len + i + 1
-            is_stop = (
-                tl.sum(((stops == token) & (offsets < num_stops)).to(tl.int32)) > 0
-            )
-            if not stopped and length >= min_len and (is_stop or length >= max_len):
-                valid = i + 1
-                stopped = True
-        num_rejected += num_sampled - valid
-        num_sampled = valid
-        computed_after = num_computed + query_len - num_rejected
-        if (
-            num_computed < prompt_len
-            and computed_after == prompt_len
-            and tl.load(seen_ptr + req_idx * NUM_CAPTURES + _PROMPT_CHECKPOINT_SLOT)
-            == 0
-        ):
-            prompt_capture = prompt_len
-            tl.store(seen_ptr + req_idx * NUM_CAPTURES + _PROMPT_CHECKPOINT_SLOT, 1)
-        if (
-            instruction_len > 0
-            and num_computed < instruction_len
-            and computed_after == instruction_len
-            and tl.load(
-                seen_ptr + req_idx * NUM_CAPTURES + _INSTRUCTION_CHECKPOINT_SLOT
-            )
-            == 0
-        ):
-            instruction_capture = instruction_len
-            tl.store(
-                seen_ptr + req_idx * NUM_CAPTURES + _INSTRUCTION_CHECKPOINT_SLOT, 1
-            )
-        if (
-            prefill_tail_len > 0
-            and num_computed < prefill_tail_len
-            and computed_after == prefill_tail_len
-            and tl.load(
-                seen_ptr + req_idx * NUM_CAPTURES + _PREFILL_TAIL_CHECKPOINT_SLOT
-            )
-            == 0
-        ):
-            prefill_tail_capture = prefill_tail_len
-            tl.store(
-                seen_ptr + req_idx * NUM_CAPTURES + _PREFILL_TAIL_CHECKPOINT_SLOT, 1
-            )
-        if (
-            stopped
-            and tl.load(seen_ptr + req_idx * NUM_CAPTURES + _RESPONSE_CHECKPOINT_SLOT)
-            == 0
-        ):
-            response_capture = computed_after
-            tl.store(seen_ptr + req_idx * NUM_CAPTURES + _RESPONSE_CHECKPOINT_SLOT, 1)
-
-    output_offset = batch_idx * NUM_CAPTURES
-    tl.store(
-        capture_tokens_ptr + output_offset + _PROMPT_CHECKPOINT_SLOT, prompt_capture
-    )
-    tl.store(
-        capture_tokens_ptr + output_offset + _RESPONSE_CHECKPOINT_SLOT,
-        response_capture,
-    )
-    tl.store(
-        capture_tokens_ptr + output_offset + _INSTRUCTION_CHECKPOINT_SLOT,
-        instruction_capture,
-    )
-    tl.store(capture_bias_ptr + output_offset + _PROMPT_CHECKPOINT_SLOT, 0)
-    tl.store(
-        capture_bias_ptr + output_offset + _RESPONSE_CHECKPOINT_SLOT,
-        tl.maximum(num_sampled - 1, 0),
-    )
-    tl.store(capture_bias_ptr + output_offset + _INSTRUCTION_CHECKPOINT_SLOT, 0)
-    tl.store(
-        capture_tokens_ptr + output_offset + _PREFILL_TAIL_CHECKPOINT_SLOT,
-        prefill_tail_capture,
-    )
-    tl.store(capture_bias_ptr + output_offset + _PREFILL_TAIL_CHECKPOINT_SLOT, 0)
-    tl.store(
-        capture_rows_ptr + output_offset + _PREFILL_TAIL_CHECKPOINT_SLOT,
-        query_start + prefill_tail_capture - num_computed - 1,
-    )
-    tl.store(
-        capture_rows_ptr + output_offset + _PROMPT_CHECKPOINT_SLOT,
-        query_start + prompt_capture - num_computed - 1,
-    )
-    tl.store(
-        capture_rows_ptr + output_offset + _RESPONSE_CHECKPOINT_SLOT,
-        query_start + response_capture - num_computed - 1,
-    )
-    tl.store(
-        capture_rows_ptr + output_offset + _INSTRUCTION_CHECKPOINT_SLOT,
-        query_start + instruction_capture - num_computed - 1,
-    )
-    return num_sampled, num_rejected
 
 
 @triton.jit
@@ -927,3 +771,14 @@ class BoundaryCheckpointState:
             size *= dim
         row = self.pool[block_id, offset:]
         return row.view(dtype)[:size].view(1, *shape)
+
+
+_TRITON_REFS = frozenset(("prepare_boundary_capture",))
+
+
+def __getattr__(name: str):
+    if name in _TRITON_REFS:
+        from vllm.v1.worker.gpu import _triton_refs
+
+        return getattr(_triton_refs, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

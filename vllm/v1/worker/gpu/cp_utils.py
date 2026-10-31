@@ -64,22 +64,12 @@ def _dcp_local_seq_lens_kernel(
     tl.store(out_ptr + block, local_seq_lens, mask=block < max_num_reqs)
 
 
-@triton.jit
-def cp_local_slot(
-    positions,
-    block_numbers,
-    block_size,
-    cp_rank,
-    CP_SIZE: tl.constexpr,
-    CP_INTERLEAVE: tl.constexpr,
-    PAD_ID: tl.constexpr,
-):
-    """Return rank-local KV slots, or PAD_ID for positions not owned by this rank."""
-    block_offsets = positions % (block_size * CP_SIZE)
-    if CP_SIZE == 1:
-        return block_numbers * block_size + block_offsets
-    is_local = block_offsets // CP_INTERLEAVE % CP_SIZE == cp_rank
-    rounds = block_offsets // (CP_INTERLEAVE * CP_SIZE)
-    remainder = block_offsets % CP_INTERLEAVE
-    local_offsets = rounds * CP_INTERLEAVE + remainder
-    return tl.where(is_local, block_numbers * block_size + local_offsets, PAD_ID)
+_TRITON_REFS = frozenset(("cp_local_slot",))
+
+
+def __getattr__(name: str):
+    if name in _TRITON_REFS:
+        from vllm.v1.worker.gpu import _triton_refs
+
+        return getattr(_triton_refs, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -4,14 +4,12 @@ from collections.abc import Iterable
 
 import torch
 
-from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheSpec
 from vllm.v1.worker.gpu.buffer_utils import (
     FusedStagedWriter,
     StagedWriteTensor,
     UvaBackedTensor,
-    _load_ptr,
 )
 
 
@@ -275,145 +273,6 @@ class BlockTables:
         return self.slot_mappings[:, :num_tokens]
 
 
-# The Triton kernels below are the reference the TileLang kernels
-# (``tilelang_inputs``) are tested against; the runner no longer launches them.
-
-
-@triton.jit(do_not_specialize=["num_reqs"])
-def _gather_block_tables_kernel(
-    batch_idx_to_req_idx,  # [batch_size]
-    src_block_table_ptrs,  # [num_kv_cache_groups]
-    dst_block_table_ptrs,  # [num_kv_cache_groups]
-    block_table_strides,  # [num_kv_cache_groups]
-    num_blocks_ptr,  # [num_kv_cache_groups, max_num_reqs]
-    num_blocks_stride,
-    num_reqs,  # actual number of requests (for padding)
-    BLOCK_SIZE: tl.constexpr,
-):
-    # kv cache group id
-    group_id = tl.program_id(0)
-    batch_idx = tl.program_id(1)
-
-    stride = tl.load(block_table_strides + group_id)
-    max_num_blocks = stride  # stride equals max_num_blocks for this group.
-    dst_block_table_ptr = _load_ptr(dst_block_table_ptrs + group_id, tl.int32)
-    dst_row_ptr = dst_block_table_ptr + batch_idx * stride
-
-    if batch_idx >= num_reqs:
-        # Zero out padded rows.
-        for i in tl.range(0, max_num_blocks, BLOCK_SIZE):
-            offset = i + tl.arange(0, BLOCK_SIZE)
-            tl.store(dst_row_ptr + offset, 0, mask=offset < max_num_blocks)
-        return
-
-    req_idx = tl.load(batch_idx_to_req_idx + batch_idx)
-    group_num_blocks_ptr = num_blocks_ptr + group_id * num_blocks_stride
-    num_blocks = tl.load(group_num_blocks_ptr + req_idx)
-
-    src_block_table_ptr = _load_ptr(src_block_table_ptrs + group_id, tl.int32)
-    src_row_ptr = src_block_table_ptr + req_idx * stride
-
-    for i in tl.range(0, num_blocks, BLOCK_SIZE):
-        offset = i + tl.arange(0, BLOCK_SIZE)
-        block_ids = tl.load(src_row_ptr + offset, mask=offset < num_blocks)
-        tl.store(dst_row_ptr + offset, block_ids, mask=offset < num_blocks)
-
-    for i in tl.range(num_blocks, max_num_blocks, BLOCK_SIZE):
-        offset = i + tl.arange(0, BLOCK_SIZE)
-        tl.store(dst_row_ptr + offset, 0, mask=offset < max_num_blocks)
-
-
-@triton.jit
-def _compute_slot_mappings_kernel(
-    max_num_tokens,
-    idx_mapping,  # [num_reqs]
-    query_start_loc,  # [num_reqs + 1]
-    pos,  # [num_tokens]
-    block_table_ptrs,  # [num_kv_cache_groups]
-    block_table_strides,  # [num_kv_cache_groups]
-    num_blocks_ptr,  # [num_kv_cache_groups, max_num_reqs]
-    num_blocks_stride,
-    block_sizes,  # [num_kv_cache_groups]
-    kernel_block_sizes,  # [num_kv_cache_groups]
-    slot_mapping_enabled,  # [num_kv_cache_groups]
-    slot_mapping_circular,  # [num_kv_cache_groups]
-    group_cp_sizes,  # [num_kv_cache_groups]
-    slot_mappings_ptr,  # [num_kv_cache_groups, max_num_tokens]
-    slot_mappings_stride,
-    cp_rank,
-    CP_SIZE: tl.constexpr,
-    CP_INTERLEAVE: tl.constexpr,
-    PAD_ID: tl.constexpr,
-    TRITON_BLOCK_SIZE: tl.constexpr,
-):
-    # kv cache group id
-    group_id = tl.program_id(0)
-    batch_idx = tl.program_id(1)
-    slot_mapping_ptr = slot_mappings_ptr + group_id * slot_mappings_stride
-
-    if batch_idx == tl.num_programs(1) - 1:
-        # Pad remaining slots to -1. This is needed for CUDA graphs.
-        # Start from actual token count (not padded) to cover the gap
-        # between actual tokens and padded tokens that can contain stale
-        # valid slot IDs from previous chunks during chunked prefill.
-        actual_num_tokens = tl.load(query_start_loc + batch_idx)
-        for i in range(actual_num_tokens, max_num_tokens, TRITON_BLOCK_SIZE):
-            offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
-            tl.store(slot_mapping_ptr + offset, PAD_ID, mask=offset < max_num_tokens)
-        return
-
-    block_table_ptr = _load_ptr(block_table_ptrs + group_id, tl.int32)
-    block_table_stride = tl.load(block_table_strides + group_id)
-    group_num_blocks_ptr = num_blocks_ptr + group_id * num_blocks_stride
-    kv_block_size = tl.load(block_sizes + group_id)
-    kernel_block_size = tl.load(kernel_block_sizes + group_id)
-    mapping_enabled = tl.load(slot_mapping_enabled + group_id)
-    circular = tl.load(slot_mapping_circular + group_id)
-    group_cp_size = tl.load(group_cp_sizes + group_id)
-
-    req_state_idx = tl.load(idx_mapping + batch_idx)
-    num_blocks = tl.load(group_num_blocks_ptr + req_state_idx)
-    start_idx = tl.load(query_start_loc + batch_idx)
-    end_idx = tl.load(query_start_loc + batch_idx + 1)
-    for i in range(start_idx, end_idx, TRITON_BLOCK_SIZE):
-        offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
-        token_mask = offset < end_idx
-        positions = tl.load(pos + offset, mask=token_mask, other=0)
-
-        if CP_SIZE == 1 or group_cp_size == 1:
-            # Common case: Context parallelism is not used.
-            local_positions = positions
-            is_local = token_mask
-        else:
-            # Context parallelism is used.
-            virtual_block_size = kv_block_size * CP_SIZE
-            virtual_block_indices = positions // virtual_block_size
-            virtual_block_offsets = positions % virtual_block_size
-            is_local = virtual_block_offsets // CP_INTERLEAVE % CP_SIZE == cp_rank
-            rounds = virtual_block_offsets // (CP_INTERLEAVE * CP_SIZE)
-            remainder = virtual_block_offsets % CP_INTERLEAVE
-            local_offsets = rounds * CP_INTERLEAVE + remainder
-            local_positions = virtual_block_indices * kv_block_size + local_offsets
-
-        block_indices = tl.where(
-            mapping_enabled & ~circular, local_positions // kernel_block_size, 0
-        )
-        block_offsets = local_positions % kernel_block_size
-        valid_block = token_mask & (block_indices < num_blocks)
-        block_numbers = tl.load(
-            block_table_ptr + req_state_idx * block_table_stride + block_indices,
-            mask=is_local & valid_block,
-            other=0,
-        )
-        slot_ids = block_numbers * kernel_block_size + block_offsets
-        if CP_SIZE != 1 and group_cp_size != 1:
-            slot_ids = tl.where(is_local, slot_ids, PAD_ID)
-        slot_ids = tl.where(valid_block, slot_ids, PAD_ID)
-
-        slot_ids = tl.where(mapping_enabled, slot_ids, PAD_ID)
-        tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)
-
-
 def declare_block_table_kernels(*, cp_size: int, cp_interleave: int) -> None:
     """Declare the gather of a step's block tables and its slot mappings for
     ``BlockTables`` with at least one KV cache group (per-group geometry is tensor
@@ -423,3 +282,16 @@ def declare_block_table_kernels(*, cp_size: int, cp_interleave: int) -> None:
     tilelang_inputs.declare(
         lambda: tilelang_inputs.block_table_calls(cp_size, cp_interleave)
     )
+
+
+_TRITON_REFS = frozenset(
+    ("_gather_block_tables_kernel", "_compute_slot_mappings_kernel")
+)
+
+
+def __getattr__(name: str):
+    if name in _TRITON_REFS:
+        from vllm.v1.worker.gpu import _triton_refs
+
+        return getattr(_triton_refs, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

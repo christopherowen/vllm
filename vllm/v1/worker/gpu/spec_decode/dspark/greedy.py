@@ -4,128 +4,9 @@
 
 import torch
 
-from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import cdiv
 
 _BLOCK = 2048
-
-
-@triton.jit
-def _first_argmax(av, ai, bv, bi):
-    a_nan = av != av
-    b_nan = bv != bv
-    take_a = (a_nan & (~b_nan | (ai < bi))) | (
-        ~a_nan & ~b_nan & ((av > bv) | ((av == bv) & (ai < bi)))
-    )
-    return tl.where(take_a, av, bv), tl.where(take_a, ai, bi)
-
-
-# Reference for ``tilelang_sampling``; the runner no longer launches it.
-@triton.jit
-def _partial_argmax(
-    base,
-    bias,
-    values,
-    indices,
-    base_stride,
-    bias_stride,
-    VOCAB: tl.constexpr,
-    PARTS: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0)
-    part = tl.program_id(1)
-    col = part * BLOCK + tl.arange(0, BLOCK)
-    a = tl.load(base + row * base_stride + col, col < VOCAB, other=0)
-    b = tl.load(bias + row * bias_stride + col, col < VOCAB, other=0)
-    # Preserve the materialized torch.add rounding before comparing logits.
-    summed = (
-        (a.to(tl.float32) + b.to(tl.float32)).to(base.dtype.element_ty).to(tl.float32)
-    )
-    summed = tl.where(col < VOCAB, summed, -float("inf"))
-    idx = tl.where(col < VOCAB, col, 2147483647)
-    value, index = tl.reduce((summed, idx), 0, _first_argmax)
-    tl.store(values + row * PARTS + part, value)
-    tl.store(indices + row * PARTS + part, index)
-
-
-# Reference for ``tilelang_sampling``; the runner no longer launches it.
-@triton.jit
-def _partial_argmax_logits(
-    logits,
-    values,
-    indices,
-    logits_stride,
-    VOCAB: tl.constexpr,
-    PARTS: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0)
-    part = tl.program_id(1)
-    col = part * BLOCK + tl.arange(0, BLOCK)
-    value = tl.load(logits + row * logits_stride + col, col < VOCAB, other=0)
-    value = tl.where(col < VOCAB, value.to(tl.float32), -float("inf"))
-    idx = tl.where(col < VOCAB, col, 2147483647)
-    best, index = tl.reduce((value, idx), 0, _first_argmax)
-    tl.store(values + row * PARTS + part, best)
-    tl.store(indices + row * PARTS + part, index)
-
-
-# Reference for ``tilelang_sampling``; the runner no longer launches it.
-@triton.jit
-def _finish_argmax(
-    values,
-    indices,
-    output,
-    output_stride,
-    PARTS: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0)
-    part = tl.arange(0, BLOCK)
-    value = tl.load(values + row * PARTS + part, part < PARTS, other=-float("inf"))
-    index = tl.load(indices + row * PARTS + part, part < PARTS, other=2147483647)
-    _, result = tl.reduce((value, index), 0, _first_argmax)
-    tl.store(output + row * output_stride, result)
-
-
-# Reference for ``tilelang_sampling``; the runner no longer launches it.
-@triton.jit
-def _finish_argmax_pair(
-    values,
-    indices,
-    pairs,
-    vocab_start,
-    PARTS: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0)
-    part = tl.arange(0, BLOCK)
-    value = tl.load(values + row * PARTS + part, part < PARTS, other=-float("inf"))
-    index = tl.load(indices + row * PARTS + part, part < PARTS, other=2147483647)
-    best, result = tl.reduce((value, index), 0, _first_argmax)
-    tl.store(pairs + row * 2, best)
-    tl.store(pairs + row * 2 + 1, (result + vocab_start).to(tl.float32))
-
-
-# Reference for ``tilelang_sampling``; the runner no longer launches it.
-@triton.jit
-def _select_first_argmax(
-    pairs,
-    output,
-    output_stride,
-    RANKS: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0)
-    rank = tl.arange(0, BLOCK)
-    value = tl.load(
-        pairs + row * 2 * RANKS + 2 * rank, rank < RANKS, other=-float("inf")
-    )
-    index = tl.load(
-        pairs + row * 2 * RANKS + 2 * rank + 1, rank < RANKS, other=1073741824.0
-    )
-    _, result = tl.reduce((value, index.to(tl.int32)), 0, _first_argmax)
-    tl.store(output + row * output_stride, result)
 
 
 def register_greedy_markov_shard_pair_warmup(
@@ -281,7 +162,7 @@ def markov_anchor_embed(
 
 
 def scratch_shape(max_requests: int, vocabulary_size: int) -> tuple[int, int]:
-    return max_requests, triton.cdiv(vocabulary_size, _BLOCK)
+    return max_requests, cdiv(vocabulary_size, _BLOCK)
 
 
 def sample_greedy_markov(
@@ -314,3 +195,23 @@ def sample_greedy_markov(
     tilelang_sampling.sample_greedy_markov(
         base_logits, markov_bias, output, partial_values, partial_indices
     )
+
+
+_TRITON_REFS = frozenset(
+    (
+        "_first_argmax",
+        "_partial_argmax",
+        "_partial_argmax_logits",
+        "_finish_argmax",
+        "_finish_argmax_pair",
+        "_select_first_argmax",
+    )
+)
+
+
+def __getattr__(name: str):
+    if name in _TRITON_REFS:
+        from vllm.v1.worker.gpu import _triton_refs
+
+        return getattr(_triton_refs, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
