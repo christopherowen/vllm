@@ -14,6 +14,8 @@ projection, which reads the packed bytes directly: B12X's prepared projection,
 or TileLang's with the TileLang linear backend.
 """
 
+import importlib.util
+
 import torch
 from torch.nn import Parameter
 
@@ -21,19 +23,28 @@ from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+from vllm.platforms import current_platform
 from vllm.utils.b12x import get_b12x_packed_bf16_vocab_projection
 
 logger = init_logger(__name__)
 
 
-def packed_bf16_supported(input_size: int, params_dtype: torch.dtype) -> bool:
-    projection = get_b12x_packed_bf16_vocab_projection()
+def _tilelang_packed_bf16_supported() -> bool:
     return (
-        projection is not None
-        and projection.is_supported()
-        and params_dtype == torch.bfloat16
-        and input_size % 128 == 0
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+        and importlib.util.find_spec("tilelang") is not None
     )
+
+
+def packed_bf16_supported(input_size: int, params_dtype: torch.dtype) -> bool:
+    if params_dtype != torch.bfloat16 or input_size <= 0 or input_size % 128 != 0:
+        return False
+    kernel_config = get_current_vllm_config().kernel_config
+    if kernel_config.linear_backend == "tilelang":
+        return _tilelang_packed_bf16_supported()
+    projection = get_b12x_packed_bf16_vocab_projection()
+    return projection is not None and projection.is_supported()
 
 
 class PackedBf16LmHeadMethod(QuantizeMethodBase):
@@ -73,15 +84,24 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
-        projection = get_b12x_packed_bf16_vocab_projection()
-        assert projection is not None
         weight = layer.weight.data
         in_features = int(weight.shape[1])
         # In place: the packed rows take the first three quarters of the BF16
         # head's own storage, so loading frees nothing the BF16 head would not.
         # On GB10 freed memory stays charged to the process, so an extra
         # allocation and free here would cost host memory for good.
-        packed = projection.pack(weight, in_place=True)
+        if self.tilelang:
+            from vllm.models.deepseek_v4_1.tilelang.vocab import pack_bf16_weight
+
+            packed = pack_bf16_weight(weight, in_place=True)
+        else:
+            projection = get_b12x_packed_bf16_vocab_projection()
+            if projection is not None:
+                packed = projection.pack(weight, in_place=True)
+            else:
+                from vllm.models.deepseek_v4_1.tilelang.vocab import pack_bf16_weight
+
+                packed = pack_bf16_weight(weight, in_place=True)
         del weight
         replace_parameter(layer, "weight", packed.values)
         replace_parameter(layer, "weight_exception_rows", packed.exception_rows)
@@ -119,9 +139,21 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
     @staticmethod
     def packed_weight(layer: torch.nn.Module):
         """The layer's current packed tensors (after any relocation)."""
-        projection = get_b12x_packed_bf16_vocab_projection()
-        assert projection is not None
-        return projection.PackedBf16Weight(
+        tilelang_method = getattr(getattr(layer, "quant_method", None), "tilelang", False)
+        if not tilelang_method:
+            projection = get_b12x_packed_bf16_vocab_projection()
+            if projection is not None:
+                return projection.PackedBf16Weight(
+                    layer.weight,
+                    layer.packed_bf16_exponent_base,
+                    layer.weight_exception_rows,
+                    layer.weight_exception_entries,
+                    layer.weight_row_offsets,
+                    layer.packed_bf16_exceptions,
+                )
+        from vllm.models.deepseek_v4_1.tilelang.vocab import PackedBf16Weight
+
+        return PackedBf16Weight(
             layer.weight,
             layer.packed_bf16_exponent_base,
             layer.weight_exception_rows,

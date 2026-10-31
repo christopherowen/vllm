@@ -16,10 +16,11 @@ if not (
     pytest.skip("TileLang V4.1 kernels target SM120/SM121", allow_module_level=True)
 
 pytest.importorskip("tilelang")
-packed_format = pytest.importorskip("b12x.gemm.packed_bf16_vocab_projection")
 
+from vllm.models.deepseek_v4_1.tilelang import vocab as packed_format  # noqa: E402
 from vllm.models.deepseek_v4_1.tilelang.vocab import (  # noqa: E402
     ROW_TILES,
+    pack_bf16_weight,
     packed_vocab_projection,
     prepare_bf16_head,
     prepare_packed_head,
@@ -27,6 +28,7 @@ from vllm.models.deepseek_v4_1.tilelang.vocab import (  # noqa: E402
     project_head_greedy_pairs,
     row_tile,
     tile_config,
+    unpack_bf16_weight,
 )
 
 DEVICE = "cuda"
@@ -322,3 +324,58 @@ def test_project_head_greedy_pairs_borrows_workspace_and_reuses_layer_scratch(
     )
     assert ws_base <= p6_ws.data_ptr() < ws_end
     assert torch.equal(p6_ws[:, :2], expected[:6, :2])
+
+
+@pytest.mark.parametrize("n,k", [(512, 256), (2500, 512), (32320, 5120)])
+@pytest.mark.parametrize("in_place", [False, True])
+def test_tilelang_pack_bf16_weight_round_trips_and_matches_b12x(n, k, in_place):
+    weight = _head(n, k, seed=n + k + 41)
+    weight[0, :7] = torch.tensor(
+        [0.0, -0.0, 1e-30, 3.0, -2.5, 1e-7, 6e-39], dtype=torch.bfloat16, device=DEVICE
+    )
+    original = weight.clone()
+    packed = pack_bf16_weight(weight.clone() if in_place else weight, in_place=in_place)
+    assert packed.out_features == n and packed.in_features == k
+    assert packed.exceptions > 0
+    unpacked = unpack_bf16_weight(packed)
+    assert torch.equal(unpacked.view(torch.int16), original.view(torch.int16))
+
+    b12x_packed_mod = pytest.importorskip("b12x.gemm.packed_bf16_vocab_projection")
+    ref = b12x_packed_mod.pack(original.clone(), in_place=False)
+    assert packed.exponent_base == ref.exponent_base
+    assert packed.exceptions == ref.exceptions
+    assert torch.equal(packed.values, ref.values)
+    assert torch.equal(packed.row_offsets, ref.row_offsets)
+    assert torch.equal(packed.exception_rows, ref.exception_rows)
+    assert torch.equal(packed.exception_entries, ref.exception_entries)
+
+
+def test_packed_bf16_lm_head_method_tilelang_without_b12x(monkeypatch):
+    from vllm.config import KernelConfig, VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.quantization.online import packed_bf16 as pbf16_mod
+    from vllm.model_executor.layers.quantization.online.packed_bf16 import (
+        PackedBf16LmHeadMethod,
+        packed_bf16_supported,
+    )
+
+    config = VllmConfig(kernel_config=KernelConfig(linear_backend="tilelang"))
+    monkeypatch.setattr(
+        pbf16_mod, "get_b12x_packed_bf16_vocab_projection", lambda: None
+    )
+    with set_current_vllm_config(config):
+        assert packed_bf16_supported(512, torch.bfloat16)
+        method = PackedBf16LmHeadMethod()
+        assert method.tilelang
+        layer = torch.nn.Module()
+        with torch.device(DEVICE):
+            method.create_weights(layer, 512, [1000], 512, 1000, torch.bfloat16)
+        original = _head(1000, 512, seed=77)
+        layer.weight.data.copy_(original)
+        method.process_weights_after_loading(layer)
+        packed = method.packed_weight(layer)
+        assert torch.equal(
+            unpack_bf16_weight(packed).view(torch.int16), original.view(torch.int16)
+        )
+        method.declare_layer_kernels(layer)
+        x = (torch.randn(9, 512, device=DEVICE) * 0.5).bfloat16()
+        assert _close_to_fp32(project_head(layer, x), x, original)
