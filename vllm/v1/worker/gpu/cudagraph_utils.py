@@ -707,18 +707,32 @@ class CudaGraphManager:
                     descs = _profiling_full_descs(descs)
                 if is_global_first_rank():
                     descs = tqdm(descs, desc=f"{progress_bar_desc} ({mode.name})")
+                warmed_families: set[tuple[Any, ...]] = set()
                 for desc in descs:
-                    # Prepare inputs and get forward function
-                    forward_fn = create_forward_fn(desc, warmup=True)
+                    family_key = (
+                        desc.cg_mode,
+                        desc.uniform_token_count,
+                        desc.max_query_len,
+                        desc.num_active_loras,
+                        desc.num_ubatches,
+                    )
+                    need_warmup = (
+                        desc.cg_mode == CUDAGraphMode.PIECEWISE
+                        and not self.use_breakable_cg
+                    ) or family_key not in warmed_families
+                    if need_warmup:
+                        # Prepare inputs and get forward function
+                        forward_fn = create_forward_fn(desc, warmup=True)
 
-                    # Warmup
-                    forward_fn(CUDAGraphMode.NONE)
-                    # A model forward may fork work onto auxiliary streams and
-                    # join them with events queued on the compute stream.  CUDA
-                    # graph capture must not begin while those warmup kernels
-                    # are still executing, even though the queued event waits
-                    # preserve normal stream ordering.
-                    torch.accelerator.synchronize()
+                        # Warmup
+                        forward_fn(CUDAGraphMode.NONE)
+                        # A model forward may fork work onto auxiliary streams and
+                        # join them with events queued on the compute stream.  CUDA
+                        # graph capture must not begin while those warmup kernels
+                        # are still executing, even though the queued event waits
+                        # preserve normal stream ordering.
+                        torch.accelerator.synchronize()
+                        warmed_families.add(family_key)
 
                     # Capture
                     logger.debug(

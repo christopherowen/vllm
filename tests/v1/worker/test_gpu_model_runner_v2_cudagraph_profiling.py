@@ -1234,3 +1234,23 @@ def test_legacy_profile_samples_exclude_cached_blocks(monkeypatch):
     first_graph = 256 * _MIB + _METADATA_BYTES + _GRAPH_EXEC_BYTES
     per_graph = 100 * _MIB + _GRAPH_EXEC_BYTES
     assert estimate == first_graph + 2 * per_graph
+
+
+def test_full_capture_warms_once_per_descriptor_family(monkeypatch):
+    device = _FakeDevice()
+    _patch_capture(monkeypatch, device)
+    manager = _CapturingGraphManager([128, 64, 32, 1])
+    calls: list[tuple[int, bool]] = []
+    base_create = device.create_forward_fn(retain_metadata=False)
+
+    def create_forward_fn(desc, warmup):
+        calls.append((desc.num_tokens, warmup))
+        return base_create(desc, warmup)
+
+    manager.capture(create_forward_fn)
+
+    warmup_tokens = [tokens for tokens, warmup in calls if warmup]
+    capture_tokens = [tokens for tokens, warmup in calls if not warmup]
+    assert warmup_tokens == [128]
+    assert capture_tokens == [128, 64, 32, 1]
+    assert len(manager.graphs) == 4
