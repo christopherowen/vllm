@@ -92,3 +92,27 @@ def test_forwarding_before_binding_fails_by_name():
     compressor = _compressor(1)
     with pytest.raises(RuntimeError, match="bound"):
         compressor.forward(torch.empty(1, 32), metadata=None)
+
+
+def test_sequential_compressor_layers_share_capacity_scratch(monkeypatch):
+    """Multiple compressor layers of the same geometry and ratio share one set
+    of transient serving scratch buffers instead of duplicating them per layer."""
+    first, second = _compressor(2), _compressor(2)
+    other_ratio = _compressor(1)
+    _bind(monkeypatch, first)
+    _bind(monkeypatch, second)
+    _bind(monkeypatch, other_ratio)
+    for attr in (
+        "_values",
+        "_latent",
+        "_emitted",
+        "_slots",
+        "_row_ids",
+        "_gates",
+        "_pending_values",
+        "_pending_gates",
+        "_pending_tags",
+        "_local_ids",
+    ):
+        assert getattr(first, attr) is getattr(second, attr)
+    assert first._values is not other_ratio._values

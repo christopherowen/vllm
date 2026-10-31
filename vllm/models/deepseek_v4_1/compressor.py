@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Native ratio-one/two compression with request-owned partial-state rings."""
 
+from weakref import WeakValueDictionary
+
 import torch
 import torch.nn as nn
 
@@ -10,6 +12,34 @@ from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.models.deepseek_v4_1.sparse_mla import SLOT_DTYPE, DeepseekV41B12xBackend
 from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.kv_cache_interface import CircularBufferSpec
+
+
+class _SharedCompressorBuffers:
+    """Transient capacity scratch shared across sequential compressor layers."""
+
+    def __init__(self, device: torch.device, t: int, r: int, ratio: int) -> None:
+        def alloc(shape, dtype):
+            return torch.empty(shape, dtype=dtype, device=device)
+
+        self.values = alloc((t, 512), torch.float32 if ratio == 2 else torch.bfloat16)
+        self.latent = alloc((t, 512), torch.bfloat16)
+        self.emitted = alloc((t,), torch.bool)
+        self.slots = alloc((t,), SLOT_DTYPE)
+        self.row_ids = torch.arange(r, dtype=torch.int64, device=device)
+        if ratio == 2:
+            self.gates = alloc((t, 512), torch.float32)
+            self.pending_values = alloc((r, 512), torch.float32)
+            self.pending_gates = alloc((r, 512), torch.float32)
+            self.pending_tags = alloc((r,), torch.int64)
+            self.local_ids = alloc((r,), torch.int64)
+        else:
+            self.gates = self.pending_values = self.pending_gates = None
+            self.pending_tags = self.local_ids = None
+
+
+_SHARED_BUFFERS: WeakValueDictionary[
+    tuple[torch.device, int, int, int], _SharedCompressorBuffers
+] = WeakValueDictionary()
 
 
 class CompressorBackend(DeepseekV41B12xBackend):
@@ -116,22 +146,25 @@ class DeepseekCompressor(nn.Module):
             if self._values.shape[0] != t:
                 raise RuntimeError("compressor capacity changed after preparation")
             return
-
-        def alloc(shape, dtype):
-            return torch.empty(shape, dtype=dtype, device=device)
-
-        ratio = self.compress_ratio
-        self._values = alloc((t, 512), torch.float32 if ratio == 2 else torch.bfloat16)
-        self._latent = alloc((t, 512), torch.bfloat16)
-        self._emitted = alloc((t,), torch.bool)
-        self._slots = alloc((t,), SLOT_DTYPE)
-        self._row_ids = torch.arange(r, dtype=torch.int64, device=device)
-        if ratio == 2:
-            self._gates = alloc((t, 512), torch.float32)
-            self._pending_values = alloc((r, 512), torch.float32)
-            self._pending_gates = alloc((r, 512), torch.float32)
-            self._pending_tags = alloc((r,), torch.int64)
-            self._local_ids = alloc((r,), torch.int64)
+        dev = torch.device(device)
+        if dev.type == "cuda" and dev.index is None:
+            dev = torch.device("cuda", torch.cuda.current_device())
+        key = (dev, int(t), int(r), int(self.compress_ratio))
+        shared = _SHARED_BUFFERS.get(key)
+        if shared is None:
+            shared = _SharedCompressorBuffers(dev, int(t), int(r), int(self.compress_ratio))
+            _SHARED_BUFFERS[key] = shared
+        self._shared_buffers = shared
+        self._values = shared.values
+        self._latent = shared.latent
+        self._emitted = shared.emitted
+        self._slots = shared.slots
+        self._row_ids = shared.row_ids
+        self._gates = shared.gates
+        self._pending_values = shared.pending_values
+        self._pending_gates = shared.pending_gates
+        self._pending_tags = shared.pending_tags
+        self._local_ids = shared.local_ids
 
     def _project(self, hidden_states):
         from vllm.models.deepseek_v4_1.tilelang.linear import project_parts
