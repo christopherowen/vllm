@@ -411,32 +411,56 @@ class DirectModelLoader(DefaultModelLoader):
         session = self._session
         if session is None:
             raise RuntimeError("the direct loader reads weights only in load_model")
-        weight_map = None
+        names_by_path = None
         if index_path.is_file():
             weight_map = json.loads(index_path.read_text())["weight_map"]
-        indexed_paths = {}
+            indexed_paths = {}
+            names_by_path = {}
+            for name, indexed_file in weight_map.items():
+                resolved_indexed = indexed_paths.get(indexed_file)
+                if resolved_indexed is None:
+                    resolved_indexed = (index_path.parent / indexed_file).resolve()
+                    indexed_paths[indexed_file] = resolved_indexed
+                names_by_path.setdefault(resolved_indexed, []).append(name)
+        prefixes = source.weight_name_prefixes
+        local_expert_ids = self.local_expert_ids
+        file_filter = source.file_weight_filter
         for path in files:
-            sources = weight_utils.safetensors_file_sources(path)
-            file_names = {name for name in sources if source.file_weight_filter(name)}
             resolved_path = Path(path).resolve()
-            selected = []
-            for name in sorted(sources):
-                if source.weight_name_prefixes and not name.startswith(
-                    source.weight_name_prefixes
-                ):
+            if names_by_path is not None:
+                indexed_names = names_by_path.get(resolved_path, ())
+                candidate_names = [
+                    name
+                    for name in indexed_names
+                    if (not prefixes or name.startswith(prefixes))
+                    and not should_skip_weight(name, local_expert_ids)
+                ]
+                if not candidate_names:
                     continue
-                if weight_map is not None:
-                    indexed_file = weight_map.get(name)
-                    if indexed_file is None:
-                        continue
-                    if indexed_file not in indexed_paths:
-                        indexed_paths[indexed_file] = (
-                            index_path.parent / indexed_file
-                        ).resolve()
-                    if indexed_paths[indexed_file] != resolved_path:
-                        continue
-                if not should_skip_weight(name, self.local_expert_ids):
-                    selected.append(name)
+                if not any(file_filter(name) for name in candidate_names):
+                    allowed_names = set(candidate_names)
+                    yield from session.weights(
+                        [path],
+                        prefix=source.prefix,
+                        needs_values=self._needs_values,
+                        skip=lambda name, allowed=allowed_names: name not in allowed,
+                    )
+                    continue
+                allowed_indexed = set(candidate_names)
+            else:
+                allowed_indexed = None
+            sources = weight_utils.safetensors_file_sources(path)
+            if allowed_indexed is not None:
+                selected = [name for name in sorted(sources) if name in allowed_indexed]
+            else:
+                selected = [
+                    name
+                    for name in sorted(sources)
+                    if (not prefixes or name.startswith(prefixes))
+                    and not should_skip_weight(name, local_expert_ids)
+                ]
+            file_names = {name for name in selected if file_filter(name)}
+            ordinary_names = {name for name in selected if name not in file_names}
             file_backed = (
                 (source.prefix + name, weight_utils.file_source_tensor(sources[name]))
                 for name in selected
@@ -447,16 +471,13 @@ class DirectModelLoader(DefaultModelLoader):
             ordinary = (
                 session.weights(
                     [path],
-                    prefixes=source.weight_name_prefixes,
                     prefix=source.prefix,
-                    index_path=index_path,
                     needs_values=self._needs_values,
-                    skip=lambda name, file_names=file_names: (
-                        name in file_names
-                        or should_skip_weight(name, self.local_expert_ids)
+                    skip=lambda name, ordinary_names=ordinary_names: (
+                        name not in ordinary_names
                     ),
                 )
-                if any(name not in file_names for name in selected)
+                if ordinary_names
                 else ()
             )
             yield from heapq.merge(file_backed, ordinary, key=lambda item: item[0])

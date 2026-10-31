@@ -1030,8 +1030,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         head_rank_start = n_local_head * tp_rank
         head_rank_end = n_local_head * (tp_rank + 1)
 
-        # Pre-compute expert mapping ONCE.
+        # Pre-compute expert mapping ONCE and index by weight_name for O(1) lookup.
         expert_mapping = self.get_expert_mapping()
+        expert_mapping_by_key: dict[str, list[tuple[str, str, int, str]]] = {}
+        for mapping in expert_mapping:
+            expert_mapping_by_key.setdefault(mapping[1], []).append(mapping)
 
         for name, loaded_weight in weights:
             if name.startswith(("vision.", "aligner.", "image_")):
@@ -1048,10 +1051,54 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     for loaded in embedding.load_weights(((leaf, loaded_weight),))
                 )
                 continue
+            if ".experts." in name:
+                # E8M0 scales are stored as float8_e8m0fnu in
+                # checkpoints but the MoE param is uint8. copy_()
+                # would do a numeric conversion (e.g. 2^-7 → 0),
+                # destroying the raw exponent bytes.
+                if (
+                    "weight_scale" in name
+                    and loaded_weight.dtype == torch.float8_e8m0fnu
+                ):
+                    loaded_weight = loaded_weight.view(torch.uint8)
+                _, _, rest = name.partition(".experts.")
+                d1 = rest.find(".")
+                d2 = rest.find(".", d1 + 1) if d1 != -1 else -1
+                candidates = (
+                    expert_mapping_by_key.get(f"experts.{rest[: d2 + 1]}")
+                    if d2 != -1
+                    else None
+                )
+                for mapping in (
+                    candidates if candidates is not None else expert_mapping
+                ):
+                    param_name, weight_name, expert_id, expert_shard_id = mapping
+                    if weight_name not in name:
+                        continue
+                    name_mapped = name.replace(weight_name, param_name)
+                    if is_pp_missing_parameter(name_mapped, self):
+                        continue
+                    param = params_dict[name_mapped]
+                    # We should ask the weight loader to return success or not
+                    # here since otherwise we may skip experts with other
+                    # available replicas.
+                    weight_loader = typing.cast(
+                        Callable[..., bool], param.weight_loader
+                    )
+                    success = weight_loader(
+                        param,
+                        loaded_weight,
+                        name_mapped,
+                        shard_id=expert_shard_id,
+                        expert_id=expert_id,
+                        return_success=True,
+                    )
+                    if success:
+                        name = name_mapped
+                        break
+                loaded_params.add(name_mapped)
+                continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                # Skip non-stacked layers and experts (experts handled below).
-                if ".experts." in name:
-                    continue
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
@@ -1069,44 +1116,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 loaded_params.add(name)
                 break
             else:
-                if ".experts." in name:
-                    # E8M0 scales are stored as float8_e8m0fnu in
-                    # checkpoints but the MoE param is uint8. copy_()
-                    # would do a numeric conversion (e.g. 2^-7 → 0),
-                    # destroying the raw exponent bytes.
-                    if (
-                        "weight_scale" in name
-                        and loaded_weight.dtype == torch.float8_e8m0fnu
-                    ):
-                        loaded_weight = loaded_weight.view(torch.uint8)
-                    for mapping in expert_mapping:
-                        param_name, weight_name, expert_id, expert_shard_id = mapping
-                        if weight_name not in name:
-                            continue
-                        name_mapped = name.replace(weight_name, param_name)
-                        if is_pp_missing_parameter(name_mapped, self):
-                            continue
-                        param = params_dict[name_mapped]
-                        # We should ask the weight loader to return success or not
-                        # here since otherwise we may skip experts with other
-                        # available replicas.
-                        weight_loader = typing.cast(
-                            Callable[..., bool], param.weight_loader
-                        )
-                        success = weight_loader(
-                            param,
-                            loaded_weight,
-                            name_mapped,
-                            shard_id=expert_shard_id,
-                            expert_id=expert_id,
-                            return_success=True,
-                        )
-                        if success:
-                            name = name_mapped
-                            break
-                    loaded_params.add(name_mapped)
-                    continue
-                elif "attn_sink" in name:
+                if "attn_sink" in name:
                     if is_pp_missing_parameter(name, self):
                         continue
                     narrow_weight = loaded_weight[head_rank_start:head_rank_end]

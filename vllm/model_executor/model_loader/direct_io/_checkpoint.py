@@ -379,9 +379,22 @@ class DirectWeightSession:
         import torch
 
         weight_map = None
-        if index_path is not None and Path(index_path).is_file():
-            weight_map = json.loads(Path(index_path).read_text())["weight_map"]
         indexed_paths = {}
+        if index_path is not None:
+            index_file_path = Path(index_path)
+            if index_file_path.is_file():
+                resolved_index = index_file_path.resolve()
+                cached = getattr(self, "_index_cache", None)
+                if cached is not None and cached[0] == resolved_index:
+                    _, weight_map, indexed_paths = cached
+                else:
+                    weight_map = json.loads(index_file_path.read_text())["weight_map"]
+                    index_parent = index_file_path.parent
+                    for indexed_file in set(weight_map.values()):
+                        indexed_paths[indexed_file] = (
+                            index_parent / indexed_file
+                        ).resolve()
+                    self._index_cache = (resolved_index, weight_map, indexed_paths)
         for path in files:
             manifest = self.manifest(path)
             resolved_path = Path(path).resolve()
@@ -393,10 +406,6 @@ class DirectWeightSession:
                     indexed_file = weight_map.get(entry.name)
                     if indexed_file is None:
                         continue
-                    if indexed_file not in indexed_paths:
-                        indexed_paths[indexed_file] = (
-                            Path(index_path).parent / indexed_file
-                        ).resolve()
                     if indexed_paths[indexed_file] != resolved_path:
                         continue
                 if skip is not None and skip(entry.name):
@@ -481,20 +490,18 @@ class DirectWeightSession:
         )
         if destination.data_ptr() - storage.data_ptr() + extent > storage.nbytes():
             raise ValueError(f"destination exceeds tensor storage: {entry.name}")
-        with torch.accelerator.device_index(destination.device.index):
-            expand = (
-                source.dtype == torch.bfloat16 and destination.dtype == torch.float32
-            )
-            byte_cast = {source.dtype, destination.dtype} <= {torch.int8, torch.uint8}
-            if destination.dtype == source.dtype or expand or byte_cast:
-                for record in view_records(entry, offset, source, destination, expand):
-                    self.records.extend(record)
-                self.destinations.append(destination)
-                if expand:
-                    self.bf16_expansion_bytes += source.nbytes
-            else:
-                if not source.is_contiguous() or not destination.is_contiguous():
-                    raise NotImplementedError(f"strided dtype conversion: {entry.name}")
+        expand = source.dtype == torch.bfloat16 and destination.dtype == torch.float32
+        byte_cast = {source.dtype, destination.dtype} <= {torch.int8, torch.uint8}
+        if destination.dtype == source.dtype or expand or byte_cast:
+            for record in view_records(entry, offset, source, destination, expand):
+                self.records.extend(record)
+            self.destinations.append(destination)
+            if expand:
+                self.bf16_expansion_bytes += source.nbytes
+        else:
+            if not source.is_contiguous() or not destination.is_contiguous():
+                raise NotImplementedError(f"strided dtype conversion: {entry.name}")
+            with torch.accelerator.device_index(destination.device.index):
                 self.flush()
                 if self.transform_scratch is None:
                     self.transform_scratch = torch.empty(

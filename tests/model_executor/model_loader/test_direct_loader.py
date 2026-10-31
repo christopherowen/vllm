@@ -527,7 +527,7 @@ ENGRAM = re.compile(r"layers\.\d+\.engram\.embed\.(?:weight|scale)")
 
 
 def test_file_backed_tables_are_descriptors_and_never_reach_the_reader(
-    tmp_path, session
+    tmp_path, session, monkeypatch
 ):
     """DS4.1's filter on a mixed shard, a table-only shard and a shard without tables:
     tables become file-source descriptors, the rest routes through the session, all
@@ -569,6 +569,16 @@ def test_file_backed_tables_are_descriptors_and_never_reach_the_reader(
         return manifest(path)
 
     session.manifest = recorded
+    file_sources_opened = []
+    real_file_sources = weight_utils.safetensors_file_sources
+
+    def recorded_file_sources(path):
+        file_sources_opened.append(os.path.basename(path))
+        return real_file_sources(path)
+
+    monkeypatch.setattr(
+        weight_utils, "safetensors_file_sources", recorded_file_sources
+    )
     source = DefaultModelLoader.Source(
         str(tmp_path),
         revision=None,
@@ -589,12 +599,16 @@ def test_file_backed_tables_are_descriptors_and_never_reach_the_reader(
         "model.layers.1.stale.weight",
     ]
     assert opened == ["a.safetensors", "c.safetensors"]  # b holds only tables
+    assert file_sources_opened == [
+        "a.safetensors",
+        "b.safetensors",
+    ]  # c holds no tables
     loaded = dict(loaded)
     for name in (*mixed, *tables):
         if ENGRAM.fullmatch(name) is None:
             continue
         path = tmp_path / ("a.safetensors" if name in mixed else "b.safetensors")
-        expected = weight_utils.safetensors_file_sources(str(path))[name]
+        expected = real_file_sources(str(path))[name]
         assert get_file_tensor_source(loaded[f"model.{name}"]) == expected
         assert loaded[f"model.{name}"].device.type == "meta"
     assert {entry.name for _, entry in session.sources.values()} == {

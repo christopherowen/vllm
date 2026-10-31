@@ -84,35 +84,50 @@ static void *bounce_copy_worker(void *opaque) {
         while (!ring->ready_count && !ring->stopping)
             pthread_cond_wait(&ring->ready, &ring->mutex);
         if (!ring->ready_count) break;
-        unsigned index = ring->ready_slots[ring->head++ % BOUNCE_SLOTS];
-        ring->ready_count--;
-        bounce_slot_t slot = ring->slots[index];
-        pthread_mutex_unlock(&ring->mutex);
-        char *buffer = ring->buffers + (size_t)index * BOUNCE_SLOT_BYTES;
-        char *source = buffer + slot.delta;
-        size_t width = slot.job.bytes;
-        size_t pitch = slot.job.rows > 1 ? (size_t)slot.job.source_stride : width;
-        if (slot.job.expand_bf16) {
-            for (int64_t row = 0; row < slot.job.rows; row++)
-                memmove(buffer + row * width, source + row * pitch, width);
-            expand_bf16_inplace(buffer, slot.job.rows * width);
-            source = buffer;
-            width *= 2;
-            pitch = width;
+        unsigned batch_indices[BOUNCE_SLOTS];
+        bounce_slot_t batch_slots[BOUNCE_SLOTS];
+        unsigned batch_count = 0;
+        while (ring->ready_count && batch_count < BOUNCE_SLOTS) {
+            unsigned index = ring->ready_slots[ring->head++ % BOUNCE_SLOTS];
+            ring->ready_count--;
+            batch_indices[batch_count] = index;
+            batch_slots[batch_count] = ring->slots[index];
+            batch_count++;
         }
-        if (!failure.message[0])
-            cuda_ok(cudaMemcpy2DAsync(slot.job.destination,
-                slot.job.rows > 1 ? (size_t)slot.job.destination_stride : width,
-                source, pitch, width, slot.job.rows, cudaMemcpyHostToDevice,
-                ring->stream), "copy checkpoint ring to CUDA weights", &failure);
-        /* Reads into other slots remain in flight while this slot is on the GPU. */
+        pthread_mutex_unlock(&ring->mutex);
+        uint64_t bounced = 0, strided = 0;
+        for (unsigned b = 0; b < batch_count; b++) {
+            unsigned index = batch_indices[b];
+            bounce_slot_t slot = batch_slots[b];
+            char *buffer = ring->buffers + (size_t)index * BOUNCE_SLOT_BYTES;
+            char *source = buffer + slot.delta;
+            size_t width = slot.job.bytes;
+            size_t pitch = slot.job.rows > 1 ? (size_t)slot.job.source_stride : width;
+            if (slot.job.expand_bf16) {
+                for (int64_t row = 0; row < slot.job.rows; row++)
+                    memmove(buffer + row * width, source + row * pitch, width);
+                expand_bf16_inplace(buffer, slot.job.rows * width);
+                source = buffer;
+                width *= 2;
+                pitch = width;
+            }
+            if (!failure.message[0])
+                cuda_ok(cudaMemcpy2DAsync(slot.job.destination,
+                    slot.job.rows > 1 ? (size_t)slot.job.destination_stride : width,
+                    source, pitch, width, slot.job.rows, cudaMemcpyHostToDevice,
+                    ring->stream), "copy checkpoint ring to CUDA weights", &failure);
+            bounced += slot.job.rows * slot.job.bytes;
+            if (slot.job.rows > 1) strided += slot.job.rows * slot.job.bytes;
+        }
+        /* Reads into other slots remain in flight while this batch is on the GPU. */
         cuda_ok(cudaStreamSynchronize(ring->stream), "complete checkpoint ring copy", &failure);
         pthread_mutex_lock(&ring->mutex);
         if (failure.message[0]) ring->copy_failure = failure;
-        ring->bounced_bytes += slot.job.rows * slot.job.bytes;
-        if (slot.job.rows > 1) ring->strided_bytes += slot.job.rows * slot.job.bytes;
-        ring->free_slots[ring->free_count++] = index;
-        ring->copying--;
+        ring->bounced_bytes += bounced;
+        ring->strided_bytes += strided;
+        for (unsigned b = 0; b < batch_count; b++)
+            ring->free_slots[ring->free_count++] = batch_indices[b];
+        ring->copying -= batch_count;
         pthread_cond_signal(&ring->available);
         if (!ring->copying) pthread_cond_signal(&ring->drained);
     }
@@ -165,10 +180,25 @@ static bool bounce_execute(bounce_ring_t *ring, read_job_t *jobs, size_t count,
         snprintf(failure->message, sizeof(failure->message), "io_uring bounce executor is unusable after a submission/completion failure");
         return false;
     }
-    for (size_t i = 0; i < count; i++) {
+    for (size_t i = 0; i < count;) {
         read_job_t *job = &jobs[i];
-        if (!job->host_copy && !validate_direct_range(job->fd, job->offset,
-                (job->rows - 1) * job->source_stride + job->bytes, failure)) return false;
+        if (job->host_copy) { i++; continue; }
+        int fd = job->fd;
+        int64_t max_end = 0;
+        size_t j = i;
+        while (j < count && (jobs[j].host_copy || jobs[j].fd == fd)) {
+            if (!jobs[j].host_copy) {
+                int64_t span = (jobs[j].rows - 1) * jobs[j].source_stride + jobs[j].bytes;
+                if (jobs[j].offset < 0 || span < 0 || jobs[j].offset > INT64_MAX - span) {
+                    if (!validate_direct_range(fd, jobs[j].offset, span, failure)) return false;
+                }
+                int64_t end = jobs[j].offset + span;
+                if (end > max_end) max_end = end;
+            }
+            j++;
+        }
+        if (!validate_direct_range(fd, 0, max_end, failure)) return false;
+        i = j;
     }
     size_t next = 0;
     int64_t row = 0, within = 0;
@@ -208,7 +238,10 @@ static bool bounce_execute(bounce_ring_t *ring, read_job_t *jobs, size_t count,
                 slot->job.bytes &= ~(int64_t)1;
             }
             slot->job.rows = 1;
-            if (!within && job->bytes < IO_ALIGNMENT && job->source_stride >= job->bytes) {
+            if (!within && job->source_stride >= job->bytes &&
+                (job->bytes < IO_ALIGNMENT || job->source_stride - job->bytes < IO_ALIGNMENT) &&
+                job->bytes <= BOUNCE_SLOT_BYTES - (int64_t)slot->delta &&
+                (!job->expand_bf16 || job->bytes <= BOUNCE_SLOT_BYTES / 2)) {
                 slot->job.rows += (BOUNCE_SLOT_BYTES - (int64_t)slot->delta - job->bytes) / job->source_stride;
                 if (slot->job.rows > job->rows - row) slot->job.rows = job->rows - row;
             }

@@ -679,6 +679,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             ckpt_up_proj_name="w3",
             num_experts=n_draft_experts,
         )
+        expert_mapping_by_key: dict[str, list[tuple[str, str, int, str]]] = {}
+        for mapping in expert_mapping:
+            expert_mapping_by_key.setdefault(mapping[1], []).append(mapping)
         expert_scale_suffix = (
             ".weight_scale"
             if getattr(self.config, "expert_dtype", "fp4") == "fp4"
@@ -729,7 +732,17 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                     and loaded_weight.dtype == torch.float8_e8m0fnu
                 ):
                     loaded_weight = loaded_weight.view(torch.uint8)
-                for param_name, weight_name, expert_id, shard_id in expert_mapping:
+                _, _, rest = name.partition(".experts.")
+                d1 = rest.find(".")
+                d2 = rest.find(".", d1 + 1) if d1 != -1 else -1
+                candidates = (
+                    expert_mapping_by_key.get(f"experts.{rest[: d2 + 1]}")
+                    if d2 != -1
+                    else None
+                )
+                for param_name, weight_name, expert_id, shard_id in (
+                    candidates if candidates is not None else expert_mapping
+                ):
                     if weight_name not in name:
                         continue
                     name_mapped = name.replace(weight_name, param_name)
