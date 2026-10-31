@@ -178,6 +178,34 @@ def test_sticky_cache_survives_text_subconfig_regeneration():
         assert text_config._supports_multimodal_for_mm_prefix() is False
 
 
+def test_get_model_arch_config_skips_registry_when_not_mm_prefix_lm():
+    """Models with is_mm_prefix_lm=False must not eagerly query the MM registry."""
+    model_config = _make_mm_prefix_model_config()
+    hf_config = PretrainedConfig(
+        model_type="deepseek_v4",
+        architectures=["DeepseekV41ForCausalLM"],
+        hidden_size=5120,
+        num_hidden_layers=42,
+        num_attention_heads=64,
+        num_key_value_heads=64,
+        vocab_size=129280,
+        head_dim=128,
+        kv_lora_rank=512,
+    )
+    model_config.hf_config = hf_config
+    model_config.hf_text_config = hf_config
+    model_config.revision = None
+    model_config.get_model_arch_config = ModelConfig.get_model_arch_config.__get__(
+        model_config, ModelConfig
+    )
+    with patch(
+        "vllm.multimodal.MULTIMODAL_REGISTRY.supports_multimodal_inputs",
+        side_effect=AssertionError("must not query registry when not mm_prefix_lm"),
+    ):
+        arch_config = model_config.get_model_arch_config()
+    assert arch_config.is_mm_prefix_lm is False
+
+
 @pytest.mark.parametrize(
     ("device", "expected"),
     [

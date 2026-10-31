@@ -61,30 +61,38 @@ class HummingMoEQuantConfig(FusedMoEQuantConfig):
     w2_humming_config: "LayerConfig"
 
 
-if has_humming():
-    from vllm.utils.humming import dtypes as humming_dtypes
+_HUMMING_TO_QUANT_DTYPE: dict[Any, Any] = {}
+_HUMMING_TO_SCALE_DTYPE: dict[Any, torch.dtype] = {}
+humming_dtypes: Any = None
 
-    _HUMMING_TO_QUANT_DTYPE: dict[humming_dtypes.DataType, Any] = {
-        humming_dtypes.float4e2m1: FP4_DTYPE,
-        humming_dtypes.float8e4m3: FP8_DTYPE,
-        humming_dtypes.float8e5m2: torch.float8_e5m2,
-        humming_dtypes.int8: torch.int8,
-        humming_dtypes.uint4: INT4_DTYPE,
-        humming_dtypes.uint8: INT8_DTYPE,
-        humming_dtypes.uint2: torch.uint8,
-        humming_dtypes.uint3: torch.uint8,
-        humming_dtypes.uint5: torch.uint8,
-        humming_dtypes.uint6: torch.uint8,
-        humming_dtypes.uint7: torch.uint8,
-    }
 
-    _HUMMING_TO_SCALE_DTYPE: dict[humming_dtypes.DataType, torch.dtype] = {
-        humming_dtypes.float8e8m0: MXFP_SCALE_DTYPE,
-        humming_dtypes.float8e4m3: FP8_DTYPE,
-        humming_dtypes.float16: torch.float16,
-        humming_dtypes.bfloat16: torch.bfloat16,
-        humming_dtypes.float32: torch.float32,
-    }
+def _ensure_humming_dtypes() -> Any:
+    global humming_dtypes, _HUMMING_TO_QUANT_DTYPE, _HUMMING_TO_SCALE_DTYPE
+    if humming_dtypes is None and has_humming():
+        from vllm.utils.humming import dtypes as _dtypes
+
+        humming_dtypes = _dtypes
+        _HUMMING_TO_QUANT_DTYPE = {
+            _dtypes.float4e2m1: FP4_DTYPE,
+            _dtypes.float8e4m3: FP8_DTYPE,
+            _dtypes.float8e5m2: torch.float8_e5m2,
+            _dtypes.int8: torch.int8,
+            _dtypes.uint4: INT4_DTYPE,
+            _dtypes.uint8: INT8_DTYPE,
+            _dtypes.uint2: torch.uint8,
+            _dtypes.uint3: torch.uint8,
+            _dtypes.uint5: torch.uint8,
+            _dtypes.uint6: torch.uint8,
+            _dtypes.uint7: torch.uint8,
+        }
+        _HUMMING_TO_SCALE_DTYPE = {
+            _dtypes.float8e8m0: MXFP_SCALE_DTYPE,
+            _dtypes.float8e4m3: FP8_DTYPE,
+            _dtypes.float16: torch.float16,
+            _dtypes.bfloat16: torch.bfloat16,
+            _dtypes.float32: torch.float32,
+        }
+    return humming_dtypes
 
 
 def _group_shape(group_size: int, group_size_n: int = 0) -> GroupShape:
@@ -113,6 +121,7 @@ def _humming_weight_schema_to_quant_key(
     from vllm.utils.humming import WeightScaleType
 
     """Convert a HummingWeightSchema to a QuantKey."""
+    _ensure_humming_dtypes()
     dtype = _HUMMING_TO_QUANT_DTYPE[schema.b_dtype]
 
     if schema.bs_dtype is not None:
@@ -191,6 +200,7 @@ def _compressed_tensors_weight_schema_to_quant_key(
     elif "nvfp4" in fmt or "mxfp4" in fmt:
         dtype = FP4_DTYPE
     else:
+        _ensure_humming_dtypes()
         dtype = _HUMMING_TO_QUANT_DTYPE[
             humming_dtypes.DataType.from_str(f"uint{schema.num_bits}")
         ]
@@ -302,6 +312,7 @@ def _humming_input_schema_to_quant_key(
     if schema.a_dtype is None or schema.a_dtype.num_bits >= 16:
         return None
 
+    _ensure_humming_dtypes()
     dtype = _HUMMING_TO_QUANT_DTYPE[schema.a_dtype]
 
     gs = schema.input_scale_group_size
@@ -335,6 +346,7 @@ def _resolve_input_quant_key(
     from vllm.utils.humming import HummingInputSchema
 
     """Resolve the actual activation QuantKey after platform fallback."""
+    _ensure_humming_dtypes()
     a_dtype = HummingInputSchema().get_fallback_input_dtype(origin_a_dtype)
     if a_dtype is None or a_dtype.num_bits >= 16:
         return None
@@ -351,6 +363,7 @@ def _resolve_input_quant_key(
 def _compressed_tensors_input_schema_to_quant_key(
     schema: "CompressedTensorsInputSchema",
 ) -> QuantKey | None:
+    _ensure_humming_dtypes()
     type_bits_to_dtype = {
         ("float", 8): humming_dtypes.float8e4m3,
         ("float", 4): humming_dtypes.float4e2m1,
@@ -378,6 +391,7 @@ def input_schema_to_quant_key(
 
     """Convert any BaseInputSchema to a QuantKey. Returns None if
     the schema represents unquantized (bf16/fp16) inputs."""
+    _ensure_humming_dtypes()
     if isinstance(schema, HummingInputSchema):
         return _humming_input_schema_to_quant_key(schema)
 
@@ -650,6 +664,7 @@ def get_humming_moe_quant_config(
         and q_dtype.startswith("float8")
         and input_scale_group_size == 128
     ):
+        _ensure_humming_dtypes()
         q_dtype = _HUMMING_TO_QUANT_DTYPE.get(input_schema.a_dtype, FP8_DTYPE)
         activation_group_shape = GroupShape(row=1, col=input_scale_group_size)
 

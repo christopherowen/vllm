@@ -856,7 +856,8 @@ class ModelConfig:
 
             # Rebuild after multimodal_config exists so text-only mm_prefix
             # clearing is applied (and cached for later with_hf_config calls).
-            self.model_arch_config = self.get_model_arch_config()
+            if self.model_arch_config.is_mm_prefix_lm:
+                self.model_arch_config = self.get_model_arch_config()
 
         if self.disable_sliding_window:
             # Set after get_and_verify_max_len to ensure that max_model_len
@@ -914,9 +915,10 @@ class ModelConfig:
             self.hf_text_config,
             revision=getattr(self, "revision", None),
         )
-        return convertor.convert(
-            supports_multimodal=self._supports_multimodal_for_mm_prefix()
-        )
+        arch_config = convertor.convert(supports_multimodal=True)
+        if arch_config.is_mm_prefix_lm and not self._supports_multimodal_for_mm_prefix():
+            return convertor.convert(supports_multimodal=False)
+        return arch_config
 
     @field_validator("tokenizer", "max_model_len", mode="wrap")
     @classmethod
@@ -1270,6 +1272,8 @@ class ModelConfig:
             # `override_quantization_method` method) must be checked in order
             # of preference (this is particularly important for GPTQ).
             overrides = [
+                "deepseek_v4_fp8",
+                "deepseek_v41_fp8",
                 "auto_gptq",
                 "gptq",
                 "gptq_marlin",
@@ -1284,26 +1288,25 @@ class ModelConfig:
                 "modelopt_mxfp8",
                 "mxfp8",
                 "modelopt_mixed",
-                "exl3",
                 "mxfp4_csf",
                 # Ensure heavy backends are probed last to avoid unnecessary
                 # imports during override detection (e.g., MXFP4 imports Triton)
                 "mxfp4",
                 "gpt_oss_mxfp4",
-                "deepseek_v4_fp8",
-                "deepseek_v41_fp8",
                 "humming",
             ]
             # if the user specifies humming, we should always use humming
             if self.quantization == "humming":
                 overrides = ["humming"] + overrides
-            quantization_methods = [
-                q for q in supported_quantization if q not in overrides
+            builtin_methods = set(get_args(me_quant.QuantizationMethods))
+            custom_overrides = [
+                q
+                for q in supported_quantization
+                if q not in builtin_methods and q not in overrides
             ]
-            # Any custom overrides will be in quantization_methods so we place
-            # them at the start of the list so custom overrides have preference
-            # over the built-in ones.
-            quantization_methods = quantization_methods + overrides
+            # Any custom overrides are placed at the start of the list so
+            # custom overrides have preference over the built-in ones.
+            quantization_methods = custom_overrides + overrides
 
             # Detect which checkpoint is it
             for name in quantization_methods:

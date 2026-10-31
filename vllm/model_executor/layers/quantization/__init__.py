@@ -115,95 +115,116 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     if quantization not in QUANTIZATION_METHODS:
         raise ValueError(f"Invalid quantization method: {quantization}")
 
-    # lazy import to avoid triggering `torch.compile` too early
-    from vllm.config.quantization import _ONLINE_SHORTHANDS
-    from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
+    if quantization in _CUSTOMIZED_METHOD_TO_QUANT_CONFIG:
+        return _CUSTOMIZED_METHOD_TO_QUANT_CONFIG[quantization]
 
-    if current_platform.is_cuda() or current_platform.is_rocm():
-        # The v4.1 class is the v4 one extended to accept model_type
-        # "deepseek_v41" and its 32x32 MXFP8 linear layout. V4.1 has
-        # platform-specific implementations for both CUDA and ROCm.
-        from vllm.models.deepseek_v41.quant_config import (
-            DeepseekV4FP8Config as UpstreamDeepseekV41FP8Config,
+    # Lazy per-method imports avoid importing heavy native/Triton backends for
+    # unrelated quantization methods during ModelConfig verification.
+    if quantization in ("awq", "awq_marlin", "auto_awq"):
+        from .auto_awq import AutoAWQConfig
+
+        return AutoAWQConfig
+    if quantization in ("auto_gptq", "gptq", "gptq_marlin"):
+        from .auto_gptq import AutoGPTQConfig
+
+        return AutoGPTQConfig
+    if quantization == "fp8":
+        from .fp8 import Fp8Config
+
+        return Fp8Config
+    if quantization == "fbgemm_fp8":
+        from .fbgemm_fp8 import FBGEMMFp8Config
+
+        return FBGEMMFp8Config
+    if quantization == "fp_quant":
+        from .fp_quant import FPQuantConfig
+
+        return FPQuantConfig
+    if quantization == "modelopt":
+        from .modelopt import ModelOptFp8Config
+
+        return ModelOptFp8Config
+    if quantization == "modelopt_fp4":
+        from .modelopt import ModelOptNvFp4Config
+
+        return ModelOptNvFp4Config
+    if quantization in ("modelopt_mxfp8", "mxfp8"):
+        from .modelopt import ModelOptMxFp8Config
+
+        return ModelOptMxFp8Config
+    if quantization == "modelopt_mixed":
+        from .modelopt import ModelOptMixedPrecisionConfig
+
+        return ModelOptMixedPrecisionConfig
+    if quantization == "compressed-tensors":
+        from .compressed_tensors.compressed_tensors import (
+            CompressedTensorsConfig,
         )
 
-        deepseek_config: type[QuantizationConfig] = UpstreamDeepseekV41FP8Config
-    else:
+        return CompressedTensorsConfig
+    if quantization == "experts_int8":
+        from .experts_int8 import ExpertsInt8Config
+
+        return ExpertsInt8Config
+    if quantization == "quark":
+        from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
+
+        return QuarkConfig
+    if quantization == "moe_wna16":
+        from .moe_wna16 import MoeWNA16Config
+
+        return MoeWNA16Config
+    if quantization == "exl3":
+        from .exl3 import Exl3Config
+
+        return Exl3Config
+    if quantization == "torchao":
+        from .torchao import TorchAOConfig
+
+        return TorchAOConfig
+    if quantization == "inc":
+        from .inc import INCConfig
+
+        return INCConfig
+    if quantization == "mxfp4":
+        from .mxfp4 import Mxfp4Config
+
+        return Mxfp4Config
+    if quantization == "gpt_oss_mxfp4":
+        from .mxfp4 import GptOssMxfp4Config
+
+        return GptOssMxfp4Config
+    if quantization == "deepseek_v4_fp8":
+        if current_platform.is_cuda() or current_platform.is_rocm():
+            from vllm.models.deepseek_v41.quant_config import (
+                DeepseekV4FP8Config as UpstreamDeepseekV41FP8Config,
+            )
+
+            return UpstreamDeepseekV41FP8Config
         from vllm.models.deepseek_v4 import DeepseekV4FP8Config
 
-        deepseek_config = DeepseekV4FP8Config
+        return DeepseekV4FP8Config
+    if quantization == "deepseek_v41_fp8":
+        from vllm.models.deepseek_v4_1.quant_config import DeepseekV41FP8Config
 
-    from vllm.models.deepseek_v4_1.quant_config import DeepseekV41FP8Config
+        return DeepseekV41FP8Config
+    if quantization == "mxfp4_csf":
+        from .mxfp4_csf import Mxfp4CsfConfig
 
-    from .auto_awq import AutoAWQConfig
-    from .auto_gptq import AutoGPTQConfig
-    from .compressed_tensors.compressed_tensors import (
-        CompressedTensorsConfig,
-    )
-    from .exl3 import Exl3Config
-    from .experts_int8 import ExpertsInt8Config
-    from .fbgemm_fp8 import FBGEMMFp8Config
-    from .fp8 import Fp8Config
-    from .fp_quant import FPQuantConfig
-    from .humming import HummingConfig
-    from .inc import INCConfig
-    from .modelopt import (
-        ModelOptFp8Config,
-        ModelOptMixedPrecisionConfig,
-        ModelOptMxFp8Config,
-        ModelOptNvFp4Config,
-    )
-    from .moe_wna16 import MoeWNA16Config
-    from .mxfp4 import GptOssMxfp4Config, Mxfp4Config
-    from .mxfp4_csf import Mxfp4CsfConfig
+        return Mxfp4CsfConfig
+    if quantization == "humming":
+        from .humming import HummingConfig
+
+        return HummingConfig
+
+    from vllm.config.quantization import _ONLINE_SHORTHANDS
+
     from .online.base import OnlineQuantizationConfig
-    from .torchao import TorchAOConfig
 
-    method_to_config: dict[str, type[QuantizationConfig]] = {
-        "awq": AutoAWQConfig,
-        "awq_marlin": AutoAWQConfig,
-        "auto_awq": AutoAWQConfig,
-        "fp8": Fp8Config,
-        "fbgemm_fp8": FBGEMMFp8Config,
-        "fp_quant": FPQuantConfig,
-        "modelopt": ModelOptFp8Config,
-        "modelopt_fp4": ModelOptNvFp4Config,
-        "modelopt_mxfp8": ModelOptMxFp8Config,
-        "modelopt_mixed": ModelOptMixedPrecisionConfig,
-        "auto_gptq": AutoGPTQConfig,
-        "gptq": AutoGPTQConfig,
-        "gptq_marlin": AutoGPTQConfig,
-        "compressed-tensors": CompressedTensorsConfig,
-        "experts_int8": ExpertsInt8Config,
-        "quark": QuarkConfig,
-        "moe_wna16": MoeWNA16Config,
-        "exl3": Exl3Config,
-        "torchao": TorchAOConfig,
-        "inc": INCConfig,
-        "mxfp4": Mxfp4Config,
-        "gpt_oss_mxfp4": GptOssMxfp4Config,
-        "deepseek_v4_fp8": deepseek_config,
-        "deepseek_v41_fp8": DeepseekV41FP8Config,
-        "mxfp4_csf": Mxfp4CsfConfig,
-        "humming": HummingConfig,
-        "online": OnlineQuantizationConfig,
-        # MiniMax-style checkpoints tag `quant_method: "mxfp8"`; load with the
-        # ModelOpt MXFP8 config (same format). The "mxfp8" online shorthand
-        # below only applies to the `--quantization mxfp8` CLI path.
-        "mxfp8": ModelOptMxFp8Config,
-    }
+    if quantization == "online" or quantization in _ONLINE_SHORTHANDS:
+        return OnlineQuantizationConfig
 
-    # Register online shorthands (e.g. "fp8_per_tensor") as quant methods.
-    # setdefault so a shorthand that is also a checkpoint method (e.g. "mxfp8")
-    # keeps its checkpoint config; the shorthand still works via the
-    # `--quantization` CLI path in `resolve_quantization_config`.
-    for shorthand in _ONLINE_SHORTHANDS:
-        method_to_config.setdefault(shorthand, OnlineQuantizationConfig)
-
-    # Update the `method_to_config` with customized quantization methods.
-    method_to_config.update(_CUSTOMIZED_METHOD_TO_QUANT_CONFIG)
-
-    return method_to_config[quantization]
+    raise ValueError(f"Invalid quantization method: {quantization}")
 
 
 __all__ = [

@@ -4,16 +4,13 @@
 
 import torch
 
-from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
-from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_scale_parameter,
     create_fp8_weight_parameter,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
-from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.parameter import BlockQuantScaleParameter
 
 
@@ -71,14 +68,25 @@ class DeepseekV41FP8Config(Fp8Config):
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant, hf_config=None):
-        if getattr(hf_config, "model_type", None) in (
-            "deepseek_v41",
-            "deepseek_v41_text",
-        ) and hf_quant_cfg.get("quant_method") in ("fp8", "deepseek_v41_fp8"):
+        quant_method = hf_quant_cfg.get("quant_method")
+        if quant_method == "deepseek_v41_fp8" or (
+            getattr(hf_config, "model_type", None)
+            in (
+                "deepseek_v41",
+                "deepseek_v41_text",
+            )
+            and quant_method == "fp8"
+        ):
             return cls.get_name()
         return None
 
     def get_quant_method(self, layer, prefix):
+        from vllm.model_executor.layers.fused_moe import RoutedExperts
+        from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
+        from vllm.model_executor.layers.vocab_parallel_embedding import (
+            VocabParallelEmbedding,
+        )
+
         from . import kernels
 
         if isinstance(layer, LinearBase):
