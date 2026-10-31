@@ -3541,13 +3541,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self._dead_row_cut if verified is not None else None,
                     match_idx_mapping=match_idx_mapping,
                 )
-                async_output.attach_copy_draft_alloc(
-                    self.copy_drafter.alloc[: input_batch.num_reqs],
+                self.copy_drafter.attach_async_output(
+                    async_output,
+                    input_batch.num_reqs,
                     self.output_copy_stream,
                     self.main_stream,
-                    slot_draft_limits=self.copy_drafter.slot_draft_limits,
                 )
-                self.copy_drafter._limits_event = async_output.copy_draft_alloc_event
             with use_workspace_lane(self._draft_workspace_lane):
                 if boundary_state is not None:
                     self.speculator.boundary_checkpoint_capture = (

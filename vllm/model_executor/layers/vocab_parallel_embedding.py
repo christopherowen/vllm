@@ -722,7 +722,7 @@ class VocabParallelEmbedding(PluggableLayer):
 
     def forward(self, input_):
         if self.tp_size == 1:
-            return self.quant_method.embedding(self, input_.long())
+            return self.quant_method.embedding(self, input_.clamp_min(0).long())
 
         if self.use_fused_embedding:
             output_parallel = self._fused_embedding(

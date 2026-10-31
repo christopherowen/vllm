@@ -213,9 +213,9 @@ def copy_select_kernel(
                 hits = T.alloc_var(T.float32, init=float_state[slot, 0])
                 trials = T.alloc_var(T.float32, init=float_state[slot, 1])
                 if pending > 0 and num_sampled[r] > 0:
-                    live = T.min(verified[r], cut[r])
+                    live = T.min(pending, T.min(verified[r], cut[r]))
                     if live > 0:
-                        accepted = num_sampled[r] - 1
+                        accepted = T.min(num_sampled[r] - 1, live)
                         doublings = T.if_then_else(
                             accepted >= live, T.min(doublings + 1, MAX_DOUBLINGS), 0
                         )
@@ -251,7 +251,7 @@ def copy_select_kernel(
                                 history[slot, start + T.min(col, chosen[1] - 1)],
                                 T.int64,
                             ),
-                            T.int64(0),
+                            T.int64(-1),
                         )
                         confidences[r, col] = T.if_then_else(
                             col < chosen[1], estimate[0], T.float32(0)
@@ -268,7 +268,7 @@ def copy_select_kernel(
                         drafts[r, col] = T.if_then_else(
                             col < block,
                             dspark_drafts[r, T.min(col, block - 1)],
-                            T.int64(0),
+                            T.int64(-1),
                         )
                         confidences[r, col] = value
                         planned[r, col] = value
@@ -316,9 +316,9 @@ def copy_alloc_kernel(
                 doublings = T.alloc_var(T.int32, init=int_state[slot, 0])
                 pending = int_state[slot, 1]
                 if pending > 0 and num_sampled[r] > 0:
-                    live = T.min(verified[r], cut[r])
+                    live = T.min(pending, T.min(verified[r], cut[r]))
                     if live > 0:
-                        accepted = num_sampled[r] - 1
+                        accepted = T.min(num_sampled[r] - 1, live)
                         doublings = T.if_then_else(
                             accepted >= live, T.min(doublings + 1, MAX_DOUBLINGS), 0
                         )

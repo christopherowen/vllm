@@ -23,11 +23,12 @@ which the scheduler gives the request's step after next (within its decode-row
 envelope), and the planned confidences the budget reads at that step.
 """
 
+from typing import Any
+
 import numpy as np
 import torch
 
 from vllm.config.speculative import CopyDraftsConfig
-from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu import tilelang_inputs
@@ -76,23 +77,45 @@ class CopyDrafter:
             (max_reqs, self.lookahead), dtype=torch.float32, device=device
         )
         self.planned = torch.zeros_like(self.confidences)
-        self.alloc = torch.zeros(max_reqs, dtype=torch.int32, device=device)
+        # Ring of pre-allocated buffers and events for async output delivery of
+        # alloc and slot_draft_limits without per-step tensor or event allocation.
+        self._ring_size = 3
+        self._ring_idx = 0
+        self._alloc_buffers = [
+            CpuGpuBuffer(max_reqs, dtype=torch.int32, device=device)
+            for _ in range(self._ring_size)
+        ]
+        self._limits_staging = [
+            CpuGpuBuffer(max_reqs, dtype=torch.int32, device=device)
+            for _ in range(self._ring_size)
+        ]
+        for buf in self._limits_staging:
+            buf.np.fill(self.lookahead)
+        self._ring_events = [
+            torch.cuda.Event(blocking=True) for _ in range(self._ring_size)
+        ]
+        self.alloc = self._alloc_buffers[0].gpu
+        self._select_alloc = torch.zeros(max_reqs, dtype=torch.int32, device=device)
         # Actual valid draft count per slot from the latest proposal, mirrored to
-        # host so the next step's adaptive budget never admits zero-padded slots.
+        # host non-blockingly so the adaptive budget caps stale wide schedules.
         self.slot_draft_limits = CpuGpuBuffer(
             max_reqs, dtype=torch.int32, device=device
         )
         self.slot_draft_limits.np.fill(self.lookahead)
         self.slot_draft_limits.gpu.fill_(self.lookahead)
         self._limits_event: torch.cuda.Event | None = None
+        self._limits_staging_np: np.ndarray = self._limits_staging[0].np
+        self._pending_limit_resets: list[int] = []
         # A step that verified no drafts: nothing to judge.
         self._no_drafts = torch.zeros(max_reqs, dtype=torch.int32, device=device)
         self._new_rows: list[int] = []
 
     def sync_slot_draft_limits(self) -> np.ndarray:
-        if self._limits_event is not None:
-            with gpu_sync_allowed():
-                self._limits_event.synchronize()
+        if self._limits_event is not None and self._limits_event.query():
+            np.copyto(self.slot_draft_limits.np, self._limits_staging_np)
+            if self._pending_limit_resets:
+                self.slot_draft_limits.np[self._pending_limit_resets] = self.lookahead
+                self._pending_limit_resets.clear()
             self._limits_event = None
         return self.slot_draft_limits.np
 
@@ -110,6 +133,8 @@ class CopyDrafter:
 
     def add_request(self, req_idx: int) -> None:
         self.sync_slot_draft_limits()[req_idx] = self.lookahead
+        if self._limits_event is not None:
+            self._pending_limit_resets.append(req_idx)
         self._new_rows.append(req_idx)
 
     def apply_staged_writes(self) -> None:
@@ -138,6 +163,9 @@ class CopyDrafter:
         """Match the batch's updated histories and write ``alloc[:num_reqs]`` and
         ``slot_draft_limits.gpu`` before the drafter runs, so the async output
         copy does not wait behind the drafter."""
+        self.sync_slot_draft_limits()
+        self._ring_idx = (self._ring_idx + 1) % self._ring_size
+        self.alloc = self._alloc_buffers[self._ring_idx].gpu
         num_reqs = idx_mapping.shape[0]
         if verified is None:
             verified = self._no_drafts[:num_reqs]
@@ -166,6 +194,32 @@ class CopyDrafter:
             self.num_draft_steps,
             self.initial,
         )
+
+    def attach_async_output(
+        self,
+        async_output: Any,
+        num_reqs: int,
+        copy_stream: torch.cuda.Stream,
+        main_stream: torch.cuda.Stream,
+    ) -> None:
+        """Queue async D2H copy of this step's ``alloc`` and ``slot_draft_limits``
+        using pre-allocated ring buffers and events."""
+        idx = self._ring_idx
+        alloc_buf = self._alloc_buffers[idx]
+        limits_staging = self._limits_staging[idx]
+        event = self._ring_events[idx]
+        async_output.attach_copy_draft_alloc(
+            alloc_buf,
+            copy_stream,
+            main_stream,
+            num_reqs=num_reqs,
+            slot_draft_limits_gpu=self.slot_draft_limits.gpu,
+            slot_draft_limits_cpu=limits_staging.cpu,
+            alloc_event=event,
+        )
+        self._limits_staging_np = limits_staging.np
+        self._limits_event = event
+        self._pending_limit_resets.clear()
 
     def propose(
         self,
@@ -220,7 +274,7 @@ class CopyDrafter:
             drafts,
             confidences,
             planned,
-            self.alloc[:num_reqs],
+            self._select_alloc[:num_reqs] if matched else self.alloc[:num_reqs],
             self.min_match,
             self.initial,
         )

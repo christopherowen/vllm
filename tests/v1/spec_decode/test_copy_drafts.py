@@ -88,9 +88,9 @@ class RefState:
 def ref_select(state, source, length, num_sampled, verified, cut):
     """The state update and the proposal's (offered, after, estimate, alloc)."""
     if state.pending > 0 and num_sampled > 0:
-        live = min(verified, cut)
+        live = min(state.pending, verified, cut)
         if live > 0:
-            accepted = num_sampled - 1
+            accepted = min(num_sampled - 1, live)
             state.doublings = (
                 min(state.doublings + 1, tlc.MAX_DOUBLINGS) if accepted >= live else 0
             )
@@ -320,7 +320,7 @@ def test_copy_select_follows_the_reference_over_a_copy():
         if source >= 0:
             copies += 1
             np.testing.assert_array_equal(d[:offered], S[source : source + offered])
-            assert (d[offered:] == 0).all()
+            assert (d[offered:] == -1).all()
             np.testing.assert_allclose(c[:offered], estimate, rtol=1e-6)
             assert (c[offered:] == 0).all()
             np.testing.assert_allclose(w[:after], estimate, rtol=1e-6)
@@ -335,7 +335,7 @@ def test_copy_select_follows_the_reference_over_a_copy():
             num_sampled, verified = accepted + 1, offered
         else:
             np.testing.assert_array_equal(d[:BLOCK], dspark[0][0].cpu().numpy())
-            assert (d[BLOCK:] == 0).all()
+            assert (d[BLOCK:] == -1).all()
             np.testing.assert_array_equal(c[:BLOCK], dspark[1][0].cpu().numpy())
             assert (c[BLOCK:] == 0).all()
             np.testing.assert_array_equal(w, c)
@@ -667,8 +667,8 @@ def test_prepare_alloc_matches_propose_and_updates_slot_draft_limits():
     assert torch.equal(early_alloc, drafter.alloc[:2])
     assert int(early_alloc[0]) == 2 * INITIAL
     assert int(early_alloc[1]) == BLOCK
-    assert (drafts[0, INITIAL:] == 0).all()
-    assert (drafts[1, BLOCK:] == 0).all()
+    assert (drafts[0, INITIAL:] == -1).all()
+    assert (drafts[1, BLOCK:] == -1).all()
     assert (confidences[0, INITIAL:] == 0).all()
     assert (confidences[1, BLOCK:] == 0).all()
     assert (planned[0, : 2 * INITIAL] > 0).all()
@@ -853,5 +853,68 @@ def test_prepare_alloc_skips_incomplete_prefill_requests():
     assert int(drafter.alloc[1]) == BLOCK
     assert int(drafter.slot_draft_limits.gpu[s1]) == BLOCK
     assert drafts[1, :BLOCK].tolist() == dspark_drafts[1].tolist()
-    assert drafts[1, BLOCK:].tolist() == [0] * (LOOKAHEAD - BLOCK)
+    assert drafts[1, BLOCK:].tolist() == [-1] * (LOOKAHEAD - BLOCK)
     torch.testing.assert_close(confs[1, :BLOCK], dspark_conf[1])
+
+
+def test_stale_wide_allocation_rejects_placeholder_tail_and_doubles_cap_without_sync():
+    """When async scheduling allocates 16 draft rows from 2 steps back while the
+    previous step only offered 8 copy drafts, columns 8..15 are -1 placeholders
+    (rejected even when the target argmax is token 0), accepting all 8 valid
+    copy drafts still doubles the cap to 16, and sync_slot_draft_limits never
+    calls synchronize() on an in-flight CUDA event."""
+    rng = np.random.default_rng(19)
+    states = _request_state(8192)
+    drafter = _drafter(states)
+    repeated = np.tile(rng.integers(1, VOCAB, 32), 6).tolist()
+    slot = _set_history(states, "req", repeated[:96])
+    drafter.add_request(slot)
+    drafter.apply_staged_writes()
+
+    idx = torch.tensor([slot], dtype=torch.int64, device=DEVICE)
+    dspark_drafts = torch.zeros((1, BLOCK), dtype=torch.int64, device=DEVICE)
+    dspark_conf = torch.full((1, BLOCK), 0.5, device=DEVICE)
+    one = torch.ones(1, dtype=torch.int32, device=DEVICE)
+    zero = torch.zeros(1, dtype=torch.int32, device=DEVICE)
+
+    # Step t proposes 8 copy drafts (columns 0..7) and pads columns 8..15 with -1.
+    drafter.prepare_alloc(idx, one, zero, None)
+    drafts, _, _ = drafter.propose(
+        idx, dspark_drafts, dspark_conf, one, zero, None, matched=True
+    )
+    assert int(drafter.int_state[slot, 1]) == INITIAL
+    assert (drafts[0, INITIAL:] == -1).all()
+
+    # Step t+1 was scheduled with 16 draft slots from an earlier wide allocation.
+    # Even if the target argmax at column 8 (and beyond) is token 0, the -1
+    # placeholder at column 8 is rejected and commits token 0 as the bonus token
+    # of the 8-draft prefix (9 tokens committed total).
+    full_drafts = drafts[0].tolist()
+    target_row = full_drafts[:INITIAL] + [0] * (LOOKAHEAD + 1 - INITIAL)
+    committed = _greedy_verify([target_row], [full_drafts], [repeated[95]])[0]
+    assert committed == full_drafts[:INITIAL] + [0]
+    assert len(committed) == INITIAL + 1
+
+    # Advance history by the 9 committed tokens (still matching the repeated span).
+    _set_history(states, "req", repeated[: 96 + INITIAL + 1])
+    num_sampled = torch.tensor([INITIAL + 1], dtype=torch.int32, device=DEVICE)
+    verified = torch.tensor([LOOKAHEAD], dtype=torch.int32, device=DEVICE)
+    drafter.prepare_alloc(idx, num_sampled, verified, None)
+    assert int(drafter.slot_draft_limits.gpu[slot]) == 2 * INITIAL
+    _, _, _ = drafter.propose(
+        idx, dspark_drafts, dspark_conf, num_sampled, verified, None, matched=True
+    )
+    assert int(drafter.int_state[slot, 0]) == 1
+    assert int(drafter.int_state[slot, 1]) == 2 * INITIAL
+
+    # In-flight event: sync_slot_draft_limits queries without synchronizing.
+    class InFlightEvent:
+        def query(self) -> bool:
+            return False
+
+        def synchronize(self) -> None:
+            raise AssertionError("sync_slot_draft_limits must not block on GPU")
+
+    drafter._limits_event = InFlightEvent()  # type: ignore[assignment]
+    limits = drafter.sync_slot_draft_limits()
+    assert limits.shape == (MAX_REQS,)
