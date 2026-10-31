@@ -282,6 +282,10 @@ class GLPSteering(nn.Module):
         self.register_buffer(
             "rows", torch.zeros(max_tokens, dtype=torch.int32), persistent=False
         )
+        # True when the current step schedules at least one steered request (or
+        # during CUDA-graph capture); eager steps with no steered request skip the
+        # per-layer glp_steer launches.
+        self.step_active: bool = True
 
     def declare_kernels(self) -> None:
         """The steering of the model's streams, for a layer's write and, when
@@ -340,6 +344,10 @@ class GLPSteering(nn.Module):
                 f"{list(residual.shape)} {residual.dtype}, write {list(parts.shape)} "
                 f"and marks {list(rows.shape)}"
             )
+        if not self.step_active and not (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        ):
+            return
         tilelang_glp.glp_steer(
             parts,
             residual,

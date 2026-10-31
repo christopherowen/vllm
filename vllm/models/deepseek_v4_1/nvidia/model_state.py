@@ -154,6 +154,8 @@ class DeepseekV41ModelState(DefaultModelState):
             None,
         )
         self.steered_requests: UvaBackedTensor | None = None
+        self._steered_req_ids: set[str] = set()
+        self._steering_rows_dirty_len: int = 0
         if self.steering is not None:
             self.steered_requests = UvaBackedTensor(self.max_num_reqs, torch.int32)
             from vllm.models.deepseek_v4_1.tilelang import glp_rows, prepare
@@ -175,7 +177,14 @@ class DeepseekV41ModelState(DefaultModelState):
             )
         sampling = new_req_data.sampling_params
         if self.steered_requests is not None:
-            self.steered_requests.np[req_index] = weightless.is_marked(sampling)
+            steered = weightless.is_marked(sampling)
+            self.steered_requests.np[req_index] = steered
+            steered_ids = getattr(self, "_steered_req_ids", None)
+            if steered_ids is not None:
+                if steered:
+                    steered_ids.add(new_req_data.req_id)
+                else:
+                    steered_ids.discard(new_req_data.req_id)
         if sampling is not None and sampling.prompt_logprobs is not None:
             self._ced_prompt_logprobs.add(new_req_data.req_id)
         else:
@@ -193,6 +202,9 @@ class DeepseekV41ModelState(DefaultModelState):
         self._prefill_tokens.pop(req_id, None)
         self._ced_prompt_logprobs.discard(req_id)
         self._ced_prefix_start.pop(req_id, None)
+        steered_ids = getattr(self, "_steered_req_ids", None)
+        if steered_ids is not None:
+            steered_ids.discard(req_id)
 
     def compacts_short_queries(self, batch) -> bool:
         """Whether CED compacts a request whose chunk fits the graphs' query bound
@@ -314,16 +326,40 @@ class DeepseekV41ModelState(DefaultModelState):
                 self._stage_ced(input_batch)
             model_inputs["ced_indices"] = self.get_ced_indices()
         if self.steering is not None:
-            from vllm.models.deepseek_v4_1.tilelang.glp_rows import mark_rows
-
-            # The step's rows of steered requests; padding rows unmarked.
             num_reqs = input_batch.num_reqs
-            mark_rows(
-                self.steering.step_rows(input_batch.num_tokens_after_padding),
-                input_batch.idx_mapping[:num_reqs],
-                input_batch.query_start_loc[: num_reqs + 1],
-                self.steered_requests.copy_to_uva(),
-            )
+            num_tokens_padded = input_batch.num_tokens_after_padding
+            steered_ids = getattr(self, "_steered_req_ids", None)
+            if steered_ids:
+                has_steered = any(
+                    req_id in steered_ids for req_id in input_batch.req_ids
+                )
+            else:
+                idx_np = getattr(input_batch, "idx_mapping_np", None)
+                has_steered = bool(
+                    idx_np is not None
+                    and self.steered_requests is not None
+                    and self.steered_requests.np[idx_np[:num_reqs]].any()
+                )
+            self.steering.step_active = has_steered
+            if has_steered:
+                from vllm.models.deepseek_v4_1.tilelang.glp_rows import mark_rows
+
+                # The step's rows of steered requests; padding rows unmarked.
+                mark_rows(
+                    self.steering.step_rows(num_tokens_padded),
+                    input_batch.idx_mapping[:num_reqs],
+                    input_batch.query_start_loc[: num_reqs + 1],
+                    self.steered_requests.copy_to_uva(),
+                )
+                self._steering_rows_dirty_len = max(
+                    getattr(self, "_steering_rows_dirty_len", 0),
+                    num_tokens_padded,
+                )
+            else:
+                dirty_len = getattr(self, "_steering_rows_dirty_len", 0)
+                if dirty_len > 0:
+                    self.steering.rows[:dirty_len].zero_()
+                    self._steering_rows_dirty_len = 0
         window = self.lookback_token_ids
         if window is None:
             return model_inputs
@@ -396,6 +432,8 @@ class DeepseekV41ModelState(DefaultModelState):
         if self.steering is not None:
             # Captured unmarked; a replay reads the step's marks in place.
             self.steering.rows.zero_()
+            self.steering.step_active = True
+            self._steering_rows_dirty_len = 0
         if self.lookback_token_ids is not None:
             # The captured graph reads this buffer; replays refill it in place.
             self.lookback_token_ids.fill_(-1)

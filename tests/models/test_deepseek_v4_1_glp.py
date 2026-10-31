@@ -364,6 +364,125 @@ def test_the_steering_is_declared_for_the_writes_it_takes(
     assert declared == [(STREAMS, WIDE, worlds)]
 
 
+def test_an_inactive_step_skips_eager_steer_launches_but_still_checks_shapes(
+    launches, monkeypatch
+):
+    module = steering()
+    module.step_active = False
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    x, residual, post_mix, res_mix = _layer_outputs()
+    rows = torch.zeros(3, dtype=torch.int32)
+    module.steer(5, x, residual, post_mix, res_mix, rows)
+    assert launches == []
+    with pytest.raises(ValueError, match="BF16 streams"):
+        module.steer(5, x, residual.float(), post_mix, res_mix, rows)
+    # While a CUDA graph captures, the launch is recorded even if step_active is False.
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    module.steer(5, x, residual, post_mix, res_mix, rows)
+    assert len(launches) == 1
+
+
+def test_model_state_skips_mark_rows_when_no_steered_request_is_scheduled(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm.models.deepseek_v4_1.nvidia.model_state import DeepseekV41ModelState
+    from vllm.models.deepseek_v4_1.tilelang import glp_rows
+    from vllm.sampling_params import SamplingParams
+
+    marked_calls = []
+    uva_copies = []
+
+    def fake_mark_rows(rows, idx_mapping, query_start_loc, marks):
+        marked_calls.append((rows, idx_mapping, query_start_loc, marks))
+        rows.fill_(1)
+
+    monkeypatch.setattr(glp_rows, "mark_rows", fake_mark_rows)
+
+    class _FakeSteeredReqs:
+        def __init__(self, n: int):
+            self.np = np.zeros(n, dtype=np.int32)
+            self.gpu = torch.zeros(n, dtype=torch.int32)
+
+        def copy_to_uva(self):
+            uva_copies.append(self.np.copy())
+            self.gpu.copy_(torch.from_numpy(self.np))
+            return self.gpu
+
+    state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
+    state.rope_state = None
+    state.prompt_embeds_state = None
+    state.supports_mm_inputs = False
+    state.ced_state = None
+    state.steering = steering()
+    state.steered_requests = _FakeSteeredReqs(8)
+    state._steered_req_ids = set()
+    state._steering_rows_dirty_len = 0
+    state._ced_prompt_logprobs = set()
+    state._ced_prefix_start = {}
+    state._ced_streaming_prefix_start = None
+    state._prefill_tokens = {}
+    state.disk_engram_models = ()
+    state.lookback_token_ids = None
+
+    def _new_req(req_id: str, steered: bool):
+        params = (
+            SamplingParams(extra_args={"weightless_steer": True})
+            if steered
+            else SamplingParams()
+        )
+        return SimpleNamespace(
+            req_id=req_id,
+            prefill_token_ids=None,
+            sampling_params=params,
+            num_computed_tokens=0,
+        )
+
+    def _batch(req_ids: list[str], idx: list[int], num_tokens_padded: int):
+        return SimpleNamespace(
+            req_ids=req_ids,
+            num_reqs=len(req_ids),
+            num_tokens_after_padding=num_tokens_padded,
+            idx_mapping=torch.tensor(idx, dtype=torch.int64),
+            idx_mapping_np=np.asarray(idx, dtype=np.intp),
+            query_start_loc=torch.arange(len(req_ids) + 1, dtype=torch.int32) * 6,
+        )
+
+    # 1. Stock request only: zero UVA copies and zero mark_rows calls.
+    state.add_request(0, _new_req("stock-0", steered=False))
+    state.prepare_inputs(_batch(["stock-0"], [0], 6), None)
+    assert marked_calls == []
+    assert uva_copies == []
+    assert state.steering.step_active is False
+    assert bool((state.steering.rows == 0).all())
+
+    # 2. Add a steered request and schedule it: mark_rows runs and marks rows dirty.
+    state.add_request(2, _new_req("steered-2", steered=True))
+    assert "steered-2" in state._steered_req_ids
+    state.prepare_inputs(_batch(["stock-0", "steered-2"], [0, 2], 12), None)
+    assert len(marked_calls) == 1
+    assert len(uva_copies) == 1
+    assert state.steering.step_active is True
+    assert state._steering_rows_dirty_len == 12
+    assert bool((state.steering.rows[:12] == 1).all())
+
+    # 3. Next step schedules only stock-0: clears the 12 dirty rows once without mark_rows.
+    state.prepare_inputs(_batch(["stock-0"], [0], 6), None)
+    assert len(marked_calls) == 1
+    assert len(uva_copies) == 1
+    assert state.steering.step_active is False
+    assert state._steering_rows_dirty_len == 0
+    assert bool((state.steering.rows == 0).all())
+
+    # 4. Subsequent unsteered step does not even need to zero rows.
+    state.remove_request("steered-2")
+    assert "steered-2" not in state._steered_req_ids
+    state.prepare_inputs(_batch(["stock-0"], [0], 6), None)
+    assert len(marked_calls) == 1
+    assert len(uva_copies) == 1
+    assert state.steering.step_active is False
+
+
 # A real GLP file, when one is named (it is not redistributed with the tests).
 
 REAL_FILE = os.environ.get("GLP_TEST_FILE")
