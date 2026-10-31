@@ -5,6 +5,7 @@
 
 """Anthropic Messages API serving handler"""
 
+import enum
 import json
 import logging
 import time
@@ -50,6 +51,37 @@ from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.renderers.online_renderer import OnlineRenderer
 
 logger = logging.getLogger(__name__)
+
+
+class InlineSystemMode(enum.Enum):
+    """Where mid-conversation system messages (for example Claude Code's
+    system reminders) go in the converted chat request."""
+
+    # The chat template renders system messages anywhere: keep them in place.
+    KEEP = "keep"
+    # The template wants the system message first: keep the text in place as
+    # a user message, so the cached prefix of the conversation stays valid.
+    AS_USER = "as_user"
+    # The template rejects that too: merge the text into the leading system
+    # message. Every new inline message then invalidates the cached prefix.
+    MERGE = "merge"
+
+
+# Probe conversations for _detect_inline_system_mode.
+_INLINE_SYSTEM_PROBE = [
+    {"role": "system", "content": "t"},
+    {"role": "user", "content": "t"},
+    {"role": "assistant", "content": "t"},
+    {"role": "system", "content": "t"},
+    {"role": "user", "content": "t"},
+]
+_INLINE_AS_USER_PROBE = [
+    {"role": "system", "content": "t"},
+    {"role": "user", "content": "t"},
+    {"role": "assistant", "content": "t"},
+    {"role": "user", "content": "t"},
+    {"role": "user", "content": "t"},
+]
 
 
 def _build_anthropic_usage(
@@ -137,36 +169,74 @@ class AnthropicServingMessages(OpenAIServingChat):
             "length": "max_tokens",
             "tool_calls": "tool_use",
         }
-        self._merge_inline_system = self._detect_merge_inline_system(chat_template)
+        self._chat_template = chat_template
+        self._inline_system_mode: InlineSystemMode | None = None
+
+    def _resolve_inline_system_mode(self) -> InlineSystemMode:
+        """The inline system mode of the served chat template, detected once."""
+        if self._inline_system_mode is None:
+            self._inline_system_mode = self.detect_inline_system_mode(
+                self._chat_template, self.online_renderer.renderer.tokenizer
+            )
+            logger.info(
+                "Anthropic Messages API: mid-conversation system messages use "
+                "inline mode %s",
+                self._inline_system_mode.value,
+            )
+        return self._inline_system_mode
 
     @staticmethod
-    def _detect_merge_inline_system(chat_template: str | None) -> bool:
-        """Auto-detect whether the chat template requires system-first ordering.
+    def detect_inline_system_mode(
+        chat_template: str | None, tokenizer: Any = None
+    ) -> InlineSystemMode:
+        """Detect how the served template takes mid-conversation system messages.
 
-        Renders a [system, user, system, user] conversation against the
-        template; if it raises (e.g. Qwen's ``loop.first`` guard), the
-        model needs inline system messages merged into the leading block.
+        Renders probe conversations with the --chat-template, or with the
+        tokenizer's own template when there is none. Tokenizers that encode
+        messages in code, such as deepseek_v41, are probed the same way and
+        may declare ``supports_inline_system_messages``.
+
+        Args:
+            chat_template: The resolved --chat-template, or None.
+            tokenizer: The served tokenizer, used when chat_template is None.
+
+        Returns:
+            KEEP when a system message renders after the first turn, AS_USER
+            when the template accepts consecutive user messages instead, and
+            MERGE otherwise or when nothing can be rendered.
         """
+
+        def renders(messages: list[dict[str, str]]) -> bool:
+            try:
+                if chat_template:
+                    env = jinja2.sandbox.ImmutableSandboxedEnvironment(
+                        trim_blocks=True,
+                        lstrip_blocks=True,
+                        extensions=[jinja2.ext.loopcontrols],
+                    )
+                    env.from_string(chat_template).render(
+                        messages=messages, add_generation_prompt=True
+                    )
+                elif tokenizer is not None:
+                    tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
+                else:
+                    return False
+            except Exception:
+                return False
+            return True
+
+        # A tokenizer that encodes messages in code may render a later system
+        # message as unmarked text although its format has no such message.
+        declared = None
         if not chat_template:
-            return True
-        try:
-            env = jinja2.sandbox.ImmutableSandboxedEnvironment(
-                trim_blocks=True,
-                lstrip_blocks=True,
-                extensions=[jinja2.ext.loopcontrols],
-            )
-            env.from_string(chat_template).render(
-                messages=[
-                    {"role": "system", "content": "t"},
-                    {"role": "user", "content": "t"},
-                    {"role": "system", "content": "t"},
-                    {"role": "user", "content": "t"},
-                ],
-                add_generation_prompt=False,
-            )
-            return False
-        except jinja2.TemplateError:
-            return True
+            declared = getattr(tokenizer, "supports_inline_system_messages", None)
+        if declared is not False and renders(_INLINE_SYSTEM_PROBE):
+            return InlineSystemMode.KEEP
+        if renders(_INLINE_AS_USER_PROBE):
+            return InlineSystemMode.AS_USER
+        return InlineSystemMode.MERGE
 
     @staticmethod
     def _convert_image_source_to_url(source: dict[str, Any]) -> str:
@@ -194,7 +264,7 @@ class AnthropicServingMessages(OpenAIServingChat):
         cls,
         anthropic_request: AnthropicMessagesRequest | AnthropicCountTokensRequest,
         *,
-        merge_inline_system: bool = False,
+        inline_system: InlineSystemMode = InlineSystemMode.KEEP,
     ) -> ChatCompletionRequest:
         """Convert Anthropic message format to OpenAI format"""
         openai_messages: list[dict[str, Any]] = []
@@ -202,12 +272,12 @@ class AnthropicServingMessages(OpenAIServingChat):
         cls._convert_system_message(
             anthropic_request,
             openai_messages,
-            merge_inline_system=merge_inline_system,
+            inline_system=inline_system,
         )
         cls._convert_messages(
             anthropic_request.messages,
             openai_messages,
-            merge_inline_system=merge_inline_system,
+            inline_system=inline_system,
         )
         req = cls._build_base_request(anthropic_request, openai_messages)
         cls._handle_streaming_options(req, anthropic_request)
@@ -222,7 +292,7 @@ class AnthropicServingMessages(OpenAIServingChat):
         anthropic_request: AnthropicMessagesRequest | AnthropicCountTokensRequest,
         openai_messages: list[dict[str, Any]],
         *,
-        merge_inline_system: bool = False,
+        inline_system: InlineSystemMode = InlineSystemMode.KEEP,
     ) -> None:
         """Convert Anthropic system message to OpenAI format"""
         system_parts: list[str] = []
@@ -240,10 +310,10 @@ class AnthropicServingMessages(OpenAIServingChat):
                             continue
                         system_parts.append(block.text)
 
-        # When the template requires system-first ordering, extract inline
-        # system messages from the messages array and merge them into the
+        # When the template accepts neither inline system messages nor
+        # consecutive user messages, merge inline system messages into the
         # top-level block so the template doesn't reject them.
-        if merge_inline_system:
+        if inline_system == InlineSystemMode.MERGE:
             for msg in anthropic_request.messages:
                 if msg.role != "system":
                     continue
@@ -276,7 +346,7 @@ class AnthropicServingMessages(OpenAIServingChat):
         messages: list,
         openai_messages: list[dict[str, Any]],
         *,
-        merge_inline_system: bool = False,
+        inline_system: InlineSystemMode = InlineSystemMode.KEEP,
     ) -> None:
         """Convert Anthropic messages to OpenAI format"""
         for msg in messages:
@@ -286,11 +356,16 @@ class AnthropicServingMessages(OpenAIServingChat):
             # doesn't strip billing headers and may produce messages with
             # no "content" key.
             if msg.role == "system":
-                if merge_inline_system:
+                if inline_system == InlineSystemMode.MERGE:
                     continue  # already merged into top-level by _convert_system_message
                 text = cls._extract_system_text(msg)
                 if text:
-                    openai_messages.append({"role": "system", "content": text})
+                    role = (
+                        "user"
+                        if inline_system == InlineSystemMode.AS_USER
+                        else "system"
+                    )
+                    openai_messages.append({"role": role, "content": text})
                 continue
 
             openai_msg: dict[str, Any] = {"role": msg.role}  # type: ignore
@@ -603,7 +678,7 @@ class AnthropicServingMessages(OpenAIServingChat):
             logger.debug("Received messages request %s", request.model_dump_json())
         chat_req = self.to_chat_completion_request(
             request,
-            merge_inline_system=self._merge_inline_system,
+            inline_system=self._resolve_inline_system_mode(),
         )
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("Convert to OpenAI request %s", chat_req.model_dump_json())
@@ -1026,7 +1101,7 @@ class AnthropicServingMessages(OpenAIServingChat):
         """Implements Anthropic's messages.count_tokens endpoint."""
         chat_req = self.to_chat_completion_request(
             request,
-            merge_inline_system=self._merge_inline_system,
+            inline_system=self._resolve_inline_system_mode(),
         )
         result = await self.render_chat_request(chat_req)
         if isinstance(result, ErrorResponse):

@@ -21,6 +21,9 @@ def get_deepseek_v32_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
     added_vocab = tokenizer.get_added_vocab()
 
     class _DeepseekV32Tokenizer(tokenizer.__class__):  # type: ignore
+        # The V3.2 format has no mid-conversation system messages.
+        supports_inline_system_messages = False
+
         def apply_chat_template(
             self,
             messages: list["ChatCompletionMessageParam"],

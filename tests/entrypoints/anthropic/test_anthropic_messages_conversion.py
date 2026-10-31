@@ -30,6 +30,7 @@ from vllm.entrypoints.anthropic.protocol import (
 )
 from vllm.entrypoints.anthropic.serving import (
     AnthropicServingMessages,
+    InlineSystemMode,
     _build_anthropic_usage,
 )
 from vllm.entrypoints.generate.base.protocol import (
@@ -1383,35 +1384,137 @@ Q35_TEMPLATE = (
 )
 
 
-class TestDetectMergeInlineSystem:
-    """Verify _detect_merge_inline_system auto-detection.
+LLAMA2_ALTERNATING_TEMPLATE = (
+    "{%- for message in messages %}"
+    "{%- if (message.role == 'user') != (loop.index0 % 2 == 0) %}"
+    "{{- raise_exception('Conversation roles must alternate') }}"
+    "{%- endif %}"
+    "{%- endfor %}"
+)
 
-    Tests three scenarios:
-    1. Template with system-first guard (e.g. Qwen) → merge needed
-    2. Template without restrictions → no merge, cache-friendly
-    3. No template provided → safe default: merge
-    """
 
-    def test_qwen_template_requires_merge(self):
-        """Template with loop.first guard rejects mid-conversation system."""
+class _ProbeTokenizer:
+    """Tokenizer that encodes messages in code, like deepseek_v41."""
+
+    def __init__(self, *, system_anywhere: bool) -> None:
+        self.system_anywhere = system_anywhere
+
+    def apply_chat_template(self, messages, tokenize=True, **kwargs):
+        for index, message in enumerate(messages):
+            if message["role"] == "system" and index and not self.system_anywhere:
+                raise ValueError("System message must be at the beginning.")
+        return "".join(message["content"] for message in messages)
+
+
+class TestDetectInlineSystemMode:
+    """How the served template takes mid-conversation system messages."""
+
+    def test_system_first_template_keeps_the_text_in_place_as_user(self):
+        """Qwen-style templates reject a later system message but accept
+        consecutive user messages."""
         assert (
-            AnthropicServingMessages._detect_merge_inline_system(Q35_TEMPLATE) is True
+            AnthropicServingMessages.detect_inline_system_mode(Q35_TEMPLATE)
+            is InlineSystemMode.AS_USER
         )
 
-    def test_no_restriction_no_merge(self):
-        """Template without restriction accepts mid-conversation system."""
+    def test_unrestricted_template_keeps_system_in_place(self):
         assert (
-            AnthropicServingMessages._detect_merge_inline_system(
+            AnthropicServingMessages.detect_inline_system_mode(
                 "{%- for message in messages %}"
                 "{{- message.role }}: {{ message.content }}\n"
                 "{%- endfor %}"
             )
-            is False
+            is InlineSystemMode.KEEP
         )
 
-    def test_no_template_defaults_merge(self):
-        """No chat_template → conservative default: merge."""
-        assert AnthropicServingMessages._detect_merge_inline_system(None) is True
+    def test_alternating_template_merges(self):
+        assert (
+            AnthropicServingMessages.detect_inline_system_mode(
+                LLAMA2_ALTERNATING_TEMPLATE
+            )
+            is InlineSystemMode.MERGE
+        )
+
+    def test_tokenizer_template_is_probed_without_chat_template(self):
+        """Without --chat-template the served tokenizer decides; before, every
+        such model (deepseek_v41 among them) had its inline system messages
+        merged into the leading block, which invalidated the cached prefix."""
+        assert (
+            AnthropicServingMessages.detect_inline_system_mode(
+                None, _ProbeTokenizer(system_anywhere=True)
+            )
+            is InlineSystemMode.KEEP
+        )
+        assert (
+            AnthropicServingMessages.detect_inline_system_mode(
+                None, _ProbeTokenizer(system_anywhere=False)
+            )
+            is InlineSystemMode.AS_USER
+        )
+
+    def test_declared_format_without_inline_system_keeps_the_text_as_user(self):
+        """DeepSeek V4 renders a later system message as unmarked text, so
+        its tokenizer declares that its format has none."""
+        tokenizer = _ProbeTokenizer(system_anywhere=True)
+        tokenizer.supports_inline_system_messages = False
+        assert (
+            AnthropicServingMessages.detect_inline_system_mode(None, tokenizer)
+            is InlineSystemMode.AS_USER
+        )
+
+    def test_nothing_to_render_merges(self):
+        assert (
+            AnthropicServingMessages.detect_inline_system_mode(None)
+            is InlineSystemMode.MERGE
+        )
+
+
+class TestInlineSystemConversion:
+    """Each mode places a mid-conversation system message differently."""
+
+    @staticmethod
+    def _roles_and_contents(mode: InlineSystemMode) -> list[tuple[str, str]]:
+        request = _make_request(
+            [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "answer"},
+                {"role": "system", "content": "reminder"},
+                {"role": "user", "content": "second"},
+            ],
+            system="base",
+        )
+        chat = AnthropicServingMessages.to_chat_completion_request(
+            request, inline_system=mode
+        )
+        return [(m["role"], m["content"]) for m in chat.messages]
+
+    def test_keep_leaves_the_system_message_in_place(self):
+        assert self._roles_and_contents(InlineSystemMode.KEEP) == [
+            ("system", "base"),
+            ("user", "first"),
+            ("assistant", "answer"),
+            ("system", "reminder"),
+            ("user", "second"),
+        ]
+
+    def test_as_user_leaves_the_text_in_place(self):
+        """The earlier turns stay byte-identical, so their cached prefix
+        remains valid when a new reminder arrives."""
+        assert self._roles_and_contents(InlineSystemMode.AS_USER) == [
+            ("system", "base"),
+            ("user", "first"),
+            ("assistant", "answer"),
+            ("user", "reminder"),
+            ("user", "second"),
+        ]
+
+    def test_merge_moves_the_text_into_the_leading_system_message(self):
+        assert self._roles_and_contents(InlineSystemMode.MERGE) == [
+            ("system", "basereminder"),
+            ("user", "first"),
+            ("assistant", "answer"),
+            ("user", "second"),
+        ]
 
 
 # ======================================================================
