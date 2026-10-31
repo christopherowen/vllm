@@ -130,3 +130,157 @@ def test_seeded_filtered_sampler_uses_precompiled_target_kernel():
     assert gumbel_kernels() == compiled, (
         "seeded filtered sampling compiled a Gumbel kernel after target warmup"
     )
+
+
+def test_temperature_only_sampling_skips_fp32_copy_and_matches_fp32_path(monkeypatch):
+    from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+
+    sampler = _make_sampler()
+    sampler.add_request(0, 1, SamplingParams(temperature=0.0, seed=11))
+    sampler.add_request(1, 1, SamplingParams(temperature=1.0, seed=22))
+    sampler.add_request(2, 1, SamplingParams(temperature=0.6, seed=33))
+    sampler.apply_staged_writes()
+
+    assert sampler.needs_logits_processing[2]
+    assert not sampler.needs_non_temperature_logits_processing[2]
+
+    mapping_np = np.array([0, 1, 2], dtype=np.intp)
+    mapping = torch.from_numpy(mapping_np).to(DEVICE)
+    gen = torch.Generator(device=DEVICE).manual_seed(1234)
+    logits = torch.randn((3, VOCAB_SIZE), generator=gen, device=DEVICE).to(
+        torch.bfloat16
+    )
+    position = torch.tensor([5, 6, 7], dtype=torch.int64, device=DEVICE)
+    input_ids = torch.ones(3, dtype=torch.int32, device=DEVICE)
+    local_position = torch.zeros(3, dtype=torch.int32, device=DEVICE)
+
+    ref_processed = sampler.apply_sampling_params(
+        logits,
+        mapping,
+        mapping,
+        mapping_np,
+        position,
+        input_ids,
+        local_position,
+        skip_top_k_top_p=True,
+    )
+    assert ref_processed.dtype == torch.float32
+    ref_sampled = gumbel_sample(
+        ref_processed,
+        mapping,
+        sampler.sampling_states.temperature.gpu,
+        sampler.sampling_states.seeds.gpu,
+        position,
+        apply_temperature=False,
+        is_drafting=False,
+    )
+
+    def forbid_temp(*args, **kwargs):
+        raise AssertionError("standalone apply_temperature should be skipped")
+
+    monkeypatch.setattr(sampler.sampling_states, "apply_temperature", forbid_temp)
+    sampled, processed = sampler.sample(
+        logits,
+        mapping,
+        mapping,
+        mapping_np,
+        position,
+        input_ids,
+        local_position,
+    )
+    torch.accelerator.synchronize()
+
+    assert processed.data_ptr() == logits.data_ptr()
+    assert processed.dtype == torch.bfloat16
+    assert torch.equal(sampled, ref_sampled)
+
+
+def test_temperature_only_block_verification_skips_fp32_copy_and_matches(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
+    from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import rejection_sample
+
+    sampler = _make_sampler()
+    sampler.add_request(0, 1, SamplingParams(temperature=0.0, seed=101))
+    sampler.add_request(1, 1, SamplingParams(temperature=0.6, seed=202))
+    sampler.add_request(2, 1, SamplingParams(temperature=1.3, seed=303))
+    sampler.apply_staged_writes()
+
+    rs = RejectionSampler.__new__(RejectionSampler)
+    rs.sampler = sampler
+    rs.watermark_key = None
+    rs.sink = None
+    rs.num_speculative_steps = 3
+    rs.num_draft_steps = 3
+    rs.enable_adaptive_verification = False
+    rs.use_block_verification = True
+    rs.synthetic_conditional_rates = None
+
+    idx_mapping_np = np.array([0, 1, 2], dtype=np.intp)
+    idx_mapping = torch.from_numpy(idx_mapping_np).to(DEVICE)
+    cu_num_logits = torch.tensor([0, 4, 8, 12], dtype=torch.int32, device=DEVICE)
+    expanded_idx_mapping = idx_mapping.repeat_interleave(4)
+    expanded_local_pos = torch.tensor([0, 1, 2, 3] * 3, dtype=torch.int32, device=DEVICE)
+    pos = torch.arange(12, dtype=torch.int64, device=DEVICE)
+
+    gen = torch.Generator(device=DEVICE).manual_seed(5678)
+    logits = (
+        torch.randn((12, VOCAB_SIZE), generator=gen, device=DEVICE) * 3.0
+    ).to(torch.bfloat16)
+    draft_sampled = torch.randint(
+        0, VOCAB_SIZE, (12,), generator=gen, dtype=torch.int32, device=DEVICE
+    )
+    for r in range(11):
+        logits[r, draft_sampled[r + 1]] += 4.0
+
+    ref_processed = sampler.apply_sampling_params(
+        logits,
+        expanded_idx_mapping,
+        idx_mapping,
+        idx_mapping_np,
+        pos,
+        draft_sampled,
+        expanded_local_pos,
+    )
+    assert ref_processed.dtype == torch.float32
+    ref_sampled, ref_num_sampled = rejection_sample(
+        ref_processed,
+        None,
+        draft_sampled,
+        cu_num_logits,
+        pos,
+        idx_mapping,
+        expanded_idx_mapping,
+        expanded_local_pos,
+        sampler.sampling_states.temperature.gpu,
+        sampler.sampling_states.seeds.gpu,
+        rs.num_speculative_steps,
+        None,
+        use_fp64=False,
+        use_block_verification=True,
+    )
+
+    def forbid_temp(*args, **kwargs):
+        raise AssertionError("standalone apply_temperature should be skipped")
+
+    monkeypatch.setattr(sampler.sampling_states, "apply_temperature", forbid_temp)
+    processed, sampled, num_sampled = rs._verify(
+        logits,
+        None,
+        draft_sampled,
+        pos,
+        cu_num_logits,
+        idx_mapping,
+        idx_mapping_np,
+        expanded_idx_mapping,
+        expanded_local_pos,
+    )
+    torch.accelerator.synchronize()
+
+    assert processed.data_ptr() == logits.data_ptr()
+    assert processed.dtype == torch.bfloat16
+    assert torch.equal(num_sampled, ref_num_sampled)
+    for req in range(3):
+        n = int(num_sampled[req].item())
+        assert torch.equal(sampled[req, :n], ref_sampled[req, :n])

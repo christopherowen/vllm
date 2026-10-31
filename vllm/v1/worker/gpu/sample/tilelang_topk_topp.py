@@ -2051,10 +2051,10 @@ def apply_top_k_top_p(
     top-k by logit, then top-p by probability over what top-k kept. Returns the
     masked logits (FP32): ``logits`` itself unless its columns are strided."""
     assert logits.ndim == 2
-    assert logits.dtype == torch.float32
     rows, vocab = logits.shape
     if rows == 0 or (k is None and p is None):
         return logits
+    assert logits.dtype == torch.float32
     if logits.stride(1) != 1:
         logits = logits.contiguous()
     if k is not None:

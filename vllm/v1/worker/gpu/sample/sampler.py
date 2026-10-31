@@ -66,6 +66,9 @@ class Sampler:
             TraceReplayState(req_states) if enable_trace_replay else None
         )
         self.needs_logits_processing = np.zeros(max_num_reqs, dtype=bool)
+        self.needs_non_temperature_logits_processing = np.zeros(
+            max_num_reqs, dtype=bool
+        )
         self.num_speculative_tokens = num_speculative_tokens
         self.return_sampling_mask = return_sampling_mask
         self.use_flashinfer = (
@@ -89,7 +92,7 @@ class Sampler:
 
         states = self.sampling_states
         temperature = states.temperature.np[req_idx]
-        self.needs_logits_processing[req_idx] = (
+        non_temperature = (
             self.logit_bias_state.use_logit_bias[req_idx]
             or self.penalties_state.use_penalty[req_idx]
             or self.bad_words_state.num_bad_words.np[req_idx] > 0
@@ -97,11 +100,24 @@ class Sampler:
                 self.thinking_budget_state.enabled
                 and self.thinking_budget_state.use_thinking_budget[req_idx]
             )
-            or (temperature != 0.0 and temperature != 1.0)
             or states.min_p.np[req_idx] != 0.0
             or states.top_k.np[req_idx] != states.vocab_size
             or states.top_p.np[req_idx] != 1.0
         )
+        self.needs_non_temperature_logits_processing[req_idx] = non_temperature
+        self.needs_logits_processing[req_idx] = non_temperature or (
+            temperature != 0.0 and temperature != 1.0
+        )
+
+    def any_non_temperature_logits_processing(
+        self, idx_mapping_np: np.ndarray
+    ) -> bool:
+        flags = getattr(
+            self,
+            "needs_non_temperature_logits_processing",
+            self.needs_logits_processing,
+        )
+        return bool(np.any(flags[idx_mapping_np]))
 
     def register_warmups(
         self,
@@ -295,8 +311,12 @@ class Sampler:
         input_ids: torch.Tensor,
         expanded_local_pos: torch.Tensor,
         skip_top_k_top_p: bool = False,
+        skip_temperature: bool = False,
     ) -> torch.Tensor:
-        if not np.any(self.needs_logits_processing[idx_mapping_np]):
+        if skip_temperature:
+            if not self.any_non_temperature_logits_processing(idx_mapping_np):
+                return logits
+        elif not np.any(self.needs_logits_processing[idx_mapping_np]):
             return logits
 
         # Copy logits to a new FP32 tensor.
@@ -336,10 +356,11 @@ class Sampler:
             expanded_local_pos,
         )
 
-        # Apply temperature in place.
-        self.sampling_states.apply_temperature(
-            logits, expanded_idx_mapping, idx_mapping_np
-        )
+        if not skip_temperature:
+            # Apply temperature in place.
+            self.sampling_states.apply_temperature(
+                logits, expanded_idx_mapping, idx_mapping_np
+            )
 
         # Apply min_p in place.
         self.sampling_states.apply_min_p(logits, expanded_idx_mapping, idx_mapping_np)
@@ -363,6 +384,15 @@ class Sampler:
         expanded_local_pos: torch.Tensor,
         return_logprobs: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        in_kernel_temperature = (
+            type(self) is Sampler
+            and not getattr(self, "use_fp64_gumbel", False)
+            and bool(np.any(self.needs_logits_processing[idx_mapping_np]))
+            and not self.any_non_temperature_logits_processing(idx_mapping_np)
+            and not (return_logprobs and self.logprobs_mode in PROCESSED_LOGPROBS_MODES)
+            and not getattr(self, "return_sampling_mask", False)
+            and getattr(self, "sink", None) is None
+        )
         processed_logits = self.apply_sampling_params(
             logits,
             expanded_idx_mapping,
@@ -372,6 +402,7 @@ class Sampler:
             input_ids,
             expanded_local_pos,
             skip_top_k_top_p=True,
+            skip_temperature=in_kernel_temperature,
         )
         top_k, top_p = self.sampling_states.get_top_k_top_p(
             expanded_idx_mapping, idx_mapping_np
@@ -386,6 +417,17 @@ class Sampler:
             or self.sampling_states.any_explicit_seed(idx_mapping_np)
         )
 
+        if in_kernel_temperature:
+            return self._sample_random(
+                processed_logits,
+                expanded_idx_mapping,
+                idx_mapping_np,
+                pos,
+                top_k,
+                top_p,
+                use_flashinfer,
+                apply_temperature=True,
+            )
         return self._sample_random(
             processed_logits,
             expanded_idx_mapping,
@@ -405,6 +447,7 @@ class Sampler:
         top_k: torch.Tensor | None,
         top_p: torch.Tensor | None,
         use_flashinfer: bool,
+        apply_temperature: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if use_flashinfer:
             sampled = flashinfer_sample(processed_logits, top_k, top_p).to(torch.int64)
@@ -418,7 +461,7 @@ class Sampler:
                 self.sampling_states.temperature.gpu,
                 self.sampling_states.seeds.gpu,
                 pos,
-                apply_temperature=False,
+                apply_temperature=apply_temperature,
                 is_drafting=False,
                 use_fp64=self.use_fp64_gumbel,
             )

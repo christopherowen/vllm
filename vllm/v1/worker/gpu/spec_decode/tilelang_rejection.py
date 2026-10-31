@@ -371,6 +371,7 @@ def local_stats_kernel(logits_dtype: str, idx_dtype: str, step_dtype: str, run: 
         expanded_local_pos: T.Tensor((step_len,), step_dtype),
         temperature: T.Tensor((temp_len,), T.float32),
         num_speculative_steps: T.int32,
+        apply_temperature: T.int32,
     ):
         with T.Kernel(rows, blocks, threads=_THREADS) as (t, blk):
             T.import_source(_HEADER)
@@ -429,6 +430,17 @@ def local_stats_kernel(logits_dtype: str, idx_dtype: str, step_dtype: str, run: 
                         )
                         local_max[t, blk] = best[0]
                 else:
+                    if (apply_temperature != 0) & (temp != T.float32(1)):
+                        for j in T.unroll(_STATS_PER_THREAD):
+                            if blk * STATS_BLOCK + _element(j, tx, run) < vocab:
+                                values[j] = T.call_extern(
+                                    "float32", "vllm_div_full", values[j], temp
+                                )
+                        best[0] = values[0]
+                        for j in T.unroll(1, _STATS_PER_THREAD):
+                            best[0] = T.call_extern(
+                                "float32", "vllm_max", best[0], values[j]
+                            )
                     _block_reduce(best, partial, tx, "vllm_max")
                     if tx == 0:
                         maximum[0] = best[0]
@@ -489,6 +501,7 @@ def compute_local_stats(
     expanded_local_pos: torch.Tensor,  # [num_logits]
     temperature: torch.Tensor,  # [max_num_reqs]
     num_speculative_steps: int,
+    apply_temperature: bool = False,
 ) -> None:
     """``_compute_local_logits_stats_kernel``'s launch without draft logits, into
     the given ``[num_logits, cdiv(vocab_size, 8192)]`` statistics."""
@@ -512,6 +525,7 @@ def compute_local_stats(
         expanded_local_pos.contiguous(),
         temperature,
         num_speculative_steps,
+        int(apply_temperature),
     )
 
 
@@ -582,6 +596,7 @@ def verify_kernel(
         seeds: T.Tensor((seed_len,), T.int64),
         pos: T.Tensor((pos_len,), pos_dtype),
         dead_row_cut: T.Tensor((cut_len,), T.int32),
+        apply_temperature: T.int32,
     ):
         with T.Kernel(reqs, threads=threads) as req:
             T.import_source(_HEADER)
@@ -636,6 +651,12 @@ def verify_kernel(
                 T.float32,
                 init=T.cast(logits[row, T.max(draft, T.int64(0))], T.float32),
             )
+            if (
+                (apply_temperature != 0)
+                & (temp != T.float32(0))
+                & (temp != T.float32(1))
+            ):
+                logit = T.call_extern("float32", "vllm_div_full", logit, temp)
 
             # The step's S: the blocks' maximum, the first block holding it (a NaN
             # maximum holds none), then the block sums rescaled to it, each with its
@@ -835,6 +856,7 @@ def verify(
     pos: torch.Tensor,  # [num_logits]
     num_speculative_steps: int,
     dead_row_cut: torch.Tensor | None = None,  # [num_reqs] int32
+    apply_temperature: bool = False,
 ) -> None:
     """The launches of ``_compute_cumulative_log_p_kernel`` and
     ``_rejection_kernel`` (block verification, one-hot drafts) as one, into the
@@ -871,6 +893,7 @@ def verify(
         pos.contiguous(),
         # Without a cut it is not read: the counts stand in.
         num_sampled if dead_row_cut is None else dead_row_cut,
+        int(apply_temperature),
     )
 
 
@@ -905,8 +928,8 @@ def resample_kernel(
     )
 
     @T.macro
-    def passes(logits, raw, score, best, best_index, row, rejected, word_seed, blk,
-               tx, noisy):  # fmt: skip
+    def passes(logits, raw, score, best, best_index, row, rejected, word_seed, temp,
+               apply_temperature, blk, tx, noisy):  # fmt: skip
         """The thread's residual scores, combined into ``(best, best_index)``; with
         ``noisy`` each element's Philox word is drawn ahead of its bound check (the
         Gumbel sampler's ``passes``)."""
@@ -925,10 +948,16 @@ def resample_kernel(
                     )
                 score[0] = -T.infinity(T.float32)
                 if index < vocab:
+                    score[0] = T.cast(raw[k], T.float32)
+                    if noisy:
+                        if (apply_temperature != 0) & (temp != T.float32(1)):
+                            score[0] = T.call_extern(
+                                "float32", "vllm_div_full", score[0], temp
+                            )
                     score[0] = T.if_then_else(
                         T.cast(index, T.int64) == rejected[0],
                         -T.infinity(T.float32),
-                        T.cast(raw[k], T.float32),
+                        score[0],
                     )
                     if noisy:
                         score[0] = T.call_extern(
@@ -953,6 +982,7 @@ def resample_kernel(
         seeds: T.Tensor((seed_len,), T.int64),
         pos: T.Tensor((pos_len,), pos_dtype),
         dead_row_cut: T.Tensor((cut_len,), T.int32),
+        apply_temperature: T.int32,
     ):
         with T.Kernel(reqs, blocks, threads=_THREADS) as (req, blk):
             T.import_source(_HEADER)
@@ -1008,10 +1038,10 @@ def resample_kernel(
                 word_seed[0] = _randint_at(seed, pos[row], pos_dtype, False)
                 if T.if_then_else(state >= 0, temp, T.float32(0)) != T.float32(0):
                     passes(logits, raw, score, best, best_index, row, rejected,
-                           word_seed, blk, tx, True)  # fmt: skip
+                           word_seed, temp, apply_temperature, blk, tx, True)  # fmt: skip
                 else:
                     passes(logits, raw, score, best, best_index, row, rejected,
-                           word_seed, blk, tx, False)  # fmt: skip
+                           word_seed, temp, apply_temperature, blk, tx, False)  # fmt: skip
                 _block_argmax(
                     best, best_index, other, other_index, partial, partial_index, tx
                 )
@@ -1054,6 +1084,7 @@ def resample(
     seed: torch.Tensor,  # [max_num_reqs]
     pos: torch.Tensor,  # [num_logits]
     dead_row_cut: torch.Tensor | None = None,  # [num_reqs] int32
+    apply_temperature: bool = False,
 ) -> None:
     """``_resample_kernel``'s launch without draft logits or watermark (FP32), into
     the given ``[num_reqs, cdiv(vocab_size, 1024)]`` block winners; with
@@ -1084,6 +1115,7 @@ def resample(
         pos.contiguous(),
         # Without a cut it is not read: the counts stand in.
         num_sampled if dead_row_cut is None else dead_row_cut,
+        int(apply_temperature),
     )
 
 
@@ -1113,6 +1145,7 @@ def verify_and_resample(
     # [num_reqs] int32
     dead_row_cut: torch.Tensor | None = None,
     kernel_steps: int | None = None,
+    apply_temperature: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """``rejection_sample``'s launches before the insertion, with one-hot drafts,
     block verification, FP32 draws and no watermark: the sampled tokens
@@ -1146,6 +1179,7 @@ def verify_and_resample(
         expanded_local_pos,
         temperature,
         steps,
+        apply_temperature,
     )
 
     # Verification up to the first rejected or bonus token.
@@ -1174,6 +1208,7 @@ def verify_and_resample(
         pos,
         steps,
         dead_row_cut,
+        apply_temperature,
     )
 
     # Resample the rejected/bonus tokens.
@@ -1196,6 +1231,7 @@ def verify_and_resample(
         seed,
         pos,
         dead_row_cut,
+        apply_temperature,
     )
     return sampled, num_sampled, resampled_local_argmax, resampled_local_max
 

@@ -255,6 +255,17 @@ class RejectionSampler:
         methods cap the count (the insertion of the resampled token stores it so).
         ``kernel_steps``: the drafts every request of the step verifies at most,
         the width block verification's kernels run at."""
+        in_kernel_temperature = (
+            self.use_block_verification
+            and draft_logits is None
+            and self.synthetic_conditional_rates is None
+            and self.watermark_key is None
+            and not getattr(self.sampler, "use_fp64_gumbel", False)
+            and sink is None
+            and self.sampler.logprobs_mode not in PROCESSED_LOGPROBS_MODES
+            and bool(np.any(self.sampler.needs_logits_processing[idx_mapping_np]))
+            and not self.sampler.any_non_temperature_logits_processing(idx_mapping_np)
+        )
         processed_logits = self.sampler.apply_sampling_params(
             logits,
             expanded_idx_mapping,
@@ -263,6 +274,7 @@ class RejectionSampler:
             pos,
             draft_sampled,
             expanded_local_pos,
+            skip_temperature=in_kernel_temperature,
         )
         cut = None
         if sink is not None:
@@ -291,6 +303,7 @@ class RejectionSampler:
             use_block_verification=self.use_block_verification,
             dead_row_cut=dead_row_cut,
             kernel_steps=kernel_steps,
+            **({"apply_temperature": True} if in_kernel_temperature else {}),
             **self._watermarking_kwargs(
                 draft_sampled, expanded_idx_mapping, expanded_local_pos
             ),

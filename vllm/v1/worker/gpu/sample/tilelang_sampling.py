@@ -2768,19 +2768,21 @@ def sampling_calls(
     temperature_strides: Sequence[int] | None = None,
 ) -> list:
     """The target sampler's calls: Gumbel-max sampling of logits of each of
-    ``logits_dtypes`` without a logits cache, the temperature already applied,
-    and the temperature of processed FP32 logits."""
+    ``logits_dtypes`` without a logits cache (with and without in-kernel
+    temperature scaling), and the temperature of processed FP32 logits."""
     strides_by_dtype: dict[torch.dtype, list[int]] = {}
     if logits_strides is not None:
         for dtype, stride in logits_strides:
             strides_by_dtype.setdefault(dtype, []).append(stride)
+    apply_temps = (False, True) if temperature else (False,)
     calls = [
         _call(
             gumbel_sample_kernel,
-            *gumbel_sample_key(dtype, RUNNER_IDX_DTYPE, False, False, run=run),
+            *gumbel_sample_key(dtype, RUNNER_IDX_DTYPE, apply_temp, False, run=run),
         )
         for dtype in dict.fromkeys(logits_dtypes)
         for run in _runs(dtype, strides_by_dtype.get(dtype))
+        for apply_temp in apply_temps
     ]
     if temperature:
         calls += [
