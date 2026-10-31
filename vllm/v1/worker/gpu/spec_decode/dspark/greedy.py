@@ -139,12 +139,21 @@ def register_greedy_markov_shard_pair_warmup(
     vocab_start: int,
 ) -> None:
     """Declare the kernels ``greedy_markov_shard_pair`` launches for base logits
-    and a Markov bias of these dtypes (the TileLang kernels take any stride,
-    alignment, shard and offset)."""
+    and a Markov bias of these dtypes, strides, alignment and shard width."""
     from vllm.v1.worker.gpu.sample import tilelang_sampling
 
+    vector = (
+        base_dtype.itemsize == 2
+        and bias_dtype.itemsize == 2
+        and base_aligned
+        and (base_stride * 2) % 16 == 0
+        and (bias_stride * 2) % 16 == 0
+        and vocab % 8 == 0
+    )
     tilelang_sampling.declare(
-        lambda: tilelang_sampling.greedy_calls(markov=[(base_dtype, bias_dtype)])
+        lambda: tilelang_sampling.greedy_calls(
+            markov=[(base_dtype, bias_dtype, vector)]
+        )
     )
 
 
@@ -152,11 +161,16 @@ def register_greedy_shard_pair_warmup(
     *, logits_dtype: torch.dtype, logits_stride: int, vocab: int, vocab_start: int
 ) -> None:
     """Declare the kernels ``greedy_shard_pair`` launches for logits of
-    ``logits_dtype``."""
+    ``logits_dtype``, ``logits_stride`` and shard width ``vocab``."""
     from vllm.v1.worker.gpu.sample import tilelang_sampling
 
+    vector = (
+        logits_dtype.itemsize == 2
+        and (logits_stride * 2) % 16 == 0
+        and vocab % 8 == 0
+    )
     tilelang_sampling.declare(
-        lambda: tilelang_sampling.greedy_calls(logits=[logits_dtype])
+        lambda: tilelang_sampling.greedy_calls(logits=[(logits_dtype, vector)])
     )
 
 

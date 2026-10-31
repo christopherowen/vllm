@@ -164,6 +164,10 @@ def test_greedy_verification_declares_its_one_launch(monkeypatch, tp_size):
         (6, "int32", tp_size, PAIR_WIDTH),
         (6, "int64", tp_size, PAIR_WIDTH),
     }
+    partial_declared = {
+        args for f, args, _ in calls if f is tls.partial_argmax_kernel
+    }
+    assert partial_declared == {("bfloat16", None, True)}
     assert not any(f is tls.select_first_argmax_kernel for f, _, _ in calls)
     prepare.prepare_declared(registry)
     launched = []
@@ -180,3 +184,49 @@ def test_greedy_verification_declares_its_one_launch(monkeypatch, tp_size):
     greedy_rejection_sample(pairs, drafts, cu, 5)
     assert [factory for factory, _ in launched] == [tls.greedy_rejection_kernel]
     assert launched[0][1] in declared
+
+
+def test_aligned_step_warmups_omit_unaligned_runs():
+    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+    from vllm.models.deepseek_v4_1.tilelang import prepare
+    from vllm.v1.worker.gpu.sample import tilelang_sampling as tls
+    from vllm.v1.worker.gpu.sample.gumbel import register_sampling_warmups
+    from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
+        register_greedy_markov_shard_pair_warmup,
+        register_greedy_shard_pair_warmup,
+    )
+
+    registry = JitWarmupRegistry(None)
+    with registry.activate():
+        register_sampling_warmups(
+            logits=((torch.bfloat16, 129408), (torch.float32, 129280)),
+            processed_logits_strides=(129280, 129408),
+            vocab_size=129280,
+            use_fp64=False,
+        )
+        register_greedy_markov_shard_pair_warmup(
+            base_dtype=torch.bfloat16,
+            base_stride=5 * 43136,
+            base_aligned=True,
+            bias_dtype=torch.bfloat16,
+            bias_stride=43136,
+            vocab=43136,
+            vocab_start=0,
+        )
+        register_greedy_shard_pair_warmup(
+            logits_dtype=torch.float32,
+            logits_stride=43136,
+            vocab=43136,
+            vocab_start=0,
+        )
+    calls = prepare.declared_calls(registry)
+    gumbel_runs = {args[-2] for f, args, _ in calls if f is tls.gumbel_sample_kernel}
+    temp_runs = {args[1] for f, args, _ in calls if f is tls.temperature_kernel}
+    partial_keys = {args for f, args, _ in calls if f is tls.partial_argmax_kernel}
+    assert 1 not in gumbel_runs
+    assert gumbel_runs == {4, 8}
+    assert temp_runs == {4}
+    assert partial_keys == {
+        ("bfloat16", "bfloat16", True),
+        ("float32", None, False),
+    }

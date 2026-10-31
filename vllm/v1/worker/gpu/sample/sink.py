@@ -701,8 +701,12 @@ class SinkSampler:
         )
 
         logits_dtypes = [dtype for dtype, _ in logits]
+        logits_strides = list(logits)
         if processed_logits_strides:
             logits_dtypes.append(torch.float32)
+            logits_strides.extend(
+                (torch.float32, stride) for stride in processed_logits_strides
+            )
         # alternate_logprobs_of ranks and scores the alternates in dense copies of
         # their rows, vocab_size apart whatever the logits' (padded) row stride.
         dense = [(dtype, vocab_size) for dtype in dict.fromkeys(logits_dtypes)]
@@ -717,5 +721,6 @@ class SinkSampler:
                 rejection=self.rejection,
                 num_event_fields=NUM_SINK_EVENT_FIELDS,
                 logits_mode=logits_mode,
+                logits_strides=logits_strides,
             )
         )

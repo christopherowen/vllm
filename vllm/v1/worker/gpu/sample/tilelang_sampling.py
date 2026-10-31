@@ -2715,9 +2715,28 @@ def apply_temperature(
 RUNNER_IDX_DTYPE = torch.int64
 
 
-def _runs(dtype: torch.dtype) -> tuple[int, int]:
-    """Both layouts a launch may take for logits of ``dtype`` (``_triton_run``)."""
-    return 1, 16 // torch.empty((), dtype=dtype).element_size()
+def _runs(dtype: torch.dtype, strides: Sequence[int] | None = None) -> tuple[int, ...]:
+    """The layouts a launch may take for logits of ``dtype`` (``_triton_run``):
+    when ``strides`` are given, each stride's layout (for a 16-byte aligned base
+    allocation); otherwise both."""
+    vec = 16 // torch.empty((), dtype=dtype).element_size()
+    if strides:
+        return tuple(
+            dict.fromkeys(vec if stride % 16 == 0 else 1 for stride in strides)
+        )
+    return 1, vec
+
+
+def _greedy_vectors(
+    dtypes: Sequence[torch.dtype], vector: bool | None = None
+) -> tuple[bool, ...]:
+    """``partial_argmax_kernel``'s ``vector`` specializations: ``_vector_rows`` is
+    True only on 16-bit tensors whose rows are 16-byte aligned and 8-element wide."""
+    if any(dtype.itemsize != 2 for dtype in dtypes):
+        return (False,)
+    if vector is not None:
+        return (bool(vector),)
+    return (True, False)
 
 
 def _call(factory: Any, *key: Any) -> tuple:
@@ -2742,26 +2761,34 @@ def declare(calls: Callable[[], list]) -> None:
 
 
 def sampling_calls(
-    logits_dtypes: Sequence[torch.dtype], temperature: bool = True
+    logits_dtypes: Sequence[torch.dtype],
+    temperature: bool = True,
+    *,
+    logits_strides: Sequence[tuple[torch.dtype, int]] | None = None,
+    temperature_strides: Sequence[int] | None = None,
 ) -> list:
     """The target sampler's calls: Gumbel-max sampling of logits of each of
     ``logits_dtypes`` without a logits cache, the temperature already applied,
     and the temperature of processed FP32 logits."""
+    strides_by_dtype: dict[torch.dtype, list[int]] = {}
+    if logits_strides is not None:
+        for dtype, stride in logits_strides:
+            strides_by_dtype.setdefault(dtype, []).append(stride)
     calls = [
         _call(
             gumbel_sample_kernel,
             *gumbel_sample_key(dtype, RUNNER_IDX_DTYPE, False, False, run=run),
         )
         for dtype in dict.fromkeys(logits_dtypes)
-        for run in _runs(dtype)
+        for run in _runs(dtype, strides_by_dtype.get(dtype))
     ]
     if temperature:
         calls += [
             _call(temperature_kernel, _DTYPES[RUNNER_IDX_DTYPE], run, block)
-            for run in _runs(torch.float32)
+            for run in _runs(torch.float32, temperature_strides)
             for block in _TEMPERATURE_BLOCKS
         ]
-    return calls
+    return _unique(calls)
 
 
 def gumbel_finish_calls(vocab_size: int) -> list:
@@ -2816,6 +2843,7 @@ def sink_calls(
     rejection: bool,
     num_event_fields: int,
     logits_mode: bool = False,
+    logits_strides: Sequence[tuple[torch.dtype, int]] | None = None,
 ) -> list:
     """``SinkSampler``'s calls: the flags, with and without dead rows; the policy
     for each sampled width, with and without logprobs; with rejection on, the
@@ -2823,6 +2851,10 @@ def sink_calls(
     ``logits_dtypes`` (a rejected draft masked when more than one row is
     sampled, with and without dead rows), and the alternates' rows for their
     logprobs (with ``logits_mode``, their logits too)."""
+    strides_by_dtype: dict[torch.dtype, list[int]] = {}
+    if logits_strides is not None:
+        for dtype, stride in logits_strides:
+            strides_by_dtype.setdefault(dtype, []).append(stride)
     calls = [_call(sink_flags_kernel, dead_rows) for dead_rows in (False, True)]
     if rejection:
         # The cut and its restore, on raw and processed logits and on a rank's
@@ -2879,8 +2911,8 @@ def sink_calls(
                     dead_rows=dead_rows,
                 ),
             )
-            for dtype in logits_dtypes
-            for run in _runs(dtype)
+            for dtype in dict.fromkeys(logits_dtypes)
+            for run in _runs(dtype, strides_by_dtype.get(dtype))
             for width in sampled_widths
             for dead_rows in ((False, True) if width > 1 else (False,))
         ]
@@ -2889,31 +2921,46 @@ def sink_calls(
 
 def greedy_calls(
     *,
-    markov: Sequence[tuple[torch.dtype, torch.dtype]] = (),
-    logits: Sequence[torch.dtype] = (),
+    markov: Sequence[
+        tuple[torch.dtype, torch.dtype] | tuple[torch.dtype, torch.dtype, bool]
+    ] = (),
+    logits: Sequence[torch.dtype | tuple[torch.dtype, bool]] = (),
     select: Sequence[tuple[torch.dtype, int, int]] = (),
     finish_outputs: Sequence[torch.dtype] = (),
     rejection: Sequence[tuple[int, int, int]] = (),
 ) -> list:
     """The greedy reductions' calls: ``greedy_markov_shard_pair`` /
     ``sample_greedy_markov`` for each ``(base, bias)`` dtype pair, and
-    ``greedy_shard_pair`` for each logits dtype (both the 16-byte and the
-    element-wise reads, which the launch picks from the rows' alignment); the
+    ``greedy_shard_pair`` for each logits dtype (the 16-byte or element-wise reads
+    matching the rows' alignment); the
     pair finish when there is a pair, ``select_first_argmax`` for each
     ``(output dtype, ranks, pair width)``, ``sample_greedy_markov``'s index finish
     for each of ``finish_outputs``, and greedy verification (its selection of the
     targets included) for each ``(sampled width, ranks, pair width)`` of
     ``rejection``."""
-    calls = [
-        _call(partial_argmax_kernel, *partial_argmax_key(base, bias, vector))
-        for base, bias in markov
-        for vector in (True, False)
-    ]
-    calls += [
-        _call(partial_argmax_kernel, *partial_argmax_key(dtype, None, vector))
-        for dtype in logits
-        for vector in (True, False)
-    ]
+    calls = []
+    for item in markov:
+        if len(item) == 3:
+            base, bias, vec = item
+            vectors = _greedy_vectors((base, bias), vec)
+        else:
+            base, bias = item
+            vectors = _greedy_vectors((base, bias))
+        for vector in vectors:
+            calls.append(
+                _call(partial_argmax_kernel, *partial_argmax_key(base, bias, vector))
+            )
+    for item in logits:
+        if isinstance(item, tuple):
+            dtype, vec = item
+            vectors = _greedy_vectors((dtype,), vec)
+        else:
+            dtype = item
+            vectors = _greedy_vectors((dtype,))
+        for vector in vectors:
+            calls.append(
+                _call(partial_argmax_kernel, *partial_argmax_key(dtype, None, vector))
+            )
     if markov or logits:
         calls += [_call(finish_argmax_kernel, "pair", lanes) for lanes in _FINISH_LANES]
     calls += [

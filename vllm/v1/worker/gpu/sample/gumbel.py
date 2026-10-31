@@ -298,7 +298,10 @@ def register_sampling_warmups(
         )
     tilelang_sampling.declare(
         lambda: tilelang_sampling.sampling_calls(
-            [dtype for dtype, _ in logits], temperature=bool(processed_logits_strides)
+            [dtype for dtype, _ in logits],
+            temperature=bool(processed_logits_strides),
+            logits_strides=logits,
+            temperature_strides=processed_logits_strides,
         )
         + tilelang_sampling.gumbel_finish_calls(vocab_size)
     )
