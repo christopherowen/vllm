@@ -1143,7 +1143,10 @@ class Worker(WorkerBase):
             ):
                 # Exercise captured execution paths before serving requests.
                 warmup_kernels(
-                    self.model_runner, self.execute_model, self.sample_tokens
+                    self.model_runner,
+                    self.execute_model,
+                    self.sample_tokens,
+                    post_capture=True,
                 )
                 torch.accelerator.synchronize()
                 torch.accelerator.empty_cache()

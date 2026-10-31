@@ -240,6 +240,8 @@ def warmup_kernels(
     model_runner: GPUModelRunner,
     worker_execute_model: Callable[[SchedulerOutput], Any],
     worker_sample_tokens: Callable[[GrammarOutput | None], Any],
+    *,
+    post_capture: bool = False,
 ) -> None:
     """Run scheduler-realistic prefill and decode steps to JIT compile kernels.
 
@@ -262,7 +264,15 @@ def warmup_kernels(
         # The warmup's synthetic rows are not traffic: neither logged nor kept.
         sink.warming = True
     try:
-        _warmup_kernels(model_runner, worker_execute_model, worker_sample_tokens)
+        if post_capture:
+            _warmup_kernels(
+                model_runner,
+                worker_execute_model,
+                worker_sample_tokens,
+                post_capture=True,
+            )
+        else:
+            _warmup_kernels(model_runner, worker_execute_model, worker_sample_tokens)
     finally:
         model_runner.adaptive_verification = adaptive_verification
         if adaptive_sampling:
@@ -270,7 +280,8 @@ def warmup_kernels(
             rejection_sampler.enable_adaptive_verification = True
         if sink is not None:
             sink.end_warmup()
-    _warmup_dead_row_kernels(model_runner)
+    if not post_capture:
+        _warmup_dead_row_kernels(model_runner)
 
 
 def _warmup_dead_row_kernels(model_runner: GPUModelRunner) -> None:
@@ -330,6 +341,8 @@ def _warmup_kernels(
     model_runner: GPUModelRunner,
     worker_execute_model: Callable[[SchedulerOutput], Any],
     worker_sample_tokens: Callable[[GrammarOutput | None], Any],
+    *,
+    post_capture: bool = False,
 ) -> None:
     if model_runner.vllm_config.is_mm_encoder_only:
         return
@@ -410,7 +423,7 @@ def _warmup_kernels(
 
     # The KV-block zeroing kernel is driven by the scheduler's
     # new_block_ids_to_zero, so none of the steps below reach it.
-    if model_runner.kv_block_zeroer is not None:
+    if not post_capture and model_runner.kv_block_zeroer is not None:
         model_runner.kv_block_zeroer.warmup(model_runner.kv_cache_config.num_blocks)
 
     # Step 1: Prefill all requests with 1 + decode_query_len prompt tokens each.
@@ -443,7 +456,7 @@ def _warmup_kernels(
         # Warm up sampler and perform a decode step for non-pooling models.
 
         grammar_output = None
-        if model_runner.is_last_pp_rank:
+        if not post_capture and model_runner.is_last_pp_rank:
             # Build a GrammarOutput to exercise the structured output bitmask
             # kernel during the prefill step.
             vocab_size = model_runner.model_config.get_vocab_size()
@@ -536,49 +549,54 @@ def _warmup_kernels(
         for step_indices, step_spec_flags in decode_steps:
             _run_decode_step(step_indices, step_spec_flags)
 
-        # Replace the singleton tail with a fresh greedy request. Mixing greedy
-        # and feature-rich requests would still promote the whole logits batch
-        # to FP32. A one-token prefill exercises native-dtype sampling without
-        # repeating the full model warmup; its decode warms native rejection.
-        # Retire the old requests before reusing their slots and KV blocks.
-        greedy_prompt = [0]
-        greedy_block_counts = [block_count(1, s) for s in kv_cache_specs]
-        greedy_output = SchedulerOutput.make_empty()
-        greedy_output.finished_req_ids = set(req_ids)
-        req_ids = ["_warmup_greedy_"]
-        next_block_id = 1
-        greedy_output.scheduled_new_reqs = [
-            NewRequestData.from_request(
-                Request(
-                    req_ids[0],
-                    greedy_prompt,
-                    SamplingParams(temperature=0.0),
-                    None,
-                    mm_features=warmup_mm_features,
-                ),
-                block_ids=tuple(_alloc_blocks(n) for n in greedy_block_counts),
-                prefill_token_ids=greedy_prompt,
-            )
-        ]
-        greedy_output.num_scheduled_tokens = {req_ids[0]: 1}
-        greedy_output.total_num_scheduled_tokens = 1
-        greedy_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
-        worker_execute_model(greedy_output)
-        worker_sample_tokens(None)
+        if not post_capture:
+            # Replace the singleton tail with a fresh greedy request. Mixing greedy
+            # and feature-rich requests would still promote the whole logits batch
+            # to FP32. A one-token prefill exercises native-dtype sampling without
+            # repeating the full model warmup; its decode warms native rejection.
+            # Retire the old requests before reusing their slots and KV blocks.
+            greedy_prompt = [0]
+            greedy_block_counts = [block_count(1, s) for s in kv_cache_specs]
+            greedy_output = SchedulerOutput.make_empty()
+            greedy_output.finished_req_ids = set(req_ids)
+            req_ids = ["_warmup_greedy_"]
+            next_block_id = 1
+            greedy_output.scheduled_new_reqs = [
+                NewRequestData.from_request(
+                    Request(
+                        req_ids[0],
+                        greedy_prompt,
+                        SamplingParams(temperature=0.0),
+                        None,
+                        mm_features=warmup_mm_features,
+                    ),
+                    block_ids=tuple(_alloc_blocks(n) for n in greedy_block_counts),
+                    prefill_token_ids=greedy_prompt,
+                )
+            ]
+            greedy_output.num_scheduled_tokens = {req_ids[0]: 1}
+            greedy_output.total_num_scheduled_tokens = 1
+            greedy_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
+            worker_execute_model(greedy_output)
+            worker_sample_tokens(None)
 
-        req_computed = [1]
-        req_blocks = [list(greedy_block_counts)]
-        if use_spec_decode:
-            _run_decode_step([0], [True])
-        # Keep a real singleton decode without drafts, not just a short prefill.
-        _run_decode_step([0], [False])
+            req_computed = [1]
+            req_blocks = [list(greedy_block_counts)]
+            if use_spec_decode:
+                _run_decode_step([0], [True])
+            # Keep a real singleton decode without drafts, not just a short prefill.
+            _run_decode_step([0], [False])
 
     # Clean up - process finish_req_ids.
     cleanup_output = SchedulerOutput.make_empty()
     cleanup_output.finished_req_ids = set(req_ids)
     worker_execute_model(cleanup_output)
     model_runner.kv_connector.set_disabled(False)
-    if model_runner.is_last_pp_rank and not model_runner.is_pooling_model:
+    if (
+        not post_capture
+        and model_runner.is_last_pp_rank
+        and not model_runner.is_pooling_model
+    ):
         warmup_processed_gumbel(
             model_runner.model_config.get_vocab_size(),
             model_runner.device,

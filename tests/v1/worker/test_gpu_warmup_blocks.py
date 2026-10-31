@@ -92,6 +92,7 @@ def _make_runner(
         adaptive_verification=None,
         rejection_sampler=None,
         decode_query_len=num_spec_steps + 1,
+        uniform_decode_query_len=num_spec_steps + 1,
         is_pooling_model=False,
         is_encoder_decoder=False,
         is_last_pp_rank=True,
@@ -453,3 +454,53 @@ def test_num_lookahead_tokens_without_speculation():
     config = _Config()
 
     assert config.num_lookahead_tokens == 0
+
+
+def test_post_capture_warmup_skips_non_graph_steps(monkeypatch):
+    from vllm.v1.worker.gpu import warmup
+
+    runner = _make_runner([_attention_group()], NUM_SPEC_STEPS, NUM_SPEC_STEPS)
+    zeroer_calls = 0
+
+    def warmup_zeroer(num_blocks: int) -> None:
+        nonlocal zeroer_calls
+        zeroer_calls += 1
+
+    runner.kv_block_zeroer = SimpleNamespace(warmup=warmup_zeroer)
+    gumbel_calls = 0
+    dead_row_calls = 0
+
+    def fake_gumbel(*args, **kwargs) -> None:
+        nonlocal gumbel_calls
+        gumbel_calls += 1
+
+    def fake_dead_row(*args, **kwargs) -> None:
+        nonlocal dead_row_calls
+        dead_row_calls += 1
+
+    monkeypatch.setattr(warmup, "warmup_processed_gumbel", fake_gumbel)
+    monkeypatch.setattr(warmup, "_warmup_dead_row_kernels", fake_dead_row)
+
+    recorder = _StepRecorder()
+    grammar_outputs: list[object] = []
+    forward_steps = 0
+
+    def execute(scheduled):
+        nonlocal forward_steps
+        recorder.execute_model(scheduled)
+        if scheduled.total_num_scheduled_tokens:
+            forward_steps += 1
+
+    def sample(grammar_output=None):
+        grammar_outputs.append(grammar_output)
+
+    warmup_kernels(runner, execute, sample, post_capture=True)
+
+    assert zeroer_calls == 0
+    assert gumbel_calls == 0
+    assert dead_row_calls == 0
+    assert all(g is None for g in grammar_outputs)
+    # 1 initial prefill + 3 decode steps (full spec, mixed, non-spec), no greedy tail.
+    assert forward_steps == 4
+    assert not recorder._held
+    _assert_covers_lookahead(recorder.steps, NUM_SPEC_STEPS)

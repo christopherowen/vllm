@@ -828,7 +828,7 @@ def test_v2_kernel_warmup_flushes_allocator_cache(monkeypatch):
         gpu_worker, "kernel_warmup", lambda *args: events.append("kernel_warmup")
     )
     monkeypatch.setattr(
-        gpu_worker, "warmup_kernels", lambda *args: events.append("warmup_kernels")
+        gpu_worker, "warmup_kernels", lambda *args, **kwargs: events.append("warmup_kernels")
     )
     monkeypatch.setattr(
         gpu_worker.torch.accelerator,
