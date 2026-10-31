@@ -190,6 +190,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.aiter_ar_comm: AiterCustomAllreduce | None = None
         self.use_aiter_ag_rs: bool = False
         self.b12x_ar_comm = None
+        self.roce_ar_comm = None
         self._roce_policy = False
 
         if self.use_b12x_allreduce and self.use_roce_allreduce:
@@ -211,7 +212,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
             from vllm.distributed.parallel_state import in_the_same_node_as
 
-            self.b12x_ar_comm = SparknetOneShotAllReduce(
+            self.roce_ar_comm = self.b12x_ar_comm = SparknetOneShotAllReduce(
                 group=self.cpu_group,
                 device_group=self.device_group,
                 device=self.device,
@@ -234,6 +235,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 group=self.cpu_group,
                 device=self.device,
             )
+
+    @property
+    def all_reduce_capacity_bytes(self) -> int:
+        comm = getattr(self, "roce_ar_comm", None) or getattr(
+            self, "b12x_ar_comm", None
+        )
+        return (
+            int(getattr(comm, "all_reduce_capacity_bytes", 0))
+            if comm is not None
+            else 0
+        )
+
+    def _init_collectives(self) -> None:
 
         if self.use_flashinfer_allreduce and self.world_size > 1:
             self.fi_ar_comm = FlashInferAllReduce(

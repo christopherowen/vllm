@@ -43,6 +43,12 @@ class TraceReplayState:
         self.trace_len.copy_to_uva()
         self.trace_token_ids.apply_write()
 
+    def register_warmups(self) -> None:
+        from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+        self.trace_token_ids.register_warmup()
+        tilelang_sampling.declare(tilelang_sampling.trace_replay_calls)
+
     def apply_trace(
         self,
         sampled: torch.Tensor,
@@ -58,6 +64,8 @@ class TraceReplayState:
         )
 
 
+# The reference the TileLang trace replay (``tilelang_sampling.trace_replay_kernel``)
+# is tested against; the sampler no longer launches it.
 @triton.jit
 def _trace_replay_kernel(
     sampled_ptr,  # [num_reqs], int64, mutated in place
@@ -101,12 +109,12 @@ def apply_trace_tokens(
     prompt_len: torch.Tensor,
 ) -> None:
     """Overwrite ``sampled`` in place with trace tokens for the current step."""
-    num_reqs = idx_mapping.shape[0]
-    _trace_replay_kernel[(num_reqs,)](
+    from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+    tilelang_sampling.apply_trace_tokens(
         sampled,
         idx_mapping,
         trace_token_ids,
-        trace_token_ids.stride(0),
         trace_len,
         total_len,
         prompt_len,

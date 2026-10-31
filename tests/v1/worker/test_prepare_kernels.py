@@ -376,3 +376,45 @@ def test_bounded_moe_and_router_declarations_omit_unreachable_cold_boot_kernels(
         tilelang_max_rows=16,
     )
     assert set(vocab._bf16_head_kernels(markov_head, torch.bfloat16)) == {16}
+
+
+def test_tilelang_backend_decouples_b12x_and_declares_pooling_and_sampling_holdouts(
+    monkeypatch,
+):
+    """TileLang backend initializes LogitsProcessor, sp_prefill, and mxfp4_csf
+    without b12x coupling, and declares pooling and sampling holdouts."""
+    import sys
+    import torch
+
+    import vllm.models.deepseek_v4_1.mxfp4_csf as mxfp4_csf
+    import vllm.models.deepseek_v4_1.sp_prefill as sp_prefill
+    from vllm.model_executor.layers import logits_processor as lp_mod
+
+    assert "B12xExperts" not in mxfp4_csf.__dict__
+
+    cfg = SimpleNamespace(
+        model_config=SimpleNamespace(head_dtype=None),
+        kernel_config=SimpleNamespace(linear_backend="tilelang", moe_backend="tilelang"),
+    )
+    monkeypatch.setattr(lp_mod, "get_current_vllm_config", lambda: cfg)
+    monkeypatch.setitem(sys.modules, "vllm.utils.b12x", None)
+    lp = lp_mod.LogitsProcessor(32768)
+    assert lp.use_tilelang_vocab_projection is True
+    assert lp.use_b12x_vocab_projection is False
+    assert lp.use_b12x_packed_vocab_projection is False
+
+    monkeypatch.setattr(sp_prefill, "model_parallel_is_initialized", lambda: True)
+    dev_comm = SimpleNamespace(all_reduce_capacity_bytes=1048576)
+    monkeypatch.setattr(
+        sp_prefill, "get_tp_group", lambda: SimpleNamespace(device_communicator=dev_comm)
+    )
+    assert sp_prefill._prefill_sp_capacity_bytes() == 1048576
+    dev_comm_roce = SimpleNamespace(
+        roce_ar_comm=SimpleNamespace(all_reduce_capacity_bytes=2097152)
+    )
+    monkeypatch.setattr(
+        sp_prefill,
+        "get_tp_group",
+        lambda: SimpleNamespace(device_communicator=dev_comm_roce),
+    )
+    assert sp_prefill._prefill_sp_capacity_bytes() == 2097152

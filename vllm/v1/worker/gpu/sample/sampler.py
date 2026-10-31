@@ -158,7 +158,21 @@ class Sampler:
             tilelang_auxiliary.register_nan_counts(logits=logits, vocab_size=vocab_size)
         self.logprob_token_ids_state.register_warmups()
         if self.trace_replay_state is not None:
-            self.trace_replay_state.trace_token_ids.register_warmup()
+            register_trace_warmups = getattr(
+                self.trace_replay_state, "register_warmups", None
+            )
+            if register_trace_warmups is not None:
+                register_trace_warmups()
+            else:
+                self.trace_replay_state.trace_token_ids.register_warmup()
+        if getattr(self, "return_sampling_mask", False):
+            from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+            tilelang_sampling.declare(
+                lambda: tilelang_sampling.compact_sampling_mask_calls(
+                    logits_dtypes=(torch.float32, *(dtype for dtype, _ in logits))
+                )
+            )
         register_topk_scores_warmup(
             logits=processed
             if self.logprobs_mode in PROCESSED_LOGPROBS_MODES

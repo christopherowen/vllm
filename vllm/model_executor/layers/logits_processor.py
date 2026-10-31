@@ -2,8 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A layer that compute logits from hidden_stats."""
 
+from __future__ import annotations
+
 from collections.abc import Callable, Sequence
 from functools import cache
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
@@ -21,14 +24,10 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.platforms import current_platform
-from vllm.utils.b12x import (
-    B12xPreparationUnit,
-    B12xWorkload,
-    get_b12x_bf16_vocab_projection,
-    get_b12x_packed_bf16_vocab_projection,
-    set_b12x_preparation_provider,
-)
 from vllm.utils.flashinfer import has_flashinfer
+
+if TYPE_CHECKING:
+    from vllm.utils.b12x import B12xPreparationUnit, B12xWorkload
 
 logger = init_logger(__name__)
 
@@ -130,15 +129,26 @@ class LogitsProcessor(PluggableLayer):
         self.use_tilelang_vocab_projection = kernel_config.linear_backend == "tilelang"
         # BF16 heads registered here, whose TileLang kernels this processor declares.
         self._tilelang_vocab_heads: list[VocabParallelEmbedding] = []
-        self._b12x_vocab_projection = get_b12x_bf16_vocab_projection()
         self._b12x_vocab_plans: dict[int, dict[int, object]] = {}
         self._b12x_vocab_heads: dict[int, VocabParallelEmbedding] = {}
+        if kernel_config.linear_backend == "b12x":
+            from vllm.utils.b12x import (
+                get_b12x_bf16_vocab_projection,
+                get_b12x_packed_bf16_vocab_projection,
+            )
+
+            self._b12x_vocab_projection = get_b12x_bf16_vocab_projection()
+            self._b12x_packed_vocab_projection = (
+                get_b12x_packed_bf16_vocab_projection()
+            )
+        else:
+            self._b12x_vocab_projection = None
+            self._b12x_packed_vocab_projection = None
         self.use_b12x_vocab_projection = bool(
             kernel_config.linear_backend == "b12x"
             and self._b12x_vocab_projection is not None
             and self._b12x_vocab_projection.is_supported()
         )
-        self._b12x_packed_vocab_projection = get_b12x_packed_bf16_vocab_projection()
         self.use_b12x_packed_vocab_projection = bool(
             kernel_config.linear_backend == "b12x"
             and self._b12x_packed_vocab_projection is not None
@@ -186,6 +196,8 @@ class LogitsProcessor(PluggableLayer):
             self._b12x_vocab_plans = owner._b12x_vocab_plans
             self._b12x_vocab_heads = owner._b12x_vocab_heads
             return
+        from vllm.utils.b12x import set_b12x_preparation_provider
+
         self._b12x_vocab_heads[id(lm_head)] = lm_head
         object.__setattr__(lm_head, "_b12x_vocab_projection_owner", self)
         set_b12x_preparation_provider(self, self)
@@ -302,6 +314,7 @@ class LogitsProcessor(PluggableLayer):
     ) -> Sequence[B12xPreparationUnit]:
         if layer is not self:
             return ()
+        from vllm.utils.b12x import B12xPreparationUnit
         units = []
         for head_id, head in self._b12x_vocab_heads.items():
             if head.weight.is_meta:

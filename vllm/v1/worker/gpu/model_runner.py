@@ -275,9 +275,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.speculative_config is not None and self.speculative_config.use_dspark()
         )
         self.observability_config = vllm_config.observability_config
-        from vllm.utils.b12x import is_b12x_a4_prefill_enabled
+        kernel_config = getattr(vllm_config, "kernel_config", None)
+        if getattr(kernel_config, "moe_backend", None) == "tilelang":
+            self._b12x_a4_prefill_enabled = False
+        else:
+            from vllm.utils.b12x import is_b12x_a4_prefill_enabled
 
-        self._b12x_a4_prefill_enabled = is_b12x_a4_prefill_enabled()
+            self._b12x_a4_prefill_enabled = is_b12x_a4_prefill_enabled()
         self.jit_warmup_registry = JitWarmupRegistry(vllm_config)
 
         self.device = device
@@ -2320,6 +2324,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.req_states.register_warmups()
         if self.copy_drafter is not None:
             self.copy_drafter.register_warmups()
+        if self.is_pooling_model:
+            tilelang_inputs.declare(
+                tilelang_inputs.post_update_num_computed_tokens_calls
+            )
         if not samples:
             return
         assert self.sampler is not None

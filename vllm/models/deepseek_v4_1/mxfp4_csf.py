@@ -14,7 +14,6 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-from vllm.model_executor.layers.fused_moe.b12x import B12xExperts
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     FusedMoEQuantDesc,
@@ -162,6 +161,7 @@ class Mxfp4CsfMoEMethod(FusedMoEMethodBase):
     def process_weights_after_loading(self, layer):
         from b12x.moe import fused_moe
 
+        from vllm.model_executor.layers.fused_moe.b12x import B12xExperts
         from vllm.model_executor.model_loader.mxfp4_csf_loader import (
             read_mxfp4_csf_layer,
         )

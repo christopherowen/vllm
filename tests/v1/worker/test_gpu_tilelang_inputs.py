@@ -1475,3 +1475,26 @@ def test_fill_rows(num_rows, dtype, width, value):
     assert torch.equal(state, expected)
     ((_, declared, _),) = tli.fill_rows_calls(torch.int64, dtype)
     assert declared == tli.fill_rows_key(torch.int64, dtype)
+
+
+@pytest.mark.parametrize("num_reqs", REQUEST_COUNTS)
+@pytest.mark.parametrize("idx_dtype", [torch.int64, torch.int32])
+def test_post_update_num_computed_tokens(num_reqs, idx_dtype):
+    """Pooling runner's computed-token commit matches Triton's reference bit for bit."""
+    gen = _gen(num_reqs * 13 + 7)
+    idx = _idx(num_reqs, gen, idx_dtype)
+    starts = _starts(_query_lens(num_reqs, prefill=True))
+    initial = _randint(0, 1000, (MAX_REQS,), gen)
+    expected = initial.clone()
+    actual = initial.clone()
+    if num_reqs > 0:
+        ib._post_update_num_computed_tokens_kernel[(num_reqs,)](
+            idx, expected, starts
+        )
+    ib.post_update_num_computed_tokens(idx, actual, starts)
+    torch.accelerator.synchronize()
+    assert torch.equal(actual, expected)
+    ((_, declared, _),) = tli.post_update_num_computed_tokens_calls(
+        tli._DTYPES[idx_dtype]
+    )
+    assert declared == tli.post_update_num_computed_tokens_key(tli._DTYPES[idx_dtype])

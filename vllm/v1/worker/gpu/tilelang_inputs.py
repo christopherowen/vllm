@@ -19,6 +19,8 @@ reference):
   ``input_batch._combine_sampled_and_draft_tokens_kernel``
 - ``expand_idx_mapping``: ``input_batch._expand_idx_mapping_kernel``
 - ``post_update``: ``input_batch._post_update_kernel``
+- ``post_update_num_computed_tokens``:
+  ``input_batch._post_update_num_computed_tokens_kernel``
 - ``prepare_dflash_inputs``: ``dflash.speculator._prepare_dflash_inputs_kernel``
 
 Integer arithmetic follows Triton's: C division and remainder (``truncdiv``,
@@ -2132,6 +2134,63 @@ def post_update(
             boundary_capture[2],
         ]
     _kernel(post_update_kernel, *key)(*args)
+
+
+@tilelang.jit(pass_configs=_PASS)
+def post_update_num_computed_tokens_kernel(idx_dtype: str):
+    """``input_batch._post_update_num_computed_tokens_kernel``: for each request in
+    the batch, adds its step query length ``query_start_loc[r + 1] -
+    query_start_loc[r]`` to ``num_computed_tokens[idx_mapping[r]]``. A block of
+    ``_REQUESTS`` threads, one request a thread."""
+    num_reqs = T.dynamic("num_reqs")
+    counts_len = T.dynamic("counts_len")
+    starts_len = T.dynamic("starts_len")
+
+    @T.prim_func
+    def post_update_num_computed_tokens(
+        idx_mapping: T.Tensor((num_reqs,), idx_dtype),
+        num_computed_tokens: T.Tensor((counts_len,), T.int32),
+        query_start_loc: T.Tensor((starts_len,), T.int32),
+    ):
+        with T.Kernel(T.ceildiv(num_reqs, _REQUESTS), threads=_REQUESTS) as b:
+            r = b * _REQUESTS + T.get_thread_binding()
+            if r < num_reqs:
+                req = T.cast(idx_mapping[r], T.int64)
+                query_len = query_start_loc[r + 1] - query_start_loc[r]
+                num_computed_tokens[req] = num_computed_tokens[req] + query_len
+
+    return post_update_num_computed_tokens
+
+
+def post_update_num_computed_tokens_key(idx_dtype: str) -> tuple:
+    return (idx_dtype,)
+
+
+def post_update_num_computed_tokens(
+    idx_mapping: torch.Tensor,
+    num_computed_tokens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+) -> None:
+    """``input_batch.post_update_num_computed_tokens``'s launch."""
+    if idx_mapping.shape[0] == 0:
+        return
+    key = post_update_num_computed_tokens_key(_DTYPES[idx_mapping.dtype])
+    _kernel(post_update_num_computed_tokens_kernel, *key)(
+        idx_mapping,
+        num_computed_tokens,
+        _as(query_start_loc, torch.int32),
+    )
+
+
+def post_update_num_computed_tokens_calls(
+    idx_dtype: str = "int64",
+) -> list:
+    return [
+        _call(
+            post_update_num_computed_tokens_kernel,
+            *post_update_num_computed_tokens_key(idx_dtype),
+        )
+    ]
 
 
 # --- DFlash drafting ----------------------------------------------------------

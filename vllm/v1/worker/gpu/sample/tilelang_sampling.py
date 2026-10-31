@@ -2709,6 +2709,197 @@ def apply_temperature(
     kernel(logits, expanded_idx_mapping.contiguous(), temperature)
 
 
+# --- Trace replay & compact sampling mask ------------------------------------
+
+
+@tilelang.jit(pass_configs=_PASS)
+def trace_replay_kernel(idx_dtype: str):
+    """``trace_replay._trace_replay_kernel``: for each request in the batch,
+    overwrites ``sampled[r]`` with ``trace_token_ids[req, total_len[req] -
+    prompt_len[req]]`` when ``req >= 0``, ``trace_len[req] > 0``, and
+    ``0 <= step < trace_len[req]``."""
+    num_reqs, states, max_len, len_states, total_states, prompt_states = T.dynamic(
+        "num_reqs, states, max_len, len_states, total_states, prompt_states"
+    )
+    trace_stride = T.dynamic("trace_stride", "int64")
+
+    @T.prim_func
+    def trace_replay(
+        sampled: T.Tensor((num_reqs,), T.int64),
+        idx_mapping: T.Tensor((num_reqs,), idx_dtype),
+        trace_token_ids: T.StridedTensor(
+            (states, max_len), (trace_stride, 1), T.int32
+        ),
+        trace_len: T.Tensor((len_states,), T.int32),
+        total_len: T.Tensor((total_states,), T.int32),
+        prompt_len: T.Tensor((prompt_states,), T.int32),
+    ):
+        with T.Kernel(T.ceildiv(num_reqs, 32), threads=32) as b:
+            r = b * 32 + T.get_thread_binding()
+            if r < num_reqs:
+                req = T.cast(idx_mapping[r], T.int64)
+                if req >= 0:
+                    t_len = trace_len[req]
+                    if t_len > 0:
+                        step = total_len[req] - prompt_len[req]
+                        if (step >= 0) & (step < t_len):
+                            sampled[r] = T.cast(trace_token_ids[req, step], T.int64)
+
+    return trace_replay
+
+
+def trace_replay_key(idx_dtype: torch.dtype) -> tuple:
+    return (_DTYPES[idx_dtype],)
+
+
+def apply_trace_tokens(
+    sampled: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    trace_token_ids: torch.Tensor,
+    trace_len: torch.Tensor,
+    total_len: torch.Tensor,
+    prompt_len: torch.Tensor,
+) -> None:
+    """``trace_replay.apply_trace_tokens``'s launch."""
+    if idx_mapping.shape[0] == 0:
+        return
+    key = trace_replay_key(idx_mapping.dtype)
+    _kernel(trace_replay_kernel, *key)(
+        sampled.view(-1),
+        idx_mapping,
+        trace_token_ids,
+        trace_len,
+        total_len,
+        prompt_len,
+    )
+
+
+_COMPACT_MASK_THREADS = 256
+_COMPACT_MASK_BITS = 8
+_COMPACT_MASK_BLOCK = _COMPACT_MASK_THREADS * _COMPACT_MASK_BITS
+
+
+@tilelang.jit(pass_configs=_PASS)
+def compact_sampling_mask_kernel(logits_dtype: str, sampled_dtype: str):
+    """``output._compact_sampling_mask_kernel``: for each request row, records the
+    first ``max_num_kept`` finite-logit vocabulary indices in ascending order in
+    ``token_ids[req, :]``, the packed little-endian bitmask in ``packed_mask[req,
+    :]``, and the full finite-logit count in ``counts[req]``. Rows with
+    ``num_sampled_tokens[req] <= 0`` record an empty mask and count 0."""
+    num_reqs, vocab, sampled_len, kept_cols, mask_cols = T.dynamic(
+        "num_reqs, vocab, sampled_len, kept_cols, mask_cols"
+    )
+    logits_stride, ids_stride, mask_stride = T.dynamic(
+        "logits_stride, ids_stride, mask_stride", "int64"
+    )
+    threads = _COMPACT_MASK_THREADS
+    warps = threads // 32
+
+    @T.prim_func
+    def compact_sampling_mask(
+        logits: T.StridedTensor((num_reqs, vocab), (logits_stride, 1), logits_dtype),
+        num_sampled_tokens: T.Tensor((sampled_len,), sampled_dtype),
+        token_ids: T.StridedTensor((num_reqs, kept_cols), (ids_stride, 1), T.int32),
+        packed_mask: T.StridedTensor((num_reqs, mask_cols), (mask_stride, 1), T.uint8),
+        counts: T.Tensor((num_reqs,), T.int32),
+        vocab_size: T.int32,
+        max_num_kept: T.int32,
+    ):
+        with T.Kernel(num_reqs, threads=threads) as req:
+            tx = T.get_thread_binding()
+            lane = tx % 32
+            warp = tx // 32
+            smem_counts = T.alloc_shared((threads,), T.int32)
+            warp_totals = T.alloc_shared((warps,), T.int32)
+            active = T.alloc_var(T.bool, init=num_sampled_tokens[req] > 0)
+            running_count = T.alloc_var(T.int32, init=0)
+            mask_bytes = T.ceildiv(vocab_size, 8)
+            num_passes = T.ceildiv(vocab_size, _COMPACT_MASK_BLOCK)
+            for p in T.serial(num_passes):
+                byte_idx = p * threads + tx
+                col0 = byte_idx * 8
+                mask_byte = T.alloc_var(T.int32, init=0)
+                thread_kept = T.alloc_var(T.int32, init=0)
+                if active:
+                    for b in T.unroll(8):
+                        col = col0 + b
+                        if col < vocab_size:
+                            val = T.cast(logits[req, col], T.float32)
+                            if (val > -T.infinity(T.float32)) & (
+                                val < T.infinity(T.float32)
+                            ):
+                                mask_byte = mask_byte | (1 << b)
+                                thread_kept = thread_kept + 1
+                if byte_idx < mask_bytes:
+                    packed_mask[req, byte_idx] = T.cast(mask_byte, T.uint8)
+                smem_counts[tx] = thread_kept
+                T.sync_threads()
+                local_offset = T.alloc_var(T.int32, init=0)
+                for i in T.unroll(32):
+                    if i < lane:
+                        local_offset = local_offset + smem_counts[warp * 32 + i]
+                if lane == 31:
+                    warp_totals[warp] = local_offset + thread_kept
+                T.sync_threads()
+                for w in T.unroll(warps):
+                    if w < warp:
+                        local_offset = local_offset + warp_totals[w]
+                pass_total = T.alloc_var(T.int32, init=0)
+                for w in T.unroll(warps):
+                    pass_total = pass_total + warp_totals[w]
+                pos = T.alloc_var(T.int32, init=running_count + local_offset)
+                if thread_kept > 0:
+                    for b in T.unroll(8):
+                        if ((mask_byte >> b) & 1) != 0:
+                            if pos < max_num_kept:
+                                token_ids[req, pos] = col0 + b
+                            pos = pos + 1
+                running_count = running_count + pass_total
+                T.sync_threads()
+            if tx == 0:
+                counts[req] = running_count
+
+    return compact_sampling_mask
+
+
+def compact_sampling_mask_key(
+    logits_dtype: torch.dtype, sampled_dtype: torch.dtype = torch.int32
+) -> tuple:
+    return (_DTYPES[logits_dtype], _DTYPES[sampled_dtype])
+
+
+def compact_sampling_mask(
+    logits: torch.Tensor,
+    num_sampled_tokens: torch.Tensor,
+    token_ids: torch.Tensor,
+    packed_mask: torch.Tensor,
+    counts: torch.Tensor,
+    vocab_size: int,
+    max_num_kept: int,
+) -> None:
+    """``SamplingMaskTensors.from_logits``'s launch."""
+    if logits.shape[0] == 0:
+        return
+    if logits.stride(1) != 1:
+        logits = logits.contiguous()
+    ids_arg = token_ids if token_ids.shape[1] > 0 else counts.view(-1, 1)
+    mask_arg = (
+        packed_mask
+        if packed_mask.shape[1] > 0
+        else counts.view(torch.uint8).view(logits.shape[0], -1)
+    )
+    key = compact_sampling_mask_key(logits.dtype, num_sampled_tokens.dtype)
+    _kernel(compact_sampling_mask_kernel, *key)(
+        logits[:, :vocab_size],
+        num_sampled_tokens,
+        ids_arg,
+        mask_arg,
+        counts,
+        vocab_size,
+        max_num_kept,
+    )
+
+
 # --- Preparation --------------------------------------------------------------
 
 # The runner's batch-to-request-state index is ``np.intp``.
@@ -2984,3 +3175,22 @@ def greedy_calls(
         for dtype in (torch.int32, torch.int64)
     ]
     return _unique(calls)
+
+
+def trace_replay_calls(idx_dtype: torch.dtype = RUNNER_IDX_DTYPE) -> list:
+    return [_call(trace_replay_kernel, *trace_replay_key(idx_dtype))]
+
+
+def compact_sampling_mask_calls(
+    logits_dtypes: Sequence[torch.dtype] = (torch.float32,),
+    sampled_dtype: torch.dtype = torch.int32,
+) -> list:
+    return _unique(
+        [
+            _call(
+                compact_sampling_mask_kernel,
+                *compact_sampling_mask_key(dtype, sampled_dtype),
+            )
+            for dtype in dict.fromkeys(logits_dtypes)
+        ]
+    )

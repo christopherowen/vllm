@@ -568,10 +568,9 @@ def post_update_num_computed_tokens(
     # [num_reqs + 1]
     query_start_loc: torch.Tensor,
 ) -> None:
-    from vllm.v1.worker.gpu._triton_refs import _post_update_num_computed_tokens_kernel
+    from vllm.v1.worker.gpu import tilelang_inputs
 
-    num_reqs = idx_mapping.shape[0]
-    _post_update_num_computed_tokens_kernel[(num_reqs,)](
+    tilelang_inputs.post_update_num_computed_tokens(
         idx_mapping,
         num_computed_tokens,
         query_start_loc,

@@ -29,6 +29,9 @@ class SamplerOutput:
     sink: SinkStepOutput | None = None
 
 
+# The reference the TileLang compact sampling mask
+# (``tilelang_sampling.compact_sampling_mask_kernel``) is tested against; the
+# sampler no longer launches it.
 @triton.jit
 def _compact_sampling_mask_kernel(
     logits_ptr,
@@ -112,19 +115,16 @@ class SamplingMaskTensors(NamedTuple):
             (num_reqs, (vocab_size + 7) // 8), dtype=torch.uint8, device=device
         )
         counts = torch.empty(num_reqs, dtype=torch.int32, device=device)
-        _compact_sampling_mask_kernel[(num_reqs,)](
+        from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+        tilelang_sampling.compact_sampling_mask(
             logits,
-            logits.stride(0),
-            logits.stride(1),
             num_sampled_tokens,
             token_ids,
-            token_ids.stride(0),
             packed_mask,
-            packed_mask.stride(0),
             counts,
             vocab_size,
             max_num_kept,
-            BLOCK_SIZE=8192,
         )
         return cls(token_ids, packed_mask, counts, vocab_size)
 

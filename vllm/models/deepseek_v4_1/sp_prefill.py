@@ -112,7 +112,13 @@ def _prefill_sp_capacity_bytes() -> int:
     """Registered RoCE capacity used as the conservative SP floor; 0 if none."""
     if not model_parallel_is_initialized():
         return 0
-    comm = getattr(get_tp_group().device_communicator, "b12x_ar_comm", None)
+    dev_comm = get_tp_group().device_communicator
+    capacity = getattr(dev_comm, "all_reduce_capacity_bytes", None)
+    if capacity is not None:
+        return int(capacity)
+    comm = getattr(dev_comm, "roce_ar_comm", None) or getattr(
+        dev_comm, "b12x_ar_comm", None
+    )
     return int(getattr(comm, "all_reduce_capacity_bytes", 0)) if comm is not None else 0
 
 

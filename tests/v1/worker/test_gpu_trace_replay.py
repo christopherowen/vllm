@@ -193,3 +193,77 @@ def test_slot_reuse_clears_trace():
     _set_lens(state, [3, 0], [3, 0])
     state.apply_trace(sampled, idx_mapping)
     assert sampled.tolist() == [888]
+
+
+@pytest.mark.parametrize("idx_dtype", [torch.int32, torch.int64])
+def test_tilelang_trace_replay_and_compact_sampling_mask_match_triton(idx_dtype):
+    """TileLang trace_replay and compact_sampling_mask match their Triton references."""
+    from vllm.v1.worker.gpu.sample import tilelang_sampling as tls
+    from vllm.v1.worker.gpu.sample.output import (
+        SamplingMaskTensors,
+        _compact_sampling_mask_kernel,
+    )
+    from vllm.v1.worker.gpu.sample.trace_replay import _trace_replay_kernel
+
+    gen = torch.Generator(device=DEVICE).manual_seed(42)
+    trace_token_ids = torch.randint(
+        0, 50000, (8, 128), generator=gen, dtype=torch.int32, device=DEVICE
+    )
+    trace_len = torch.tensor([0, 4, 10, 2, 0, 8, 1, 5], dtype=torch.int32, device=DEVICE)
+    prompt_len = torch.tensor([5, 3, 12, 8, 4, 2, 9, 1], dtype=torch.int32, device=DEVICE)
+    total_len = torch.tensor([5, 5, 12, 10, 7, 9, 9, 4], dtype=torch.int32, device=DEVICE)
+    idx_mapping = torch.tensor([1, -1, 2, 3, 5, 6, 7, 0], dtype=idx_dtype, device=DEVICE)
+    expected = torch.arange(100, 108, dtype=torch.int64, device=DEVICE)
+    actual = expected.clone()
+    _trace_replay_kernel[(idx_mapping.shape[0],)](
+        expected,
+        idx_mapping,
+        trace_token_ids,
+        trace_token_ids.stride(0),
+        trace_len,
+        total_len,
+        prompt_len,
+    )
+    apply_trace_tokens(
+        actual, idx_mapping, trace_token_ids, trace_len, total_len, prompt_len
+    )
+    assert torch.equal(actual, expected)
+    assert tls.trace_replay_calls(idx_dtype) == [
+        (tls.trace_replay_kernel, tls.trace_replay_key(idx_dtype), {})
+    ]
+
+    vocab_size = 4099
+    max_num_kept = 64
+    logits = torch.full((4, vocab_size), -float("inf"), dtype=torch.float32, device=DEVICE)
+    logits[0, [0, 7, 511, 512, 2048, 4098]] = torch.tensor(
+        [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], device=DEVICE
+    )
+    logits[1, :150] = torch.linspace(-1.0, 1.0, 150, device=DEVICE)
+    logits[2, [3, 9, 15]] = 0.5
+    num_sampled = torch.tensor([1, 1, 0, 1], dtype=torch.int32, device=DEVICE)
+
+    ref_ids = torch.zeros((4, max_num_kept), dtype=torch.int32, device=DEVICE)
+    ref_mask = torch.empty((4, (vocab_size + 7) // 8), dtype=torch.uint8, device=DEVICE)
+    ref_counts = torch.empty(4, dtype=torch.int32, device=DEVICE)
+    _compact_sampling_mask_kernel[(4,)](
+        logits,
+        logits.stride(0),
+        logits.stride(1),
+        num_sampled,
+        ref_ids,
+        ref_ids.stride(0),
+        ref_mask,
+        ref_mask.stride(0),
+        ref_counts,
+        vocab_size,
+        max_num_kept,
+        BLOCK_SIZE=8192,
+    )
+    masks = SamplingMaskTensors.from_logits(logits, num_sampled, max_num_kept)
+    assert torch.equal(masks.counts, ref_counts)
+    assert torch.equal(masks.packed_mask, ref_mask)
+    assert torch.equal(masks.token_ids[0, :6], ref_ids[0, :6])
+    assert torch.equal(masks.token_ids[1], ref_ids[1])
+    assert masks.tolists().to_nested_list() == SamplingMaskTensors(
+        ref_ids, ref_mask, ref_counts, vocab_size
+    ).tolists().to_nested_list()
