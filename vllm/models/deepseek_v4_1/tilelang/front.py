@@ -213,7 +213,6 @@ def attention_front_kernel(eps: float, page_size: int, slot_dtype: str = "int64"
     ):
         with T.Kernel(T.ceildiv(M, qb) + T.ceildiv(M, kb), threads=_THREADS) as bx:
             T.import_source(_CVT_HEADER)
-            pdl.chain()
             tid = T.get_thread_binding()
             q_sum_partial = T.alloc_fragment((qb, qt), T.float32)
             q_warp_reducer = T.alloc_reducer((qb, qw), T.float32, op="sum")
@@ -243,15 +242,46 @@ def attention_front_kernel(eps: float, page_size: int, slot_dtype: str = "int64"
             )
             q_x = T.alloc_local((q["num_thread_vec"], _VEC), T.bfloat16)
             q_y = T.alloc_local((q["num_thread_vec"], _VEC), T.bfloat16)
+            q_w = T.alloc_local((q["num_thread_vec"], _VEC), T.bfloat16)
             k_x = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
             k_y = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
+            k_w = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
             y_fp32_local = T.alloc_local((_VEC,), T.float32)
             sum_local = T.alloc_local((2,), T.float32)
-            weight_local = T.alloc_local((_VEC,), T.bfloat16)
             sf_local = T.alloc_local((q["num_thread_vec"],), out_config.sf_dtype)
             amax_local = T.alloc_local((q["num_thread_vec"],), T.float32)
             cs = T.alloc_local((_VEC,), T.float32)
             values = T.alloc_local((_VEC,), T.float32)
+            slot_local = T.alloc_local((1,), T.int64)
+
+            if bx < T.ceildiv(M, qb):
+                row_offset = tid % qt
+                for vi in T.unroll(q["num_thread_vec"]):
+                    token_offset = (vi * qt + row_offset) * _VEC
+                    if token_offset < Q_LATENT:
+                        for j in T.vectorized(_VEC):
+                            q_w[vi, j] = q_weight[token_offset + j]
+            else:
+                pid = bx - T.ceildiv(M, qb)
+                lane = tid % kt
+                token_id = pid * kb + tid // kt
+                for vi in T.unroll(k["num_thread_vec"]):
+                    token_offset = (vi * kt + lane) * _VEC
+                    for j in T.vectorized(_VEC):
+                        k_w[vi, j] = kv_weight[token_offset + j]
+                if token_id < M:
+                    slot_local[0] = T.cast(slots[token_id], T.int64)
+                    if last * kt + lane >= rope_vec:
+                        rope_lane = last * kt + lane - rope_vec
+                        position = positions[token_id]
+                        for i in T.vectorized(_VEC // 2):
+                            cs[i] = cos_sin[position, rope_lane * (_VEC // 2) + i]
+                        for i in T.vectorized(_VEC // 2):
+                            cs[_VEC // 2 + i] = cos_sin[
+                                position, half + rope_lane * (_VEC // 2) + i
+                            ]
+
+            pdl.chain()
 
             if bx < T.ceildiv(M, qb):
                 # The q latent: TileKernels' norm with its cast, and a BF16 copy.
@@ -281,14 +311,11 @@ def attention_front_kernel(eps: float, page_size: int, slot_dtype: str = "int64"
                 for vi in T.unroll(q["num_thread_vec"]):
                     token_offset = (vi * qt + row_offset) * _VEC
                     is_valid = token_id < M and token_offset < Q_LATENT
-                    if token_offset < Q_LATENT:
-                        for j in T.vectorized(_VEC):
-                            weight_local[j] = q_weight[token_offset + j]
                     for j in T.vectorized(_VEC):
                         y_fp32_local[j] = (
                             T.float32(q_x[vi, j])
                             * rstd_value
-                            * (T.float32(weight_local[j]) * out_scale)
+                            * (T.float32(q_w[vi, j]) * out_scale)
                         )
                     for j in T.vectorized(_VEC):
                         q_y[vi, j] = y_fp32_local[j]
@@ -346,28 +373,17 @@ def attention_front_kernel(eps: float, page_size: int, slot_dtype: str = "int64"
                     init=T.rsqrt(k_sum_fragment[tid // kt, lane] / KV_LATENT + eps),
                 )
                 for vi in T.unroll(k["num_thread_vec"]):
-                    token_offset = (vi * kt + lane) * _VEC
-                    for j in T.vectorized(_VEC):
-                        weight_local[j] = kv_weight[token_offset + j]
                     for j in T.vectorized(_VEC):
                         y_fp32_local[j] = (
                             T.float32(k_x[vi, j])
                             * rstd_value
-                            * (T.float32(weight_local[j]) * out_scale)
+                            * (T.float32(k_w[vi, j]) * out_scale)
                         )
                     for j in T.vectorized(_VEC):
                         k_y[vi, j] = y_fp32_local[j]
                 # rope_kernel's rotation of the last 64 columns (GPT-J pairs): the
                 # last vector of lanes 8-15, rope_kernel's lanes 0-7.
                 if (last * kt + lane >= rope_vec) & (token_id < M):
-                    rope_lane = last * kt + lane - rope_vec
-                    position = positions[token_id]
-                    for i in T.vectorized(_VEC // 2):
-                        cs[i] = cos_sin[position, rope_lane * (_VEC // 2) + i]
-                    for i in T.vectorized(_VEC // 2):
-                        cs[_VEC // 2 + i] = cos_sin[
-                            position, half + rope_lane * (_VEC // 2) + i
-                        ]
                     for j in T.unroll(_VEC // 2):
                         first = T.cast(k_y[last, 2 * j], T.float32)
                         second = T.cast(k_y[last, 2 * j + 1], T.float32)
@@ -392,7 +408,7 @@ def attention_front_kernel(eps: float, page_size: int, slot_dtype: str = "int64"
                     amax = T.max(amax, T.shfl_xor(amax, 1))
                     amax = T.max(amax, T.shfl_xor(amax, 2))
                     if token_id < M:
-                        slot = T.cast(slots[token_id], T.int64)
+                        slot = slot_local[0]
                         page = slot // page_size
                         if (slot >= 0) & (page < pages):
                             base = (slot % page_size) * record

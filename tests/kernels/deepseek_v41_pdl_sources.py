@@ -68,8 +68,12 @@ EXEMPT = {"pdl_early_reader"}
 # Predecessor-independent weights and RoPE/sink metadata that may be pre-loaded
 # before cudaGridDependencySynchronize().
 EARLY_PARAMETERS: dict[str, set[str]] = {
+    "attention_front": {"cos_sin", "kv_weight", "positions", "q_weight", "slots"},
+    "indexer_mxfp4_quantize": {"CosSin", "Positions", "Slots", "Weight"},
+    "mhc_post": {"comb", "post", "residual"},
     "moe_grouped_fp8_fp4_gemm": {"Narrow", "Order", "SFBase", "TileExpert"},
     "moe_swiglu_cast_kernel": {"Order", "TileExpert", "Weights"},
+    "rope": {"cos_sin", "positions"},
     "sparse_mla": {"CosSin", "Positions", "Sinks"},
 }
 WAIT = "cudaGridDependencySynchronize()"

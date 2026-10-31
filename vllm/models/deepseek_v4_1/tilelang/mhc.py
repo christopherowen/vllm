@@ -817,7 +817,6 @@ def post_streams(hidden_size: int, threads: int = 128):
         out: T.Tensor((M, MULT, hidden_size), T.bfloat16),
     ):
         with T.Kernel(M * blocks, threads=threads) as pid:
-            pdl.chain()
             token = pid // blocks
             col = (pid % blocks * threads + T.get_thread_binding()) * VEC
             xv = T.alloc_local((VEC,), T.bfloat16)
@@ -831,11 +830,12 @@ def post_streams(hidden_size: int, threads: int = 128):
             for m in T.unroll(MULT):
                 for n in T.vectorized(MULT):
                     cm[m * MULT + n] = comb[token, m, n]
-            for v in T.vectorized(VEC):
-                xv[v] = x[token, col + v]
             for m in T.unroll(MULT):
                 for v in T.vectorized(VEC):
                     rv[m * VEC + v] = residual[token, m, col + v]
+            pdl.chain()
+            for v in T.vectorized(VEC):
+                xv[v] = x[token, col + v]
             for n in T.unroll(MULT):
                 for v in T.unroll(VEC):
                     acc = cm[n] * T.Cast(T.float32, rv[v])

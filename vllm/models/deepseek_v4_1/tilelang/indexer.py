@@ -455,23 +455,32 @@ def mxfp4_quantize_v41(
     @T.macro
     def body(X, Positions, CosSin, Q, S, Slots, Pool):
         with T.Kernel(T.ceildiv(rows * groups, threads), threads=threads) as bx:
-            pdl.chain()
             tx = T.get_thread_binding()
             g = bx * threads + tx
             row, k = g // groups, g % groups
             vals = T.alloc_local([SF_BLOCK], T.bfloat16)
+            pos_l = T.alloc_local([1], T.int64)
+            slot_l = T.alloc_local([1], T.int64)
             amax = T.alloc_var(T.float32)
+            if row < rows:
+                if rope_heads > 0:
+                    if k >= start_group:
+                        token = row // rope_heads
+                        pos_l[0] = T.cast(
+                            Positions[token] // ratio * ratio
+                            if ratio > 1
+                            else Positions[token],
+                            T.int64,
+                        )
+                if paged:
+                    slot_l[0] = Slots[row]
+            pdl.chain()
             if row < rows:
                 for i in T.serial(SF_BLOCK):
                     vals[i] = X[row, k * SF_BLOCK + i]
                 if rope_heads > 0:
                     if k >= start_group:
-                        token = row // rope_heads
-                        pos = (
-                            Positions[token] // ratio * ratio
-                            if ratio > 1
-                            else Positions[token]
-                        )
+                        pos = pos_l[0]
                         pair_base = (k - start_group) * half
                         for i in T.unroll(half):
                             first = T.cast(vals[2 * i], T.float32)
@@ -497,7 +506,7 @@ def mxfp4_quantize_v41(
                     T.cast(T.shift_left(254 - sf, 23), T.uint32), T.float32
                 )
                 if paged:
-                    slot = Slots[row]
+                    slot = slot_l[0]
                     page, token = slot // page_size, slot % page_size
                     if (slot >= 0) & (page < pool_pages):
                         for i in T.serial(half):
@@ -641,7 +650,6 @@ def mxfp4_norm_rope_quantize_v41(
         ),
     ):
         with T.Kernel(T.ceildiv(rows, kb), threads=_THREADS) as bx:
-            pdl.chain()
             tid = T.get_thread_binding()
             k_sum_partial = T.alloc_fragment((kb, kt), T.float32)
             k_warp_reducer = T.alloc_reducer((kb, 1), T.float32, op="sum")
@@ -660,14 +668,33 @@ def mxfp4_norm_rope_quantize_v41(
             )
             k_x = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
             k_y = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
+            k_w = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
             y_fp32_local = T.alloc_local((_VEC,), T.float32)
             sum_local = T.alloc_local((2,), T.float32)
-            weight_local = T.alloc_local((_VEC,), T.bfloat16)
             cs = T.alloc_local((_VEC,), T.float32)
+            slot_l = T.alloc_local((1,), T.int64)
 
             row_id = tid // kt
             lane = tid % kt
             token_id = bx * kb + row_id
+            for vi in T.unroll(k["num_thread_vec"]):
+                token_offset = (vi * kt + lane) * _VEC
+                for j in T.vectorized(_VEC):
+                    k_w[vi, j] = Weight[token_offset + j]
+            if token_id < rows:
+                slot_l[0] = T.cast(Slots[token_id], T.int64)
+                pos = (
+                    Positions[token_id] // ratio * ratio
+                    if ratio > 1
+                    else Positions[token_id]
+                )
+                for i in T.vectorized(pairs):
+                    cs[i] = CosSin[pos, lane * pairs + i]
+                for i in T.vectorized(pairs):
+                    cs[pairs + i] = CosSin[pos, half + lane * pairs + i]
+
+            pdl.chain()
+
             T.clear(sum_local)
             for vi in T.unroll(k["num_thread_vec"]):
                 token_offset = (vi * kt + lane) * _VEC
@@ -700,28 +727,16 @@ def mxfp4_norm_rope_quantize_v41(
                 init=T.rsqrt(k_sum_fragment[row_id, lane] / INDEX_DIM + eps),
             )
             for vi in T.unroll(k["num_thread_vec"]):
-                token_offset = (vi * kt + lane) * _VEC
-                for j in T.vectorized(_VEC):
-                    weight_local[j] = Weight[token_offset + j]
                 for j in T.vectorized(_VEC):
                     y_fp32_local[j] = (
                         T.float32(k_x[vi, j])
                         * rstd_value
-                        * (T.float32(weight_local[j]) * out_scale)
+                        * (T.float32(k_w[vi, j]) * out_scale)
                     )
                 for j in T.vectorized(_VEC):
                     k_y[vi, j] = y_fp32_local[j]
 
             if token_id < rows:
-                pos = (
-                    Positions[token_id] // ratio * ratio
-                    if ratio > 1
-                    else Positions[token_id]
-                )
-                for i in T.vectorized(pairs):
-                    cs[i] = CosSin[pos, lane * pairs + i]
-                for i in T.vectorized(pairs):
-                    cs[pairs + i] = CosSin[pos, half + lane * pairs + i]
                 for j in T.unroll(pairs):
                     first = T.cast(k_y[1, 2 * j], T.float32)
                     second = T.cast(k_y[1, 2 * j + 1], T.float32)
@@ -743,7 +758,7 @@ def mxfp4_norm_rope_quantize_v41(
                 amax = T.max(amax, T.shfl_xor(amax, 1))
                 amax = T.max(amax, T.shfl_xor(amax, 2))
                 if token_id < rows:
-                    slot = T.cast(Slots[token_id], T.int64)
+                    slot = slot_l[0]
                     page = slot // page_size
                     tok = slot % page_size
                     if (slot >= 0) & (page < pool_pages):

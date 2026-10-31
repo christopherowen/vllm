@@ -46,7 +46,6 @@ def rope_kernel(heads: int, dim: int, rope_dim: int, ratio: int, inverse: bool):
             T.ceildiv(heads, heads_per_block),
             threads=threads,
         ) as (tb, hb):
-            pdl.chain()
             tx = T.get_thread_binding()
             t = tb * tokens_per_block + tx // per_token
             head = hb * heads_per_block + tx % per_token // lanes
@@ -59,6 +58,8 @@ def rope_kernel(heads: int, dim: int, rope_dim: int, ratio: int, inverse: bool):
                     cs[i] = cos_sin[position, lane * _PAIRS + i]
                 for i in T.vectorized(_PAIRS):
                     cs[_PAIRS + i] = cos_sin[position, half + lane * _PAIRS + i]
+            pdl.chain()
+            if t < tokens and head < heads:
                 for j in T.vectorized(2 * _PAIRS):
                     xs[j] = x[t, head, start + lane * 2 * _PAIRS + j]
                 for j in T.unroll(_PAIRS):
