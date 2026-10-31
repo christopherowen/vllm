@@ -1121,11 +1121,12 @@ def test_grammar_sees_committed_tokens_only():
         spec = so.scheduled_spec_decode_tokens.get("a", [])
         rows = output.grammar_bitmask.shape[0]
         if "a" in (so.sink_draft_zero_req_ids or ()):
-            # One mask per spec token, the first after draft zero.
+            # One mask per spec token, the first after draft zero; rows past a
+            # grammar-invalid draft are unconstrained.
             assert rows == len(spec)
-            assert grammar.filled[start:] == [
-                committed + 1 + i for i in range(len(spec))
-            ]
+            valid = len(grammar.validate_tokens(spec))
+            assert grammar.filled[start:] == [committed + 1 + i for i in range(valid)]
+            assert (output.grammar_bitmask[valid:] == -1).all()
         else:
             assert rows == len(spec) + 1
         masks.append((committed, rows, len(spec)))

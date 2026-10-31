@@ -135,24 +135,36 @@ def test_gpu_sampler_rejects_drafts_after_grammar_termination(
         scheduled_spec_decode_tokens={request.request_id: [-1] * 3},
     )
     scheduler = SimpleNamespace(
-        requests={request.request_id: request}, structured_output_manager=manager
+        requests={request.request_id: request},
+        structured_output_manager=manager,
+        sink_rejection=False,
+        _reject_unconstrained_drafts=lambda *args: None,
     )
     Scheduler.update_draft_token_ids_in_output(
         scheduler, DraftTokenIds([request.request_id], [drafts.copy()]), scheduled
     )
-    assert scheduled.num_invalid_spec_tokens.get(request.request_id, 0) == 3 - num_valid
+    # When num_valid == 0, the grammar is not yet terminated so the first
+    # grammar-invalid draft is kept for rejection sampling and rejected by
+    # the active bitmask row; when num_valid > 0, drafts[num_valid - 1] is
+    # EOS and terminates the grammar, so all trailing drafts are invalidated.
+    num_kept = max(num_valid, 1)
+    assert scheduled.num_invalid_spec_tokens.get(request.request_id, 0) == 3 - num_kept
     grammar_output = Scheduler.get_grammar_bitmask(scheduler, scheduled)
     assert grammar_output is not None
 
     # The adjacent unstructured request and non-logit input slots must survive
     # compaction and grammar rejection unchanged.
     num_logits = num_verified + 2
-    input_ids = torch.tensor([17, 19, 23, 29, *drafts], device="cuda")
-    logits_indices = torch.tensor([1, *range(3, 4 + num_verified)], device="cuda")
+    input_ids = torch.tensor(
+        [17, 19, 23, 29, *drafts], dtype=torch.int32, device="cuda"
+    )
+    logits_indices = torch.tensor(
+        [1, *range(3, 4 + num_verified)], dtype=torch.int64, device="cuda"
+    )
     batch = SimpleNamespace(
         req_ids=["unstructured", request.request_id],
         cu_num_logits_np=np.array([0, 1, num_logits], dtype=np.int32),
-        cu_num_logits=torch.tensor([0, 1, num_logits], device="cuda"),
+        cu_num_logits=torch.tensor([0, 1, num_logits], dtype=torch.int32, device="cuda"),
         num_draft_tokens_per_req=np.array([0, 3], dtype=np.int32),
         input_ids=input_ids,
         logits_indices=logits_indices,
@@ -170,8 +182,8 @@ def test_gpu_sampler_rejects_drafts_after_grammar_termination(
         grammar_output.num_invalid_spec_tokens,
     )
     expected_inputs = [17, 19, 23, 29, *drafts]
-    expected_inputs[4 + num_valid : 4 + num_verified] = [-1] * max(
-        num_verified - num_valid, 0
+    expected_inputs[4 + num_kept : 4 + num_verified] = [-1] * max(
+        num_verified - num_kept, 0
     )
     assert input_ids.tolist() == expected_inputs
     sampled, lengths = rejection_sample(

@@ -3965,7 +3965,7 @@ class Scheduler(SchedulerInterface):
                 assert request.sink_provisional is not None, req_id
                 spec_token_ids = [request.sink_provisional, *spec_token_ids]
             # Add newly generated spec token ids to the request.
-            request.spec_token_ids = self.structured_output_manager.validate_tokens(
+            request.spec_token_ids = self.structured_output_manager.trim_spec_tokens(
                 request, spec_token_ids
             )
             if request.sink_draft_zero:
@@ -4003,8 +4003,10 @@ class Scheduler(SchedulerInterface):
             # Trim drafts to scheduled number of spec tokens
             # (needed for chunked prefill case for example).
             del spec_token_ids[orig_num_spec_tokens:]
-            # Filter out spec tokens which do not adhere to the grammar.
-            spec_token_ids = self.structured_output_manager.validate_tokens(
+            # Trim padding, post-termination tokens, and suffixes past the
+            # first grammar-invalid draft; keep the first grammar-invalid
+            # draft so rejection sampling preserves the target distribution.
+            spec_token_ids = self.structured_output_manager.trim_spec_tokens(
                 request, spec_token_ids
             )
             # Pad to original number of spec tokens.

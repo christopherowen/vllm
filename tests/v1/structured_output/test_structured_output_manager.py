@@ -18,6 +18,7 @@ TOKENIZER = "gpt2"
 THINK_END = "\n"  # reasoning-end marker (single GPT-2 token)
 EOS = "<|eos|>"  # resolved to tokenizer.eos_token_id
 JSON_SCHEMA = '{"type": "object"}'
+DIGITS_REGEX = "[0-9]+"
 BACKENDS = ("xgrammar", "guidance")
 MAX_WAIT_SECONDS = 5
 NUM_SPEC_TOKENS = 8
@@ -30,9 +31,9 @@ def tokenizer():
 
 @dataclass(frozen=True)
 class FlowCase:
-    """One validate -> bitmask -> accept -> post-accept bitmask scenario."""
+    """One bitmask -> accept -> post-accept bitmask scenario."""
 
-    raw_drafts: tuple[str, ...]
+    raw_drafts: tuple[str | int, ...]
     expected_row_pattern: str
     expected_reasoning: bool | None
     expect_terminated: bool
@@ -61,10 +62,14 @@ def _single_token(tokenizer, text: str) -> int:
     return token_ids[0]
 
 
-def _to_token_ids(tokenizer, texts: tuple[str, ...]) -> list[int]:
-    """Convert literal text (or EOS sentinel) to token IDs."""
+def _to_token_ids(tokenizer, texts: tuple[str | int, ...]) -> list[int]:
+    """Convert literal text, EOS, or speculative-padding tokens to IDs."""
     return [
-        tokenizer.eos_token_id if t == EOS else _single_token(tokenizer, t)
+        t
+        if isinstance(t, int)
+        else tokenizer.eos_token_id
+        if t == EOS
+        else _single_token(tokenizer, t)
         for t in texts
     ]
 
@@ -88,6 +93,7 @@ def _build_harness(
     reasoning_ended: bool | None = None,
     enable_in_reasoning: bool = False,
     reasoning_parser_kwargs: dict | None = None,
+    structured_outputs: StructuredOutputsParams | None = None,
 ) -> tuple[StructuredOutputManager, Request]:
     vllm_config = VllmConfig(
         model_config=ModelConfig(tokenizer=TOKENIZER),
@@ -106,7 +112,8 @@ def _build_harness(
         manager.reasoner_cls = MockReasoner
 
     sampling_params = SamplingParams(
-        structured_outputs=StructuredOutputsParams(json=JSON_SCHEMA)
+        structured_outputs=structured_outputs
+        or StructuredOutputsParams(json=JSON_SCHEMA)
     )
     sampling_params.structured_outputs._backend = backend
     sampling_params.update_from_generation_config({}, tokenizer.eos_token_id)
@@ -135,6 +142,40 @@ def _build_harness(
     return manager, request
 
 
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize(
+    ("raw_drafts", "expected_length"),
+    [
+        ((THINK_END, "1", "2", -1), 3),
+        ((THINK_END, "1", "z", "2"), 3),
+        (("1", "z", "2", -1), 3),
+        (("z", THINK_END, "1", "z", "2", -1), 4),
+    ],
+)
+def test_trim_spec_tokens_with_grammar(
+    tokenizer,
+    backend: str,
+    raw_drafts: tuple[str | int, ...],
+    expected_length: int,
+):
+    manager, request = _build_harness(
+        tokenizer,
+        backend,
+        reasoning_ended=False,
+        reasoning_parser_kwargs={
+            "marker": _single_token(tokenizer, THINK_END),
+        },
+        structured_outputs=StructuredOutputsParams(regex=DIGITS_REGEX),
+    )
+
+    spec_tokens = _to_token_ids(tokenizer, raw_drafts)
+
+    # The reasoning marker makes the manager find the grammar boundary from
+    # the real request state instead of hard-coding a boundary in the test.
+    trimmed = manager.trim_spec_tokens(request, spec_tokens)
+    assert trimmed == spec_tokens[:expected_length]
+
+
 def _row_pattern(bitmask) -> str:
     return "".join("U" if (row == -1).all() else "C" for row in bitmask)
 
@@ -150,21 +191,14 @@ def _run_real_flow(
 ) -> None:
     assert len(expected_validated) <= len(raw_drafts)
 
-    validated = manager.validate_tokens(request, list(raw_drafts))
-    assert validated == expected_validated
-
-    padded = validated + [-1] * (len(raw_drafts) - len(validated))
     bitmask = manager.grammar_bitmask(
         requests={request.request_id: request},
         structured_output_request_ids=[request.request_id],
-        scheduled_spec_decode_tokens={request.request_id: padded},
+        scheduled_spec_decode_tokens={request.request_id: raw_drafts},
     )
     assert bitmask is not None
     assert bitmask.shape[0] == len(raw_drafts) + 1
     assert _row_pattern(bitmask) == expected_row_pattern
-
-    # grammar_bitmask() must rollback any speculative state it advanced.
-    assert manager.validate_tokens(request, list(raw_drafts)) == expected_validated
 
     structured_req = request.structured_output_request
     assert structured_req is not None
@@ -177,8 +211,7 @@ def _run_real_flow(
     expected_post_accept_row = bitmask[len(expected_validated)].copy()
 
     # Mirror the scheduler flow: sampled tokens are appended before
-    # StructuredOutputManager.accept_tokens() trims them to the
-    # grammar-constrained suffix.
+    # StructuredOutputManager.accept_tokens() advances the grammar.
     request.append_output_token_ids(list(expected_validated))
     assert manager.accept_tokens(request, list(expected_validated))
 
@@ -207,8 +240,9 @@ FLOW_CASES = [
     pytest.param(
         FlowCase(
             prefix='{"a"',
-            raw_drafts=(":", ' "', "b", '"}'),
-            expected_row_pattern="CCCCC",
+            raw_drafts=(":", ' "', "b", '"}', -1, -1),
+            expected_validated=(":", ' "', "b", '"}'),
+            expected_row_pattern="CCCCCUU",
             expected_reasoning=True,
             expect_terminated=False,
             reasoning_ended=True,
@@ -248,10 +282,6 @@ FLOW_CASES = [
             expected_reasoning=True,
             expect_terminated=True,
             reasoning_ended=True,
-            xfail_guidance=(
-                "guidance validate_tokens rejects EOS on an already-complete "
-                "object even though accept_tokens would accept it"
-            ),
         ),
         id="active_first_token_terminates",
     ),
@@ -393,17 +423,14 @@ def test_initial_constraint_activation(
         },
     )
 
-    # "{" is valid JSON start; "z" is not. Truncation proves grammar is active.
     open_brace = _single_token(tokenizer, "{")
-    z = _single_token(tokenizer, "z")
-    assert manager.validate_tokens(request, [open_brace, z]) == [open_brace]
-
     bitmask = manager.grammar_bitmask(
         requests={request.request_id: request},
         structured_output_request_ids=[request.request_id],
-        scheduled_spec_decode_tokens={},
+        scheduled_spec_decode_tokens={request.request_id: [open_brace]},
     )
     assert bitmask is not None
+    assert _row_pattern(bitmask) == "CC"
     request.append_output_token_ids([open_brace])
     assert manager.accept_tokens(request, [open_brace])
 

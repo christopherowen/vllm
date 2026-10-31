@@ -291,12 +291,15 @@ class StructuredOutputManager:
                 return i + 1
         return 1
 
-    def validate_tokens(self, request: "Request", spec_tokens: list[int]) -> list[int]:
-        """Return the longest unconstrained or grammar-valid prefix of `spec_tokens`."""
+    def trim_spec_tokens(self, request: "Request", spec_tokens: list[int]) -> list[int]:
+        """Trim structured-output padding and grammar-invalid suffixes."""
         if not request.use_structured_output:
+            # Synchronous unstructured decoding uses -1 values as scheduler-side
+            # markers for speculative slots, so preserve their length.
             return spec_tokens
 
         spec_tokens = strip_speculative_padding(spec_tokens)
+
         constraint_start = self._get_constraint_start(request, spec_tokens)
         if constraint_start >= len(spec_tokens):
             return spec_tokens
@@ -307,9 +310,21 @@ class StructuredOutputManager:
         grammar = structured_req.grammar
         if TYPE_CHECKING:
             assert isinstance(grammar, StructuredOutputGrammar)
+        if grammar.is_terminated():
+            return spec_tokens[:constraint_start]
         prefix = spec_tokens[:constraint_start]
         validated = grammar.validate_tokens(spec_tokens[constraint_start:])
-        return prefix + validated
+        if (
+            validated
+            and request.sampling_params is not None
+            and validated[-1] in request.sampling_params.all_stop_token_ids
+        ):
+            return prefix + validated
+        len_validated = len(validated)
+        return (
+            prefix
+            + spec_tokens[constraint_start : constraint_start + len_validated + 1]
+        )
 
     def grammar_bitmask(
         self,
@@ -394,14 +409,13 @@ class StructuredOutputManager:
                     request, strip_speculative_padding(req_tokens)
                 )
                 state_advancements = 0
-                seen_padding = False
-                failed = False
+                padding_or_grammar_invalid = False
                 draft_zero = draft_zero_req_ids is not None and (
                     req_id in draft_zero_req_ids
                 )
                 for i, token in enumerate(req_tokens):
                     apply_bitmask = (
-                        not failed and not seen_padding and i >= constraint_start
+                        not padding_or_grammar_invalid and i >= constraint_start
                     )
                     if i > 0 or not draft_zero:
                         self._fill_bitmasks(
@@ -409,27 +423,20 @@ class StructuredOutputManager:
                         )
                         cumulative_index += 1
                     if token == -1:
-                        seen_padding = True
+                        padding_or_grammar_invalid = True
                     elif apply_bitmask:
                         if not grammar.is_terminated() and grammar.accept_tokens(
                             req_id, [token]
                         ):
                             state_advancements += 1
                         else:
-                            failed = True
-                            logger.error(
-                                "Unexpected: grammar terminated or rejected draft "
-                                "token %s for request %s during bitmask fill.",
-                                token,
-                                req_id,
-                            )
+                            padding_or_grammar_invalid = True
 
                 # Diffusion LLMs don't sample a bonus token after the
                 # scheduled positions, so skip its bitmask in that case.
                 if not (self.vllm_config.model_config.is_diffusion and req_tokens):
                     bonus_apply = (
-                        not failed
-                        and not seen_padding
+                        not padding_or_grammar_invalid
                         and constraint_start <= len(req_tokens)
                     )
                     self._fill_bitmasks(((grammar, cumulative_index, bonus_apply),))
