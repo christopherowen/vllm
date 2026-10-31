@@ -20,9 +20,11 @@ pytest.importorskip("tilelang")
 from vllm.models.deepseek_v4_1.tilelang import vocab as packed_format  # noqa: E402
 from vllm.models.deepseek_v4_1.tilelang.vocab import (  # noqa: E402
     ROW_TILES,
+    nvfp4_vocab_projection,
     pack_bf16_weight,
     packed_vocab_projection,
     prepare_bf16_head,
+    prepare_nvfp4_head,
     prepare_packed_head,
     project_head,
     project_head_greedy_pairs,
@@ -379,3 +381,123 @@ def test_packed_bf16_lm_head_method_tilelang_without_b12x(monkeypatch):
         method.declare_layer_kernels(layer)
         x = (torch.randn(9, 512, device=DEVICE) * 0.5).bfloat16()
         assert _close_to_fp32(project_head(layer, x), x, original)
+
+
+
+def _nvfp4_layer(weight: torch.Tensor):
+    from vllm._custom_ops import scaled_fp4_quant
+    from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
+        FLOAT4_E2M1_MAX,
+        dequantize_to_dtype,
+    )
+
+    float8_e4m3_max = torch.finfo(torch.float8_e4m3fn).max
+    amax = weight.abs().amax().float().clamp_min(1e-8)
+    global_scale = (FLOAT4_E2M1_MAX * float8_e4m3_max) / amax
+    packed, scales = scaled_fp4_quant(
+        weight.contiguous(), global_scale, is_sf_swizzled_layout=False
+    )
+    weight_global_scale = global_scale.reciprocal().reshape(1).to(torch.float32)
+    dequant = dequantize_to_dtype(
+        packed,
+        scales.view(torch.float8_e4m3fn),
+        weight_global_scale,
+        dtype=torch.float32,
+        block_size=16,
+        swizzle=False,
+    )
+    layer = SimpleNamespace(
+        weight=packed,
+        weight_scale=scales,
+        weight_global_scale=weight_global_scale,
+        nvfp4_in_features=int(weight.shape[1]),
+    )
+    return layer, dequant
+
+
+@pytest.mark.parametrize("n,k", [(1000, 256), (32320, 256), (1000, 512)])
+def test_nvfp4_head_matches_dequantized_reference_and_is_batch_invariant(n, k):
+    generator = torch.Generator(device=DEVICE).manual_seed(n + k + 23)
+    weight = (torch.randn(n, k, generator=generator, device=DEVICE) * 0.05).bfloat16()
+    layer, dequant_weight = _nvfp4_layer(weight)
+    prepare_nvfp4_head(layer)
+    assert set(layer.tilelang_vocab) == set(ROW_TILES)
+    x = (torch.randn(130, k, generator=generator, device=DEVICE) * 0.5).bfloat16()
+    full = project_head(layer, x)
+    assert _close_to_fp32(full, x, dequant_weight)
+    for rows in (1, 5, 16, 17, 33, 64, 96, 128):
+        assert torch.equal(project_head(layer, x[:rows].contiguous()), full[:rows]), rows
+    assert torch.equal(project_head(layer, x[70:71].contiguous()), full[70:71])
+
+
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+def test_nvfp4_head_greedy_pairs_match_greedy_shard_pair(out_dtype):
+    from vllm.v1.worker.gpu.spec_decode.greedy_verification import (
+        vocab_parallel_pairs,
+        vocab_parallel_pairs_from_head,
+    )
+
+    n, k = 1000, 256
+    generator = torch.Generator(device=DEVICE).manual_seed(109)
+    weight = (torch.randn(n, k, generator=generator, device=DEVICE) * 0.05).bfloat16()
+    weight[100] = weight[5]
+    weight[500] = weight[5]
+    layer, _ = _nvfp4_layer(weight)
+    prepare_nvfp4_head(layer, out_dtype)
+    assert set(layer.tilelang_vocab_greedy) == set(ROW_TILES)
+    x = (torch.randn(96, k, generator=generator, device=DEVICE) * 0.5).bfloat16()
+    for vocab, vocab_start in ((n, 0), (n - 37, 32320)):
+        for rows in (1, 6, 24, 48, 65, 96):
+            part = x[:rows].contiguous()
+            logits = project_head(layer, part)
+            expected = vocab_parallel_pairs(logits, vocab, vocab_start, tp_size=1)
+            actual = project_head_greedy_pairs(
+                layer, part, vocab=vocab, vocab_start=vocab_start
+            )
+            from_head = vocab_parallel_pairs_from_head(
+                layer, part, vocab, vocab_start, tp_size=1
+            )
+            assert torch.equal(actual[:, :2], expected[:, :2]), (rows, vocab)
+            assert torch.equal(from_head[:, :2], expected[:, :2]), (rows, vocab)
+
+
+def test_nvfp4_online_linear_method_tilelang_without_b12x(monkeypatch):
+    from vllm.config import KernelConfig, VllmConfig, set_current_vllm_config
+    from vllm.model_executor.kernels.linear.nvfp4.b12x import B12xNvFp4LinearKernel
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+    from vllm.model_executor.layers.quantization.online.nvfp4 import (
+        Nvfp4OnlineLinearMethod,
+    )
+
+    monkeypatch.setattr(
+        B12xNvFp4LinearKernel,
+        "is_supported",
+        classmethod(lambda cls, *_args, **_kwargs: (False, "b12x disabled")),
+    )
+    config = VllmConfig(kernel_config=KernelConfig(linear_backend="tilelang"))
+    with set_current_vllm_config(config):
+        method = Nvfp4OnlineLinearMethod()
+        assert method.tilelang and method.kernel is None
+        layer = torch.nn.Module()
+        generator = torch.Generator(device=DEVICE).manual_seed(83)
+        original = (
+            torch.randn(1000, 256, generator=generator, device=DEVICE) * 0.05
+        ).bfloat16()
+        layer.register_parameter(
+            "weight", torch.nn.Parameter(original.clone(), requires_grad=False)
+        )
+        method.process_weights_after_loading(layer)
+        method.declare_layer_kernels(layer)
+
+        _, dequant = _nvfp4_layer(original)
+        x = (torch.randn(2, 5, 256, generator=generator, device=DEVICE) * 0.5).bfloat16()
+        out = method.apply(layer, x)
+        assert out.shape == (2, 5, 1000) and out.dtype == torch.bfloat16
+        assert _close_to_fp32(out.reshape(-1, 1000), x.reshape(-1, 256), dequant)
+
+        processor = LogitsProcessor.__new__(LogitsProcessor)
+        torch.nn.Module.__init__(processor)
+        processor.head_dtype = None
+        processor.use_tilelang_vocab_projection = True
+        logits = processor._apply_head(layer, x, None)
+        assert torch.equal(logits, out)

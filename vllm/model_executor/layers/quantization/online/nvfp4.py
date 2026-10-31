@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import importlib.util
+
 import torch
 from torch.nn import Module
 
 from vllm._custom_ops import create_fp4_output_tensors, scaled_fp4_quant
+from vllm.config import get_current_vllm_config
 from vllm.model_executor.kernels.linear.nvfp4.b12x import (
     B12xNvFp4LinearKernel,
     run_b12x_nvfp4_serialized_linear,
@@ -40,15 +43,37 @@ from vllm.platforms import current_platform
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 
 
+def _tilelang_nvfp4_head_supported() -> bool:
+    return (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+        and importlib.util.find_spec("tilelang") is not None
+    )
+
+
 class Nvfp4OnlineLinearMethod(OnlineLinearBase):
     """Online NVFP4 draft head with selectable activation precision."""
 
     def __init__(self, *, use_a16: bool = False):
-        super().__init__()
-        supported, reason = B12xNvFp4LinearKernel.is_supported()
-        if not supported:
-            raise ValueError(f"Online NVFP4 draft head requires b12x: {reason}")
-        self.kernel = B12xNvFp4LinearKernel(NvFp4LinearLayerConfig())
+        vllm_config = get_current_vllm_config()
+        if vllm_config.model_config is not None:
+            super().__init__()
+        else:
+            self.out_dtype = torch.get_default_dtype()
+            self.input_dtype = torch.bfloat16
+        kernel_config = vllm_config.kernel_config
+        self.tilelang = kernel_config.linear_backend == "tilelang"
+        if self.tilelang:
+            if not _tilelang_nvfp4_head_supported():
+                raise ValueError(
+                    "Online NVFP4 draft head with TileLang requires SM120/SM121 and tilelang"
+                )
+            self.kernel = None
+        else:
+            supported, reason = B12xNvFp4LinearKernel.is_supported()
+            if not supported:
+                raise ValueError(f"Online NVFP4 draft head requires b12x: {reason}")
+            self.kernel = B12xNvFp4LinearKernel(NvFp4LinearLayerConfig())
         self.use_a16 = use_a16
         if use_a16 and self.input_dtype != torch.bfloat16:
             raise ValueError("A16 LM heads require BF16 activations")
@@ -57,8 +82,11 @@ class Nvfp4OnlineLinearMethod(OnlineLinearBase):
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
         weight = layer.weight.contiguous()
-        if weight.shape[1] % 16:
+        in_features = int(weight.shape[1])
+        if in_features % 16:
             raise ValueError("Online NVFP4 head requires K divisible by 16")
+        if self.tilelang and in_features % 128:
+            raise ValueError("TileLang online NVFP4 head requires K divisible by 128")
         amax = weight.abs().amax().float().clamp_min(1e-8)
         global_scale = (FLOAT4_E2M1_MAX * FLOAT8_E4M3_MAX) / amax
         packed, scales = scaled_fp4_quant(
@@ -69,13 +97,33 @@ class Nvfp4OnlineLinearMethod(OnlineLinearBase):
         replace_parameter(layer, "weight_global_scale", global_scale.reciprocal())
         replace_parameter(layer, "input_global_scale_inv", torch.ones_like(amax))
         replace_parameter(layer, "alpha", layer.weight_global_scale.clone())
-        # The quantized head scales its activations per call and runs the
-        # serialized GEMM, so its exact-M plans are serialized declarations
-        # even though the activations arrive in BF16.
-        layer.b12x_nvfp4_serialized_activations = not self.use_a16
-        layer.b12x_activation_mode = "a16" if self.use_a16 else "quantized"
-        self.kernel.process_weights_after_loading(layer)
+        layer.nvfp4_in_features = in_features
+        if self.tilelang:
+            model_config = get_current_vllm_config().model_config
+            layer.tilelang_vocab_dtype = (
+                (model_config.head_dtype or torch.bfloat16)
+                if model_config
+                else torch.bfloat16
+            )
+        else:
+            # The quantized head scales its activations per call and runs the
+            # serialized GEMM, so its exact-M plans are serialized declarations
+            # even though the activations arrive in BF16.
+            layer.b12x_nvfp4_serialized_activations = not self.use_a16
+            layer.b12x_activation_mode = "a16" if self.use_a16 else "quantized"
+            assert self.kernel is not None
+            self.kernel.process_weights_after_loading(layer)
         layer._already_called_process_weights_after_loading = True
+
+    def declare_layer_kernels(self, layer: torch.nn.Module) -> None:
+        """With the TileLang backend, declare the online NVFP4 head's projection."""
+        if not self.tilelang or not hasattr(layer, "nvfp4_in_features"):
+            return
+        from vllm.models.deepseek_v4_1.tilelang.vocab import prepare_nvfp4_head
+
+        prepare_nvfp4_head(
+            layer, getattr(layer, "tilelang_vocab_dtype", torch.bfloat16)
+        )
 
     def apply(
         self,
@@ -83,6 +131,21 @@ class Nvfp4OnlineLinearMethod(OnlineLinearBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.tilelang:
+            from vllm.models.deepseek_v4_1.tilelang.vocab import (
+                prepare_nvfp4_head,
+                project_head,
+            )
+
+            if not hasattr(layer, "tilelang_vocab"):
+                prepare_nvfp4_head(
+                    layer, getattr(layer, "tilelang_vocab_dtype", x.dtype)
+                )
+            output = project_head(layer, x.reshape(-1, x.shape[-1]))
+            if bias is not None:
+                output = output + bias
+            return output.view(*x.shape[:-1], layer.weight.shape[0])
+        assert self.kernel is not None
         if self.use_a16 or (
             x.numel() // x.shape[-1] <= layer.b12x_linear.a16_max_tokens
         ):

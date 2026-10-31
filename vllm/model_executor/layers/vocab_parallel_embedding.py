@@ -93,6 +93,10 @@ def _supports_default_lm_head_quantization(
         return False
 
     if recipe == "nvfp4":
+        if config.kernel_config.linear_backend == "tilelang":
+            import importlib.util
+
+            return importlib.util.find_spec("tilelang") is not None
         from vllm.model_executor.kernels.linear.nvfp4.b12x import (
             B12xNvFp4LinearKernel,
         )
