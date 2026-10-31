@@ -347,3 +347,106 @@ def test_ced_global_context_and_full_row_output_abi(monkeypatch, compact):
         # not twice (once inside layer 2 and once in DeepseekV4Model.forward).
         assert gather_calls.count(positions.data_ptr()) == 1
         assert gather_calls.count(ids.data_ptr()) == 1
+
+
+def test_decoder_layer_and_model_release_transient_activations_early(monkeypatch):
+    """``DeepseekV4DecoderLayer.forward`` releases ``previous_output`` and
+    attention's ``x_q`` before ``mhc.post_pre``, and ``DeepseekV4Model.forward``
+    releases non-final ``aux_recon`` tensors before subsequent layers."""
+    import weakref
+    from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows
+
+    monkeypatch.setattr(
+        native,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(native.l2_prefetch, "ENABLED", False)
+    refs = {}
+
+    class _TrackingMix(_Mix):
+        post_collapse = None
+
+        def pre(self, residual, fn, scale, base, norm, pre, **previous):
+            res, post, comb, y, mix, _ = super().pre(
+                residual, fn, scale, base, norm, pre, **previous
+            )
+            y = y.clone()
+            values = torch.ones_like(y)
+            cast = MXFP8Rows(y, values, torch.ones_like(y))
+            refs["attn_cast"] = weakref.ref(values)
+            refs["attn_in"] = weakref.ref(y)
+            return res, post, comb, y, mix, cast
+
+        def post_pre(self, x, residual, post, comb, fn, scale, base, norm, pre):
+            # Attention's x_q, x_in, and the previous layer's output must be
+            # released before post_pre allocates the FFN entry buffers.
+            assert refs["attn_cast"]() is None
+            assert refs["attn_in"]() is None
+            if "prev_out" in refs:
+                assert refs["prev_out"]() is None
+            if "prev_res" in refs:
+                assert refs["prev_res"]() is None
+            res, post, comb, y, mix, _ = super().post_pre(
+                x, residual, post, comb, fn, scale, base, norm, pre
+            )
+            y = y.clone()
+            values = torch.ones_like(y)
+            cast = MXFP8Rows(y, values, torch.ones_like(y))
+            refs["ffn_cast"] = weakref.ref(values)
+            refs["prev_res"] = weakref.ref(res)
+            return res, post, comb, y, mix, cast
+
+        def post(self, x, residual, post, comb):
+            out = super().post(x, residual, post, comb)
+            refs.setdefault("aux_recons", []).append(weakref.ref(out))
+            return out
+
+    shared: dict[str, torch.Tensor | int] = {}
+    row_work: list[tuple[str, int, int]] = []
+    layers = nn.ModuleList(_Layer(i, shared, row_work) for i in range(4))
+    for layer in layers:
+        layer.mhc = _TrackingMix()
+
+    orig_ffn0_forward = layers[0].ffn.forward
+
+    def tracked_ffn0_forward(hidden, ids):
+        out = orig_ffn0_forward(hidden, ids)
+        refs["prev_out"] = weakref.ref(out)
+        return out
+
+    layers[0].ffn.forward = tracked_ffn0_forward
+
+    orig_layer3_forward = layers[3].forward
+
+    def tracked_layer3_forward(x, *args, **kwargs):
+        # Layer 2 (idx=2, idx+1=3 in aux_hidden_state_layers) is not end_layer=4,
+        # so its 4-stream aux_recon must already be released when layer 3 runs.
+        assert refs["aux_recons"][-1]() is None
+        return orig_layer3_forward(x, *args, **kwargs)
+
+    layers[3].forward = tracked_layer3_forward
+
+    inputs = torch.ones((4, 2), dtype=torch.float32)
+    target = SimpleNamespace(
+        embed_input_ids=lambda _: inputs.clone(),
+        use_mega_moe=False,
+        use_sequence_parallel=False,
+        prefill_sp_min_rows=0,
+        disk_engram=False,
+        engram_hash=None,
+        start_layer=0,
+        end_layer=4,
+        ced_decoder_start=None,
+        layers=layers,
+        aux_hidden_state_layers={3, 4},
+        _sink_columns=None,
+        _graph_out=lambda index, rows: None,
+        glp=None,
+        norm=lambda hidden: hidden,
+    )
+    output, aux = native.DeepseekV4Model.forward(
+        target, torch.arange(4), torch.arange(4), None
+    )
+    assert output.shape == (4, 2) and len(aux) == 2
+    assert refs["ffn_cast"]() is None

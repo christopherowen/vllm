@@ -303,7 +303,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
+        x: torch.Tensor | list[torch.Tensor | None],
         positions: torch.Tensor,
         input_ids: torch.Tensor | None,
         pre_mix: torch.Tensor | None = None,
@@ -318,6 +318,17 @@ class DeepseekV4DecoderLayer(nn.Module):
         ced_positions: torch.Tensor | None = None,
         ced_input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if isinstance(x, list):
+            # Pop the caller's carry list in place so nn.Module.__call__'s *args
+            # tuple does not pin the previous layer's residual and hidden state
+            # across attention, post_pre, and FFN.
+            x, pre_mix, post_mix, res_mix, residual = (
+                x.pop(),
+                x.pop(),
+                x.pop(),
+                x.pop(),
+                x.pop(),
+            )
         previous_output = x if residual is not None else None
         apply_engram = self.engram is not None and engram_hashes is not None
         if residual is None:
@@ -350,11 +361,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             previous_post=post_mix if previous_output is not None else None,
             previous_comb=res_mix if previous_output is not None else None,
         )
+        del previous_output, pre_mix
         global_kv_ready = None
         if ced_indices is not None:
             # Decoder global KV needs every encoder row, but decoder queries,
             # residual updates and experts only need the selected replay rows.
             global_kv_ready = self.attn.prepare_global_kv(positions, x)
+            del x_q
             x = gather_rows(x, ced_indices)
             x_q = self.mhc.cast_rows(x)
             residual = gather_rows(residual, ced_indices)
@@ -381,6 +394,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 x = self.attn(positions, x, None, global_kv_ready=global_kv_ready)
             if sp_rows.unreduced:
                 x = sp_prefill.unreduced_parts(x)
+        del x_q
         residual, post_mix, res_mix, x, ffn_pre, x_q = self.mhc.post_pre(
             x,
             residual,
@@ -392,9 +406,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.ffn_norm.weight,
             attn_pre,
         )
+        del attn_pre
         if sp_rows is None:
             with kernels.mxfp8_inputs(x_q):
                 x = self.ffn(x, input_ids)
+            del x_q
         else:
             # SP: route local rows, gather MXFP8 + routes, and reduce-scatter.
             with (
@@ -403,11 +419,13 @@ class DeepseekV4DecoderLayer(nn.Module):
                     sp_rows, x, x_q, self.ffn, input_ids, self.mhc
                 ) as rows,
             ):
+                del x, x_q
                 x = self.ffn(
                     rows,
                     input_ids,
                     reduce_scatter_rows=sp_rows.padded_rows,
                 )
+            del rows
             if sp_rows.unreduced:
                 x = sp_prefill.unreduced_parts(x)
         return x, residual, post_mix, res_mix, ffn_pre
@@ -877,14 +895,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 if boundary_indices is not None and input_ids is not None
                 else None
             )
+            carry = [residual, res_mix, post_mix, pre_mix, hidden_states]
+            hidden_states = pre_mix = post_mix = res_mix = residual = None
             hidden_states, residual, post_mix, res_mix, pre_mix = layer(
-                hidden_states,
+                carry,
                 positions,
                 input_ids,
-                pre_mix,
-                post_mix,
-                res_mix,
-                residual,
+                None,
+                None,
+                None,
+                None,
                 engram_hashes,
                 engram_mask,
                 ced_indices=boundary_indices,
@@ -912,7 +932,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     if sp is None and not decoder_compacted
                     else None
                 )
-                if idx + 1 != self.end_layer and hasattr(layer.mhc, "post_collapse"):
+                if idx + 1 != self.end_layer and callable(
+                    getattr(layer.mhc, "post_collapse", None)
+                ):
                     aux_hidden_state = layer.mhc.post_collapse(
                         hidden_states, residual, post_mix, res_mix, out=aux_out
                     )
@@ -925,7 +947,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         if aux_out is None
                         else layer.mhc.collapse(aux_recon, out=aux_out)
                     )
-                    final_aux_recon = aux_recon
+                    if idx + 1 == self.end_layer:
+                        final_aux_recon = aux_recon
+                    del aux_recon
                 if sp is not None:
                     aux_hidden_state = sp.gather(aux_hidden_state)
                 if decoder_compacted:
@@ -940,12 +964,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             and last_rank
             and self.end_layer not in self.aux_hidden_state_layers
             and self._sink_columns is None
-            and hasattr(layer.mhc, "post_collapse")
+            and callable(getattr(layer.mhc, "post_collapse", None))
         )
         if fused_final_collapse:
             hidden_states = layer.mhc.post_collapse(
                 hidden_states, residual, post_mix, res_mix, pre_mix
             )
+            del final_aux_recon, residual, post_mix, res_mix, pre_mix
         elif layer is not None:
             # Reuse if the last layer was captured as an aux hidden state
             if self.end_layer in self.aux_hidden_state_layers:
@@ -954,6 +979,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 hidden_states = layer.mhc.post(
                     hidden_states, residual, post_mix, res_mix
                 )
+            del final_aux_recon, residual, post_mix, res_mix
 
         if not last_rank:
             if decoder_compacted:

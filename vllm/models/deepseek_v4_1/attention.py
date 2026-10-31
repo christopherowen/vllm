@@ -253,6 +253,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
     # Index scores need bounded row scratch; attention handles the whole batch.
     INDEX_CHUNK = 256
     DECODE_CHUNK = 64
+    _l2pf_wo = None
+    _l2pf_comp = None
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads):
@@ -902,10 +904,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             # its product, narrower than the hidden state, is gathered.
             qr_kv, _ = self.fused_wqa_wkv(hidden_states)
             qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
+            del qr_kv
             parts = self._gather_front(sp_rows, hidden_states, qr, kv)
             qr, kv = parts[0], parts[1]
             if self.indexer is not None:
                 index_weights = parts[2]
+            del parts
             hidden_states = None
             rows = sp_rows.num_tokens
         else:
@@ -918,30 +922,41 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             rows = hidden_states.shape[0]
             with kernels.mxfp8_inputs(gathered):
                 qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+            del gathered
             front = self._front(qr_kv, positions, sp_rows)
             if front is None:
                 qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
+                del qr_kv
                 qr, kv = self.q_norm(qr), self.kv_norm(kv)
+            else:
+                del qr_kv
         if front is None:
             q_cast = kernels.cast_mxfp8(qr)
+            front_wrote_kv = False
         else:
             qr, kv, q_cast = front
+            front = None
+            front_wrote_kv = True
         with kernels.mxfp8_inputs(q_cast):
             q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
+        if self.indexer is None:
+            del q_cast
         self._issue_wo_prefetch(rows, after="q-b")
         q = self._rope(q, positions, "q")
-        output = torch.empty_like(q)
         metadata = cast(
             dict[str, DeepseekV41B12xMetadata] | None,
             get_forward_context().attn_metadata,
         )
         if not isinstance(metadata, dict):
             # Memory profiling has no cache pages; serving does not use this branch.
-            output.zero_()
+            q_cast = None
+            del qr, kv, hidden_states, index_weights, q_cast
+            output = torch.zeros_like(q)
+            del q
         else:
             original_swa = metadata[self.swa_cache_layer.prefix]
             swa = self._query_metadata(original_swa)
-            if front is None:  # the front's kernel wrote the record
+            if not front_wrote_kv:  # the front's kernel wrote the record
                 self._cache_context_kv(kv, positions)
             if swa is original_swa and hidden_states is not None:
                 self._prepare_global_kv(positions, hidden_states)
@@ -975,8 +990,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                         swa,
                         q_cast,
                     )
+                del q_cast
                 index_query = (*query, split, reference)
+            del qr, hidden_states, index_weights
+            output = torch.empty_like(q)
             self.forward_mqa(q, kv, positions, output, index_query=index_query)
+            del q, kv, index_query
         return self._o_proj(output, sp_rows=sp_rows)
 
     def _issue_wo_prefetch(self, rows, *, after):
@@ -1012,6 +1031,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         )
         with kernels.mxfp8_inputs(cast_rows):
             iq = self.indexer.wq_b(qr_rows).view(rows, h, 128)
+        del cast_rows, q_cast
         iq_data = torch.empty((rows, h, 64), dtype=torch.uint8, device=qr.device)
         iq_scale = torch.empty((rows, h, 4), dtype=torch.uint8, device=qr.device)
         self._quantize_index_query(
@@ -1021,6 +1041,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             iq_scale,
             positions=positions[first:last],
         )
+        del iq
         # The BF16 head-weight projection runs on every row: its GEMV rounds
         # differently at another row count, which would move top-k selections.
         # The FP8 wq_b quantizes per row and does not depend on the row count.

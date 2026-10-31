@@ -305,3 +305,78 @@ def test_prepare_global_kv_fuses_index_key_and_latent_writes(monkeypatch):
     assert cache_writes[0][0][0] is latent
     assert cache_writes[0][1]["positions"] is positions
     assert cache_writes[0][1]["cache_kind"] == "indexed"
+
+
+def test_attention_forward_releases_intermediates_before_o_proj(monkeypatch):
+    """``_forward`` releases ``qr_kv``, ``q_cast``, ``qr``, ``q``, ``kv`` and
+    ``_index_query``'s ``iq`` before ``_o_proj`` allocates the output projection."""
+    import weakref
+
+    from vllm.models.deepseek_v4_1 import attention, kernels
+    from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows
+
+    module = _tilelang_layer(layer_id=3)
+    module._ready = True
+    module.q_lora_rank = 16
+    module.n_local_heads = 2
+    module._l2pf_wo = None
+    module._l2pf_comp = None
+    module.swa_cache_layer = SimpleNamespace(prefix="swa")
+    refs = {}
+
+    def track(name, tensor):
+        refs[name] = weakref.ref(tensor)
+        return tensor
+
+    module.fused_wqa_wkv = lambda h: (track("qr_kv", torch.ones(4, 528)), None)
+    module._front = lambda qr_kv, pos, sp: None
+    module.q_norm = lambda x: track("qr", x.clone())
+    module.kv_norm = lambda x: track("kv", x.clone())
+    monkeypatch.setattr(
+        kernels,
+        "cast_mxfp8",
+        lambda rows: MXFP8Rows(
+            rows,
+            track("q_cast", torch.ones(4, 16, dtype=torch.uint8)),
+            torch.ones(4, 4, dtype=torch.uint8),
+        ),
+    )
+    module.wq_b = lambda qr: track("q", torch.ones(4, 2 * 512))
+    module._rope = lambda x, pos, role: x
+    module._cache_context_kv = lambda kv, pos: None
+    module.indexer = SimpleNamespace(
+        heads=4,
+        wq_b=lambda qr: track("iq", torch.ones(4, 4 * 128)),
+        weights_proj=lambda h: (
+            # iq must already be released when weights_proj runs
+            assert_dead("iq"),
+            torch.ones(4, 4),
+        )[1],
+    )
+    module._quantize_index_query = (
+        lambda mode, iq, data, scale, positions=None: None
+    )
+
+    def assert_dead(*names):
+        for name in names:
+            assert refs[name]() is None, f"{name} is still alive"
+
+    def check_forward_mqa(q, kv, pos, output, *, index_query=None):
+        assert_dead("qr_kv", "q_cast", "qr", "iq", "hidden")
+        output.zero_()
+
+    def check_o_proj(output, sp_rows=None):
+        assert_dead("qr_kv", "q_cast", "qr", "iq", "hidden", "q", "kv")
+        return torch.zeros(4, 32)
+
+    module.forward_mqa = check_forward_mqa
+    module._o_proj = check_o_proj
+    metadata = {"swa": SimpleNamespace(is_decode=False)}
+    monkeypatch.setattr(
+        attention,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=metadata),
+    )
+    positions = torch.arange(4)
+    out = module._forward(positions, track("hidden", torch.ones(4, 32)))
+    assert out.shape == (4, 32)
