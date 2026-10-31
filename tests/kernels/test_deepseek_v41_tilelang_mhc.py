@@ -39,11 +39,15 @@ from vllm.models.deepseek_v4_1.tilelang.gemm import scale_words  # noqa: E402
 from vllm.models.deepseek_v4_1.tilelang.linear import mxfp8_rows  # noqa: E402
 from vllm.models.deepseek_v4_1.tilelang.mhc import (  # noqa: E402
     BLOCK_H,
+    BLOCK_M,
+    FINALIZE_FUSE_MAX_ROWS,
     MIXES,
     TileKernelsMHC,
     collapse_streams,
+    finalize,
     post_collapse_streams,
     post_streams,
+    project_and_finalize_streams,
     project_streams,
 )
 
@@ -698,3 +702,117 @@ def test_declared_calls_are_the_forwards(mhc, monkeypatch):
         RankOrderParts(torch.stack((x, x))), residual, post, comb, _pre_mix(6, seed=72)
     )
     assert sorted(launched, key=by_factory) == ours
+
+
+@pytest.mark.parametrize("mode", ["pre", "post_pre", "broadcast"])
+@pytest.mark.parametrize("tokens", [1, 6, 16, 33, 64])
+def test_project_and_finalize_bits_match_split(tokens, mode):
+    """project_and_finalize_streams produces bit-identical outputs to project_streams
+    plus finalize across all modes and token counts, and resets its counters to zero."""
+    residual, fn, scale, base, weight, incoming = _inputs(tokens, seed=2100 + tokens)
+    x, _, prev_post, prev_comb = _post_inputs(tokens, seed=2200 + tokens)
+    splits = HIDDEN // BLOCK_H
+    streams = 4 * HIDDEN
+    k = HIDDEN if mode == "broadcast" else streams
+    fn_in = fn.view(MIXES, 4, HIDDEN).sum(1) if mode == "broadcast" else fn
+    source = residual.view(tokens, streams)
+    x_in = (residual[:, 0].contiguous() if mode == "broadcast" else x).unsqueeze(0)
+    mix_post = prev_post if mode == "post_pre" else incoming
+    mix_comb = prev_comb if mode == "post_pre" else prev_comb
+
+    R_ref = source.clone() if mode == "pre" else torch.empty(tokens, streams, dtype=torch.bfloat16, device=DEVICE)
+    P_ref = torch.empty(splits, tokens, 1, MIXES, dtype=torch.float32, device=DEVICE)
+    S_ref = torch.empty(splits, tokens, 1, dtype=torch.float32, device=DEVICE)
+    C_ref = torch.empty(tokens, HIDDEN, dtype=torch.bfloat16, device=DEVICE)
+    Q_ref = torch.empty(splits, tokens, dtype=torch.float32, device=DEVICE)
+    post_ref = torch.empty(tokens, 4, dtype=torch.float32, device=DEVICE)
+    comb_ref = torch.empty(tokens, 4, 4, dtype=torch.float32, device=DEVICE)
+    pre_ref = torch.empty(tokens, 4, dtype=torch.float32, device=DEVICE)
+    y_ref = torch.empty(tokens, HIDDEN, dtype=torch.bfloat16, device=DEVICE)
+    mq = mxfp8_rows(tokens)
+    yq_ref = torch.empty(mq, HIDDEN, dtype=torch.float8_e4m3fn, device=DEVICE)
+    ysf_ref = torch.empty(mq, 4 * scale_words(HIDDEN), dtype=torch.uint8, device=DEVICE)
+
+    project_streams(HIDDEN, mode, block_M=BLOCK_M)(
+        x_in, source, mix_post, mix_comb, incoming, fn_in, R_ref, P_ref, S_ref, C_ref, Q_ref
+    )
+    finalize(HIDDEN, k, CONFIG.rms_norm_eps, CONFIG.hc_eps, CONFIG.hc_sinkhorn_iters, CONFIG.rms_norm_eps)(
+        P_ref, S_ref, C_ref, Q_ref, scale, base, weight, post_ref, comb_ref, pre_ref, y_ref, yq_ref, ysf_ref
+    )
+
+    R_out = source.clone() if mode == "pre" else torch.empty_like(R_ref)
+    P_out = torch.empty_like(P_ref)
+    S_out = torch.empty_like(S_ref)
+    C_out = torch.empty_like(C_ref)
+    Q_out = torch.empty_like(Q_ref)
+    post_out = torch.empty_like(post_ref)
+    comb_out = torch.empty_like(comb_ref)
+    pre_out = torch.empty_like(pre_ref)
+    y_out = torch.empty_like(y_ref)
+    yq_out = torch.empty_like(yq_ref)
+    ysf_out = torch.empty_like(ysf_ref)
+    tiles = (tokens + BLOCK_M - 1) // BLOCK_M
+    counters = torch.zeros(tiles, dtype=torch.int32, device=DEVICE)
+
+    fused = project_and_finalize_streams(
+        HIDDEN,
+        mode,
+        k,
+        CONFIG.rms_norm_eps,
+        CONFIG.hc_eps,
+        CONFIG.hc_sinkhorn_iters,
+        CONFIG.rms_norm_eps,
+        block_M=BLOCK_M,
+    )
+    for _ in range(2):
+        fused(
+            x_in,
+            source,
+            mix_post,
+            mix_comb,
+            incoming,
+            fn_in,
+            R_out,
+            P_out,
+            S_out,
+            C_out,
+            Q_out,
+            counters,
+            scale,
+            base,
+            weight,
+            post_out,
+            comb_out,
+            pre_out,
+            y_out,
+            yq_out,
+            ysf_out,
+        )
+        assert (counters == 0).all()
+
+    assert torch.equal(R_out, R_ref)
+    assert torch.equal(post_out, post_ref)
+    assert torch.equal(comb_out, comb_ref)
+    assert torch.equal(pre_out, pre_ref)
+    assert torch.equal(y_out, y_ref)
+    _assert_bytes_equal(yq_out[:tokens], yq_ref[:tokens], "yq: ")
+    _assert_bytes_equal(ysf_out[:tokens], ysf_ref[:tokens], "ysf: ")
+
+
+def test_single_row_entry_launches_fused_kernel(mhc, monkeypatch):
+    """mhc.pre with tokens <= FINALIZE_FUSE_MAX_ROWS dispatches to _project_finalize."""
+    assert FINALIZE_FUSE_MAX_ROWS == 1
+    called = []
+    orig = mhc_module._project_finalize
+
+    def spy(*args, **kwargs):
+        called.append((args, kwargs))
+        return orig(*args, **kwargs)
+
+    monkeypatch.setattr(mhc_module, "_project_finalize", spy)
+    residual, fn, scale, base, weight, incoming = _inputs(1, seed=2301)
+    mhc.pre(residual, fn, scale, base, weight, incoming)
+    assert len(called) == 1
+    residual2, fn2, scale2, base2, weight2, incoming2 = _inputs(2, seed=2302)
+    mhc.pre(residual2, fn2, scale2, base2, weight2, incoming2)
+    assert len(called) == 1
