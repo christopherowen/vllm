@@ -111,7 +111,23 @@ def _serving_tiles():
                 tiles.add((k, block_k))
     # Shapes with no sweep entry take pick_block_K: 128, else the widest
     # multiple of 64 up to 192 that divides K. 576 is the straddle.
-    for k in (64, 192, 256, 384, 512, 576, 640, 768, 1024, 1280, 2048, 4096, 5120, 6144):
+    for k in (
+        64,
+        192,
+        256,
+        384,
+        512,
+        576,
+        640,
+        768,
+        1024,
+        1280,
+        2048,
+        4096,
+        5120,
+        6144,
+        15360,
+    ):
         for block_k in (128, *range(192, 0, -64)):
             if k % block_k == 0:
                 tiles.add((k, block_k))
@@ -130,7 +146,7 @@ def test_every_serving_k_tile_loads_the_scale_words_it_consumes():
     tiles = _serving_tiles()
     # These are sweep entries, not the default 128-wide tile. A walker that
     # misses ``dict(block_K=...)`` would drop them.
-    assert {(576, 64), (576, 192), (1280, 256), (5120, 256)} <= tiles
+    assert {(576, 64), (576, 192), (5120, 256), (6144, 256), (15360, 256)} <= tiles
     short = []
     for k, block_k in sorted(tiles):
         assert k % block_k == 0, (k, block_k)

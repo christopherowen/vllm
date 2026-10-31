@@ -1268,11 +1268,21 @@ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
         64: dict(block_N=128, block_K=128, num_stages=2),
         96: dict(block_N=64, block_K=128, num_stages=2),
     },
-    # TP4 DSpark main projection.
+    # DSpark main projection (replicated, TP4 shard, and TP3 padded shard).
     (6400, 6144): {
         16: dict(block_N=32, block_K=256, num_stages=4, threads=64),
         32: dict(block_N=32, block_K=256, num_stages=4, threads=64),
         64: dict(block_N=64, block_K=256, num_stages=2),
+    },
+    (1280, 15360): {
+        16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+        32: dict(block_N=64, block_K=256, num_stages=3, threads=128),
+        64: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+    },
+    (1728, 15360): {
+        16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+        32: dict(block_N=64, block_K=256, num_stages=3, threads=128),
+        64: dict(block_N=64, block_K=256, num_stages=3, threads=128),
     },
 }
 

@@ -76,7 +76,16 @@ def _mxfp8(x):
 
 # K blocks of 128 and, for TP4's 576-wide shared expert rows, 192 and 64.
 @pytest.mark.parametrize(
-    "n, k", [(256, 512), (1536, 1024), (224, 384), (320, 576), (1152, 576)]
+    "n, k",
+    [
+        (256, 512),
+        (1536, 1024),
+        (224, 384),
+        (320, 576),
+        (1152, 576),
+        (1280, 15360),
+        (1728, 15360),
+    ],
 )
 def test_mxfp8_gemm(n, k):
     weight, exps, weight_values = _block32_weight(n, k, 1)
