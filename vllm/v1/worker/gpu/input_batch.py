@@ -34,6 +34,15 @@ class InputBuffers:
         self.input_ids = torch.zeros(max_num_tokens, dtype=torch.int32, device=device)
         self.positions = torch.zeros(max_num_tokens, dtype=torch.int64, device=device)
         self.is_padding = torch.zeros(max_num_tokens, dtype=torch.bool, device=device)
+        self.logits_indices = torch.zeros(
+            max_num_tokens, dtype=torch.int64, device=device
+        )
+        self.expanded_idx_mapping = torch.zeros(
+            max_num_tokens, dtype=torch.int64, device=device
+        )
+        self.expanded_local_pos = torch.zeros(
+            max_num_tokens, dtype=torch.int32, device=device
+        )
         self.query_start_loc = torch.zeros(
             max_num_reqs + 1, dtype=torch.int32, device=device
         )
@@ -145,14 +154,53 @@ class InputBatch:
     _logits_rows: "tuple[torch.Tensor, torch.Tensor] | None" = field(
         default=None, init=False, repr=False, compare=False
     )
+    # True when logits_indices is the contiguous identity prefix [0, ..., n - 1]
+    # of input_ids/positions/hidden_states. Not an init field: a replaced batch
+    # (e.g. batch sharding or PCP) has its own logits_indices.
+    _logits_rows_contiguous: bool = field(
+        default=False, init=False, repr=False, compare=False
+    )
+    # Set when expand_idx_mapping was deferred on a greedy verification step so
+    # sample() can materialize expanded_idx_mapping/expanded_local_pos lazily if
+    # a caller takes the non-greedy path.
+    _deferred_expand_max_len: int | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def logits_rows(self) -> tuple[torch.Tensor, torch.Tensor]:
         """``input_ids[logits_indices]`` and ``positions[logits_indices]``: one
         TileLang launch the first time a step asks, shared by every reader (the
         samplers, the sink policy and its cut read them, never write them)."""
         if self._logits_rows is None:
-            self._logits_rows = _gather_logits_rows(self)
+            if self._logits_rows_contiguous:
+                n = self.logits_indices.shape[0]
+                self._logits_rows = (self.input_ids[:n], self.positions[:n])
+            else:
+                self._logits_rows = _gather_logits_rows(self)
         return self._logits_rows
+
+    def ensure_expanded_idx_mapping(
+        self, input_buffers: InputBuffers | None = None
+    ) -> None:
+        if self._deferred_expand_max_len is None:
+            return
+        max_expand_len = self._deferred_expand_max_len
+        self._deferred_expand_max_len = None
+        out = (
+            (
+                input_buffers.expanded_idx_mapping,
+                input_buffers.expanded_local_pos,
+            )
+            if input_buffers is not None
+            else None
+        )
+        self.expanded_idx_mapping, self.expanded_local_pos = expand_idx_mapping(
+            self.idx_mapping,
+            self.logits_indices.shape[0],
+            self.cu_num_logits,
+            max_expand_len,
+            out=out,
+        )
 
     @classmethod
     def make_dummy(
@@ -588,6 +636,7 @@ def combine_sampled_and_draft_tokens(
     num_logits: int,
     num_new_sampled_tokens: int = 1,  # excl accepted draft tokens, a.k.a bonus tokens
     dead_rows: "DeadRows | None" = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``dead_rows`` marks low-survival draft rows as padding (see DeadRows)."""
     assert num_new_sampled_tokens in (0, 1), (
@@ -595,11 +644,14 @@ def combine_sampled_and_draft_tokens(
     )
     from vllm.v1.worker.gpu import tilelang_inputs
 
-    logits_indices = torch.empty(
-        num_logits,
-        dtype=torch.int64,
-        device=input_ids.device,
-    )
+    if out is not None and out.shape[0] >= num_logits:
+        logits_indices = out[:num_logits]
+    else:
+        logits_indices = torch.empty(
+            num_logits,
+            dtype=torch.int64,
+            device=input_ids.device,
+        )
     # A request covers up to next_power_of_2(drafts + new sampled tokens) logits.
     tilelang_inputs.combine_sampled_and_draft_tokens(
         input_ids,
@@ -879,13 +931,23 @@ def expand_idx_mapping(
     total_num_logits: int,
     cu_num_logits: torch.Tensor,
     max_expand_len: int,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from vllm.v1.worker.gpu import tilelang_inputs
 
-    expanded_idx_mapping = idx_mapping.new_empty(total_num_logits)
-    expanded_local_pos = torch.empty(
-        total_num_logits, dtype=torch.int32, device=idx_mapping.device
-    )
+    if (
+        out is not None
+        and out[0].dtype == idx_mapping.dtype
+        and out[0].shape[0] >= total_num_logits
+        and out[1].shape[0] >= total_num_logits
+    ):
+        expanded_idx_mapping = out[0][:total_num_logits]
+        expanded_local_pos = out[1][:total_num_logits]
+    else:
+        expanded_idx_mapping = idx_mapping.new_empty(total_num_logits)
+        expanded_local_pos = torch.empty(
+            total_num_logits, dtype=torch.int32, device=idx_mapping.device
+        )
     tilelang_inputs.expand_idx_mapping(
         idx_mapping,
         expanded_idx_mapping,

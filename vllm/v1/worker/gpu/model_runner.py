@@ -1771,6 +1771,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Get the number of draft tokens for each request.
         draft_tokens = self._drafter_spec_tokens(scheduler_output)
         num_draft_tokens_per_req = None
+        adaptive_verification = None
         if not draft_tokens:
             # No draft token scheduled (common case).
             total_num_draft_tokens = 0
@@ -1793,14 +1794,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # at [query_end - num_logits, query_end). Fewer query rows than
             # that would silently select the preceding request's hidden states.
             assert (num_scheduled_tokens_np >= num_logits).all()
-            cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
-            cu_num_logits_np[0] = 0
-            np.cumsum(num_logits, out=cu_num_logits_np[1:])
-            cu_num_logits = async_tensor_h2d(cu_num_logits_np, device=self.device)
+            adaptive_verification = self.adaptive_verification
+            if adaptive_verification is not None or total_num_logits != num_tokens:
+                cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
+                cu_num_logits_np[0] = 0
+                np.cumsum(num_logits, out=cu_num_logits_np[1:])
+                cu_num_logits = async_tensor_h2d(cu_num_logits_np, device=self.device)
 
-        adaptive_verification = (
-            self.adaptive_verification if num_draft_tokens_per_req is not None else None
-        )
         num_scheduled_tokens_upper_bound = num_scheduled_tokens_np
         if adaptive_verification is not None:
             # num_scheduled_tokens represents the draft budget evenly distributed across
@@ -1825,6 +1825,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         query_start_loc_np[num_reqs + 1 :] = num_tokens
         query_start_loc = self.input_buffers.query_start_loc
         async_tensor_h2d(query_start_loc_np, out=query_start_loc)
+        if (
+            draft_tokens
+            and adaptive_verification is None
+            and total_num_logits == num_tokens
+        ):
+            cu_num_logits_np = query_start_loc_np[: num_reqs + 1]
+            cu_num_logits = query_start_loc[: num_reqs + 1]
+        deferred_expand_max_len: int | None = None
         if adaptive_verification is not None:
             (
                 cu_num_logits,
@@ -1835,9 +1843,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ) = adaptive_verification.reallocate_drafts(req_ids, idx_mapping)
             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
         elif draft_tokens:
-            expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
-                idx_mapping, total_num_logits, cu_num_logits, self.decode_query_len
-            )
+            if self.pcp_manager is None and self._batch_verifies_greedily(
+                idx_mapping_np,
+                num_reqs,
+                total_num_draft_tokens,
+                scheduler_output.has_structured_output_requests,
+            ):
+                expanded_idx_mapping = idx_mapping
+                expanded_local_pos = self.input_buffers.zero_local_pos[:num_reqs]
+                deferred_expand_max_len = self.decode_query_len
+            else:
+                expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
+                    idx_mapping,
+                    total_num_logits,
+                    cu_num_logits,
+                    self.decode_query_len,
+                    out=(
+                        self.input_buffers.expanded_idx_mapping,
+                        self.input_buffers.expanded_local_pos,
+                    ),
+                )
         query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
         query_start_loc = query_start_loc[: num_reqs_padded + 1]
 
@@ -1899,6 +1924,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             total_num_logits,
             self.model_state.num_new_sampled_tokens_per_step,
             dead_rows=dead_rows,
+            out=self.input_buffers.logits_indices,
         )
 
         fast_prefill = None
@@ -1973,6 +1999,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch,
             batch_desc,
         )
+        if deferred_expand_max_len is not None:
+            input_batch._deferred_expand_max_len = deferred_expand_max_len
+        if (
+            adaptive_verification is None
+            and self.pcp_manager is None
+            and total_num_logits == num_tokens
+        ):
+            input_batch._logits_rows_contiguous = True
         return input_batch
 
     def prepare_attn(
@@ -2028,6 +2062,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         shard_metadata = None
         global_input_batch = input_batch
         if self.batch_sharder is not None:
+            input_batch.ensure_expanded_idx_mapping(self.input_buffers)
             # Shard the inputs along the batch dimension to sample in parallel
             # across TP ranks.
             input_batch, sorted_logits_indices, grammar_output, shard_metadata = (
@@ -2041,9 +2076,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logits = all_to_all_logits(local_logits, shard_metadata)
             logits = logits[:, : self.vocab_size]
         else:
-            sample_hidden_states = tilelang_inputs.gather_hidden_rows(
-                hidden_states, input_batch.logits_indices
-            )
+            if input_batch._logits_rows_contiguous:
+                sample_hidden_states = hidden_states[
+                    : input_batch.logits_indices.shape[0]
+                ]
+            else:
+                sample_hidden_states = tilelang_inputs.gather_hidden_rows(
+                    hidden_states, input_batch.logits_indices
+                )
             if self._verifies_greedily(input_batch, grammar_output):
                 output = self._verify_greedily(
                     sample_hidden_states, input_batch, sink_flags
@@ -2053,6 +2093,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 assert output.num_sampled is not None
                 assert output.num_rejected is not None
                 return output, output.num_sampled, output.num_rejected
+            input_batch.ensure_expanded_idx_mapping(self.input_buffers)
             logits = self.model.compute_logits(sample_hidden_states)
 
         if grammar_output is not None:
@@ -2471,25 +2512,38 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
         return layouts
 
-    def _verifies_greedily(
-        self, input_batch: InputBatch, grammar_output: GrammarOutput | None
+    def _batch_verifies_greedily(
+        self,
+        idx_mapping_np: np.ndarray,
+        num_reqs: int,
+        num_draft_tokens: int,
+        has_structured_output: bool,
     ) -> bool:
-        """An all-greedy verification step that nothing else reads the logits of."""
         if (
-            grammar_output is not None
-            or input_batch.num_reqs == 0
-            or input_batch.num_draft_tokens == 0
+            has_structured_output
+            or num_reqs == 0
+            or num_draft_tokens == 0
             or not self._greedy_verification_available()
         ):
             return False
         assert self.sampler is not None
-        idx = input_batch.idx_mapping_np
         states = self.sampler.sampling_states
         # No logprobs: neither top logprobs nor logprob_token_ids.
         return bool(
-            np.all(states.temperature.np[idx] == 0.0)
-            and not np.any(self.sampler.needs_logits_processing[idx])
-            and self.sampler.get_logprobs_dims(idx) is None
+            np.all(states.temperature.np[idx_mapping_np] == 0.0)
+            and not np.any(self.sampler.needs_logits_processing[idx_mapping_np])
+            and self.sampler.get_logprobs_dims(idx_mapping_np) is None
+        )
+
+    def _verifies_greedily(
+        self, input_batch: InputBatch, grammar_output: GrammarOutput | None
+    ) -> bool:
+        """An all-greedy verification step that nothing else reads the logits of."""
+        return self._batch_verifies_greedily(
+            input_batch.idx_mapping_np,
+            input_batch.num_reqs,
+            input_batch.num_draft_tokens,
+            grammar_output is not None,
         )
 
     def _verify_greedily(
@@ -3470,12 +3524,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
         elif self.speculator is not None and num_spec_tokens_to_schedule > 0:
             assert self.sampler is not None
-            if isinstance(self.speculator, DraftModelSpeculator):
+            if (
+                isinstance(self.speculator, DraftModelSpeculator)
+                and self.speculator.acceptance_estimator is not None
+            ):
                 observed_rejected = num_rejected
-                if (
-                    self._dead_row_cut is not None
-                    and self.speculator.acceptance_estimator is not None
-                ):
+                if self._dead_row_cut is not None:
                     # Rows past the dead-row cut skipped routed MoE and were
                     # never verified; only live rows can be observed as rejected.
                     live_rejected = (
@@ -3485,10 +3539,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     observed_rejected = torch.minimum(
                         observed_rejected, live_rejected
                     )
-                if (
-                    sampler_output.sink is not None
-                    and self.speculator.acceptance_estimator is not None
-                ):
+                if sampler_output.sink is not None:
                     # A rejected draft zero left the drafts unjudged.
                     observed_rejected = observed_rejected.masked_fill(
                         sampler_output.sink.events[:, 0] == SinkOutcome.REJECTED, 0
