@@ -71,3 +71,53 @@ def test_dropped_rows_stay_unknown_in_the_step_ids():
     assert (ids[:6] == UNKNOWN).all()
     assert (ids[6:8] == 0).all()
     assert (ids[8:] == -1).all()
+
+
+def test_compact_int32_token_map_matches_int64_reference():
+    from vllm.models.deepseek_v4_1.engram_rows import host_hash
+
+    rng = np.random.default_rng(7)
+    vocab = 129_280
+    token_map = rng.integers(0, 96_000, size=vocab, dtype=np.int64)
+    multipliers = rng.integers(1, 10_000_000, size=(2, 4), dtype=np.int64) | 1
+    primes = rng.integers(100_003, 500_009, size=(2, host_hash.HEADS), dtype=np.int64)
+    offsets = np.arange(host_hash.HEADS, dtype=np.int64) * 500_000
+    offsets = np.broadcast_to(offsets, (2, host_hash.HEADS)).copy()
+
+    host = host_hash.HostEngramHash(token_map, multipliers, primes, offsets)
+    assert host.token_map.dtype == np.int32
+    assert host.token_map.nbytes == vocab * 4
+
+    tokens = rng.integers(-2, vocab + 10, size=512, dtype=np.int64)
+    tokens[17] = host_hash.IMAGE_SENTINEL
+    positions = np.arange(512, dtype=np.int64)
+
+    compressed = host.compress(tokens)
+    assert compressed.dtype == np.int64
+    got = host.hash_positions(tokens, positions)
+
+    # Compare against an explicit int64 token_map copy.
+    host.token_map = token_map.astype(np.int64)
+    host.pad = host.token_map[host_hash.PAD_TOKEN]
+    expected_compressed = host.compress(tokens)
+    expected = host.hash_positions(tokens, positions)
+
+    np.testing.assert_array_equal(compressed, expected_compressed)
+    np.testing.assert_array_equal(got, expected)
+
+
+def test_max_l2_cpus_selects_big_l2_cores(tmp_path, monkeypatch):
+    from vllm.models.deepseek_v4_1.engram_rows import host_hash
+
+    for cpu in range(20):
+        size_dir = tmp_path / f"cpu{cpu}" / "cache" / "index2"
+        size_dir.mkdir(parents=True)
+        is_x925 = (5 <= cpu <= 9) or (15 <= cpu <= 19)
+        (size_dir / "size").write_text("2048K\n" if is_x925 else "512K\n", encoding="utf-8")
+
+    expected = [5, 6, 7, 8, 9, 15, 16, 17, 18, 19]
+    assert host_hash.max_l2_cpus(tmp_path, allowed=set(range(20))) == expected
+    assert host_hash.max_l2_cpus(tmp_path, allowed={0, 1, 5, 15}) == [5, 15]
+
+    monkeypatch.setenv("SPARK_DS41F_ENGRAM_CPU_AFFINITY", "0")
+    assert host_hash.pin_to_max_l2_cpus(sysfs_root=tmp_path) == []

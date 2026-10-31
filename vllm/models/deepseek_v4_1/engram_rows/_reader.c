@@ -35,6 +35,7 @@
 #include <errno.h>
 #include <liburing.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -495,10 +496,58 @@ static void queue_init(void) {
     pthread_condattr_destroy(&monotonic);
 }
 
+static unsigned worker_l2_kib;
+
+static unsigned read_cpu_l2_kib(int cpu) {
+    char path[128], buf[32];
+    snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cache/index2/size", cpu);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n == 0) return 0;
+    buf[n] = '\0';
+    char *end = NULL;
+    unsigned long val = strtoul(buf, &end, 10);
+    if (end == buf || val == 0) return 0;
+    while (*end == ' ' || *end == '\t') end++;
+    if (*end == 'M' || *end == 'm') return (unsigned)(val * 1024ul);
+    if (*end == 'G' || *end == 'g') return (unsigned)(val * 1024ul * 1024ul);
+    return (unsigned)val;
+}
+
+static void pin_worker_to_max_l2_cpus(void) {
+    const char *env = getenv("SPARK_DS41F_ENGRAM_CPU_AFFINITY");
+    if (env && strcmp(env, "0") == 0) return;
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) return;
+    unsigned max_kib = 0;
+    cpu_set_t best;
+    CPU_ZERO(&best);
+    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+        if (!CPU_ISSET(cpu, &allowed)) continue;
+        unsigned kib = read_cpu_l2_kib(cpu);
+        if (kib > max_kib) {
+            max_kib = kib;
+            CPU_ZERO(&best);
+            CPU_SET(cpu, &best);
+        } else if (kib > 0 && kib == max_kib) {
+            CPU_SET(cpu, &best);
+        }
+    }
+    if (max_kib > 0 && CPU_COUNT(&best) > 0) {
+        if (sched_setaffinity(0, sizeof(best), &best) == 0) {
+            __atomic_store_n(&worker_l2_kib, max_kib, __ATOMIC_RELAXED);
+        }
+    }
+}
+
 static void *worker_main(void *arg) {
     (void)arg;
     /* Sleep as asked: the default 50 us timer slack would stretch every 10 us poll. */
     prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
+    pin_worker_to_max_l2_cpus();
     pthread_mutex_lock(&queue.mutex);
     for (;;) {
         while (queue.head == queue.tail) pthread_cond_wait(&queue.wake, &queue.mutex);
@@ -780,12 +829,13 @@ static PyObject *py_status(PyObject *self, PyObject *capsule) {
     Py_END_ALLOW_THREADS
     PyObject *message = failure.message[0] ? PyUnicode_FromString(failure.message) : Py_NewRef(Py_None);
     if (!message) return NULL;
-    PyObject *result = Py_BuildValue("{s:N,s:K,s:K,s:K,s:K,s:d,s:d,s:d,s:d}", "failure", message, "steps",
+    unsigned l2_kib = __atomic_load_n(&worker_l2_kib, __ATOMIC_RELAXED);
+    PyObject *result = Py_BuildValue("{s:N,s:K,s:K,s:K,s:K,s:d,s:d,s:d,s:d,s:I}", "failure", message, "steps",
                                      (unsigned long long)steps, "lookups", (unsigned long long)lookups,
                                      "early_lookups", (unsigned long long)early, "queued",
                                      (unsigned long long)queued, "ids_wait_seconds", ids_wait,
                                      "read_seconds", read, "consumed_wait_seconds", consumed_wait,
-                                     "early_read_seconds", early_read);
+                                     "early_read_seconds", early_read, "worker_l2_kib", l2_kib);
     return result;
 }
 
