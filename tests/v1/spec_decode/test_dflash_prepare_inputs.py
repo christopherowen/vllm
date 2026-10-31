@@ -174,3 +174,111 @@ def test_prepare_dflash_inputs_never_writes_the_null_block():
         PAD_SLOT_ID,
         PAD_SLOT_ID,
     ]
+
+
+def test_dflash_full_cg_attn_metadata_fastpath_detection():
+    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+
+    FlashAttentionMetadataBuilder = type("FlashAttentionMetadataBuilder", (), {})
+
+    def _make_builder(**kwargs):
+        defaults = dict(
+            aot_schedule=False,
+            dcp_world_size=1,
+            rswa_window=None,
+            mm_prefix_query_ranges_np=None,
+        )
+        defaults.update(kwargs)
+        b = FlashAttentionMetadataBuilder()
+        for k, v in defaults.items():
+            setattr(b, k, v)
+        return SimpleNamespace(get_metadata_builder=lambda: b)
+
+    spec = DFlashSpeculator.__new__(DFlashSpeculator)
+    spec.draft_cp_size = 1
+    spec.block_tables = SimpleNamespace(cp_size=1)
+    spec.model_state = SimpleNamespace()
+    spec.attn_groups = [[_make_builder()], [_make_builder()], [_make_builder()]]
+    assert spec._compute_full_cg_needs_attn_metadata_build() is False
+
+    class _CustomState:
+        def prepare_draft_attn_metadata(self, **kwargs):
+            return {}
+
+    spec.model_state = _CustomState()
+    assert spec._compute_full_cg_needs_attn_metadata_build() is True
+    spec.model_state = SimpleNamespace()
+
+    spec.attn_groups = [[_make_builder(aot_schedule=True)]]
+    assert spec._compute_full_cg_needs_attn_metadata_build() is True
+
+    spec.attn_groups = [[_make_builder(rswa_window=(128, 0))]]
+    assert spec._compute_full_cg_needs_attn_metadata_build() is True
+
+    spec.attn_groups = [[_make_builder()]]
+    spec.draft_cp_size = 2
+    assert spec._compute_full_cg_needs_attn_metadata_build() is True
+
+
+def test_dflash_build_uniform_attn_metadata_forwards_max_query_len(monkeypatch):
+    import numpy as np
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+    from vllm.v1.worker.gpu.spec_decode import speculator as speculator_mod
+    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+
+    captured = {}
+
+    def _fake_build_attn_metadata(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        speculator_mod, "build_attn_metadata", _fake_build_attn_metadata
+    )
+
+    spec = DFlashSpeculator.__new__(DFlashSpeculator)
+    spec.arange_np = np.arange(5, dtype=np.int32)
+    spec._query_start_loc_cpu = torch.zeros(5, dtype=torch.int32, device="cpu")
+    spec._draft_seq_lens_cpu_upper_bound = torch.zeros(
+        4, dtype=torch.int32, device="cpu"
+    )
+    spec.draft_attn_layer_names = ["layer.0"]
+    spec.draft_cp_size = 1
+    spec.block_tables = SimpleNamespace(
+        cp_size=1,
+        input_block_tables=[torch.zeros((4, 8), dtype=torch.int32)],
+        slot_mappings=torch.zeros((1, 20), dtype=torch.int64),
+    )
+    spec.input_buffers = SimpleNamespace(
+        query_start_loc=torch.zeros(5, dtype=torch.int32),
+        seq_lens=torch.zeros(4, dtype=torch.int32),
+    )
+    spec.max_model_len = 1024
+    spec.draft_max_seq_len = 64
+    spec.kv_cache_config = SimpleNamespace()
+    spec.attn_groups = []
+    spec.draft_is_prefilling = torch.zeros(4, dtype=torch.bool)
+    spec.idx_mapping = torch.arange(4, dtype=torch.int32)
+    spec.model_state = SimpleNamespace(prepare_draft_attn_metadata=lambda **kw: {})
+
+    batch_desc = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.FULL,
+        num_tokens=20,
+        num_reqs=4,
+    )
+    seq_lens_ub = torch.tensor([10, 20, 30, 40], dtype=torch.int32)
+    out = spec._build_uniform_attn_metadata(
+        batch_desc=batch_desc,
+        num_reqs=2,
+        num_query_per_req=5,
+        seq_lens_cpu_upper_bound=seq_lens_ub,
+        step=5,
+        causal=True,
+    )
+    assert out == {"ok": True}
+    assert captured["max_query_len"] == 5
+    assert captured["num_reqs"] == 4
+    assert captured["num_tokens"] == 20
+    assert captured["query_start_loc_cpu"].tolist() == [0, 5, 10, 10, 10]
+    assert captured["seq_lens_cpu_upper_bound"].tolist() == [15, 25, 0, 0]

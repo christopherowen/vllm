@@ -429,6 +429,36 @@ class DFlashSpeculator(DraftModelSpeculator):
                         layer_names, self.model.get_draft_attn_causal()
                     )
                 }
+        self._full_cg_needs_attn_metadata_build = (
+            self._compute_full_cg_needs_attn_metadata_build()
+        )
+
+    def _compute_full_cg_needs_attn_metadata_build(self) -> bool:
+        """Return True if any draft attention builder or model state mutates
+        captured state during ``CUDAGraphMode.FULL`` replay."""
+        if self.draft_cp_size > 1 or getattr(self.block_tables, "cp_size", 1) > 1:
+            return True
+        if (
+            getattr(
+                type(self.model_state),
+                "prepare_draft_attn_metadata",
+                ModelState.prepare_draft_attn_metadata,
+            )
+            is not ModelState.prepare_draft_attn_metadata
+        ):
+            return True
+        for groups in self.attn_groups:
+            for group in groups:
+                builder = group.get_metadata_builder()
+                if (
+                    type(builder).__name__ != "FlashAttentionMetadataBuilder"
+                    or getattr(builder, "aot_schedule", True)
+                    or getattr(builder, "dcp_world_size", 1) > 1
+                    or getattr(builder, "rswa_window", None) is not None
+                    or getattr(builder, "mm_prefix_query_ranges_np", None) is not None
+                ):
+                    return True
+        return False
 
     def reset_attn(self) -> None:
         """Release DFlash state derived from the target KV-cache layout."""
@@ -443,6 +473,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             "_context_slot_mappings",
             "_layer_group_idx",
             "_group_causal",
+            "_full_cg_needs_attn_metadata_build",
         ):
             if hasattr(self, name):
                 delattr(self, name)
@@ -517,6 +548,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         step: int,
         causal: bool | Mapping[int, bool] = False,
         dcp_local_seq_lens: torch.Tensor | None = None,
+        max_query_len: int | None = None,
     ) -> dict[str, Any] | None:
         if not self.draft_attn_layer_names:
             return None
@@ -540,6 +572,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             step=step,
             causal=causal,
             dcp_local_seq_lens=dcp_local_seq_lens,
+            max_query_len=max_query_len,
         )
 
     @torch.inference_mode()
@@ -576,10 +609,6 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
         num_query_tokens = num_reqs * self.num_query_per_req
-        max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
-        self.draft_max_seq_len = min(
-            max_seq_len + self.num_query_per_req, self.max_model_len
-        )
 
         get_ced_indices = getattr(
             getattr(self, "model_state", None), "get_ced_indices", None
@@ -708,39 +737,42 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.sample_from_anchor,
             )
 
-        context_positions = self.context_positions[:num_target_tokens]
-        packed_context_slots = None
-        if ced_indices is not None:
-            # Keep query anchors and rejection masking in the ORIGINAL target
-            # coordinates. Only the prepared context inputs are packed afterward.
-            context_positions = gather_rows(self.context_positions, ced_indices)
-            from vllm.models.deepseek_v4_1.tilelang import ced as ced_kernels
-
-            packed_context_slots = [
-                ced_kernels.gather_slots(slots, ced_indices)
-                for slots in self._context_slot_mappings
-            ]
-        # Each layer uses the context slots of its own KV-cache group. V4.1 can
-        # replay bounded decode context graphs; compact prefills use eager projection.
-        # Dummy runs reserve workspace without clobbering real cache entries.
-        if dummy_run:
-            context_slots: torch.Tensor | list[torch.Tensor | None] | None = None
-        else:
-            group_slots = (
-                packed_context_slots
-                if packed_context_slots is not None
-                else [
-                    slots[:num_context_tokens] for slots in self._context_slot_mappings
-                ]
-            )
-            if self._layer_group_idx is not None:
-                context_slots = [group_slots[gidx] for gidx in self._layer_group_idx]
-            else:
-                context_slots = group_slots[0]
         if use_context_graph:
             assert self._context_preparer is not None
             self._context_preparer.run(aux_hidden_states, num_target_tokens)
         elif not context_kv_is_restored:
+            context_positions = self.context_positions[:num_target_tokens]
+            packed_context_slots = None
+            if ced_indices is not None:
+                # Keep query anchors and rejection masking in the ORIGINAL target
+                # coordinates. Only the prepared context inputs are packed afterward.
+                context_positions = gather_rows(self.context_positions, ced_indices)
+                from vllm.models.deepseek_v4_1.tilelang import ced as ced_kernels
+
+                packed_context_slots = [
+                    ced_kernels.gather_slots(slots, ced_indices)
+                    for slots in self._context_slot_mappings
+                ]
+            # Each layer uses the context slots of its own KV-cache group. V4.1 can
+            # replay bounded decode context graphs; compact prefills use eager projection.
+            # Dummy runs reserve workspace without clobbering real cache entries.
+            if dummy_run:
+                context_slots: torch.Tensor | list[torch.Tensor | None] | None = None
+            else:
+                group_slots = (
+                    packed_context_slots
+                    if packed_context_slots is not None
+                    else [
+                        slots[:num_context_tokens]
+                        for slots in self._context_slot_mappings
+                    ]
+                )
+                if self._layer_group_idx is not None:
+                    context_slots = [
+                        group_slots[gidx] for gidx in self._layer_group_idx
+                    ]
+                else:
+                    context_slots = group_slots[0]
             self.model.precompute_and_store_context_kv(
                 context_states,
                 context_positions,
@@ -764,24 +796,6 @@ class DFlashSpeculator(DraftModelSpeculator):
             dp_sync=batch_sync,
         )
         num_tokens_padded = batch_desc.num_tokens
-        num_tokens_across_dp = (
-            batch_sync.num_tokens_across_dp if batch_sync is not None else None
-        )
-
-        # Rebuild the draft attention metadata even when replaying the FULL
-        # graph so that any attention metadata builder state is updated.
-        draft_attn_metadata = self._build_uniform_attn_metadata(
-            num_reqs=num_reqs,
-            batch_desc=batch_desc,
-            num_query_per_req=self.num_query_per_req,
-            seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
-            step=self.num_query_per_req,
-            causal=self._group_causal,
-        )
-        draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
-            self.block_tables.slot_mappings[:, :num_tokens_padded],
-            self.kv_cache_config,
-        )
 
         # DFlash processes all speculative tokens in one forward pass,
         # so the real token count is num_query_tokens.
@@ -796,9 +810,41 @@ class DFlashSpeculator(DraftModelSpeculator):
         tilelang_inputs.padding_rows(self._is_padding, live, num_tokens_padded)
 
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
+            if getattr(self, "_full_cg_needs_attn_metadata_build", True):
+                max_seq_len = int(input_batch.seq_lens_cpu_upper_bound[:num_reqs].max())
+                self.draft_max_seq_len = min(
+                    max_seq_len + self.num_query_per_req, self.max_model_len
+                )
+                self._build_uniform_attn_metadata(
+                    num_reqs=num_reqs,
+                    batch_desc=batch_desc,
+                    num_query_per_req=self.num_query_per_req,
+                    seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
+                    step=self.num_query_per_req,
+                    causal=self._group_causal,
+                )
             assert self.query_cudagraph_manager is not None
             self.query_cudagraph_manager.run_fullgraph(batch_desc)
         else:
+            max_seq_len = int(input_batch.seq_lens_cpu_upper_bound[:num_reqs].max())
+            self.draft_max_seq_len = min(
+                max_seq_len + self.num_query_per_req, self.max_model_len
+            )
+            draft_attn_metadata = self._build_uniform_attn_metadata(
+                num_reqs=num_reqs,
+                batch_desc=batch_desc,
+                num_query_per_req=self.num_query_per_req,
+                seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
+                step=self.num_query_per_req,
+                causal=self._group_causal,
+            )
+            draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
+                self.block_tables.slot_mappings[:, :num_tokens_padded],
+                self.kv_cache_config,
+            )
+            num_tokens_across_dp = (
+                batch_sync.num_tokens_across_dp if batch_sync is not None else None
+            )
             self._generate_draft(
                 num_reqs,
                 num_tokens_padded,

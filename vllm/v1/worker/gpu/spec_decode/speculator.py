@@ -165,6 +165,12 @@ class DraftModelSpeculator(BaseSpeculator):
         )
         self.arange_np = np.arange(self.max_num_reqs + 1, dtype=np.int32)
         self.draft_is_prefilling = torch.zeros(self.max_num_reqs, dtype=torch.bool)
+        self._query_start_loc_cpu = torch.zeros(
+            self.max_num_reqs + 1, dtype=torch.int32, device="cpu"
+        )
+        self._draft_seq_lens_cpu_upper_bound = torch.zeros(
+            self.max_num_reqs, dtype=torch.int32, device="cpu"
+        )
 
         self.draft_token_confidence_probs = torch.empty_like(
             self.draft_tokens, dtype=torch.float32
@@ -338,6 +344,7 @@ class DraftModelSpeculator(BaseSpeculator):
         step: int,
         causal: bool | Mapping[int, bool] = True,
         dcp_local_seq_lens: torch.Tensor | None = None,
+        max_query_len: int | None = None,
     ) -> dict[str, Any] | None:
         num_reqs_padded = batch_desc.num_reqs or num_reqs
         # A FULL graph replays a captured shape whose padded requests each hold
@@ -350,19 +357,24 @@ class DraftModelSpeculator(BaseSpeculator):
             if batch_desc.cg_mode == CUDAGraphMode.FULL
             else int(query_start_loc_np[-1])
         )
-        query_start_loc_cpu = torch.empty(num_reqs_padded + 1, dtype=torch.int32)
+        query_start_loc_cpu = self._query_start_loc_cpu[: num_reqs_padded + 1]
         query_start_loc_cpu[: num_reqs + 1] = torch.from_numpy(
             query_start_loc_np[: num_reqs + 1]
         )
         query_start_loc_cpu[num_reqs:] = query_start_loc_cpu[num_reqs]
-        max_query_len = int((query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]).max())
+        if max_query_len is None:
+            max_query_len = int(
+                (query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]).max()
+            )
         block_tables = [
             x[:num_reqs_padded] for x in self.block_tables.input_block_tables
         ]
         slot_mappings = self.block_tables.slot_mappings[:, :num_tokens]
-        draft_seq_lens_cpu_upper_bound = torch.zeros(
-            num_reqs_padded, dtype=torch.int32, device="cpu"
-        )
+        draft_seq_lens_cpu_upper_bound = self._draft_seq_lens_cpu_upper_bound[
+            :num_reqs_padded
+        ]
+        if num_reqs < num_reqs_padded:
+            draft_seq_lens_cpu_upper_bound[num_reqs:].zero_()
         torch.add(
             seq_lens_cpu_upper_bound[:num_reqs],
             step,
@@ -574,4 +586,5 @@ class DraftModelSpeculator(BaseSpeculator):
             step=step,
             causal=causal,
             dcp_local_seq_lens=dcp_local_seq_lens,
+            max_query_len=num_query_per_req if num_reqs > 0 else 0,
         )
