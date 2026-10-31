@@ -565,8 +565,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
 
         self._attention_geometry()
         calls = self._tilelang_calls()
+        q_lora_rank = self.q_lora_rank
         # Q-B's input cast where the front's one kernel does not write it.
-        prepare.declare(lambda: calls, warm=lambda: _warm_casts(self.q_lora_rank))
+        prepare.declare(lambda: calls, warm=lambda: _warm_casts(q_lora_rank))
         declare_wo = getattr(self._wo_projection_weights, "declare_kernels", None)
         if declare_wo is not None:
             declare_wo()

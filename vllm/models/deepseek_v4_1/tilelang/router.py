@@ -667,13 +667,23 @@ class TileLangGateRouter(TileKernelsRouter):
         kernels."""
 
         def bind() -> None:
-            for key, (function, args, kwargs) in self._partials_kernels().items():
-                self._kernels[key] = function(*args, **kwargs)
+            for key, entry in self._partials_kernels().items():
+                self._kernels[key] = prepare.launch(entry)
+
+        top_k = self.top_k
+        num_experts = self.gate.weight.shape[0]
+        image = self.bias_vl is not None and self.image_sentinel_lo > 0
+        masks = self._mask_variants
+        warm = (
+            (lambda: [_warm_topk_gate(top_k, num_experts, image, m) for m in masks])
+            if self._gates_every_row()
+            else None
+        )
 
         prepare.declare(
             lambda: [*self._partials_kernels().values(), *self._mask_calls()],
             bind=bind,
-            warm=self._warm,
+            warm=warm,
         )
 
     def route_local(

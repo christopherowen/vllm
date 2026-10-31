@@ -1005,6 +1005,24 @@ def _same_registration(
     ) and all(_same_value(left_kwargs[k], right_kwargs[k]) for k in left_kwargs)
 
 
+_FAST_KEY_ATOMS = (int, float, str, bytes, bool, type(None), type)
+
+
+def _fast_registration_key(value: Any) -> Any:
+    if isinstance(value, _FAST_KEY_ATOMS):
+        return (type(value), value)
+    if callable(value):
+        return (id, id(value))
+    if isinstance(value, tuple):
+        return (tuple, tuple(_fast_registration_key(x) for x in value))
+    if isinstance(value, dict) and all(isinstance(k, str) for k in value):
+        return (
+            dict,
+            tuple((k, _fast_registration_key(value[k])) for k in sorted(value)),
+        )
+    raise TypeError
+
+
 class JitWarmupRegistry:
     """Collect and compile JIT kernels selected during runner setup."""
 
@@ -1016,6 +1034,11 @@ class JitWarmupRegistry:
     def __init__(self, vllm_config: Any) -> None:
         self.vllm_config = vllm_config
         self._registrations: dict[
+            VllmJitKernel[Any],
+            list[tuple[tuple[Any, ...], dict[str, Any]]],
+        ] = {}
+        self._fast_registration_keys: dict[VllmJitKernel[Any], set[Any]] = {}
+        self._slow_registrations: dict[
             VllmJitKernel[Any],
             list[tuple[tuple[Any, ...], dict[str, Any]]],
         ] = {}
@@ -1072,11 +1095,21 @@ class JitWarmupRegistry:
         # get_warmup_keys once per distinct registration is sufficient. Dedup on
         # identity-or-equality -- identity short-circuits shared singletons like
         # vllm_config before any deep __eq__.
-        if any(
-            _same_registration(registered, (args, kwargs))
-            for registered in registrations
-        ):
-            return
+        try:
+            fast_key = _fast_registration_key((args, kwargs))
+        except TypeError:
+            slow = self._slow_registrations.setdefault(kernel, [])
+            if any(
+                _same_registration(registered, (args, kwargs))
+                for registered in slow
+            ):
+                return
+            slow.append((args, kwargs))
+        else:
+            fast_keys = self._fast_registration_keys.setdefault(kernel, set())
+            if fast_key in fast_keys:
+                return
+            fast_keys.add(fast_key)
         registrations.append((args, kwargs))
 
     def __len__(self) -> int:

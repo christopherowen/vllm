@@ -431,15 +431,10 @@ def _calls(kernels: dict) -> list[prepare.TileLangCall]:
 
 def _launch(kernels: dict) -> dict:
     """A ``*_kernels`` table with each call made (prepared: cache hits)."""
-
-    def make(entry):
-        function, args, kwargs = entry
-        return function(*args, **kwargs)
-
     return {
-        name: {key: make(c) for key, c in value.items()}
+        name: {key: prepare.launch(c) for key, c in value.items()}
         if isinstance(value, dict)
-        else make(value)
+        else prepare.launch(value)
         for name, value in kernels.items()
     }
 

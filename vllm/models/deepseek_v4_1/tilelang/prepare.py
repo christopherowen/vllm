@@ -21,6 +21,7 @@ processing transforms weights only.
 from __future__ import annotations
 
 import threading
+import weakref
 from collections.abc import Callable, Iterable
 from typing import Any
 
@@ -72,14 +73,25 @@ class TileLangKernels(VllmJitKernel[_CallKey]):
 
     def __init__(self) -> None:
         super().__init__()
-        self._prepared_calls: set[int] = set()
+        self._prepared_calls: weakref.WeakSet[Calls] = weakref.WeakSet()
+
+    def declared_keys(
+        self, calls: Calls | None, bind=None, warm=None
+    ) -> list[_CallKey]:
+        if calls is None:
+            return []
+        return [_CallKey(function, args, kwargs) for function, args, kwargs in calls()]
 
     def get_warmup_keys(
         self, calls: Calls | None, bind=None, warm=None
     ) -> list[_CallKey]:
-        if calls is None or id(calls) in self._prepared_calls:
+        if calls is None or calls in self._prepared_calls:
             return []
-        return [_CallKey(function, args, kwargs) for function, args, kwargs in calls()]
+        return self.declared_keys(calls, bind, warm)
+
+    def mark_prepared(self, calls: Calls | None) -> None:
+        if calls is not None:
+            self._prepared_calls.add(calls)
 
     def compile(self, compile_key: _CallKey) -> None:
         self.compile_many([compile_key])
@@ -134,13 +146,14 @@ def declare(
 def declare_modules(*models: Any) -> None:
     """Let the modules of ``models`` declare their kernels, after loading.
 
-    Calls ``module.declare_kernels()`` on every module that defines it, and
-    ``quant_method.declare_layer_kernels(module)`` on every module's linear method
-    that does (methods are often attached after a layer is built, so construction
-    is not where they can declare). Must run while the runner's JIT registry
+    Calls ``quant_method.declare_layer_kernels(module)`` on every module's linear
+    method that does (methods are often attached after a layer is built, so
+    construction is not where they can declare), then ``module.declare_kernels()``
+    on every module that defines it. Must run while the runner's JIT registry
     collects.
     """
     seen: set[int] = set()
+    modules: list[Any] = []
     for model in models:
         if model is None:
             continue
@@ -148,13 +161,15 @@ def declare_modules(*models: Any) -> None:
             if id(module) in seen:
                 continue
             seen.add(id(module))
+            modules.append(module)
             method = getattr(module, "quant_method", None)
             declare_layer = getattr(method, "declare_layer_kernels", None)
             if declare_layer is not None:
                 declare_layer(module)
-            declare_own = getattr(module, "declare_kernels", None)
-            if declare_own is not None:
-                declare_own()
+    for module in modules:
+        declare_own = getattr(module, "declare_kernels", None)
+        if declare_own is not None:
+            declare_own()
 
 
 class _Progress:
@@ -189,12 +204,8 @@ def declared_calls(registry: JitWarmupRegistry) -> list[TileLangCall]:
     for kernel, registrations in registry.registrations():
         if kernel is not TILELANG:
             continue
-        for args, _ in registrations:
-            fn = args[0] if args else None
-            if fn is None:
-                continue
-            for function, call_args, call_kwargs in fn():
-                key = _CallKey(function, call_args, call_kwargs)
+        for args, kwargs in registrations:
+            for key in kernel.declared_keys(*args, **kwargs):
                 calls.setdefault(key, (key.function, key.args, key.kwargs))
     return list(calls.values())
 
@@ -217,10 +228,11 @@ def prepare_declared(registry: JitWarmupRegistry) -> int:
     PROGRESS.start(len(calls))
     tilelang.prepare(calls, num_workers=compile_workers(), progress=PROGRESS.report)
     for kernel, registrations in registry.registrations():
-        if kernel is TILELANG:
-            for args, _ in registrations:
-                if args and args[0] is not None:
-                    TILELANG._prepared_calls.add(id(args[0]))
+        if kernel is not TILELANG:
+            continue
+        for args, _ in registrations:
+            if args:
+                TILELANG.mark_prepared(args[0])
     return len(calls)
 
 
@@ -234,21 +246,54 @@ def release_host_memory() -> None:
         ctypes.CDLL("libc.so.6").malloc_trim(0)
 
 
-def _callbacks(registry: JitWarmupRegistry, index: int) -> list[Callable[[], None]]:
-    found: dict[int, Callable[[], None]] = {}
+_SAFE_CELL_ATOMS = (int, float, str, bytes, bool, type(None), type)
+
+
+def _cell_key(value: Any) -> Any:
+    if isinstance(value, _SAFE_CELL_ATOMS):
+        return (type(value), value)
+    if isinstance(value, tuple):
+        return (tuple, tuple(_cell_key(x) for x in value))
+    return ("id", id(value))
+
+
+def _callback_dedup_key(callback: Callable[[], None], deduplicate_closures: bool) -> Any:
+    if not deduplicate_closures:
+        return ("id", id(callback))
+    code = getattr(callback, "__code__", None)
+    if code is None or getattr(callback, "__self__", None) is not None:
+        return ("id", id(callback))
+    closure = getattr(callback, "__closure__", None)
+    if not closure:
+        return ("code", code)
+    try:
+        cells = tuple(_cell_key(cell.cell_contents) for cell in closure)
+    except (TypeError, ValueError):
+        return ("id", id(callback))
+    return ("closure", code, cells)
+
+
+def _callbacks(
+    registry: JitWarmupRegistry,
+    index: int,
+    *,
+    deduplicate_closures: bool = False,
+) -> list[Callable[[], None]]:
+    found: dict[Any, Callable[[], None]] = {}
     for kernel, registrations in registry.registrations():
         if kernel is not TILELANG:
             continue
         for args, _ in registrations:
             callback = args[index] if len(args) > index else None
             if callback is not None:
-                found.setdefault(id(callback), callback)
+                key = _callback_dedup_key(callback, deduplicate_closures)
+                found.setdefault(key, callback)
     return list(found.values())
 
 
 def warm_declared(registry: JitWarmupRegistry) -> int:
     """Run every owner's ``warm()`` (before ``freeze``); return how many ran."""
-    callbacks = _callbacks(registry, 2)
+    callbacks = _callbacks(registry, 2, deduplicate_closures=True)
     for warm in callbacks:
         warm()
     return len(callbacks)
@@ -261,8 +306,29 @@ def freeze(reason: str) -> None:
     freeze_cache(reason)
 
 
+_BOUND_CACHE: dict[_CallKey, Any] | None = None
+
+
+def launch(entry: TileLangCall) -> Any:
+    """Return the prepared kernel for ``entry``, reusing bindings within ``bind_declared``."""
+    function, args, kwargs = entry
+    if _BOUND_CACHE is not None:
+        key = _CallKey(function, args, kwargs)
+        kernel = _BOUND_CACHE.get(key)
+        if kernel is None:
+            kernel = function(*args, **kwargs)
+            _BOUND_CACHE[key] = kernel
+        return kernel
+    return function(*args, **kwargs)
+
+
 def bind_declared(registry: JitWarmupRegistry) -> None:
     """Let every owner store its prepared kernels (after ``freeze``, so a bind that
     asks for an undeclared call fails by name)."""
-    for bind in _callbacks(registry, 1):
-        bind()
+    global _BOUND_CACHE
+    _BOUND_CACHE = {}
+    try:
+        for bind in _callbacks(registry, 1):
+            bind()
+    finally:
+        _BOUND_CACHE = None

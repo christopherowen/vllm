@@ -225,7 +225,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         declare = getattr(router, "declare_kernels", None)
         if declare is not None:
             declare()
-        prepare.declare(warm=lambda: _warm_casts(self.hidden_size))
+        hidden_size = self.hidden_size
+        prepare.declare(warm=lambda: _warm_casts(hidden_size))
 
     def build_l2_prefetch(self, nxt: "DeepseekV4DecoderLayer | None") -> str:
         """Install this layer's L2 prefetch windows; see ``l2_prefetch``."""
