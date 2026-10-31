@@ -33,6 +33,45 @@ from .scale_pack import pack_scale_words
 
 SF_BLOCK = 32  # K elements per UE8M0 scale
 SF_WORD_K = 4 * SF_BLOCK  # K elements per packed scale word
+TILE_WEIGHT_N = 128  # N rows per tile-contiguous FP8 weight block
+TILE_WEIGHT_K = 128  # K columns per tile-contiguous FP8 weight block
+
+
+def pack_weight_tiles(
+    weight: torch.Tensor,
+    tile_n: int = TILE_WEIGHT_N,
+    tile_k: int = TILE_WEIGHT_K,
+) -> torch.Tensor:
+    """Pack row-major ``[N, K]`` FP8 weight into ``[N // tile_n, K // tile_k, tile_n, tile_k]``
+    viewed as ``(N * (K // tile_k), tile_k)``, so each ``block_N x 128`` tile (for
+    ``block_N`` dividing ``tile_n``) is a single contiguous slab in DRAM."""
+    n, k = weight.shape
+    if n % tile_n or k % tile_k:
+        raise ValueError(
+            f"weight shape {(n, k)} must be divisible by tile {(tile_n, tile_k)}"
+        )
+    return (
+        weight.reshape(n // tile_n, tile_n, k // tile_k, tile_k)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .view(n * (k // tile_k), tile_k)
+    )
+
+
+def unpack_weight_tiles(
+    packed: torch.Tensor,
+    n: int,
+    k: int,
+    tile_n: int = TILE_WEIGHT_N,
+    tile_k: int = TILE_WEIGHT_K,
+) -> torch.Tensor:
+    """Inverse of ``pack_weight_tiles``: restore row-major ``[N, K]`` FP8 weight."""
+    return (
+        packed.reshape(n // tile_n, k // tile_k, tile_n, tile_k)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .view(n, k)
+    )
 
 
 def scale_words(k: int) -> int:
@@ -70,6 +109,7 @@ def _mxfp8_gemm(
     groups: int = 1,
     shards: int = 1,
     pdl_chain: bool = False,
+    tile_contiguous: bool = False,
 ):
     """``C[M, N] = (A * SFA) @ (B * SFB)^T`` for MXFP8 ``A[M, K]``, ``B[N, K]``.
 
@@ -127,11 +167,19 @@ def _mxfp8_gemm(
     sf_words = scale_words(K)
     block_words = block_scale_words(block_K)
     total_N = groups * N
+    if tile_contiguous:
+        assert total_N % TILE_WEIGHT_N == 0 and K % TILE_WEIGHT_K == 0
+        assert TILE_WEIGHT_N % block_N == 0 and block_K % TILE_WEIGHT_K == 0
+    k_tiles = K // TILE_WEIGHT_K
+    sub_tiles_k = block_K // TILE_WEIGHT_K
+    b_shape = (
+        (total_N * k_tiles, TILE_WEIGHT_K) if tile_contiguous else (total_N, K)
+    )
 
     @T.prim_func
     def gemm_mxfp8(
         A: T.Tensor((Mp, groups * K), in_dtype),
-        B: T.Tensor((total_N, K), in_dtype),
+        B: T.Tensor(b_shape, in_dtype),
         SFA: T.Tensor((Mp, groups * sf_words), T.uint32),
         SFB: T.Tensor((total_N // 32, sf_words), T.uint32),
         C: T.Tensor((M, total_N), out_dtype),
@@ -160,7 +208,32 @@ def _mxfp8_gemm(
                 T.clear(C_total)
             for ko in T.Pipelined(k_blocks, num_stages=num_stages):
                 T.copy(A[by * block_M, a_k + ko * block_K], A_shared)
-                T.copy(B[bx * block_N, ko * block_K], B_shared)
+                if not tile_contiguous:
+                    T.copy(B[bx * block_N, ko * block_K], B_shared)
+                elif sub_tiles_k == 1:
+                    row0 = (
+                        ((bx * block_N // TILE_WEIGHT_N) * k_tiles + ko) * TILE_WEIGHT_N
+                        + (bx * block_N % TILE_WEIGHT_N)
+                    )
+                    T.copy(B[row0, 0], B_shared)
+                else:
+                    for sub_k in T.serial(sub_tiles_k):
+                        row0 = (
+                            (
+                                (bx * block_N // TILE_WEIGHT_N) * k_tiles
+                                + ko * sub_tiles_k
+                                + sub_k
+                            )
+                            * TILE_WEIGHT_N
+                            + (bx * block_N % TILE_WEIGHT_N)
+                        )
+                        T.copy(
+                            B[row0 : row0 + block_N, 0:TILE_WEIGHT_K],
+                            B_shared[
+                                0:block_N,
+                                sub_k * TILE_WEIGHT_K : (sub_k + 1) * TILE_WEIGHT_K,
+                            ],
+                        )
                 # Edge tiles clamp their scale rows; those rows are never stored.
                 # SFB is the packed block grid, so the clamped row is divided by
                 # 32. That is the per-row broadcast's word, and it stays on the
@@ -300,6 +373,7 @@ def _mxfp8_gemm_decode(
     swizzle_panel: int = 0,
     groups: int = 1,
     shards: int = 1,
+    tile_contiguous: bool = False,
 ):
     """``_mxfp8_gemm``'s decode tiles: no warp specialization, on the PDL chain."""
     return _mxfp8_gemm(
@@ -316,6 +390,7 @@ def _mxfp8_gemm_decode(
         groups,
         shards,
         pdl_chain=True,
+        tile_contiguous=tile_contiguous,
     )
 
 
@@ -1143,15 +1218,23 @@ DECODE_TILE_ROWS = (16, 32, DECODE_ROWS)
 # to B12X over the three is lowest. Every field only changes speed: each tile
 # accumulates K in the same order, so a row's bits do not depend on the tile
 # or on prefill.
+# Decode Q-B (8192 x 1280) and indexer Q-B (4096 x 1280) pack their [N, K] weights
+# into [N // 128, K // 128, 128, 128] tiles so each decode and prefill tile reads a
+# contiguous 128-wide slab per K step while keeping bit-identity with row-major [N, K].
+TILE_CONTIGUOUS_FP8: set[tuple[int, int]] = {
+    (8192, 1280),
+    (4096, 1280),
+}
+
 DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
     # TP4 attention: Q-B, indexer Q-B, fused Q-A/KV.
     (8192, 1280): {
         16: dict(block_N=128, block_K=128, num_stages=3),
         32: dict(block_N=64, block_K=128, num_stages=3),
-        64: dict(block_N=64, block_K=256, num_stages=2),
+        64: dict(block_N=64, block_K=128, num_stages=3),
     },
     (4096, 1280): {
-        16: dict(block_N=64, block_K=256, num_stages=4),
+        16: dict(block_N=64, block_K=128, num_stages=3),
         32: dict(block_N=128, block_K=128, num_stages=3),
         64: dict(block_N=64, block_K=128, num_stages=2, threads=64),
     },

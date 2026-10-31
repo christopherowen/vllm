@@ -45,6 +45,7 @@ from .gemm import (
     SPLIT_BF16,
     SPLIT_DECODE_ROWS,
     SPLIT_FP8,
+    TILE_CONTIGUOUS_FP8,
     WIDE_DECODE,
     bf16_gemm,
     bf16_gemm_partials,
@@ -58,6 +59,7 @@ from .gemm import (
     mxfp8_gemm_decode,
     mxfp8_gemm_partials,
     pack_scale_words,
+    pack_weight_tiles,
     scale_words,
     split_bucket,
     split_row_tile,
@@ -294,7 +296,8 @@ def _block32_gemm(layer, xq, sf, out, rows: int) -> None:
         xq, sf = xq[:rows], sf[:rows]
     else:
         gemm = layer.tilelang_decode[decode_tile_rows(rows, layer.tilelang_wide)]
-    gemm(xq, layer.weight, sf.view(torch.uint32), layer.tilelang_weight_sf, out)
+    weight = getattr(layer, "tilelang_weight", layer.weight)
+    gemm(xq, weight, sf.view(torch.uint32), layer.tilelang_weight_sf, out)
 
 
 @_block32_linear.register_fake
@@ -403,6 +406,11 @@ def _block32_kernels(n: int, k: int, groups: int = 1) -> dict:
     wide = WIDE_DECODE.get((n, k), {}) if groups == 1 else {}
     # The wide decode table can name a tile taller than DECODE_ROWS (WO-B's 96).
     heights = sorted({*DECODE_TILE_ROWS, *wide.values()})
+    tile_kw = (
+        {"tile_contiguous": True}
+        if groups == 1 and (n, k) in TILE_CONTIGUOUS_FP8
+        else {}
+    )
     return {
         "decode": {
             block_M: prepare.call(
@@ -412,11 +420,17 @@ def _block32_kernels(n: int, k: int, groups: int = 1) -> dict:
                 **fp8_decode_config(part, k, block_M, groups),
                 padded_rows=True,
                 groups=groups,
+                **tile_kw,
             )
             for block_M in heights
         },
         "prefill": prepare.call(
-            mxfp8_gemm, part, k, **fp8_prefill_config(part, k, groups), groups=groups
+            mxfp8_gemm,
+            part,
+            k,
+            **fp8_prefill_config(part, k, groups),
+            groups=groups,
+            **tile_kw,
         ),
     }
 
@@ -532,13 +546,24 @@ def _block32_scale_words(layer) -> None:
     Grouped weights are stacked in N, so the same index is the broadcast's word.
     """
     scales = layer.weight_scale_inv.view(torch.uint8)
-    rows = layer.weight.shape[0]
+    rows, cols = layer.weight.shape
     if scales.shape[0] * 32 != rows:
         raise ValueError(
             f"block scales have {scales.shape[0]} rows for {rows} outputs; "
             "the GEMM reads one scale row per 32 output rows"
         )
     layer.tilelang_weight_sf = pack_scale_words(scales)
+    if (
+        (rows, cols) in TILE_CONTIGUOUS_FP8
+        and getattr(layer, "tilelang_groups", 1) == 1
+        and not getattr(layer, "tilelang_weight_packed", False)
+    ):
+        packed = pack_weight_tiles(layer.weight)
+        layer.weight.data = packed.view(rows, cols)
+        layer.tilelang_weight = packed
+        layer.tilelang_weight_packed = True
+    elif not getattr(layer, "tilelang_weight_packed", False):
+        layer.tilelang_weight = layer.weight
 
 
 def _apply_block32(layer, x: torch.Tensor) -> torch.Tensor:

@@ -25,6 +25,7 @@ from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
 from vllm.models.deepseek_v4_1.tilelang.gemm import (  # noqa: E402
     DECODE_ROWS,
     DECODE_TILE_ROWS,
+    TILE_CONTIGUOUS_FP8,
     bf16_gemm,
     bf16_gemm_partials,
     bf16_shards,
@@ -33,7 +34,9 @@ from vllm.models.deepseek_v4_1.tilelang.gemm import (  # noqa: E402
     mxfp8_gemm,
     mxfp8_gemm_decode,
     pack_scale_words,
+    pack_weight_tiles,
     splitk_reduce,
+    unpack_weight_tiles,
 )
 from vllm.models.deepseek_v4_1.tilelang.norm import TileLangRMSNorm  # noqa: E402
 
@@ -480,3 +483,62 @@ def test_rmsnorm_of_a_fused_projections_half(width, rows=33, eps=1e-6):
     out = norm(half)
     assert out.is_contiguous()
     assert torch.equal(out.view(torch.int16), norm(half.contiguous()).view(torch.int16))
+
+
+@pytest.mark.parametrize("n, k", sorted(TILE_CONTIGUOUS_FP8))
+def test_tile_contiguous_fp8_matches_row_major(default_vllm_config, n, k):
+    """Tile-contiguous [N // 128, K // 128, 128, 128] weights for Q-B (8192 x 1280)
+    and indexer Q-B (4096 x 1280) match row-major [N, K] bit for bit across all decode
+    tile heights and prefill."""
+    from types import SimpleNamespace
+    from torch import nn
+
+    from vllm.models.deepseek_v4_1.tilelang.linear import TileLangFP8LinearMethod
+    from vllm.v1.worker.workspace import use_preallocated_workspace
+
+    weight, exps, _ = _block32_weight(n, k, 19)
+    packed = pack_weight_tiles(weight)
+    assert torch.equal(unpack_weight_tiles(packed, n, k), weight)
+
+    weight_sf = pack_scale_words(exps)
+    x = torch.randn((max(ROWS), k), generator=_gen(23), device=DEVICE).bfloat16()
+    xq, sf, _ = _mxfp8(x)
+    words = sf.contiguous().view(torch.uint32)
+
+    ref_prefill = mxfp8_gemm(n, k, **fp8_prefill_config(n, k))
+    tiled_prefill = mxfp8_gemm(n, k, **fp8_prefill_config(n, k), tile_contiguous=True)
+    full_ref = torch.empty((max(ROWS), n), dtype=torch.bfloat16, device=DEVICE)
+    full_tiled = torch.empty_like(full_ref)
+    ref_prefill(xq, weight, words, weight_sf, full_ref)
+    tiled_prefill(xq, packed, words, weight_sf, full_tiled)
+    assert torch.equal(full_tiled, full_ref)
+
+    for block_M in DECODE_TILE_ROWS:
+        cfg = fp8_decode_config(n, k, block_M)
+        k_ref = mxfp8_gemm_decode(n, k, **cfg, padded_rows=True)
+        k_tiled = mxfp8_gemm_decode(
+            n, k, **cfg, padded_rows=True, tile_contiguous=True
+        )
+        for rows in (1, 6, block_M):
+            out_ref = torch.empty((rows, n), dtype=torch.bfloat16, device=DEVICE)
+            out_tiled = torch.empty_like(out_ref)
+            k_ref(xq[:DECODE_ROWS], weight, words[:DECODE_ROWS], weight_sf, out_ref)
+            k_tiled(xq[:DECODE_ROWS], packed, words[:DECODE_ROWS], weight_sf, out_tiled)
+            assert torch.equal(out_tiled, out_ref), f"block_M={block_M} rows={rows}"
+            assert torch.equal(out_tiled, full_ref[:rows])
+
+    layer = nn.Module()
+    layer.weight = nn.Parameter(weight.clone(), requires_grad=False)
+    layer.weight_scale_inv = nn.Parameter(exps.clone(), requires_grad=False)
+    method = TileLangFP8LinearMethod(SimpleNamespace(weight_block_size=[32, 32]))
+    method.process_weights_after_loading(layer)
+    method.declare_layer_kernels(layer)
+    assert getattr(layer, "tilelang_weight_packed", False) is True
+    assert layer.weight.shape == (n, k)
+    assert layer.tilelang_weight.shape == (n * (k // 128), 128)
+
+    scratch = torch.empty(16 << 20, dtype=torch.uint8, device=DEVICE)
+    with use_preallocated_workspace(scratch):
+        for rows in ROWS:
+            out = method.apply(layer, x[:rows])
+            assert torch.equal(out, full_ref[:rows]), f"linear apply rows={rows}"
