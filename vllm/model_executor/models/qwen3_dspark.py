@@ -192,6 +192,8 @@ class DSparkMarkovHead(nn.Module):
 class DSparkConfidenceHead(nn.Module):
     """DSpark acceptance-confidence head."""
 
+    tp_invariant: bool = False
+
     def __init__(
         self,
         input_dim: int,

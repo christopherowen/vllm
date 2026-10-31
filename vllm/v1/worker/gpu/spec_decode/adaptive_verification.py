@@ -119,6 +119,8 @@ class AdaptiveVerificationManager:
         planned_confidences: bool = False,
         num_draft_steps: int | None = None,
         slot_draft_limits: Callable[[], np.ndarray] | np.ndarray | None = None,
+        *,
+        tp_invariant_confidence: bool = False,
     ):
         self.req_states = req_states
         self.num_speculative_steps = req_states.num_speculative_steps
@@ -137,6 +139,7 @@ class AdaptiveVerificationManager:
         # cost: a recipe constant, so the budget is a rule of the inputs, the same
         # on every build and boot, with nothing timed.
         self.row_cost = row_cost
+        self.tp_invariant_confidence = tp_invariant_confidence
         self.dead_rows_tau = _DEAD_ROWS_TAU
         self._dead_row_cut = torch.empty(
             req_states.max_num_reqs, dtype=torch.int32, device=device
@@ -279,10 +282,18 @@ class AdaptiveVerificationManager:
                 self._new_rows.extend(mid_prefill_slots)
                 self.apply_staged_writes()
         # Replicated projections may differ through unordered floating-point
-        # reductions. Both CPU graph selection and GPU request compaction must
-        # consume one TP-wide confidence snapshot to issue matching collectives.
+        # reductions unless both the TP group's reductions and the confidence
+        # head are rank-invariant. Both CPU graph selection and GPU request
+        # compaction must consume one TP-wide confidence snapshot.
         tp_group = get_tp_group()
-        if tp_group.world_size > 1:
+        if tp_group.world_size > 1 and not (
+            getattr(self, "tp_invariant_confidence", False)
+            and getattr(
+                getattr(tp_group, "device_communicator", None),
+                "rank_order_reduce_scatter",
+                False,
+            )
+        ):
             tp_group.broadcast(self._confidence_buffer, src=0)
         write_slot = self._stale_confidences[write_idx]
         write_slot.gpu.copy_(self._planned_probs)
@@ -537,6 +548,7 @@ def maybe_create_adaptive_verification_manager(
     additional_attn_cg_support: tuple[AttentionCGSupport, str | None] | None = None,
     planned_confidences: bool = False,
     slot_draft_limits: Callable[[], np.ndarray] | np.ndarray | None = None,
+    tp_invariant_confidence: bool = False,
 ) -> AdaptiveVerificationManager | None:
     if not enable_adaptive_verification:
         return None
@@ -612,4 +624,5 @@ def maybe_create_adaptive_verification_manager(
         )
         or None,
         slot_draft_limits=slot_draft_limits,
+        tp_invariant_confidence=tp_invariant_confidence,
     )

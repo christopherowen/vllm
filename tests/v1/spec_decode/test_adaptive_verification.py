@@ -199,6 +199,75 @@ def test_planned_confidences_reach_the_budget_and_the_current_the_ranking(
 
 
 @pytest.mark.parametrize(
+    ("tp_invariant_confidence", "rank_order_reduce_scatter", "expected_broadcasts"),
+    [
+        (False, False, 1),
+        (False, True, 1),
+        (True, False, 1),
+        (True, True, 0),
+    ],
+)
+def test_tp_invariant_confidence_elides_broadcast_only_when_rank_ordered(
+    monkeypatch,
+    tp_invariant_confidence,
+    rank_order_reduce_scatter,
+    expected_broadcasts,
+):
+    local = torch.tensor([[0.75]], dtype=torch.float32)
+    manager = make_manager(local.numpy().copy(), row_cost=0.1)
+    manager.tp_invariant_confidence = tp_invariant_confidence
+    manager.req_states.device = torch.device("cpu")
+    manager._confidence_buffer = torch.zeros_like(local).unsqueeze(0)
+    manager._confidence_probs = manager._confidence_buffer[0]
+    manager._planned_probs = manager._confidence_buffer[-1]
+    manager._pending_resets = []
+    manager._stale_confidences = [
+        SimpleNamespace(
+            np=np.ones((1, 1), dtype=np.float32),
+            gpu=torch.empty_like(local),
+            copy_to_cpu=lambda: None,
+        )
+        for _ in range(2)
+    ]
+    manager._copy_events = [
+        SimpleNamespace(synchronize=lambda: None, record=lambda: None) for _ in range(2)
+    ]
+    manager._copy_stream = SimpleNamespace(wait_stream=lambda _stream: None)
+    calls = []
+
+    def broadcast(tensor, src):
+        assert src == 0
+        calls.append(tensor)
+
+    monkeypatch.setattr(
+        adaptive_module,
+        "get_tp_group",
+        lambda: SimpleNamespace(
+            world_size=2,
+            broadcast=broadcast,
+            device_communicator=SimpleNamespace(
+                rank_order_reduce_scatter=rank_order_reduce_scatter
+            ),
+        ),
+    )
+    monkeypatch.setattr(adaptive_module, "gpu_sync_allowed", nullcontext)
+    monkeypatch.setattr(adaptive_module.torch.cuda, "current_stream", lambda _: None)
+    monkeypatch.setattr(adaptive_module, "stream", lambda *_: nullcontext())
+    monkeypatch.setattr(
+        adaptive_module.tilelang_inputs,
+        "scatter_rows",
+        lambda idx_mapping, source, state, gather=False: state.__setitem__(
+            (idx_mapping, slice(0, source.shape[1])), source
+        ),
+    )
+    batch = SimpleNamespace(num_reqs=1, idx_mapping=torch.tensor([0]))
+    manager.record_confidences(local, batch)
+    assert len(calls) == expected_broadcasts
+    torch.testing.assert_close(manager._confidence_probs, local, rtol=0, atol=0)
+
+
+
+@pytest.mark.parametrize(
     "target_support,varlen_decode,allowed",
     [
         (AttentionCGSupport.ALWAYS, False, True),

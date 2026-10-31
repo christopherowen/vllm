@@ -828,6 +828,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 if self.copy_drafter is not None
                 else None
             ),
+            tp_invariant_confidence=getattr(
+                self.speculator, "tp_invariant_confidence", False
+            ),
         )
         if self.copy_drafter is not None and self.adaptive_verification is None:
             # The draft budget decides how many of a copy's drafts a step

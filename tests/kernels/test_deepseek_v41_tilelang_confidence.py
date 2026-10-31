@@ -188,14 +188,21 @@ def test_refuses_other_layouts():
 def test_the_head_runs_its_weight_row():
     """``TileLangConfidenceHead.probability`` reads its projection's [1, H + R]
     weight; its logit path is not available."""
+    from vllm.model_executor.models.qwen3_dspark import DSparkConfidenceHead
+
     head = confidence.TileLangConfidenceHead.__new__(confidence.TileLangConfidenceHead)
     torch.nn.Module.__init__(head)
     hidden, markov, weight = _inputs(5, seed=6)
     head.proj = SimpleNamespace(weight=weight.view(1, -1))
     head.hidden_size, head.markov_rank = HIDDEN, RANK
-    assert torch.equal(
-        head.probability(hidden, markov), _tilelang(hidden, markov, weight)
-    )
+    assert head.tp_invariant is True
+    assert DSparkConfidenceHead.tp_invariant is False
+    want = _tilelang(hidden, markov, weight)
+    assert torch.equal(head.probability(hidden, markov), want)
+    out = torch.empty(5, dtype=torch.float32, device="cuda")
+    returned = head.probability(hidden, markov, out=out)
+    assert returned is out
+    assert torch.equal(out, want)
     with pytest.raises(NotImplementedError):
         head(hidden, markov)
 

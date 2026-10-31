@@ -184,6 +184,8 @@ class TileLangConfidenceHead(DSparkConfidenceHead):
     """``DSparkConfidenceHead`` (its FP32 projection and weight loading) whose
     probability is the one-launch kernel."""
 
+    tp_invariant: bool = True
+
     def __init__(self, hidden_size: int, markov_rank: int, prefix: str = ""):
         super().__init__(hidden_size + markov_rank, prefix=prefix)
         self.hidden_size = hidden_size

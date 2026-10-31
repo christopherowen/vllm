@@ -185,6 +185,15 @@ class DSparkSpeculator(DFlashSpeculator):
             self.use_acceptance_estimator = False
         return model
 
+    @property
+    def tp_invariant_confidence(self) -> bool:
+        """Whether every TP rank computes bitwise-identical draft confidences
+        when TP reductions are rank-ordered."""
+        if not self.use_confidence_head or self.acceptance_estimator is not None:
+            return False
+        head = getattr(getattr(self.model, "model", None), "confidence_head", None)
+        return bool(getattr(head, "tp_invariant", False))
+
     def _sample_logits(
         self,
         logits: torch.Tensor,
@@ -442,12 +451,10 @@ class DSparkSpeculator(DFlashSpeculator):
                 out=self.draft_token_confidence_probs[:num_reqs].view(-1),
             )
         elif self.use_confidence_head:
-            confidence = self.model.compute_confidence(
+            self.model.compute_confidence(
                 sample_hidden,
                 torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
-            )
-            self.draft_token_confidence_probs[:num_reqs] = confidence.view(
-                num_reqs, n_spec
+                out=self.draft_token_confidence_probs[:num_reqs].view(-1),
             )
 
     def _sample_sequential_topk(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
@@ -493,12 +500,10 @@ class DSparkSpeculator(DFlashSpeculator):
             prev = draft_sampled_i
 
         if self.use_confidence_head:
-            confidence = self.model.compute_confidence(
+            self.model.compute_confidence(
                 sample_hidden,
                 torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
-            )
-            self.draft_token_confidence_probs[:num_reqs] = confidence.view(
-                num_reqs, n_spec
+                out=self.draft_token_confidence_probs[:num_reqs].view(-1),
             )
 
     def _generate_draft(
