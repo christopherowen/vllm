@@ -1187,6 +1187,8 @@ class Worker(WorkerBase):
             self._startup_heartbeat.stop()
             self._startup_heartbeat = None
 
+        log_startup_memory_breakdown(self, cuda_graph_memory_bytes)
+
         # All warmup is done — start monitoring for unexpected JIT
         # compilations that would cause latency spikes during inference.
         from vllm.utils.jit_monitor import activate as activate_jit_monitor
@@ -1997,3 +1999,85 @@ def init_worker_distributed_environment(
     # Init ec connector here before KV caches init
     # NOTE: We do not init KV caches for Encoder-only instance in EPD disagg mode
     ensure_ec_transfer_initialized(vllm_config)
+
+
+def log_startup_memory_breakdown(
+    worker: Any,
+    cuda_graph_memory_bytes: int = 0,
+) -> dict[str, int]:
+    """Record and log a per-component GPU/UMA memory breakdown after warmup."""
+    device = getattr(worker, "device", None)
+    if device is None:
+        return {}
+
+    snapshot = MemorySnapshot(device=device)
+    model_runner = getattr(worker, "model_runner", None)
+    cache_config = getattr(worker, "cache_config", None)
+
+    weights_bytes = int(getattr(model_runner, "model_memory_usage", 0) or 0)
+    kv_cache_bytes = int(
+        getattr(worker, "available_kv_cache_memory_bytes", 0)
+        or getattr(cache_config, "kv_cache_memory_bytes", 0)
+        or 0
+    )
+
+    from vllm.v1.worker import workspace as workspace_mod
+
+    mgr = workspace_mod._manager
+    workspace_bytes = 0
+    if mgr is not None:
+        workspace_bytes = sum(
+            workspace_mod.WorkspaceManager._workspace_size_bytes(ws)
+            for ws in getattr(mgr, "_current_workspaces", ())
+        ) + int(getattr(mgr, "_moe_output_bytes", 0) or 0)
+
+    torch_allocated_bytes = int(getattr(snapshot, "torch_allocated", 0) or 0)
+    torch_reserved_bytes = int(getattr(snapshot, "torch_memory", 0) or 0)
+    torch_allocator_slack_bytes = max(
+        torch_reserved_bytes - torch_allocated_bytes, 0
+    )
+    other_torch_allocated_bytes = max(
+        torch_allocated_bytes - weights_bytes - kv_cache_bytes - workspace_bytes,
+        0,
+    )
+    peak_activation_bytes = int(
+        getattr(worker, "peak_activation_memory", 0) or 0
+    )
+    cudagraph_bytes = int(cuda_graph_memory_bytes or 0)
+    non_torch_cuda_bytes = int(getattr(snapshot, "non_torch_memory", 0) or 0)
+    free_memory_bytes = int(getattr(snapshot, "free_memory", 0) or 0)
+
+    breakdown = {
+        "weights_bytes": weights_bytes,
+        "kv_cache_bytes": kv_cache_bytes,
+        "workspace_bytes": workspace_bytes,
+        "other_torch_allocated_bytes": other_torch_allocated_bytes,
+        "torch_allocated_bytes": torch_allocated_bytes,
+        "torch_reserved_bytes": torch_reserved_bytes,
+        "torch_allocator_slack_bytes": torch_allocator_slack_bytes,
+        "peak_activation_bytes": peak_activation_bytes,
+        "cudagraph_bytes": cudagraph_bytes,
+        "non_torch_cuda_bytes": non_torch_cuda_bytes,
+        "free_memory_bytes": free_memory_bytes,
+    }
+    worker.startup_memory_breakdown = breakdown
+    logger.info(
+        "[memory_breakdown] rank=%s weights=%s GiB kv_cache=%s GiB "
+        "workspace=%s GiB other_torch_allocated=%s GiB "
+        "torch_allocated=%s GiB torch_reserved=%s GiB "
+        "torch_allocator_slack=%s GiB peak_activation=%s GiB "
+        "cudagraph=%s GiB non_torch_cuda=%s GiB free_memory=%s GiB",
+        getattr(worker, "rank", 0),
+        format_gib(weights_bytes),
+        format_gib(kv_cache_bytes),
+        format_gib(workspace_bytes),
+        format_gib(other_torch_allocated_bytes),
+        format_gib(torch_allocated_bytes),
+        format_gib(torch_reserved_bytes),
+        format_gib(torch_allocator_slack_bytes),
+        format_gib(peak_activation_bytes),
+        format_gib(cudagraph_bytes),
+        format_gib(non_torch_cuda_bytes),
+        format_gib(free_memory_bytes),
+    )
+    return breakdown

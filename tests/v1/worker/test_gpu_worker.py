@@ -855,3 +855,112 @@ def test_v2_kernel_warmup_flushes_allocator_cache(monkeypatch):
         "synchronize",
         "empty_cache",
     ]
+
+
+def test_compile_or_warm_up_logs_startup_memory_breakdown(monkeypatch):
+    """Warmup records and logs a per-component startup memory breakdown."""
+    import torch
+
+    from vllm.v1.worker import workspace as workspace_mod
+
+    compilation = SimpleNamespace(
+        mode=gpu_worker.CompilationMode.NONE,
+        compilation_time=0.0,
+        encoder_compilation_time=0.0,
+    )
+    worker = SimpleNamespace(
+        rank=2,
+        device="cuda:0",
+        vllm_config=SimpleNamespace(compilation_config=compilation),
+        compilation_config=compilation,
+        model_runner=SimpleNamespace(
+            lora_config=None,
+            maybe_remove_all_loras=lambda config: None,
+            capture_model=lambda: 2 * GiB_bytes,
+            model_memory_usage=31 * GiB_bytes,
+        ),
+        model_config=SimpleNamespace(enforce_eager=False, seed=0),
+        cache_config=SimpleNamespace(kv_cache_memory_bytes=20 * GiB_bytes),
+        available_kv_cache_memory_bytes=20 * GiB_bytes,
+        peak_activation_memory=3 * GiB_bytes,
+        use_v2_model_runner=False,
+        observability_config=SimpleNamespace(
+            jit_monitor_mode="off", jit_monitor_verbose=False
+        ),
+        _roce_failure=lambda: None,
+        _startup_rendezvous=lambda stage: None,
+        _startup_heartbeat=None,
+    )
+    monkeypatch.setattr(
+        gpu_worker, "get_pp_group", lambda: SimpleNamespace(is_last_rank=False)
+    )
+    for name in (
+        "kernel_warmup",
+        "set_random_seed",
+        "freeze_gc_heap",
+        "maybe_attach_gc_debug_callback",
+        "enable_gpu_sync_check",
+        "set_torch_threads_for_runtime",
+    ):
+        monkeypatch.setattr(gpu_worker, name, lambda *args: None)
+    monkeypatch.setattr("vllm.utils.jit_monitor.activate", lambda **kwargs: None)
+
+    ws_tensor = torch.empty((256 * 1024 * 1024,), dtype=torch.uint8)
+    monkeypatch.setattr(
+        workspace_mod,
+        "_manager",
+        SimpleNamespace(
+            _current_workspaces=[ws_tensor],
+            _moe_output_bytes=128 * 1024 * 1024,
+        ),
+    )
+    monkeypatch.setattr(
+        gpu_worker,
+        "MemorySnapshot",
+        lambda device=None: SimpleNamespace(
+            torch_allocated=53 * GiB_bytes,
+            torch_memory=54 * GiB_bytes,
+            non_torch_memory=4 * GiB_bytes,
+            free_memory=6 * GiB_bytes,
+        ),
+    )
+
+    logged_messages: list[str] = []
+    monkeypatch.setattr(
+        gpu_worker.logger,
+        "info",
+        lambda msg, *args: logged_messages.append(msg % args if args else str(msg)),
+    )
+
+    worker._compile_or_warm_up_model_after_preparation = lambda: (
+        gpu_worker.Worker._compile_or_warm_up_model_after_preparation(worker)
+    )
+    worker._b12x_session = None
+    worker._get_cudagraph_capture_context = nullcontext
+    gpu_worker.Worker.compile_or_warm_up_model(worker)
+
+    expected_workspace = (256 + 128) * 1024 * 1024
+    expected_other = 53 * GiB_bytes - 31 * GiB_bytes - 20 * GiB_bytes - expected_workspace
+    assert worker.startup_memory_breakdown == {
+        "weights_bytes": 31 * GiB_bytes,
+        "kv_cache_bytes": 20 * GiB_bytes,
+        "workspace_bytes": expected_workspace,
+        "other_torch_allocated_bytes": expected_other,
+        "torch_allocated_bytes": 53 * GiB_bytes,
+        "torch_reserved_bytes": 54 * GiB_bytes,
+        "torch_allocator_slack_bytes": 1 * GiB_bytes,
+        "peak_activation_bytes": 3 * GiB_bytes,
+        "cudagraph_bytes": 2 * GiB_bytes,
+        "non_torch_cuda_bytes": 4 * GiB_bytes,
+        "free_memory_bytes": 6 * GiB_bytes,
+    }
+    breakdown_logs = [m for m in logged_messages if m.startswith("[memory_breakdown]")]
+    assert len(breakdown_logs) == 1
+    assert "rank=2" in breakdown_logs[0]
+    assert "weights=31.0 GiB" in breakdown_logs[0]
+    assert "kv_cache=20.0 GiB" in breakdown_logs[0]
+    assert "workspace=0.38 GiB" in breakdown_logs[0]
+    assert "torch_allocator_slack=1.0 GiB" in breakdown_logs[0]
+    assert "cudagraph=2.0 GiB" in breakdown_logs[0]
+    assert "non_torch_cuda=4.0 GiB" in breakdown_logs[0]
+    assert "free_memory=6.0 GiB" in breakdown_logs[0]
