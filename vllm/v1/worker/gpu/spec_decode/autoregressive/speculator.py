@@ -266,9 +266,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
     ) -> torch.Tensor:
         if num_speculative_tokens is None:
             num_speculative_tokens = self.num_speculative_steps
-        if not 1 <= num_speculative_tokens <= self.num_speculative_steps:
+        if not 0 <= num_speculative_tokens <= self.num_speculative_steps:
             raise ValueError(
-                "num_speculative_tokens must be between 1 and "
+                "num_speculative_tokens must be between 0 and "
                 f"{self.num_speculative_steps}, got {num_speculative_tokens}."
             )
 
@@ -374,12 +374,13 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=prefill_batch_desc.cg_mode,
                 mm_inputs=mm_inputs,
+                skip_sample=num_speculative_tokens == 0,
             )
         self.on_prefill_end(num_reqs)
 
-        if num_speculative_tokens == 1:
+        if num_speculative_tokens <= 1:
             # Early exit.
-            return self.draft_tokens[:num_reqs, :1]
+            return self.draft_tokens[:num_reqs, :num_speculative_tokens]
 
         if self.pcp_manager is not None and not dummy_run:
             self.block_tables.gather_block_tables(
@@ -545,6 +546,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        skip_sample: bool = False,
     ) -> None:
         # Bind compact outputs to this graph's request capacity during capture.
         self.on_prefill_begin(num_reqs)
@@ -568,6 +570,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             last_hidden_states, hidden_states = self.pcp_manager.restore_draft_prefill(
                 last_hidden_states, hidden_states
             )
+        if skip_sample:
+            # No drafts are needed; this pass only keeps the drafter KV in sync.
+            return
         if self.prefill_outputs_are_compact:
             sample_hidden_states = last_hidden_states[:num_reqs]
             feedback_hidden_states = hidden_states[:num_reqs]

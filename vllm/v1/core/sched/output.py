@@ -317,6 +317,11 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int | None = None
 
+    # Whether no scheduled request can use the drafts proposed after this step
+    # (non-final prefill chunks, or requests sure to reach max_tokens), so the
+    # drafter can skip proposing them.
+    skip_drafts: bool = False
+
     # Sink rejection (vllm.v1.sample.sink): the requests whose scheduled spec
     # tokens start with draft zero, the provisional token their previous step
     # sampled, ahead of the drafter's tokens. None with rejection off.

@@ -641,7 +641,6 @@ class DFlashSpeculator(DraftModelSpeculator):
         is_profile: bool = False,
         context_kv_is_restored: bool = False,
     ) -> torch.Tensor:
-        del num_speculative_tokens
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
         num_query_tokens = num_reqs * self.num_query_per_req
@@ -856,6 +855,11 @@ class DFlashSpeculator(DraftModelSpeculator):
                 context_positions,
                 context_slots,
             )
+
+        if num_speculative_tokens == 0:
+            # No drafts are needed: the context K/V has been stored above to
+            # keep the drafter in sync, so skip the query pass.
+            return self.draft_tokens[:num_reqs]
 
         batch_sync, num_batch_tokens = (
             self._build_uniform_batch_dp_sync(dp_sync, num_reqs, self.num_query_per_req)

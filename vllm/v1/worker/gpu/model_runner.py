@@ -197,6 +197,9 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     maybe_create_adaptive_verification_manager,
     resolve_adaptive_cudagraph_mode,
 )
+from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
+    AutoRegressiveSpeculator,
+)
 from vllm.v1.worker.gpu.spec_decode.copy_drafts import CopyDrafter
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
     DFlashSpeculator,
@@ -2962,6 +2965,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.ubatch_runner is not None and not skip_attn_for_dummy_run
             ),
             uniform_decode=uniform_tok_count == self.uniform_decode_query_len,
+            allow_skip_drafts=getattr(scheduler_output, "skip_drafts", False),
         )
 
         if batch_desc.num_tokens == 0:
@@ -3003,6 +3007,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # Connector metadata can carry stores for other requests even
                 # when this request resumes without an attention forward.
                 self.kv_connector.pre_forward(scheduler_output)
+                skip_drafts = (
+                    dp_sync.skip_drafts
+                    if dp_sync is not None
+                    else getattr(scheduler_output, "skip_drafts", False)
+                )
                 self.execute_model_state = ExecuteModelState(
                     input_batch=input_batch,
                     attn_metadata=None,
@@ -3014,8 +3023,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     ec_connector_output=None,
                     routed_experts=None,
                     cudagraph_stats=cudagraph_stats,
-                    num_spec_tokens_to_schedule=scheduler_output.resolve_num_spec_tokens_to_schedule(
-                        self.num_draft_steps
+                    num_spec_tokens_to_schedule=(
+                        0
+                        if skip_drafts
+                        else scheduler_output.resolve_num_spec_tokens_to_schedule(
+                            self.num_draft_steps
+                        )
                     ),
                     boundary_logits_only=True,
                     boundary_aux_block_id=checkpoint.auxiliary_block_ids[0],
@@ -3297,6 +3310,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             routed_experts = capturer.get_routed_experts(slot_mappings, num_toks)
 
         finished_req_ids = scheduler_output.finished_req_ids
+        # Propose no drafts (K=0) when no DP rank's scheduled requests can use them.
+        skip_drafts = (
+            dp_sync.skip_drafts
+            if dp_sync is not None
+            else getattr(scheduler_output, "skip_drafts", False)
+        )
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
             attn_metadata=attn_metadata,
@@ -3309,7 +3328,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             routed_experts=routed_experts,
             cudagraph_stats=cudagraph_stats,
             num_spec_tokens_to_schedule=(
-                scheduler_output.resolve_num_spec_tokens_to_schedule(
+                0
+                if skip_drafts
+                else scheduler_output.resolve_num_spec_tokens_to_schedule(
                     self.num_draft_steps
                 )
             ),
@@ -3522,7 +3543,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 draft_tokens_for_next_step,
                 self.req_states.draft_tokens,
             )
-        elif self.speculator is not None and num_spec_tokens_to_schedule > 0:
+        elif self.speculator is not None and not boundary_logits_only and (
+            num_spec_tokens_to_schedule > 0
+            or isinstance(
+                self.speculator, (DFlashSpeculator, AutoRegressiveSpeculator)
+            )
+        ):
             assert self.sampler is not None
             if (
                 isinstance(self.speculator, DraftModelSpeculator)
@@ -3550,13 +3576,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Let the target override the hidden state fed to the drafter
             # (_mtp_target_states).
             spec_hidden_states = _mtp_target_states(self.model, draft_hidden_states)
-            if isinstance(self.sampler, GPUWatermarkSampler):
+            if (
+                isinstance(self.sampler, GPUWatermarkSampler)
+                and num_spec_tokens_to_schedule > 0
+            ):
                 self.speculator.prepare_watermarking(
                     self.sampler._get_contexts(input_batch.idx_mapping),
                     self.sampler.watermarking.gpu[input_batch.idx_mapping],
                 )
             verified = None
-            if self.copy_drafter is not None:
+            if self.copy_drafter is not None and num_spec_tokens_to_schedule > 0:
                 # Match the updated histories and publish next-step alloc and
                 # slot draft limits before the drafter runs, so the async output
                 # copy completes on output_copy_stream while DSpark executes.
@@ -3623,14 +3652,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
                 if boundary_state is not None:
                     self.speculator.boundary_checkpoint_capture = None
-                draft_tokens = limit_draft_tokens(
-                    draft_tokens,
-                    num_spec_tokens_to_schedule,
-                    self.num_draft_steps,
-                )
+                if num_spec_tokens_to_schedule > 0:
+                    draft_tokens = limit_draft_tokens(
+                        draft_tokens,
+                        num_spec_tokens_to_schedule,
+                        self.num_draft_steps,
+                    )
+                else:
+                    draft_tokens = draft_tokens[:, :0]
             confidences = self.speculator.draft_token_confidence_probs
             planned_confidences = None
-            if self.copy_drafter is not None:
+            if self.copy_drafter is not None and num_spec_tokens_to_schedule > 0:
                 # A request whose context repeats its own earlier text takes the
                 # copy in place of DSpark's drafts. Warmup runs without adaptive
                 # verification (fixed draft counts); its rows verify none.
@@ -3665,7 +3697,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     )
             else:
                 draft_tokens_for_next_step = draft_tokens
-            if self.adaptive_verification is not None:
+            if (
+                self.adaptive_verification is not None
+                and num_spec_tokens_to_schedule > 0
+            ):
                 self.adaptive_verification.record_confidences(
                     confidences, input_batch, planned=planned_confidences
                 )
