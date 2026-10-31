@@ -55,7 +55,12 @@ from .gemm import (
     scale_words,
 )
 from .linear import MXFP8Rows, _calls, _launch
-from .scale_codes import overlay_byte_codes, pack_expert_scale_codes, tile_byte_codes
+from .scale_codes import (
+    narrow_code_offsets,
+    overlay_byte_codes,
+    pack_expert_scale_codes,
+    tile_byte_codes,
+)
 
 # Routes handled by one CTA of the dispatch kernels.
 _CHUNK = 512
@@ -674,6 +679,9 @@ def grouped_fp8_fp4_gemm(
     stages = num_stages
     assert stages >= 2
     n_blocks = N // block_N
+    code_rows = (
+        T.dynamic("code_rows") if narrow_codes else num_experts * n_blocks * k_blocks
+    )
     b_shape = (num_experts * n_blocks * k_full, block_N, block_K)
     bt_shape = (num_experts * n_blocks, block_N, tail // 2)
     code_chunks = block_N * 2 // 16  # 16-byte copies of one stage's 4-bit codes
@@ -686,7 +694,8 @@ def grouped_fp8_fp4_gemm(
 
     @T.macro
     def load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared, SFB_shared,
-             a_row, sfa_row, loaded, expert, bx, tx, ko, s, SFB8, SFC8, Narrow):  # fmt: skip
+             a_row, sfa_row, loaded, expert, bx, tx, ko, s, SFB8, SFC8,
+             Narrow_flag=None, code_base=None):  # fmt: skip
         """Stage s <- K block ko: weights, gathered activation rows, scale words."""
         if ko < k_full:
             tile = (expert * n_blocks + bx) * k_full + ko
@@ -742,23 +751,30 @@ def grouped_fp8_fp4_gemm(
             # SFB_shared is this stage's 4-bit codes; the words are expanded later.
             # A narrow expert loads half as many bytes: one uint8 a row. The
             # expert is one per CTA, so the branch is uniform across the block.
-            row = (expert * n_blocks + bx) * k_blocks + ko
             if narrow_codes:
-                if Narrow[expert] != 0:
+                if Narrow_flag != 0:
                     if tx < code_chunks8:
                         T.ptx_cp_async(
                             T.access_ptr(SFC8[s, tx * 16], "w", 16),
-                            T.access_ptr(SFB8[row, tx * 16], "r", 16),
+                            T.access_ptr(SFB8[code_base + ko, tx * 16], "r", 16),
                             16,  # elements: sixteen 1-byte codes
                         )
                 else:
                     if tx < code_chunks:
                         T.ptx_cp_async(
                             T.access_ptr(SFB_shared[s, tx * 8], "w", 8),
-                            T.access_ptr(SFB[row, tx * 8], "r", 8),
+                            T.access_ptr(
+                                SFB[
+                                    code_base + 2 * ko + tx // code_chunks8,
+                                    (tx % code_chunks8) * 8,
+                                ],
+                                "r",
+                                8,
+                            ),
                             8,  # elements: eight 2-byte codes, one 16-byte copy
                         )
             else:
+                row = (expert * n_blocks + bx) * k_blocks + ko
                 if tx < code_chunks:
                     T.ptx_cp_async(
                         T.access_ptr(SFB_shared[s, tx * 8], "w", 8),
@@ -806,6 +822,8 @@ def grouped_fp8_fp4_gemm(
             base_words = (
                 T.alloc_local((sfb_copies,), T.uint32) if coded_scales else None
             )
+            code_base = T.alloc_var(T.int32) if narrow_codes else None
+            Narrow_flag = T.alloc_var(T.int32) if narrow_codes else None
             rows_shared = T.alloc_shared((block_M,), T.int32)
             a_row = T.alloc_local((a_copies,), T.int32)
             sfa_row = T.alloc_local((sfa_copies,), T.int32)
@@ -836,6 +854,13 @@ def grouped_fp8_fp4_gemm(
                         base_words[c] = T.cast(
                             SFBase[expert, bx * block_N + j], T.uint32
                         ) * T.uint32(0x01010101)
+                if narrow_codes:
+                    narrow_entry = T.cast(Narrow[expert], T.int32)
+                    Narrow_flag = narrow_entry & 1
+                    code_base = (
+                        (narrow_entry >> 1) * n_blocks
+                        + bx * (2 - Narrow_flag)
+                    ) * k_blocks
             sf_dest = SFC_shared if coded_scales else SFB_shared
 
             T.clear(C_local)
@@ -844,11 +869,11 @@ def grouped_fp8_fp4_gemm(
                     if narrow_codes:
                         load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
                              sf_dest, a_row, sfa_row, loaded, expert, bx, tx, p,
-                             p, SFB8, SFC8, Narrow)  # fmt: skip
+                             p, SFB8, SFC8, Narrow_flag, code_base)  # fmt: skip
                     else:
                         load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
                              sf_dest, a_row, sfa_row, loaded, expert, bx, tx, p,
-                             p, SFB, SFB_shared, SFB)  # fmt: skip
+                             p, SFB, SFB_shared)  # fmt: skip
                 else:
                     T.ptx_commit_group()
             for ko in T.serial(k_blocks):
@@ -859,11 +884,11 @@ def grouped_fp8_fp4_gemm(
                     if narrow_codes:
                         load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
                              sf_dest, a_row, sfa_row, loaded, expert, bx, tx, nxt,
-                             nxt % stages, SFB8, SFC8, Narrow)  # fmt: skip
+                             nxt % stages, SFB8, SFC8, Narrow_flag, code_base)  # fmt: skip
                     else:
                         load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
                              sf_dest, a_row, sfa_row, loaded, expert, bx, tx, nxt,
-                             nxt % stages, SFB, SFB_shared, SFB)  # fmt: skip
+                             nxt % stages, SFB, SFB_shared)  # fmt: skip
                 else:
                     T.ptx_commit_group()
                 T.ptx_wait_group(stages - 1)
@@ -878,7 +903,7 @@ def grouped_fp8_fp4_gemm(
                         j = c * threads + tx
                         if j < block_N:
                             if narrow_codes:
-                                if Narrow[expert] != 0:
+                                if Narrow_flag != 0:
                                     code8 = T.cast(SFC8[s, j], T.uint32)
                                     SFB_shared[s, j, 0] = (
                                         (code8 & T.uint32(0x3))
@@ -936,15 +961,17 @@ def grouped_fp8_fp4_gemm(
                     C[t * block_M + i, bx * block_N + j] = C_local[i, j]
 
     sfb_spec = (
-        T.Tensor((num_experts * n_blocks * k_blocks, block_N), T.uint16)
+        T.Tensor((code_rows, block_N // 2), T.uint16)
+        if narrow_codes
+        else T.Tensor((num_experts * n_blocks * k_blocks, block_N), T.uint16)
         if coded_scales
         else T.Tensor((num_experts, N, sf_words), T.uint32)
     )
     base_spec = T.Tensor((num_experts, N), T.uint8)
-    # SFB's bytes (``overlay_byte_codes``): a narrow expert's row holds its 2-bit
-    # codes in the first block_N of its 2 * block_N bytes.
-    sfb8_spec = T.Tensor((num_experts * n_blocks * k_blocks, 2 * block_N), T.uint8)
-    narrow_spec = T.Tensor((num_experts,), T.uint8)
+    # SFB's bytes (``overlay_byte_codes``): a narrow expert takes one [k_blocks,
+    # block_N]-byte unit a tile; a wide expert takes two.
+    sfb8_spec = T.Tensor((code_rows, block_N), T.uint8)
+    narrow_spec = T.Tensor((num_experts,), T.uint16)
 
     if tail and coded_scales and narrow_codes:
 
@@ -1499,20 +1526,20 @@ class MoeExpertsV41Plan:
         )
         del packed
         tiles, tails = tile_expert_weights(w.view(torch.int8), self.block_N)
-        return tiles, tails, codes, codes_2bit, narrow, base
+        return tiles, tails, codes, codes_2bit, narrow_code_offsets(narrow), base
 
     def prepare_weights(self, w13, w13_scale, w2, w2_scale):
         """Per GEMM ``(tiles, tails, codes, codes_2bit, narrow, base)``.
 
         ``tails`` is None unless the GEMM's K is 64 past a multiple of 128 (the
-        down projection of TP4's 576-wide expert rows). ``codes`` is
-        ``pack_scale_codes`` in ``tile_codes`` layout for a wide expert. An
-        expert whose every row has delta <= 3 is narrow (``narrow`` uint8 1, else
-        0) and its rows of the same buffer hold 2-bit codes instead (four deltas a
-        byte, low bits first, in each row's first ``block_N`` bytes);
-        ``codes_2bit`` is that buffer as uint8 (``overlay_byte_codes``). A narrow
-        expert's GEMM loads ``codes_2bit``; a wide expert loads ``codes``. No
-        expert holds both forms, so the codes take the 4-bit codes' bytes.
+        down projection of TP4's 576-wide expert rows). ``codes`` and
+        ``codes_2bit`` are ``overlay_byte_codes``' uint16 and uint8 views of one
+        compact buffer: an expert whose every row has delta <= 3 is narrow and
+        takes one ``[n_blocks * k_blocks, block_N]``-byte unit (four 2-bit deltas
+        a byte, low bits first); a wide expert takes two units (its ``tile_codes``
+        4-bit codes). ``narrow`` is ``narrow_code_offsets``' uint16
+        ``(unit_base << 1) | is_narrow`` per expert. A narrow expert's GEMM loads
+        ``codes_2bit``; a wide expert loads ``codes``.
         """
         return (
             self.prepare_weight(w13, w13_scale),

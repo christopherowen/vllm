@@ -194,31 +194,51 @@ def tile_byte_codes(codes: torch.Tensor, block_N: int) -> torch.Tensor:
     )
 
 
+def narrow_code_offsets(narrow: torch.Tensor) -> torch.Tensor:
+    """Per-expert ``uint16`` ``(unit_base << 1) | is_narrow`` for the compact code buffer.
+
+    Expert ``e`` starts at ``[per, block_N]``-byte unit ``unit_base = 2 * e -
+    narrow[:e].sum()``; bit 0 is ``narrow[e]`` (1 for 2-bit codes, 0 for 4-bit).
+    """
+    flags = (narrow & 1).to(torch.int32)
+    units = 2 - flags
+    unit_base = torch.cumsum(units, dim=0) - units
+    return ((unit_base << 1) | flags).to(torch.uint16).contiguous()
+
+
 def overlay_byte_codes(
     codes: torch.Tensor, byte_codes: torch.Tensor, narrow: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """One buffer for both code widths: ``(codes, bytes)`` over the same storage.
+    """One compact buffer for both widths: ``(codes, bytes)`` over the same storage.
 
     ``codes`` is ``tile_codes``' uint16 ``[rows, block_N]``, ``byte_codes`` is
     ``tile_byte_codes``' uint8 ``[rows, block_N]`` and ``narrow`` the per-expert
-    flags; each expert's rows are contiguous in both. A narrow expert's rows of
-    ``codes`` are rewritten in place: its 2-bit bytes in the first ``block_N``
-    bytes of each row, zeros after. ``bytes`` is that storage as uint8
-    ``[rows, 2 * block_N]``, so a narrow row's 2-bit codes are ``bytes[row,
-    :block_N]``, still contiguous. A wide expert's rows keep their 4-bit codes,
-    so no expert holds both forms.
+    flags; each expert's ``per = rows // experts`` rows are contiguous in both.
+    A narrow expert takes one ``[per, block_N]``-byte unit (its 2-bit codes); a
+    wide expert takes two units (its ``[per, block_N]`` uint16 4-bit codes as
+    ``[2 * per, block_N]`` bytes), starting at unit ``2 * e - narrow[:e].sum()``.
+    ``bytes`` is that storage as uint8 ``[units * per, block_N]`` and ``codes``
+    is ``bytes.view(torch.uint16)`` (``[units * per, block_N // 2]``), so narrow
+    experts take half the bytes of wide ones and no expert holds both forms.
     """
     if codes.dtype != torch.uint16 or byte_codes.dtype != torch.uint8:
         raise TypeError("expected uint16 4-bit codes and uint8 2-bit codes")
     if codes.shape != byte_codes.shape or not codes.is_contiguous():
         raise ValueError("the two code layouts must be the same contiguous rows")
     rows, block_N = codes.shape
+    if block_N % 2:
+        raise ValueError(f"block_N={block_N} must be even")
     experts = narrow.numel()
     if rows % experts:
         raise ValueError(f"{rows} code rows do not split into {experts} experts")
-    raw = codes.view(torch.uint8).view(experts, rows // experts, 2 * block_N)
     mask = narrow.bool()
-    if mask.any().item():
-        raw[mask, :, :block_N] = byte_codes.view(experts, -1, block_N)[mask]
-        raw[mask, :, block_N:] = 0
-    return codes, codes.view(torch.uint8)
+    if not mask.any().item():
+        compact = codes.view(2 * rows, block_N // 2)
+        return compact, compact.view(torch.uint8)
+    per = rows // experts
+    units = codes.view(torch.uint8).view(experts, 2, per, block_N)
+    units[mask, 0] = byte_codes.view(experts, per, block_N)[mask]
+    keep = torch.ones((experts, 2), dtype=torch.bool, device=codes.device)
+    keep[mask, 1] = False
+    compact_bytes = units[keep].reshape(-1, block_N).contiguous()
+    return compact_bytes.view(torch.uint16), compact_bytes

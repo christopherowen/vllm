@@ -41,6 +41,7 @@ from vllm.models.deepseek_v4_1.tilelang.moe import (  # noqa: E402
     workspace_bytes,
 )
 from vllm.models.deepseek_v4_1.tilelang.scale_codes import (  # noqa: E402
+    narrow_code_offsets,
     overlay_byte_codes,
     pack_expert_scale_codes,
     tile_byte_codes,
@@ -764,7 +765,7 @@ def test_narrow_and_wide_codes_give_the_uncoded_gemm_bits(rows, n, k, gather):
         *extra,
         codes,
         byte_codes,
-        coded.narrow,
+        narrow_code_offsets(coded.narrow),
         coded.base,
         order,
         tile_expert,

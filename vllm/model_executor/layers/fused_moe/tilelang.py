@@ -216,10 +216,10 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
         # Tile-major copies replace the checkpoint layout, so each GEMM tile's
         # weights and scale codes are contiguous. A K that ends 64 past a multiple
         # of 128 (TP4's 576-wide rows) keeps its last 64 columns as compact tails.
-        # ``codes`` is the 4-bit tile layout a wide expert loads. ``byte`` is the
-        # same buffer as uint8, holding the narrow experts' 2-bit codes in their
-        # rows; ``narrow`` is 1 for those experts. The GEMM loads ``byte`` when
-        # the flag is 1.
+        # ``codes`` and ``byte`` are uint16 and uint8 views of one compact buffer
+        # where narrow experts (``narrow & 1`` = 1) take one ``block_N``-byte unit
+        # a tile row (2-bit codes) and wide experts take two (4-bit codes);
+        # ``narrow >> 1`` is each expert's starting unit in that buffer.
         t13, tail13, codes13, byte13, narrow13, base13 = self._plan.prepare_weight(
             w13, layer.w13_weight_scale
         )

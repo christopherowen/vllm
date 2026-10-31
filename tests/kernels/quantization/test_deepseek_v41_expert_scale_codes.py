@@ -36,6 +36,7 @@ pack_scale_codes_2bit = _codes.pack_scale_codes_2bit
 expand_scale_codes_2bit = _codes.expand_scale_codes_2bit
 pack_expert_scale_codes = _codes.pack_expert_scale_codes
 tile_byte_codes = _codes.tile_byte_codes
+narrow_code_offsets = _codes.narrow_code_offsets
 overlay_byte_codes = _codes.overlay_byte_codes
 scale_word = _codes.scale_word
 
@@ -409,18 +410,22 @@ def test_the_mixed_launch_shapes_match_the_narrow_kernel(n, k):
     assert wide_codes.shape == (rows, block_n) and wide_codes.dtype == torch.uint16
     assert byte_codes.shape == (rows, block_n) and byte_codes.dtype == torch.uint8
     codes, byte_codes = overlay_byte_codes(wide_codes, byte_codes, packed.narrow)
-    assert codes.shape == (rows, block_n) and codes.dtype == torch.uint16
-    assert byte_codes.shape == (rows, 2 * block_n) and byte_codes.dtype == torch.uint8
+    units = int((2 - packed.narrow.to(torch.int64)).sum().item())
+    code_rows = units * n_blocks * k_blocks
+    offsets = narrow_code_offsets(packed.narrow)
+    assert codes.shape == (code_rows, block_n // 2) and codes.dtype == torch.uint16
+    assert byte_codes.shape == (code_rows, block_n) and byte_codes.dtype == torch.uint8
+    assert offsets.shape == (experts,) and offsets.dtype == torch.uint16
     assert packed.narrow.shape == (experts,) and packed.base.shape == (experts, n)
 
 
 def test_one_buffer_holds_each_experts_one_form():
-    """The 2-bit codes take no bytes beyond the 4-bit codes.
+    """Each expert keeps only its own code width in one compact buffer.
 
-    ``overlay_byte_codes`` returns two views of one storage the size of the 4-bit
-    tile codes. A wide expert's rows are its 4-bit codes. A narrow expert's row
-    at ``bytes[row, :block_N]`` is its ``tile_byte_codes`` row and the rest is
-    zero. K=576 has the padded fifth word.
+    ``overlay_byte_codes`` returns uint16 and uint8 views of one storage where a
+    narrow expert takes one ``[per, block_N]``-byte unit (its ``tile_byte_codes``
+    rows) and a wide expert takes two units (its ``tile_codes`` rows), starting
+    at unit ``2 * e - narrow[:e].sum()``. K=576 has the padded fifth word.
     """
     (tile_codes,) = _moe_functions("tile_codes")
     gen = torch.Generator().manual_seed(5)
@@ -432,23 +437,28 @@ def test_one_buffer_holds_each_experts_one_form():
     wide = tile_codes(packed.codes, _BLOCK_N)
     narrow = tile_byte_codes(packed.codes_2bit, _BLOCK_N)
     codes, byte_codes = overlay_byte_codes(wide.clone(), narrow, packed.narrow)
-    assert codes.dtype == torch.uint16 and codes.shape == wide.shape
-    assert byte_codes.dtype == torch.uint8
-    assert byte_codes.shape == (wide.shape[0], 2 * _BLOCK_N)
-    assert byte_codes.data_ptr() == codes.data_ptr()
-    assert codes.untyped_storage().nbytes() == wide.nbytes
+    offsets = narrow_code_offsets(packed.narrow)
+    assert offsets.dtype == torch.uint16 and offsets.tolist() == [1, 2, 7]
     per = wide.shape[0] // 3
+    assert codes.dtype == torch.uint16 and codes.shape == (4 * per, _BLOCK_N // 2)
+    assert byte_codes.dtype == torch.uint8
+    assert byte_codes.shape == (4 * per, _BLOCK_N)
+    assert byte_codes.data_ptr() == codes.data_ptr()
+    assert codes.untyped_storage().nbytes() == 4 * per * _BLOCK_N
     for expert in range(3):
-        rows = slice(expert * per, (expert + 1) * per)
+        src = slice(expert * per, (expert + 1) * per)
+        slot = 2 * expert - int(packed.narrow[:expert].sum().item())
+        assert (int(offsets[expert].item()) >> 1) == slot
+        assert (int(offsets[expert].item()) & 1) == int(packed.narrow[expert].item())
         if packed.narrow[expert]:
-            assert torch.equal(byte_codes[rows, :_BLOCK_N], narrow[rows])
-            assert not byte_codes[rows, _BLOCK_N:].any()
+            assert torch.equal(byte_codes[slot * per : (slot + 1) * per], narrow[src])
         else:
-            assert torch.equal(codes[rows], wide[rows])
+            got = codes[slot * per : (slot + 2) * per].view(per, _BLOCK_N)
+            assert torch.equal(got, wide[src])
 
 
 def test_an_all_wide_tensor_keeps_its_4bit_codes():
-    """With no narrow expert the overlay writes nothing."""
+    """With no narrow expert the overlay keeps all 4-bit codes without copying."""
     (tile_codes,) = _moe_functions("tile_codes")
     exps = torch.full((2, 128, 16), 100, dtype=torch.uint8)
     exps[:, 0, 0] = 108
@@ -457,18 +467,35 @@ def test_an_all_wide_tensor_keeps_its_4bit_codes():
     wide = tile_codes(packed.codes, _BLOCK_N)
     narrow = tile_byte_codes(packed.codes_2bit, _BLOCK_N)
     codes, _ = overlay_byte_codes(wide.clone(), narrow, packed.narrow)
-    assert torch.equal(codes, wide)
+    assert torch.equal(codes.view_as(wide), wide)
+
+
+def test_an_all_narrow_tensor_uses_half_the_4bit_bytes():
+    """With every expert narrow the compact buffer takes half the 4-bit bytes."""
+    (tile_codes,) = _moe_functions("tile_codes")
+    gen = torch.Generator().manual_seed(9)
+    exps = torch.randint(90, 94, (4, 128, 18), generator=gen, dtype=torch.uint8)
+    packed = pack_expert_scale_codes(exps)
+    assert packed.narrow.tolist() == [1, 1, 1, 1]
+    wide = tile_codes(packed.codes, _BLOCK_N)
+    narrow = tile_byte_codes(packed.codes_2bit, _BLOCK_N)
+    codes, byte_codes = overlay_byte_codes(wide.clone(), narrow, packed.narrow)
+    assert codes.untyped_storage().nbytes() * 2 == wide.nbytes
+    assert torch.equal(byte_codes, narrow)
 
 
 def test_the_narrow_kernel_reads_2bit_codes_as_double_width_rows():
-    """The GEMM's 2-bit spec is the 4-bit codes' bytes: ``[rows, 2 * block_N]``."""
+    """The GEMM's 2-bit spec is the compact ``[code_rows, block_N]`` byte view."""
     src = (
         Path(__file__).resolve().parents[3]
         / "vllm/models/deepseek_v4_1/tilelang/moe.py"
     ).read_text()
-    spec = "T.Tensor((num_experts * n_blocks * k_blocks, 2 * block_N), T.uint8)"
+    spec = "T.Tensor((code_rows, block_N), T.uint8)"
     assert f"sfb8_spec = {spec}" in src
+    assert "narrow_spec = T.Tensor((num_experts,), T.uint16)" in src
     assert "overlay_byte_codes(" in src
+    assert "narrow_code_offsets(" in src
+    assert "for e in T.serial(expert)" not in src
 
 
 def test_the_tail_pad_byte_is_the_row_base_and_the_real_exponents_match():
