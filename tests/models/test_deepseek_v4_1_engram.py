@@ -14,7 +14,6 @@ import pytest
 import torch
 from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.preparation import PreparationSession
-from b12x.sequence import engram as native
 from safetensors.torch import save_file
 from torch import nn
 
@@ -28,6 +27,8 @@ from vllm.models.deepseek_v4_1.common.engram import (
     NgramHashState,
     ParallelEngramEmbedding,
 )
+from vllm.models.deepseek_v4_1.tilelang import engram_hash as native
+from vllm.models.deepseek_v4_1.tilelang import engram_rows as engram_rows_module
 from vllm.models.deepseek_v4_1.nvidia.dspark import DSparkDeepseekV4ForCausalLM
 from vllm.models.deepseek_v4_1.nvidia.model import (
     DeepseekV4Model,
@@ -101,21 +102,7 @@ def tiny_engram_checkpoint(tmp_path, dist_init):
         )
         layout = SimpleNamespace(
             caps=local_caps,
-            lookup_plans=tuple(
-                None
-                if memory == "disk"
-                else native.plan(
-                    caps,
-                    token_map=list(range(32)),
-                    geometry=geometry,
-                    invocation={
-                        "operation": "lookup",
-                        "compact_rows": False,
-                        "resident_scales": False,
-                    },
-                )
-                for caps in local_caps
-            ),
+            lookup_plans=(None,) * len(local_caps),
             layer_ids=geometry.layer_ids,
             geometry=geometry,
             token_map=list(range(32)),
@@ -496,7 +483,9 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
             raise AssertionError("capture preparation/consumer performed table lookup")
 
         with monkeypatch.context() as capture_guard:
-            capture_guard.setattr(native, "run_lookup", forbid_lookup)
+            capture_guard.setattr(
+                engram_rows_module, "engram_resident_lookup", forbid_lookup
+            )
             state.prepare_dummy_inputs(2, 4)
             for _ in range(3):
                 consume()
@@ -823,15 +812,9 @@ def test_engram_graphs_gate_text_rows_and_pass_the_image_sentinel_rows(dist_init
         tp_size=1,
         tp_rank=0,
     )
-    lookup = native.plan(
-        caps,
-        token_map=list(range(32)),
-        geometry=geometry,
-        invocation={"operation": "lookup", "compact_rows": False},
-    )
     layout = SimpleNamespace(
         caps=(caps,),
-        lookup_plans=(lookup,),
+        lookup_plans=(None,),
         geometry=geometry,
         table_memory="device",
         projection_tp=False,

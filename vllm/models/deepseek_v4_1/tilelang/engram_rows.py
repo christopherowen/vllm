@@ -271,3 +271,98 @@ def engram_rows_gather(
         )
         kernel(ids[:tokens], num_tokens, rows, scales, out)
     engram_rows_release_kernel()(control)
+
+
+@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+def engram_resident_lookup_kernel(
+    shard_rows: int,
+    shard_start: int,
+    shard_end: int,
+    columns: int = (1 << HEADS) - 1,
+    out_cols: int = 0,
+    threads: int = 64,
+    vec: int = 4,
+):
+    assert threads * vec == ROW and 32 % vec == 0
+    first, step, count = column_span(columns)
+    stride_cols = out_cols or count
+    assert stride_cols >= count
+    tokens = T.dynamic("tokens")
+
+    @T.prim_func
+    def engram_resident_lookup(
+        ids: T.Tensor((tokens, HEADS), T.int64),
+        num_tokens: T.Tensor((1,), T.int32),
+        weight: T.Tensor((shard_rows, ROW), T.float8_e4m3fn),
+        scales: T.Tensor((shard_rows, SCALES), T.uint8),
+        out: T.Tensor((tokens, stride_cols * ROW), T.bfloat16),
+    ):
+        with T.Kernel(count, tokens, threads=threads) as (column, t):
+            tx = T.get_thread_binding()
+            head = first + column * step
+            row = ids[t, head]
+            owned = (t < num_tokens[0]) & (row >= shard_start) & (row < shard_end)
+            if owned:
+                local_row = row - T.int64(shard_start)
+                exponent = T.cast(scales[local_row, tx * vec // 32], T.uint32)
+                scale = T.reinterpret(T.shift_left(exponent, 23), T.float32)
+                scale = T.if_then_else(exponent == 0, T.float32(2.0**-127), scale)
+                scale = T.if_then_else(exponent == 255, T.float32(float("nan")), scale)
+                for i in T.vectorized(vec):
+                    out[t, column * ROW + tx * vec + i] = T.cast(
+                        T.cast(weight[local_row, tx * vec + i], T.float32) * scale,
+                        T.bfloat16,
+                    )
+            else:
+                for i in T.vectorized(vec):
+                    out[t, column * ROW + tx * vec + i] = T.bfloat16(0)
+
+    return engram_resident_lookup
+
+
+def resident_lookup_calls(
+    shard_rows: int,
+    shard_start: int,
+    shard_end: int,
+    columns: int = (1 << HEADS) - 1,
+    out_cols: int = 0,
+) -> list[prepare.TileLangCall]:
+    """The kernel call ``engram_resident_lookup`` makes for a resident shard of
+    ``shard_rows`` rows covering ``[shard_start, shard_end)`` and the hash columns
+    in the mask ``columns``."""
+    _, _, count = column_span(columns)
+    extra = (out_cols,) if out_cols and out_cols != count else ()
+    return [
+        prepare.call(
+            engram_resident_lookup_kernel,
+            shard_rows,
+            shard_start,
+            shard_end,
+            columns,
+            *extra,
+        ),
+    ]
+
+
+def engram_resident_lookup(
+    ids: torch.Tensor,
+    num_tokens: torch.Tensor,
+    weight: torch.Tensor,
+    scales: torch.Tensor,
+    out: torch.Tensor,
+    shard_start: int,
+    shard_end: int,
+    columns: int = (1 << HEADS) - 1,
+) -> None:
+    """Dequantize the first ``num_tokens`` tokens' resident Engram rows from ``weight``
+    and ``scales`` into ``out`` ([tokens, columns * 256] BF16) and zero any trailing
+    rows up to ``out.shape[0]``."""
+    tokens = out.shape[0]
+    if tokens:
+        _, _, count = column_span(columns)
+        stride_cols = out.shape[1] // ROW
+        extra = (stride_cols,) if stride_cols != count else ()
+        kernel = engram_resident_lookup_kernel(
+            weight.shape[0], shard_start, shard_end, columns, *extra
+        )
+        kernel(ids[:tokens], num_tokens, weight, scales.view(torch.uint8), out)

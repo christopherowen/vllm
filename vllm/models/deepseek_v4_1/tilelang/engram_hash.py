@@ -23,6 +23,9 @@ first block also publishes the request and live token counts.
 
 # No `from __future__ import annotations`: TileLang reads the prim_func
 # annotations eagerly, and the symbolic shape must resolve.
+from dataclasses import dataclass
+
+import numpy as np
 import tilelang
 import tilelang.language as T
 import torch
@@ -32,6 +35,162 @@ LAGS = 4
 HISTORY = LAGS - 1
 IMAGE_SENTINEL = 129264  # the history exclusion of vLLM's Engram metadata
 PAD_TOKEN = 2
+
+
+def _device(value) -> torch.device:
+    d = torch.device(value)
+    if d.type == "cuda" and d.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    return d
+
+
+@dataclass(frozen=True, kw_only=True)
+class Caps:
+    device: torch.device | str
+    max_tokens: int
+    max_seqs: int
+    max_requests: int
+    vocab_size: int = 129280
+    layer_id: int = 1
+    tp_size: int = 8
+    tp_rank: int = 0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "device", _device(self.device))
+        if self.device.type != "cuda" or any(
+            type(getattr(self, n)) is not int or getattr(self, n) <= 0
+            for n in ("max_tokens", "max_seqs", "max_requests", "vocab_size", "tp_size")
+        ):
+            raise ValueError("Engram requires positive CUDA capacities")
+        if (
+            not 0 <= self.tp_rank < self.tp_size
+            or self.max_tokens >= 2**31
+            or self.max_seqs >= 2**31
+        ):
+            raise ValueError("invalid Engram rank or int32 capacity")
+
+
+@dataclass(frozen=True)
+class Geometry:
+    """Host-only immutable geometry; all device geometry uses signed int64."""
+
+    layer_ids: tuple[int, ...]
+    primes: tuple[tuple[int, ...], ...]
+    offsets: tuple[tuple[int, ...], ...]
+    multipliers: tuple[tuple[int, ...], ...]
+    num_embeddings: tuple[int, ...]
+    compressed_vocab_size: int
+
+
+def _is_prime_64(n: int) -> bool:
+    """Deterministic Miller-Rabin primality test for 0 <= n < 2**64."""
+    if n < 2:
+        return False
+    for p in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+        if n % p == 0:
+            return n == p
+    d = n - 1
+    r = 0
+    while d % 2 == 0:
+        d //= 2
+        r += 1
+    for a in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+        if a >= n:
+            continue
+        x = pow(a, d, n)
+        if x in (1, n - 1):
+            continue
+        for _ in range(r - 1):
+            x = (x * x) % n
+            if x == n - 1:
+                break
+        else:
+            return False
+    return True
+
+
+def build_compressed_token_map(tokenizer) -> tuple[list[int], int]:
+    """Use raw backend decoding, retaining malformed UTF-8 token spellings."""
+    from tokenizers import Regex, normalizers
+
+    sentinel = "\ue000"
+    normalizer = normalizers.Sequence(
+        [
+            normalizers.NFKC(),
+            normalizers.NFD(),
+            normalizers.StripAccents(),
+            normalizers.Lowercase(),
+            normalizers.Replace(Regex(r"[ \t\r\n]+"), " "),
+            normalizers.Replace(Regex(r"^ $"), sentinel),
+            normalizers.Strip(),
+            normalizers.Replace(sentinel, " "),
+        ]
+    )
+    backend = tokenizer.backend_tokenizer
+    keys: dict[str, int] = {}
+    lookup = []
+    for token_id in range(len(tokenizer)):
+        text = backend.decode([token_id], skip_special_tokens=False)
+        key = (
+            backend.id_to_token(token_id)
+            if "\ufffd" in text
+            else normalizer.normalize_str(text) or text
+        )
+        if key not in keys:
+            keys[key] = len(keys)
+        lookup.append(keys[key])
+    return lookup, len(keys)
+
+
+def build_geometry(
+    *,
+    layer_ids=(1, 14),
+    base_table_size=16_000_000,
+    compressed_vocab_size=99_092,
+) -> Geometry:
+    """Generate 2/3/4-gram, eight-head geometry with globally unreused primes."""
+    layer_ids = tuple(layer_ids)
+    if (
+        not layer_ids
+        or len(set(layer_ids)) != len(layer_ids)
+        or any(i < 0 for i in layer_ids)
+    ):
+        raise ValueError("layer_ids must be unique nonnegative actual layer IDs")
+    if base_table_size < 2 or not 0 < compressed_vocab_size < (1 << 62):
+        raise ValueError("invalid table or compressed vocabulary size")
+    seen: set[int] = set()
+    primes, offsets, multipliers, totals = [], [], [], []
+    bound = max(1, (((1 << 63) - 1) // compressed_vocab_size) // 2)
+    for layer in layer_ids:
+        sizes = []
+        for _ in range(3):
+            current = base_table_size - 1
+            for _ in range(8):
+                current += 1
+                while current in seen or not _is_prime_64(current):
+                    current += 1
+                seen.add(current)
+                sizes.append(current)
+        cumulative, total = [], 0
+        for size in sizes:
+            cumulative.append(total)
+            total += size
+        if total * 256 > (1 << 63) - 1:
+            raise ValueError("table extent exceeds signed int64 indexing")
+        rng = np.random.Generator(np.random.PCG64(10007 * layer))
+        values = rng.integers(0, bound, size=4, dtype=np.int64) * 2 + 1
+        primes.append(tuple(sizes))
+        offsets.append(tuple(cumulative))
+        multipliers.append(tuple(int(v) for v in values))
+        totals.append(total)
+    return Geometry(
+        layer_ids,
+        tuple(primes),
+        tuple(offsets),
+        tuple(multipliers),
+        tuple(totals),
+        compressed_vocab_size,
+    )
 
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
@@ -160,4 +319,12 @@ def geometry_tensors(geometry, device) -> tuple[torch.Tensor, ...]:
     )
 
 
-__all__ = ["engram_hash", "engram_hash_kernel", "geometry_tensors"]
+__all__ = [
+    "Caps",
+    "Geometry",
+    "build_compressed_token_map",
+    "build_geometry",
+    "engram_hash",
+    "engram_hash_kernel",
+    "geometry_tensors",
+]

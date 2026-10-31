@@ -544,3 +544,64 @@ def test_timeline_is_off_by_default():
     torch.cuda.synchronize()
     assert not rows.timeline_enabled and rows.timeline() == []
     rows.close()
+
+
+@pytest.mark.parametrize("columns", [ALL_COLUMNS, TP3_RANK1])
+@pytest.mark.parametrize("shard", [(0, TABLE_ROWS), (1000, 3000)])
+def test_resident_lookup_matches_reference_bits(shard, columns):
+    """TileLang resident lookup dequantizes in-shard rows, zeroes out-of-shard/dead/tail
+    rows, and handles E8M0 scale edge cases (0 -> 2^-127, 255 -> NaN) identically to
+    the reference and disk gather."""
+    from vllm.models.deepseek_v4_1.tilelang.engram_rows import (
+        engram_resident_lookup,
+        resident_lookup_calls,
+    )
+
+    codes, scales, _ = _write_table(_table_dir(), seed=31)
+    start, end = shard
+    shard_rows = end - start
+    weight_shard = codes[start:end].cuda().view(torch.float8_e4m3fn)
+    scale_shard = scales[start:end].cuda()
+
+    calls = resident_lookup_calls(shard_rows, start, end, columns)
+    assert len(calls) == 1
+
+    gen = torch.Generator().manual_seed(32)
+    ids = torch.randint(0, TABLE_ROWS, (16, HEADS), generator=gen)
+    if start == 0:
+        ids[0, :3] = torch.tensor([1, 2, 3])  # scale edge cases: 0, 255, 254
+    ids[5, 4] = -1  # dead lookup
+    ids[6, 7] = TABLE_ROWS + 5  # past global table_rows
+    ids_gpu = ids.cuda()
+    num_tokens = torch.tensor([13], dtype=torch.int32, device="cuda")
+    width = bin(columns).count("1") * 256
+    out = torch.full((16, width), 7, dtype=torch.bfloat16, device="cuda")
+    engram_resident_lookup(
+        ids_gpu, num_tokens, weight_shard, scale_shard, out, start, end, columns
+    )
+    expected = _reference(codes, scales, ids, 13, start, end, columns)
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0, equal_nan=True)
+    assert torch.count_nonzero(out[13:]) == 0
+
+
+def test_tilelang_engram_geometry_matches_prime_and_pcg64_contract():
+    from vllm.models.deepseek_v4_1.tilelang.engram_hash import (
+        Caps,
+        build_geometry,
+    )
+
+    geom = build_geometry(layer_ids=(1, 14), base_table_size=19, compressed_vocab_size=32)
+    assert geom.layer_ids == (1, 14)
+    assert len(geom.primes) == 2 and all(len(p) == HEADS for p in geom.primes)
+    assert len(set(p for row in geom.primes for p in row)) == 2 * HEADS
+    caps = Caps(
+        device="cuda",
+        max_tokens=8,
+        max_seqs=2,
+        max_requests=2,
+        vocab_size=32,
+        layer_id=1,
+        tp_size=4,
+        tp_rank=1,
+    )
+    assert caps.device.type == "cuda" and caps.tp_rank == 1

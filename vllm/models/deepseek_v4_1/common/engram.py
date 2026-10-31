@@ -7,8 +7,6 @@ from functools import lru_cache
 
 import torch
 import torch.nn as nn
-from b12x.preparation import PreparedCall
-from b12x.sequence import engram as native
 
 from vllm.config import get_current_vllm_config
 from vllm.distributed import (
@@ -22,12 +20,7 @@ from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLi
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.model_executor.weight_transfer import copy_weight, get_file_tensor_source
 from vllm.models.deepseek_v4_1.engram_rows import EngramDiskRows, MappedHostAllocation
-from vllm.utils.b12x import (
-    B12xPreparationUnit,
-    B12xWorkload,
-    PreparationResourceUnavailableError,
-    set_b12x_preparation_provider,
-)
+from vllm.models.deepseek_v4_1.tilelang import engram_hash as native
 from vllm.v1.worker.workspace import retain_cuda_graph_capture_resource
 
 _FP8_BLOCK_ROWS = 32
@@ -212,23 +205,8 @@ class EngramLayout:
             )
             for layer in self.layer_ids
         )
-        # Disk tables gather with the TileLang kernel; only resident tables use
-        # the B12X lookup.
-        self.lookup_plans = tuple(
-            None
-            if self.table_memory == "disk"
-            else native.plan(
-                caps,
-                token_map=token_map,
-                geometry=self.geometry,
-                invocation={
-                    "operation": "lookup",
-                    "compact_rows": False,
-                    "resident_scales": False,
-                },
-            )
-            for caps in self.caps
-        )
+        # Both disk and resident tables gather/lookup with TileLang kernels.
+        self.lookup_plans = (None,) * len(self.caps)
 
     @classmethod
     def from_config(cls, config):
@@ -602,13 +580,24 @@ class ParallelEngramEmbedding(nn.Module):
 
     def declare_kernels(self) -> None:
         """Declare a disk table's TileLang row kernels (the wait, the gather of its
-        reader's buffers and shard, and the release)."""
-        if self.table_memory != "disk":
-            return
+        reader's buffers and shard, and the release) or a resident table's TileLang
+        lookup kernel."""
         from vllm.models.deepseek_v4_1.tilelang import prepare
-        from vllm.models.deepseek_v4_1.tilelang.engram_rows import row_kernel_calls
+        from vllm.models.deepseek_v4_1.tilelang.engram_rows import (
+            resident_lookup_calls,
+            row_kernel_calls,
+        )
 
-        calls = row_kernel_calls(**self._disk_shard(), out_cols=self.max_columns)
+        if self.table_memory == "disk":
+            calls = row_kernel_calls(**self._disk_shard(), out_cols=self.max_columns)
+        else:
+            calls = resident_lookup_calls(
+                self.weight.shape[0],
+                min(self.shard_start, self.table_rows),
+                min(self.shard_end, self.table_rows),
+                self.column_mask,
+                out_cols=self.max_columns,
+            )
         prepare.declare(lambda: calls)
 
     def open_disk_rows(self) -> None:
@@ -663,25 +652,25 @@ class ParallelEngramEmbedding(nn.Module):
         self.disk_rows.gather(out, self.hashes, self.num_tokens)
 
     def lookup_native(self, indices, out, *, clear_tail: bool = True):
-        if self.plan.prepared is None:
-            raise PreparationResourceUnavailableError(
-                "Engram lookup plan must be prepared before forwarding"
-            )
+        from vllm.models.deepseek_v4_1.tilelang.engram_rows import (
+            engram_resident_lookup,
+        )
+
         if indices.data_ptr() != self.hashes.data_ptr():
             self.hashes[: indices.shape[0]].copy_(indices)
             self.num_tokens.fill_(indices.shape[0])
-        binding = native.bind_lookup(
-            self.plan,
-            weight=self.weight,
-            scales=self.weight_scale_inv,
-            hash_ids=self.hashes,
-            num_tokens=self.num_tokens,
-            out=out,
+        retain_cuda_graph_capture_resource(self)
+        target = out if clear_tail else out[: indices.shape[0]]
+        engram_resident_lookup(
+            self.hashes,
+            self.num_tokens,
+            self.weight,
+            self.weight_scale_inv,
+            target,
+            min(self.shard_start, self.table_rows),
+            min(self.shard_end, self.table_rows),
+            self.column_mask,
         )
-        retain_cuda_graph_capture_resource(binding)
-        if self.mapped_host_nbytes:
-            retain_cuda_graph_capture_resource(self)
-        native.run_lookup(binding, indices.shape[0], clear_tail=clear_tail)
 
     def lookup(self, indices, out, *, clear_tail: bool = True):
         self.lookup_native(indices, out, clear_tail=clear_tail)
@@ -777,65 +766,9 @@ class Engram(nn.Module):
             shared_staged_rows,
             persistent=False,
         )
-        # A resident table's lookup is prepared through B12X (the lookup unit).
-        set_b12x_preparation_provider(self, self)
 
-    def get_b12x_preparation_units(
-        self, layer: torch.nn.Module, workload: B12xWorkload
-    ) -> tuple[B12xPreparationUnit, ...]:
-        if workload.max_tokens > self.embed_tokens.caps.max_tokens:
-            return ()
-
-        def make_call(state):
-            from b12x.sequence.engram._impl import _bind_lookup_state
-
-            embed = self.embed_tokens
-            hash_ids = torch.full(
-                (embed.caps.max_tokens, 24),
-                -1,
-                dtype=torch.int64,
-                device=embed.caps.device,
-            )
-            prime_row = min(embed.shard_start + 1, embed.shard_end - 1)
-            if prime_row <= 0:
-                raise PreparationResourceUnavailableError(
-                    "Engram shard has no nonzero local lookup row"
-                )
-            hash_ids[0, 0] = prime_row
-            num_tokens = torch.ones((1,), dtype=torch.int32, device=embed.caps.device)
-            out = torch.empty(
-                (embed.caps.max_tokens, 6144),
-                dtype=torch.bfloat16,
-                device=embed.caps.device,
-            )
-            binding = _bind_lookup_state(
-                state,
-                weight=embed.weight,
-                scales=embed.weight_scale_inv,
-                hash_ids=hash_ids,
-                num_tokens=num_tokens,
-                out=out,
-            )
-            return PreparedCall(
-                run=lambda: state.run_lookup(binding, 1, clear_tail=True),
-                owners=(embed.weight, embed.weight_scale_inv),
-            )
-
-        if self.embed_tokens.table_memory == "disk":
-            return ()
-        request = self.embed_tokens.plan.request(
-            name=f"{id(self)}/engram-lookup",
-            prepare_call=make_call,
-            benchmark_call=make_call,
-        )
-        return (
-            B12xPreparationUnit(
-                name="EngramLookup",
-                key=(id(self), workload.max_tokens),
-                requests=(request,),
-                stage="weights",
-            ),
-        )
+    def get_b12x_preparation_units(self, layer=None, workload=None):
+        return ()
 
     def declare_kernels(self) -> None:
         """Declare the TileLang gate: on packed rows always, and on the column blocks
