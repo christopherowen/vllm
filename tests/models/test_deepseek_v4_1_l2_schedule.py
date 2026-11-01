@@ -178,3 +178,71 @@ def test_engram_layer_moves_next_after_its_projection(segments, issued):
     other.ffn.experts._l2_prefetch_pre_reduce_hook(6)
     (plan, _), *rest = issued
     assert not rest and plan[-2:] == ("indexer.wq_b", "indexer.weights_proj")
+
+
+def test_decode_shared_experts_launch_after_router_gate():
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+    from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+        SharedExpertsOrder,
+    )
+
+    events = []
+    experts = SimpleNamespace(fold_shared=True, combine_addend=None)
+
+    class _Router:
+        routes_hidden_states = True
+        _post_gate_hook = None
+
+        def select_experts(self, **kwargs):
+            events.append("gate")
+            if self._post_gate_hook is not None:
+                hook = self._post_gate_hook
+                self._post_gate_hook = None
+                hook()
+            events.append("topk")
+            return torch.ones(1, 1), torch.zeros(1, 1, dtype=torch.int64)
+
+    class _Shared:
+        output = "shared_out"
+
+        def workspace_size(self, x):
+            return 0
+
+        def __call__(self, x, order, workspace=None):
+            return None
+
+        def _determine_shared_experts_order(self, x):
+            return SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
+
+        def maybe_forward_async(self, x, workspace=None):
+            events.append("shared_async")
+            return True
+
+        def wait_output(self):
+            return "shared_out"
+
+        def wait(self):
+            events.append("shared_wait")
+
+    runner = SimpleNamespace(
+        _shared_experts=_Shared(),
+        _maybe_apply_shared_experts=lambda *a, **k: None,
+        _quant_method=SimpleNamespace(
+            modular_experts=experts,
+            topk_indices_dtype=torch.int64,
+        ),
+        routed_experts=SimpleNamespace(
+            quant_method=SimpleNamespace(is_monolithic=False),
+            forward_modular=lambda **kwargs: (events.append("routed"), "routed_out")[1],
+        ),
+        router=_Router(),
+    )
+
+    x6 = torch.zeros(6, 16)
+    MoERunner._apply_quant_method(runner, x6, x6, x6)
+    assert events == ["gate", "shared_async", "topk", "routed", "shared_wait"]
+
+    events.clear()
+    x48 = torch.zeros(48, 16)
+    MoERunner._apply_quant_method(runner, x48, x48, x48)
+    assert events == ["shared_async", "gate", "topk", "routed", "shared_wait"]

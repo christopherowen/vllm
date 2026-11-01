@@ -756,6 +756,7 @@ class MoERunner(MoERunnerInterface):
         )
         experts = self._quant_method.modular_experts
         overlap_fold = False
+        launch_shared = None
         if getattr(experts, "fold_shared", False):
             assert self._shared_experts is not None
             assert shared_experts_input is not None
@@ -771,14 +772,36 @@ class MoERunner(MoERunnerInterface):
             else:
                 # The shared expert runs on the aux stream beside the routed
                 # experts; their combine waits for it, then adds its output.
+                # When the router runs a single-tile decode gate projection
+                # itself (<= 32 rows, 24 CTAs), defer the aux-stream launch
+                # until immediately after the gate GEMM so shared gate_up_proj
+                # overlaps top-k routing and routed experts instead of
+                # contending with the critical-path gate GEMM and FFN L2
+                # prefetch.
                 if not shared_experts_overlapping:
-                    launched = self._shared_experts.maybe_forward_async(
-                        shared_experts_input, shared_workspace
-                    )
-                    assert launched
+                    shared_experts = self._shared_experts
+
+                    def _launch_shared() -> None:
+                        nonlocal launch_shared
+                        if launch_shared is None:
+                            return
+                        launch_shared = None
+                        launched = shared_experts.maybe_forward_async(
+                            shared_experts_input, shared_workspace
+                        )
+                        assert launched
+
+                    launch_shared = _launch_shared
+                    if (
+                        not getattr(self.router, "routes_hidden_states", False)
+                        or hidden_states.shape[0] > 32
+                    ):
+                        launch_shared()
                 experts.combine_addend = self._shared_experts.wait_output
 
         if self.routed_experts.quant_method.is_monolithic:
+            if launch_shared is not None:
+                launch_shared()
             # Monolithic kernels: pass router_logits to routed_experts
             fused_out = self.routed_experts.forward_monolithic(
                 x=hidden_states,
@@ -787,12 +810,20 @@ class MoERunner(MoERunnerInterface):
             )
         else:
             # Modular kernels: select experts first, then call routed_experts
-            topk_weights, topk_ids = self.router.select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                topk_indices_dtype=self._quant_method.topk_indices_dtype,
-                input_ids=input_ids,
-            )
+            if launch_shared is not None:
+                self.router._post_gate_hook = launch_shared
+            try:
+                topk_weights, topk_ids = self.router.select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    topk_indices_dtype=self._quant_method.topk_indices_dtype,
+                    input_ids=input_ids,
+                )
+            finally:
+                if launch_shared is not None:
+                    self.router._post_gate_hook = None
+            if launch_shared is not None:
+                launch_shared()
 
             if workspace is None:
                 fused_out = self.routed_experts.forward_modular(

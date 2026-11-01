@@ -1211,16 +1211,23 @@ class TileLangGateRouter(TileKernelsRouter):
 
         gate = self.gate
         x = router_logits.reshape(-1, gate.weight.shape[1])
+        post_gate = getattr(self, "_post_gate_hook", None)
+        if post_gate is not None:
+            self._post_gate_hook = None
         provided = provided_routes(x)
         if provided is not None:
             if indices_type not in (None, torch.int64):
                 raise ValueError(
                     f"TileLang routing writes int64 expert ids, not {indices_type}"
                 )
+            if post_gate is not None:
+                post_gate()
             return provided
         specs = _partial_specs(gate, x.shape[0])
         if not specs:
             logits, _ = gate(x)
+            if post_gate is not None:
+                post_gate()
             return super()._compute_routing(
                 hidden_states,
                 logits,
@@ -1234,6 +1241,8 @@ class TileLangGateRouter(TileKernelsRouter):
             )
         (partials,) = _scratch(specs, None)
         partials_kernel(gate, x.shape[0])(x, gate.weight, partials)
+        if post_gate is not None:
+            post_gate()
         image = self.bias_vl is not None and self.image_sentinel_lo > 0
         if image and input_ids is None:
             raise ValueError("DeepSeek V4.1 vision routing requires input_ids")
