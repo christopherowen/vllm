@@ -30,6 +30,10 @@ from vllm.v1.utils import mlock_memory, munlock_memory
 
 ROW_BYTES = 256  # E4M3 values of one row
 SCALE_BYTES = 8  # E8M0 scales of one row, one per 32 values
+PACKED_ROW_BYTES = ROW_BYTES + SCALE_BYTES  # 264-byte row-interleaved storage
+PACKED_ROWS_PER_PAGE = 15  # 15 * 264 = 3,960 B + 136 B padding per 4096 B NVMe page
+PACKED_PAGE_BYTES = 4096
+DEFAULT_CACHE_ROWS = 65536  # 4-way set-associative row cache (16,384 sets x 4 ways)
 PHASES = {
     0: "idle",
     1: "waiting for the step's row IDs",
@@ -37,6 +41,14 @@ PHASES = {
     3: "failed",
     4: "waiting for the GPU to gather the previous step's rows",
 }
+
+
+def packed_table_bytes(rows: int) -> int:
+    """Exact byte size of ``rows`` 264-byte rows packed at 15 rows per 4096-byte page."""
+    rows = int(rows)
+    if rows <= 0:
+        return 0
+    return ((rows + PACKED_ROWS_PER_PAGE - 1) // PACKED_ROWS_PER_PAGE) * PACKED_PAGE_BYTES
 
 
 def _check(result, operation: str):
@@ -107,6 +119,75 @@ class MappedHostAllocation:
 ALL_COLUMNS = (1 << 24) - 1
 
 
+def column_compaction_map(
+    offsets,
+    table_rows: int,
+    columns: tuple[int, ...],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build per-column compaction tables for ``columns`` (a subset of ``0..23``).
+
+    Returns ``(col_start, col_end, col_delta, owned_starts, owned_rows)`` as contiguous
+    ``int64`` arrays, where global row ``id`` of owned column ``c`` maps to physical
+    compacted row ``id - col_delta[c]`` in ``[0, owned_rows.sum())``.
+    """
+    starts = np.asarray(offsets, dtype=np.int64)
+    if starts.shape != (24,):
+        raise ValueError(f"Engram column offsets must have 24 entries, got {starts.shape}")
+    ends = np.empty(24, dtype=np.int64)
+    ends[:23] = starts[1:]
+    ends[23] = int(table_rows)
+
+    owned = sorted(int(c) for c in columns)
+    col_start = np.zeros(24, dtype=np.int64)
+    col_end = np.zeros(24, dtype=np.int64)
+    col_delta = np.zeros(24, dtype=np.int64)
+    owned_starts = np.empty(len(owned), dtype=np.int64)
+    owned_rows = np.empty(len(owned), dtype=np.int64)
+
+    phys_offset = 0
+    for idx, col in enumerate(owned):
+        if not 0 <= col < 24:
+            raise ValueError(f"Engram column index out of range: {col}")
+        s = int(starts[col])
+        e = int(ends[col])
+        r = e - s
+        if r < 0:
+            raise ValueError(f"Invalid column range [{s}, {e}) for column {col}")
+        col_start[col] = s
+        col_end[col] = e
+        col_delta[col] = s - phys_offset
+        owned_starts[idx] = s
+        owned_rows[idx] = r
+        phys_offset += r
+
+    return col_start, col_end, col_delta, owned_starts, owned_rows
+
+
+def pack_engram_columns(
+    weight_path: str,
+    weight_offset: int,
+    scale_path: str,
+    scale_offset: int,
+    out_path: str,
+    col_starts: np.ndarray,
+    col_rows: np.ndarray,
+) -> None:
+    """Stream ``(col_starts, col_rows)`` from ``weight_path`` and ``scale_path`` into a
+    single-plane 4 KiB-page-aligned (15 x 264-byte rows per 4096-byte page) file at
+    ``out_path`` without polluting the OS page cache."""
+    starts = np.ascontiguousarray(col_starts, dtype=np.int64).reshape(-1)
+    rows = np.ascontiguousarray(col_rows, dtype=np.int64).reshape(-1)
+    load().pack_columns(
+        str(weight_path),
+        int(weight_offset),
+        str(scale_path),
+        int(scale_offset),
+        str(out_path),
+        starts,
+        rows,
+    )
+
+
 class EngramDiskRows:
     """Rows ``[shard_start, shard_end)`` of the hash columns in the 24-bit mask ``columns``
     of one Engram table (lookup i of a step is column i % 24), ``max_lookups`` per step.
@@ -121,7 +202,8 @@ class EngramDiskRows:
                  max_lookups: int, columns: int = ALL_COLUMNS, queue_depth: int = 128,
                  ids_timeout_s: float = 20.0,
                  rows_timeout_s: float = 10.0, delay_s: float = 0.0,
-                 check_early: bool = False, timeline: bool = False):
+                 check_early: bool = False, timeline: bool = False,
+                 cache_rows: int = DEFAULT_CACHE_ROWS):
         self.native = load()
         self.device = _indexed(device)
         self.shard_start, self.shard_end = int(shard_start), int(shard_end)
@@ -131,6 +213,7 @@ class EngramDiskRows:
         self.max_lookups = int(max_lookups)
         self.check_early = bool(check_early)
         self.timeline_enabled = bool(timeline)
+        self.cache_rows = int(cache_rows)
         self._allocations = []
         self.ids = torch.empty(self.max_lookups, dtype=torch.int64, pin_memory=True)
         self._ids_mlocked = mlock_memory(self.ids.data_ptr(), self.ids.nbytes)
@@ -145,7 +228,7 @@ class EngramDiskRows:
             table_rows, self.shard_start, self.shard_end, self.columns, self.max_lookups, queue_depth,
             self.ids.data_ptr(), self.weights.pointer, self.scales.pointer, self.control.pointer,
             float(ids_timeout_s), float(delay_s), self.check_early,
-            self.timeline_enabled,
+            self.timeline_enabled, self.cache_rows,
         )
         self._ids_seq_device = self.control.device_view.data_ptr() + 4 * self.native.CTRL_IDS_SEQ
         self._sequence = 0
@@ -159,6 +242,32 @@ class EngramDiskRows:
         """Register the table's E4M3 rows (``scale=False``) or E8M0 scale rows, which
         start at ``offset`` in the immutable file ``path``."""
         self.native.add(self._reader, str(path), int(offset), bool(scale))
+
+    def add_packed_source(
+        self,
+        path: str,
+        offset: int = 0,
+        *,
+        col_start: np.ndarray | None = None,
+        col_end: np.ndarray | None = None,
+        col_delta: np.ndarray | None = None,
+    ) -> None:
+        """Register a single-plane 4 KiB-page-aligned (15 x 264B rows per 4096B page)
+        source at ``offset`` in ``path``, optionally compacted to this rank's hash
+        columns via ``(col_start, col_end, col_delta)``."""
+        if (col_start is None) != (col_end is None) or (col_start is None) != (
+            col_delta is None
+        ):
+            raise ValueError(
+                "col_start, col_end and col_delta must all be provided together or omitted"
+            )
+        if col_start is not None:
+            col_start = np.ascontiguousarray(col_start, dtype=np.int64).reshape(-1)
+            col_end = np.ascontiguousarray(col_end, dtype=np.int64).reshape(-1)
+            col_delta = np.ascontiguousarray(col_delta, dtype=np.int64).reshape(-1)
+        self.native.add_packed(
+            self._reader, str(path), int(offset), col_start, col_end, col_delta
+        )
 
     def stage(
         self,
@@ -197,6 +306,13 @@ class EngramDiskRows:
         self.native.submit(
             self._reader, self._sequence, count, 60.0, early, int(has_unknown)
         )
+
+    def prefetch(self, ids: np.ndarray) -> None:
+        """Warm the reader's user-space row cache in the background for ``ids`` (int64
+        on the host) without advancing or modifying the GPU step buffers."""
+        self.raise_if_failed()
+        arr = np.ascontiguousarray(ids, dtype=np.int64).reshape(-1)
+        self.native.prefetch(self._reader, arr, 60.0)
 
     def gather(self, out: torch.Tensor, ids: torch.Tensor, num_tokens: torch.Tensor) -> None:
         """Wait for the staged step's rows and dequantize the first ``num_tokens``

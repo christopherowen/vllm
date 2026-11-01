@@ -12,10 +12,21 @@ import subprocess
 import sys
 import time
 
+import numpy as np
 import pytest
 import torch
 
-from vllm.models.deepseek_v4_1.engram_rows import EngramDiskRows
+from vllm.models.deepseek_v4_1.engram_rows import (
+    PACKED_PAGE_BYTES,
+    PACKED_ROW_BYTES,
+    PACKED_ROWS_PER_PAGE,
+    EngramDiskRows,
+    column_compaction_map,
+    host_hash,
+    pack_engram_columns,
+    packed_table_bytes,
+)
+from vllm.models.deepseek_v4_1.engram_rows.rows import ROW_BYTES
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -75,12 +86,12 @@ def _rows(paths, start=0, end=TABLE_ROWS, tokens=16, **kwargs):
     return rows
 
 
-def _step(rows, ids, live):
+def _step(rows, ids, live, early=None):
     stream = torch.cuda.current_stream()
     num_tokens = torch.tensor([live], dtype=torch.int32, device="cuda")
     width = bin(rows.columns).count("1") * 256  # the rank's columns, side by side
     out = torch.full((ids.shape[0], width), 7, dtype=torch.bfloat16, device="cuda")
-    rows.stage(stream, ids, ids.numel())
+    rows.stage(stream, ids, ids.numel(), early)
     rows.gather(out, ids, num_tokens)
     return out, num_tokens
 
@@ -741,3 +752,311 @@ def test_column_masked_early_ids_skip_d2h_ids_copy_and_match_reference():
         assert torch.equal(rows.ids[: ids.numel()], ids.view(-1))
     finally:
         rows.close()
+
+
+def test_early_rows_complete_disk_reads_before_previous_gather_finishes():
+    """When CTRL_CONSUMED_SEQ >= previous, read_early scatters directly into mapped
+    weights/scales (early_prefetched_steps == 0). When the previous gather is still in
+    flight (CTRL_CONSUMED_SEQ < previous), read_early stages into early_weights /
+    early_scales while the GPU is busy, then copies into mapped buffers after consumed."""
+    codes, scales, paths = _write_table(_table_dir(), seed=24)
+    rows = _rows(paths, tokens=4, cache_rows=0)
+    stream = torch.cuda.current_stream()
+    first = torch.randint(0, TABLE_ROWS, (4, HEADS)).cuda()
+    second = torch.randint(0, TABLE_ROWS, (4, HEADS))
+    second_gpu = second.cuda()
+    num_tokens = torch.tensor([4], dtype=torch.int32, device="cuda")
+    out1 = torch.empty((4, HEADS * 256), dtype=torch.bfloat16, device="cuda")
+    out2 = torch.empty_like(out1)
+
+    # Step 1: previous step is already consumed (0 >= 0), so read_early uses the
+    # zero-bounce-buffer fast path directly into mapped weights/scales.
+    rows.stage(stream, first, first.numel(), first.cpu().numpy())
+    rows.gather(out1, first, num_tokens)
+    torch.cuda.synchronize()
+    assert rows.stats()["early_prefetched_steps"] == 0
+
+    rows.stage(stream, first, first.numel())
+    deadline = time.monotonic() + 30
+    while (
+        int(rows._control[rows.native.CTRL_ROWS_SEQ]) != rows._sequence
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.001)
+    held_weights = rows.weights.host.clone()
+    held_scales = rows.scales.host.clone()
+    calls_before = rows.stats()["read_calls"]
+
+    torch.cuda._sleep(int(1.5e9))
+    rows.gather(out1, first, num_tokens)
+    rows.stage(stream, second_gpu, second.numel(), second.numpy())
+
+    deadline = time.monotonic() + 30
+    while (
+        rows.stats()["early_prefetched_steps"] < 1
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.001)
+
+    # Disk reads for step 3 finished into early_weights/early_scales while the GPU is
+    # still sleeping before step 2's gather!
+    assert rows.stats()["early_prefetched_steps"] == 1
+    assert rows.stats()["read_calls"] > calls_before
+    assert int(rows._control[rows.native.CTRL_CONSUMED_SEQ]) < 2
+    assert torch.equal(rows.weights.host, held_weights)
+    assert torch.equal(rows.scales.host, held_scales)
+
+    rows.gather(out2, second_gpu, num_tokens)
+    torch.testing.assert_close(
+        out1.cpu(),
+        _reference(codes, scales, first, 4, 0, TABLE_ROWS),
+        rtol=0,
+        atol=0,
+        equal_nan=True,
+    )
+    torch.testing.assert_close(
+        out2.cpu(),
+        _reference(codes, scales, second, 4, 0, TABLE_ROWS),
+        rtol=0,
+        atol=0,
+        equal_nan=True,
+    )
+    rows.close()
+
+
+@pytest.mark.parametrize("columns", [ALL_COLUMNS, TP3_RANK1])
+def test_user_space_row_cache_hits_evicts_and_matches_reference(columns):
+    """A 4-way set-associative row cache serves repeated rows from RAM with zero disk
+    reads and preserves bit-exact BF16 output under set conflicts and evictions."""
+    codes, scales, paths = _write_table(_table_dir(), seed=37)
+    rows = _rows(paths, tokens=16, columns=columns, cache_rows=64)
+    try:
+        gen = torch.Generator().manual_seed(38)
+        ids = torch.randint(0, TABLE_ROWS, (16, HEADS), generator=gen)
+        # Force >4 distinct row IDs into the same 16-set cache bucket (set 0) to test
+        # conflict handling within a single step and across steps.
+        same_set = []
+        for candidate in range(TABLE_ROWS):
+            h = (candidate * 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+            if ((h ^ (h >> 32)) & 15) == 0:
+                same_set.append(candidate)
+                if len(same_set) == 8:
+                    break
+        ids[0, :8] = torch.tensor(same_set, dtype=torch.int64)
+        ids_gpu = ids.cuda()
+
+        out1, _ = _step(rows, ids_gpu, 14)
+        expected = _reference(codes, scales, ids, 14, 0, TABLE_ROWS, columns)
+        torch.testing.assert_close(
+            out1.cpu(), expected, rtol=0, atol=0, equal_nan=True
+        )
+
+        # Now run a step whose unique rows fit entirely within the 64-row cache.
+        small_ids = torch.arange(24, dtype=torch.int64).unsqueeze(0).expand(16, -1).contiguous()
+        small_gpu = small_ids.cuda()
+        out_warm, _ = _step(rows, small_gpu, 16, early=small_ids.numpy())
+        expected_small = _reference(codes, scales, small_ids, 16, 0, TABLE_ROWS, columns)
+        torch.testing.assert_close(
+            out_warm.cpu(), expected_small, rtol=0, atol=0, equal_nan=True
+        )
+        torch.cuda.synchronize()
+        deadline = time.monotonic() + 5.0
+        while rows.stats()["queued"] and time.monotonic() < deadline:
+            time.sleep(0.001)
+        stats_after_warm = rows.stats()
+
+        # Repeating small_ids must hit 100% in the row cache with 0 disk read_calls!
+        rows.weights.host.fill_(0x7F)
+        rows.scales.host.fill_(0xFF)
+        out_hit, _ = _step(rows, small_gpu, 16, early=small_ids.numpy())
+        torch.testing.assert_close(
+            out_hit.cpu(), expected_small, rtol=0, atol=0, equal_nan=True
+        )
+        torch.cuda.synchronize()
+        while rows.stats()["queued"] and time.monotonic() < deadline:
+            time.sleep(0.001)
+        stats_after_hit = rows.stats()
+        owned_per_token = bin(columns).count("1")
+        assert stats_after_hit["read_calls"] == stats_after_warm["read_calls"]
+        assert (
+            stats_after_hit["cache_hits"] - stats_after_warm["cache_hits"]
+            == 16 * owned_per_token
+        )
+        assert stats_after_hit["cache_misses"] == stats_after_warm["cache_misses"]
+    finally:
+        rows.close()
+
+
+def test_background_prefetch_warms_row_cache_without_touching_step_buffers():
+    """rows.prefetch(ids) populates the user-space row cache on the worker thread without
+    modifying mapped weights/scales or control sequence words, so the subsequent step
+    hits 100% in cache with zero disk reads."""
+    codes, scales, paths = _write_table(_table_dir(), seed=43)
+    rows = _rows(paths, tokens=8, cache_rows=4096)
+    try:
+        rows.weights.host.fill_(0x5A)
+        rows.scales.host.fill_(0xA5)
+        held_weights = rows.weights.host.clone()
+        held_scales = rows.scales.host.clone()
+
+        ids = torch.randint(0, TABLE_ROWS, (8, HEADS), dtype=torch.int64)
+        rows.prefetch(ids.numpy())
+        deadline = time.monotonic() + 10.0
+        while rows.stats()["prefetch_steps"] < 1 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        s_pref = rows.stats()
+        assert s_pref["prefetch_steps"] == 1
+        assert s_pref["read_calls"] > 0
+        assert int(rows._control[rows.native.CTRL_ROWS_SEQ]) == 0
+        assert torch.equal(rows.weights.host, held_weights)
+        assert torch.equal(rows.scales.host, held_scales)
+
+        out, _ = _step(rows, ids.cuda(), 8, early=ids.numpy())
+        expected = _reference(codes, scales, ids, 8, 0, TABLE_ROWS)
+        torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0, equal_nan=True)
+        torch.cuda.synchronize()
+        while rows.stats()["queued"] and time.monotonic() < deadline:
+            time.sleep(0.001)
+        s_step = rows.stats()
+        assert s_step["read_calls"] == s_pref["read_calls"]
+        assert s_step["cache_hits"] >= 8 * HEADS
+    finally:
+        rows.close()
+
+
+@pytest.mark.parametrize("offset", [0, 4093, 4096 - ROW_BYTES, 4096 - ROW_BYTES - 4])
+def test_packed_single_plane_rows_split_cleanly_across_page_boundaries(offset):
+    """A 15-row-per-4KiB-page (15 x 264B + 136B padding) source never splits across
+    4 KiB page boundaries when offset == 0, and scatters weights [0..256) and scales
+    [256..264) identically to the two-plane reader even at unaligned offsets."""
+    directory = _table_dir()
+    weights, scales, paths = _write_table(directory, seed=31)
+    base_packed = os.path.join(directory, "packed-base.bin")
+    pack_engram_columns(
+        paths[0],
+        WEIGHT_OFFSET,
+        paths[1],
+        SCALE_OFFSET,
+        base_packed,
+        np.array([0], dtype=np.int64),
+        np.array([TABLE_ROWS], dtype=np.int64),
+    )
+    assert os.path.getsize(base_packed) == packed_table_bytes(TABLE_ROWS)
+    if offset == 0:
+        packed_path = base_packed
+    else:
+        packed_path = os.path.join(directory, f"packed-{offset}.bin")
+        with open(base_packed, "rb") as src_f:
+            payload = src_f.read()
+        with open(packed_path, "wb") as f:
+            f.write(b"\x5a" * offset)
+            f.write(payload)
+
+    rows = EngramDiskRows(
+        device="cuda",
+        table_rows=TABLE_ROWS,
+        shard_start=0,
+        shard_end=TABLE_ROWS,
+        max_lookups=16 * HEADS,
+    )
+    rows.add_packed_source(packed_path, offset)
+    try:
+        ids = torch.randint(0, TABLE_ROWS, (16, HEADS), dtype=torch.int64)
+        ids[0, :8] = torch.tensor([0, 1, 14, 15, 16, 29, TABLE_ROWS - 2, TABLE_ROWS - 1])
+        ids[1, :4] = torch.tensor([-1, -99, TABLE_ROWS, TABLE_ROWS + 5])
+        actual, _ = _step(rows, ids.cuda(), 13)
+        expected = _reference(weights, scales, ids, 13, 0, TABLE_ROWS)
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0, equal_nan=True)
+    finally:
+        rows.close()
+
+
+@pytest.mark.parametrize(
+    "tp_size,tp_rank",
+    [(3, 0), (3, 1), (3, 2), (4, 0), (4, 3)],
+)
+def test_pack_engram_columns_and_compacted_column_map_match_two_plane_reader(
+    tp_size, tp_rank
+):
+    """Packing a rank's interleaved hash columns at 15 rows per 4096 B NVMe page writes
+    only that rank's rows with zero 4 KiB page straddling, cuts per-step disk read calls
+    compared to two-plane storage, and gathers the exact same BF16 values."""
+    directory = _table_dir()
+    weights, scales, paths = _write_table(directory, seed=41 + tp_size * 10 + tp_rank)
+    widths = np.full(HEADS, TABLE_ROWS // HEADS, dtype=np.int64)
+    widths[: TABLE_ROWS % HEADS] += 1
+    offsets = np.zeros(HEADS, dtype=np.int64)
+    np.cumsum(widths[:-1], out=offsets[1:])
+
+    owned_cols = tuple(range(tp_rank, HEADS, tp_size))
+    col_mask = sum(1 << c for c in owned_cols)
+    col_start, col_end, col_delta, owned_starts, owned_rows = column_compaction_map(
+        offsets, TABLE_ROWS, owned_cols
+    )
+    packed_path = os.path.join(directory, f"rank-tp{tp_size}-r{tp_rank}.packed")
+    pack_engram_columns(
+        paths[0],
+        WEIGHT_OFFSET,
+        paths[1],
+        SCALE_OFFSET,
+        packed_path,
+        owned_starts,
+        owned_rows,
+    )
+    assert os.path.getsize(packed_path) == packed_table_bytes(int(owned_rows.sum()))
+
+    two_plane = _rows(paths, tokens=32, columns=col_mask)
+    packed_rows = EngramDiskRows(
+        device="cuda",
+        table_rows=TABLE_ROWS,
+        shard_start=0,
+        shard_end=TABLE_ROWS,
+        columns=col_mask,
+        max_lookups=32 * HEADS,
+        check_early=True,
+    )
+    packed_rows.add_packed_source(
+        packed_path,
+        0,
+        col_start=col_start,
+        col_end=col_end,
+        col_delta=col_delta,
+    )
+    try:
+        rng = np.random.default_rng(100 + tp_rank)
+        ids_np = np.empty((32, HEADS), dtype=np.int64)
+        for c in range(HEADS):
+            s = int(offsets[c])
+            e = int(offsets[c + 1]) if c + 1 < HEADS else TABLE_ROWS
+            ids_np[:, c] = rng.integers(s, e, size=32, dtype=np.int64)
+        ids_np[0, owned_cols[0]] = int(offsets[owned_cols[0]])
+        ids_np[1, owned_cols[-1]] = (
+            int(offsets[owned_cols[-1] + 1]) - 1
+            if owned_cols[-1] + 1 < HEADS
+            else TABLE_ROWS - 1
+        )
+        ids_np[2, ::3] = -1
+        ids = torch.from_numpy(ids_np)
+        early = ids_np.copy()
+        early[20:] = host_hash.UNKNOWN
+
+        out_two, _ = _step(two_plane, ids.cuda(), 29, early=early)
+        out_packed, _ = _step(packed_rows, ids.cuda(), 29, early=early)
+        expected = _reference(weights, scales, ids, 29, 0, TABLE_ROWS, col_mask)
+        torch.testing.assert_close(
+            out_packed.cpu(), expected, rtol=0, atol=0, equal_nan=True
+        )
+        torch.testing.assert_close(
+            out_packed.cpu(), out_two.cpu(), rtol=0, atol=0, equal_nan=True
+        )
+
+        torch.cuda.synchronize()
+        deadline = time.monotonic() + 5.0
+        while (
+            two_plane.stats()["queued"] or packed_rows.stats()["queued"]
+        ) and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert packed_rows.stats()["read_calls"] < two_plane.stats()["read_calls"]
+    finally:
+        two_plane.close()
+        packed_rows.close()
