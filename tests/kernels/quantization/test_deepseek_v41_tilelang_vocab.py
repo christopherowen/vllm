@@ -28,6 +28,7 @@ from vllm.models.deepseek_v4_1.tilelang.vocab import (  # noqa: E402
     prepare_packed_head,
     project_head,
     project_head_greedy_pairs,
+    project_head_markov_greedy_pairs,
     row_tile,
     tile_config,
     unpack_bf16_weight,
@@ -501,3 +502,54 @@ def test_nvfp4_online_linear_method_tilelang_without_b12x(monkeypatch):
         processor.use_tilelang_vocab_projection = True
         logits = processor._apply_head(layer, x, None)
         assert torch.equal(logits, out)
+
+
+@pytest.mark.parametrize("n", [32320, 43092])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+def test_packed_head_markov_greedy_pairs_match_greedy_markov_shard_pair(n, out_dtype):
+    from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
+        greedy_markov_shard_pair,
+        scratch_shape,
+    )
+
+    k = 256
+    weight = _head(n, k, seed=n + 303)
+    weight[100] = weight[5]
+    weight[500] = weight[5]
+    layer = _packed_layer(weight)
+    layer.tilelang_max_rows = 64
+    layer.tilelang_markov_head = True
+    prepare_packed_head(layer, out_dtype)
+    assert hasattr(layer, "tilelang_vocab_markov_greedy")
+    generator = torch.Generator(device=DEVICE).manual_seed(n + 404)
+    x = torch.randn(64, k, generator=generator, device=DEVICE, dtype=torch.bfloat16)
+    base_3d = torch.randn(
+        64, 5, n, generator=generator, device=DEVICE, dtype=out_dtype
+    )
+    for vocab, vocab_start in ((n, 0), (n - 37, 32320)):
+        for rows in (1, 5, 16, 17, 33, 64):
+            part = x[:rows].contiguous()
+            base_step = base_3d[:rows, 2]
+            bias = project_head(layer, part)
+            expected = torch.empty((rows, 4), dtype=torch.float32, device=DEVICE)
+            shape = scratch_shape(rows, vocab)
+            values = torch.empty(shape, dtype=torch.float32, device=DEVICE)
+            indices = torch.empty(shape, dtype=torch.int32, device=DEVICE)
+            greedy_markov_shard_pair(
+                base_step[:, :vocab],
+                bias[:, :vocab],
+                vocab_start,
+                expected,
+                values,
+                indices,
+            )
+            actual = torch.empty((rows, 4), dtype=torch.float32, device=DEVICE)
+            project_head_markov_greedy_pairs(
+                layer,
+                part,
+                base_step,
+                vocab=vocab,
+                vocab_start=vocab_start,
+                out=actual,
+            )
+            assert torch.equal(actual[:, :2], expected[:, :2]), (rows, vocab, out_dtype)

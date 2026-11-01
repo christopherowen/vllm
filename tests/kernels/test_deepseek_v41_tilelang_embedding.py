@@ -226,3 +226,76 @@ def test_declared_as_the_lookup_calls_it():
         for d in ("int32", "int64")
         for p in (1, full)
     ]
+
+
+def _embedding_table_with_exceptions(rows: int, width: int, seed: int) -> torch.Tensor:
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    weight = (torch.randn(rows, width, generator=generator, device="cuda") * 0.02).bfloat16()
+    flat = weight.view(-1)
+    picks = torch.randint(0, flat.numel(), (128,), generator=generator, device="cuda")
+    flat[picks[:48]] = 300.0
+    flat[picks[48:96]] = -1.5e-7
+    flat[picks[96:]] = 0.0
+    return weight
+
+
+@pytest.mark.parametrize("tp,rank", [(4, 0), (4, 3), (3, 2)])
+@pytest.mark.parametrize("tokens", [1, 6, 80, 1024])
+@pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
+def test_packed_embedding_bit_identical_to_the_cuda_kernel(tp, rank, tokens, id_dtype):
+    """After ``process_weights_after_loading`` packs the BF16 shard into 12 bits per
+    weight (with out-of-window exceptions), ``TileLangEmbeddingMethod`` produces the
+    exact same bits as ``ops.vocab_parallel_embedding`` on the unpacked BF16 shard."""
+    shard, rows = _shard_indices(VOCAB, VOCAB, rank, tp)
+    original = _embedding_table_with_exceptions(rows, HIDDEN, seed=tp * 100 + rank)
+    ids = _ids(tokens, VOCAB, id_dtype, seed=tokens + 17)
+    ends = torch.tensor(
+        [shard.org_vocab_start_index, shard.org_vocab_end_index - 1], dtype=id_dtype
+    )[:tokens]
+    ids[: ends.numel()] = ends
+    want = _cuda(ids, original, shard)
+
+    layer = torch.nn.Module()
+    layer.register_parameter("weight", torch.nn.Parameter(original.clone(), requires_grad=False))
+    layer.shard_indices = shard
+    method = embedding.TileLangEmbeddingMethod()
+    method.process_weights_after_loading(layer)
+    assert layer.weight.dtype == torch.uint8
+    assert layer.weight.shape == (rows, HIDDEN + HIDDEN // 2)
+    assert layer.packed_bf16_exceptions > 0
+
+    got = method.parallel_embedding(layer, ids)
+    assert got.dtype == want.dtype and got.shape == want.shape
+    assert torch.equal(_bits(got), _bits(want))
+
+
+def test_packed_embedding_declaration_and_tp1_embedding():
+    """Declared kernels for a packed embedding layer match ``vocab_embedding_packed``
+    and ``method.embedding`` handles arbitrary input shapes."""
+    shard, rows = _shard_indices(2048, 2048, 0, 1)
+    width = 256
+    original = _embedding_table_with_exceptions(rows, width, seed=55)
+    layer = torch.nn.Module()
+    layer.register_parameter("weight", torch.nn.Parameter(original.clone(), requires_grad=False))
+    layer.shard_indices = shard
+    method = embedding.TileLangEmbeddingMethod()
+    method.process_weights_after_loading(layer)
+
+    registry = JitWarmupRegistry(vllm_config=None)
+    with registry.activate():
+        method.declare_layer_kernels(layer)
+    calls = list(prepare.declared_calls(registry))
+    assert calls == [
+        (
+            embedding.packed_vocab_embedding_kernel,
+            (width, layer.packed_bf16_exponent_base, d),
+            {"threads": 128},
+        )
+        for d in ("int32", "int64")
+    ]
+
+    ids_2d = torch.randint(0, 2048, (4, 7), dtype=torch.int64, device="cuda")
+    got_2d = method.embedding(layer, ids_2d)
+    want_2d = torch.nn.functional.embedding(ids_2d, original)
+    assert got_2d.shape == (4, 7, width)
+    assert torch.equal(_bits(got_2d), _bits(want_2d))

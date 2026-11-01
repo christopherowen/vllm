@@ -304,20 +304,39 @@ class DSparkDeepseekV4Model(nn.Module):
         draft_vocab_size = (
             getattr(config, "draft_vocab_size", None) or config.vocab_size
         )
+        from vllm.model_executor.layers.quantization.online.packed_bf16 import (
+            packed_bf16_supported,
+        )
+
+        markov_quantization = (
+            "nvfp4"
+            if envs.VLLM_DS41_MARKOV_NVFP4
+            else (
+                "packed_bf16"
+                if current_vllm_config.kernel_config.linear_backend == "tilelang"
+                and packed_bf16_supported(
+                    config.dspark_markov_rank, torch.get_default_dtype()
+                )
+                else None
+            )
+        )
         self.markov_head = DSparkMarkovHead(
             config.vocab_size,
             draft_vocab_size,
             config.dspark_markov_rank,
             prefix=maybe_prefix(prefix, "markov_head"),
             # An NVFP4 transition head fits the GB10 L2, so the sequential
-            # draft positions after the first reread it from L2.
-            lm_head_quantization="nvfp4" if envs.VLLM_DS41_MARKOV_NVFP4 else None,
+            # draft positions after the first reread it from L2. On the
+            # TileLang path without NVFP4, pack the BF16 transition head
+            # losslessly into 12 bits per weight (75% of BF16 bytes).
+            lm_head_quantization=markov_quantization,
             vocab_parallel=_vocab_parallel_greedy(),
         )
         # Each sequential Markov step projects one row per request.
         self.markov_head.markov_w2.tilelang_max_rows = (
             vllm_config.scheduler_config.max_num_seqs
         )
+        self.markov_head.markov_w2.tilelang_markov_head = True
         self.confidence_head: DSparkConfidenceHead | None = None
         if getattr(config, "enable_confidence_head", True):
             self.confidence_head = kernels.dspark_confidence_head(
@@ -692,7 +711,35 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         scattered into it. The target still verifies every draft, so this
         can change acceptance but not the output.
         """
-        weight = self.model.markov_head.markov_w2.weight[index]
+        w2 = self.model.markov_head.markov_w2
+        if hasattr(w2, "packed_bf16_exponent_base"):
+            from ..tilelang.embedding import vocab_embedding_packed
+
+            flat_index = index.reshape(-1).contiguous()
+            in_features = w2.packed_bf16_in_features
+            weight = torch.empty(
+                (flat_index.shape[0], in_features),
+                dtype=torch.bfloat16,
+                device=w2.weight.device,
+            )
+            shard = w2.shard_indices
+            vocab_embedding_packed(
+                flat_index,
+                w2.weight,
+                w2.weight_exception_entries,
+                w2.weight_row_offsets,
+                in_features,
+                w2.packed_bf16_exponent_base,
+                weight,
+                shard.org_vocab_start_index,
+                shard.org_vocab_end_index,
+                shard.num_org_vocab_padding,
+                shard.added_vocab_start_index,
+                shard.added_vocab_end_index,
+            )
+            weight = weight.view(*index.shape, in_features)
+        else:
+            weight = w2.weight[index]
         bias = torch.bmm(weight, markov_embed.to(weight.dtype).unsqueeze(-1))
         bias = bias.squeeze(-1).to(values.dtype)
         if self.logits_processor.scale != 1.0:

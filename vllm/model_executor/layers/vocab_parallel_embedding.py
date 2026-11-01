@@ -430,7 +430,7 @@ class VocabParallelEmbedding(PluggableLayer):
             )
 
             config = get_current_vllm_config()
-            tied = getattr(
+            tied = not prefix.endswith("markov_w2") and getattr(
                 getattr(config.model_config, "hf_text_config", None),
                 "tie_word_embeddings",
                 False,
@@ -791,8 +791,8 @@ class VocabParallelEmbedding(PluggableLayer):
             )
         if self.use_fused_embedding:
             output_parallel = torch.empty(
-                (padded_rows, self.weight.shape[1]),
-                dtype=self.weight.dtype,
+                (padded_rows, self.embedding_dim),
+                dtype=self.params_dtype,
                 device=self.weight.device,
             )
             self._fused_embedding(input_, out=output_parallel[:rows])
