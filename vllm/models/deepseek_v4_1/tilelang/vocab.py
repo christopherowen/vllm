@@ -314,23 +314,26 @@ def packed_vocab_projection(
             # unchanged, so no other output gains a +0.0 (which would turn a
             # -0.0 into +0.0).
             first = bx * block_N
-            start = row_offsets[first]
-            end = row_offsets[T.min(first + block_N, N)]
-            for index in T.serial(start, end):
-                row = exception_rows[index] - first
-                entry = exception_entries[index]
-                value = T.Cast(
-                    T.float32,
-                    T.reinterpret(T.Cast(T.uint16, entry & 0xFFFF), T.bfloat16),
-                )
-                column = entry >> 16
-                for i, j in T.Parallel(block_M, block_N):
-                    token = T.min(by * block_M + i, M - 1)
-                    C_local[i, j] = T.if_then_else(
-                        j == row,
-                        C_local[i, j] + value * T.Cast(T.float32, A[token, column]),
-                        C_local[i, j],
+            start = T.alloc_var(T.int32, init=row_offsets[first])
+            end = T.alloc_var(T.int32, init=row_offsets[T.min(first + block_N, N)])
+            if start < end:
+                for index in T.serial(start, end):
+                    row = T.alloc_var(T.int32, init=exception_rows[index] - first)
+                    entry = T.alloc_var(T.int32, init=exception_entries[index])
+                    value = T.alloc_var(
+                        T.float32,
+                        init=T.Cast(
+                            T.float32,
+                            T.reinterpret(T.Cast(T.uint16, entry & 0xFFFF), T.bfloat16),
+                        ),
                     )
+                    column = T.alloc_var(T.int32, init=entry >> 16)
+                    for i, j in T.Parallel(block_M, block_N):
+                        if j == row:
+                            token = T.min(by * block_M + i, M - 1)
+                            C_local[i, j] = C_local[i, j] + value * T.Cast(
+                                T.float32, A[token, column]
+                            )
             T.copy(C_local, C[by * block_M, bx * block_N])
 
     return vocab_packed_projection
@@ -426,23 +429,26 @@ def packed_vocab_greedy_partials(
                             B_shared[j, g * GROUP + HALF + c + v] = out_b[v]
                 T.gemm(A_shared, B_shared, C_local, transpose_B=True)
             first = bx * block_N
-            start = row_offsets[first]
-            end = row_offsets[T.min(first + block_N, N)]
-            for index in T.serial(start, end):
-                row = exception_rows[index] - first
-                entry = exception_entries[index]
-                value = T.Cast(
-                    T.float32,
-                    T.reinterpret(T.Cast(T.uint16, entry & 0xFFFF), T.bfloat16),
-                )
-                column = entry >> 16
-                for i, j in T.Parallel(block_M, block_N):
-                    token = T.min(by * block_M + i, M - 1)
-                    C_local[i, j] = T.if_then_else(
-                        j == row,
-                        C_local[i, j] + value * T.Cast(T.float32, A[token, column]),
-                        C_local[i, j],
+            start = T.alloc_var(T.int32, init=row_offsets[first])
+            end = T.alloc_var(T.int32, init=row_offsets[T.min(first + block_N, N)])
+            if start < end:
+                for index in T.serial(start, end):
+                    row = T.alloc_var(T.int32, init=exception_rows[index] - first)
+                    entry = T.alloc_var(T.int32, init=exception_entries[index])
+                    value = T.alloc_var(
+                        T.float32,
+                        init=T.Cast(
+                            T.float32,
+                            T.reinterpret(T.Cast(T.uint16, entry & 0xFFFF), T.bfloat16),
+                        ),
                     )
+                    column = T.alloc_var(T.int32, init=entry >> 16)
+                    for i, j in T.Parallel(block_M, block_N):
+                        if j == row:
+                            token = T.min(by * block_M + i, M - 1)
+                            C_local[i, j] = C_local[i, j] + value * T.Cast(
+                                T.float32, A[token, column]
+                            )
             if out_dtype == T.bfloat16:
                 for i, j in T.Parallel(block_M, block_N):
                     C_local[i, j] = T.Cast(
