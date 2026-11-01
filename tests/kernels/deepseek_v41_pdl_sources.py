@@ -65,6 +65,11 @@ CHAIN = {
 WARP_SPECIALIZED = {"gemm_bf16", "gemm_bf16_two"}
 # test_deepseek_v41_tilelang_pdl's reader that loads before its wait on purpose
 EXEMPT = {"pdl_early_reader"}
+# Predecessor-independent weights and RoPE/sink metadata that may be pre-loaded
+# before cudaGridDependencySynchronize().
+EARLY_PARAMETERS: dict[str, set[str]] = {
+    "sparse_mla": {"CosSin", "Positions", "Sinks"},
+}
 WAIT = "cudaGridDependencySynchronize()"
 TRIGGER = "cudaTriggerProgrammaticLaunchCompletion()"
 _GLOBAL = re.compile(
@@ -117,8 +122,11 @@ def violations(source: str, warp_specialized: bool) -> list[str]:
         if before.count("{") != before.count("}"):
             out.append(f"{name}: waits inside a block, so some threads may not")
         # A parameter, not a member such as threadIdx.x.
+        allowed = EARLY_PARAMETERS.get(base, set())
         early = [
-            p for p in pointers if re.search(rf"(?<![\w.]){re.escape(p)}\b", before)
+            p
+            for p in pointers
+            if p not in allowed and re.search(rf"(?<![\w.]){re.escape(p)}\b", before)
         ]
         if early:
             out.append(f"{name}: names {', '.join(early)} before the wait")
