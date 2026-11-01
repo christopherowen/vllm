@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek-V4.1's attention front after the fused Q-A/KV projection, in one launch.
 
-At decode sizes the projection's two latents went through five small kernels:
+Without fusion the projection's two latents went through five small kernels:
 TileKernels' RMSNorm of each (``norm_forward``), ``per_token_cast`` of the
 normalized q latent for Q-B, and the kv latent's RoPE and SWA cache record
 (``rope_kernel``, ``cache_writer_kernel``). ``attention_front`` is one kernel that

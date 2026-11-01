@@ -1228,6 +1228,7 @@ DECODE_TILE_ROWS = (16, 32, DECODE_ROWS)
 # into [N // 128, K // 128, 128, 128] tiles so each decode and prefill tile reads a
 # contiguous 128-wide slab per K step while keeping bit-identity with row-major [N, K].
 TILE_CONTIGUOUS_FP8: set[tuple[int, int]] = {
+    (12288, 1280),
     (8192, 1280),
     (4096, 1280),
 }

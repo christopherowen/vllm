@@ -262,8 +262,8 @@ def _carve(scratch: torch.Tensor, specs):
 def _block32_linear(
     layer, x: torch.Tensor, out: torch.Tensor, scratch: torch.Tensor | None
 ) -> None:
-    n, k = layer.weight.shape
-    k *= layer.tilelang_groups  # a grouped weight reads every group's columns
+    n = out.shape[-1]
+    k = layer.weight.shape[1] * layer.tilelang_groups  # grouped reads all groups' K
     if x.ndim != 2:
         x = x.reshape(-1, k)
         out = out.view(x.shape[0], n)
@@ -303,6 +303,19 @@ def _block32_gemm(layer, xq, sf, out, rows: int) -> None:
     """The GEMM of a block-32 projection without split-K on its MXFP8 activations
     (``_activation_specs`` buffers or a producer's ``MXFP8Rows``, the first ``rows``
     rows live)."""
+    shard_decode = getattr(layer, "tilelang_shard_decode", None)
+    if shard_decode is not None and out.shape[-1] == getattr(
+        layer, "part_output_size", -1
+    ):
+        gemm = shard_decode[decode_tile_rows(rows, {})]
+        gemm(
+            xq,
+            layer.shard_weight,
+            sf.view(torch.uint32),
+            layer.shard_weight_sf,
+            out,
+        )
+        return
     if rows > layer.tilelang_decode_rows:
         gemm = layer.tilelang_prefill
         # A producer pads rows that another projection's decode tiles read.
@@ -523,8 +536,32 @@ def _declare_block32(layer, groups: int = 1, cast: bool = True) -> None:
     caller hands the GEMMs MXFP8 activations (WO-B), so no per-token cast launches.
     A layer marked ``tilelang_mxfp8_input`` reads its input's cast from the input's
     producer (``provide_mxfp8``) and casts nothing either."""
-    n, k = layer.weight.shape
+    n = (
+        layer.logical_output_size
+        if getattr(layer, "part_output_size", 0) > 0
+        else layer.weight.shape[0]
+    )
+    k = layer.weight.shape[1]
     kernels = _block32_kernels(n, k, groups)
+    part_n = (
+        getattr(layer, "part_output_size", 0)
+        if getattr(layer, "tp_size", 1) > 1 and groups == 1
+        else 0
+    )
+    shard_decode = (
+        {
+            block_M: prepare.call(
+                mxfp8_gemm_decode,
+                part_n,
+                k,
+                **fp8_decode_config(part_n, k, block_M),
+                padded_rows=True,
+            )
+            for block_M in DECODE_TILE_ROWS
+        }
+        if part_n
+        else None
+    )
     layer.tilelang_groups = groups
     layer.tilelang_wide = WIDE_DECODE.get((n, k), {}) if groups == 1 else {}
     layer.tilelang_decode_rows = max(layer.tilelang_wide, default=DECODE_ROWS)
@@ -553,9 +590,14 @@ def _declare_block32(layer, groups: int = 1, cast: bool = True) -> None:
     def bind() -> None:
         for name, kernel in _launch(kernels).items():
             setattr(layer, f"tilelang_{name}", kernel)
+        if shard_decode is not None:
+            layer.tilelang_shard_decode = {
+                block_M: prepare.launch(c) for block_M, c in shard_decode.items()
+            }
 
     prepare.declare(
-        lambda: _calls(kernels),
+        lambda: _calls(kernels)
+        + (list(shard_decode.values()) if shard_decode is not None else []),
         bind=bind,
         warm=(lambda: _warm_casts(k * groups)) if cast else None,
     )
@@ -575,9 +617,25 @@ def _block32_scale_words(layer) -> None:
             f"block scales have {scales.shape[0]} rows for {rows} outputs; "
             "the GEMM reads one scale row per 32 output rows"
         )
-    layer.tilelang_weight_sf = pack_scale_words(scales)
+    full_sf = pack_scale_words(scales)
+    logical_n = (
+        layer.logical_output_size
+        if getattr(layer, "part_output_size", 0) > 0
+        else rows
+    )
+    layer.tilelang_weight_sf = full_sf[: logical_n // 32]
     if (
-        (rows, cols) in TILE_CONTIGUOUS_FP8
+        getattr(layer, "tp_size", 1) > 1
+        and getattr(layer, "part_output_size", 0) > 0
+    ):
+        part_n = layer.part_output_size
+        r0 = layer.tp_rank * part_n
+        r1 = r0 + part_n
+        layer.shard_weight = layer.weight[r0:r1]
+        layer.shard_weight_sf = full_sf[r0 // 32 : r1 // 32]
+    if (
+        (logical_n, cols) in TILE_CONTIGUOUS_FP8
+        and logical_n == rows
         and getattr(layer, "tilelang_groups", 1) == 1
         and not getattr(layer, "tilelang_weight_packed", False)
     ):
@@ -586,12 +644,23 @@ def _block32_scale_words(layer) -> None:
         layer.tilelang_weight = packed
         layer.tilelang_weight_packed = True
     elif not getattr(layer, "tilelang_weight_packed", False):
-        layer.tilelang_weight = layer.weight
+        layer.tilelang_weight = layer.weight[:logical_n]
 
 
-def _apply_block32(layer, x: torch.Tensor) -> torch.Tensor:
+def _apply_block32(
+    layer, x: torch.Tensor, *, out_cols: int | None = None
+) -> torch.Tensor:
+    cols = (
+        out_cols
+        if out_cols is not None
+        else (
+            layer.logical_output_size
+            if getattr(layer, "part_output_size", 0) > 0
+            else layer.weight.shape[0]
+        )
+    )
     out = torch.empty(
-        (*x.shape[:-1], layer.weight.shape[0]),
+        (*x.shape[:-1], cols),
         dtype=torch.bfloat16,
         device=x.device,
     )
@@ -634,8 +703,13 @@ class TileLangBlock32Rows:
     def __init__(self, layer: nn.Module, start: int):
         if start % 32:
             raise ValueError(f"rows from {start} do not start on a 32-row scale block")
-        self.weight = layer.weight[start:]
-        self.weight_scale_inv = layer.weight_scale_inv[start // 32 :]
+        stop = (
+            layer.logical_output_size
+            if getattr(layer, "part_output_size", 0) > 0
+            else layer.weight.shape[0]
+        )
+        self.weight = layer.weight[start:stop]
+        self.weight_scale_inv = layer.weight_scale_inv[start // 32 : stop // 32]
         _block32_scale_words(self)
 
     def declare_kernels(self) -> None:

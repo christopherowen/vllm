@@ -15,9 +15,14 @@ from vllm.compilation.breakable_cudagraph import (
     is_breakable_cudagraph_enabled,
 )
 from vllm.config import CacheConfig
-from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers import linear as linear_layers
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -155,16 +160,21 @@ class _WOProjectionWeightMethod(LinearMethodBase):
 
 
 class _PaddedMergedColumnParallelLinear(ColumnParallelLinear):
-    """Contiguously column-sharded merged projection padded to 32-row block scales.
+    """Hybrid merged projection: TP-sharded at decode, replicated at prefill/SP.
 
-    Unlike ``MergedColumnParallelLinear``, which shards each logical output tensor
-    separately (and interleaves their shards across TP ranks), this layer stacks
-    ``output_sizes`` into one logical ``sum(output_sizes)``-row weight, pads the
-    total output rows to a multiple of ``tp_size * 32`` (with zero weights and unit
-    scales in any trailing pad rows), and gives each TP rank a single contiguous
-    slice of rows. ``all_gather(dim=-1)`` reconstructs the merged output in logical
-    order, sliced back to ``sum(output_sizes)`` columns.
+    Stacks ``output_sizes`` into one logical ``sum(output_sizes)``-row weight padded
+    to a multiple of ``tp_size * 32`` (with zero weights and unit scales in any
+    trailing pad rows). Because the weight is row-major, both the full logical
+    ``[:logical_output_size]`` view and this rank's contiguous TP decode shard
+    ``[r * part : (r + 1) * part]`` are zero-copy views of ``self.weight``:
+    - Decode (``rows <= DECODE_ROWS`` outside SP prefill) projects this rank's
+      ``part_output_size`` shard and ``all_gather(dim=-1)``s back to
+      ``logical_output_size`` columns (prefetching only the TP shard into L2).
+    - Prefill, wide decode (``rows > DECODE_ROWS``) and SP prefill project the
+      full ``logical_output_size`` view locally without any TP all-gather.
     """
+
+    replicated_sp_prefill = True
 
     def __init__(
         self,
@@ -199,30 +209,54 @@ class _PaddedMergedColumnParallelLinear(ColumnParallelLinear):
                 else get_tensor_model_parallel_world_size()
             )
         )
+        rank = (
+            0
+            if disable_tp
+            else (
+                tp_rank
+                if tp_rank is not None
+                else get_tensor_model_parallel_rank()
+            )
+        )
         block = world_size * 32
         padded_output_size = cdiv(self.logical_output_size, block) * block
+        self.part_output_size = padded_output_size // world_size
         super().__init__(
             input_size=input_size,
             output_size=padded_output_size,
             bias=False,
-            gather_output=gather_output,
+            gather_output=False,
             skip_bias_add=skip_bias_add,
             params_dtype=params_dtype,
             quant_config=quant_config,
             prefix=prefix,
             return_bias=return_bias,
-            disable_tp=disable_tp,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            disable_tp=True,
         )
+        self.tp_rank = rank
+        self.tp_size = world_size
+        self.gather_output = gather_output
+        self.output_size_per_partition = self.part_output_size
         self._init_pad_rows()
+        self._refresh_views()
+
+    def _refresh_views(self) -> None:
+        r0 = self.tp_rank * self.part_output_size
+        r1 = r0 + self.part_output_size
+        w = getattr(self, "weight", None)
+        if w is not None:
+            self.full_weight = w[: self.logical_output_size]
+            self.shard_weight = w[r0:r1]
+        s = getattr(self, "weight_scale_inv", None)
+        if s is not None:
+            block_n = getattr(self, "weight_block_size", [32, 32])[0]
+            self.full_weight_scale_inv = s[: self.logical_output_size // block_n]
+            self.shard_weight_scale_inv = s[r0 // block_n : r1 // block_n]
 
     def _init_pad_rows(self, param: nn.Parameter | None = None) -> None:
-        rank_start = self.tp_rank * self.output_size_per_partition
-        rank_end = rank_start + self.output_size_per_partition
-        if rank_end <= self.logical_output_size:
+        if self.output_size <= self.logical_output_size:
             return
-        pad_start = max(0, self.logical_output_size - rank_start)
+        pad_start = self.logical_output_size
         targets = (
             (param,)
             if param is not None
@@ -283,31 +317,51 @@ class _PaddedMergedColumnParallelLinear(ColumnParallelLinear):
                 f"Expected shard {loaded_shard_id} output size "
                 f"{shard_end - shard_start}, got {loaded_weight.shape[output_dim]}"
             )
-        part_rows = self.output_size_per_partition // block_n
-        rank_start = self.tp_rank * part_rows
-        rank_end = rank_start + part_rows
-        copy_start = max(shard_start, rank_start)
-        copy_end = min(shard_end, rank_end)
-        if copy_start < copy_end:
-            copy_len = copy_end - copy_start
-            dst = param.data.narrow(output_dim, copy_start - rank_start, copy_len)
-            src = loaded_weight.narrow(output_dim, copy_start - shard_start, copy_len)
-            copy_weight(dst, src)
-        if rank_end > self.logical_output_size // block_n:
+        dst = param.data.narrow(output_dim, shard_start, shard_end - shard_start)
+        copy_weight(dst, loaded_weight)
+        if self.output_size > self.logical_output_size:
             self._init_pad_rows(param)
+        self._refresh_views()
 
     weight_loader_v2 = weight_loader
 
     def forward(self, input_):
-        output = super().forward(input_)
-        if self.output_size == self.logical_output_size or (
-            not self.gather_output and self.tp_size > 1
-        ):
-            return output
-        if self.return_bias:
-            out, bias = output
-            return out[..., : self.logical_output_size], bias
-        return output[..., : self.logical_output_size]
+        from vllm.models.deepseek_v4_1.tilelang.linear import (
+            TileLangFP8LinearMethod,
+            _apply_block32,
+        )
+
+        rows = (
+            input_.shape[0]
+            if input_.ndim == 2
+            else input_.numel() // self.input_size
+        )
+        use_shard = (
+            self.tp_size > 1
+            and self.gather_output
+            and rows <= DECODE_ROWS
+            and sp_prefill.current() is None
+        )
+        if use_shard:
+            if isinstance(self.quant_method, TileLangFP8LinearMethod):
+                local_out = _apply_block32(
+                    self, input_, out_cols=self.part_output_size
+                )
+            else:
+                local_out = self.quant_method.apply(self, input_)
+            output = linear_layers.tensor_model_parallel_all_gather(local_out)[
+                ..., : self.logical_output_size
+            ]
+        else:
+            if isinstance(self.quant_method, TileLangFP8LinearMethod):
+                output = _apply_block32(
+                    self, input_, out_cols=self.logical_output_size
+                )
+            else:
+                output = self.quant_method.apply(self, input_)[
+                    ..., : self.logical_output_size
+                ]
+        return (output, None) if self.return_bias else output
 
 
 class DeepseekV4Indexer(nn.Module):
@@ -998,22 +1052,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             columns.copy_columns(weights, front[:, q + 512 :])
         return columns.split_columns(sp_rows.gather(front), widths)
 
-    def _front(self, qr_kv, positions, sp_rows):
-        """The decode front after the fused projection in one launch
-        (``tilelang.front``): the normalized q latent and its MXFP8 cast, and the
-        normalized kv latent rotated, with its SWA record written. None where the
-        separate kernels run: sequence-parallel or prefill rows past a decode tile,
-        memory profiling (no cache pages), and breakable graphs, which write the
+    def _front(self, qr_kv, positions, sp_rows=None):
+        """The front after the fused projection in one launch (``tilelang.front``):
+        the normalized q latent and its MXFP8 cast, and the normalized kv latent
+        rotated, with its SWA record written. None where the separate kernels run:
+        memory profiling (no cache pages) and breakable graphs, which write the
         record from live metadata in an eager segment (``_cache_context_kv``)."""
         from vllm.models.deepseek_v4_1.tilelang.front import attention_front
         from vllm.models.deepseek_v4_1.tilelang.linear import empty_mxfp8
 
         rows = qr_kv.shape[0]
-        if (
-            sp_rows is not None
-            or rows > DECODE_ROWS
-            or is_breakable_cudagraph_enabled()
-        ):
+        if rows == 0 or is_breakable_cudagraph_enabled():
             return None
         metadata = get_forward_context().attn_metadata
         if not isinstance(metadata, dict):
@@ -1048,7 +1097,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         index_weights = None
         front = None
         if sp_rows is not None and self.compressor is None:
-            if getattr(self.fused_wqa_wkv, "tp_size", 1) == 1:
+            if getattr(self.fused_wqa_wkv, "tp_size", 1) == 1 or getattr(
+                self.fused_wqa_wkv, "replicated_sp_prefill", False
+            ):
                 # Sequence-parallel prefill without a compressor when fused_wqa_wkv
                 # is replicated: the row-wise front (projection, norms, index weights)
                 # runs on this rank's rows, and its product is gathered.
@@ -1103,7 +1154,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             with kernels.mxfp8_inputs(gathered):
                 qr_kv, _ = self.fused_wqa_wkv(hidden_states)
             del gathered
-            front = self._front(qr_kv, positions, sp_rows)
+            front = self._front(qr_kv, positions)
             if front is None:
                 qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
                 del qr_kv
@@ -1499,44 +1550,40 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         # Reuse the shared arena only after indexing completes. Keep full-batch
         # metadata beside, not overlapping, the native attention scratch.
         metadata_specs = self._attention_workspace_specs[mode]
-        arena = current_workspace_manager().get_simultaneous(
-            *metadata_specs, *self._attention_scratch_specs(mode, rows)
-        )
-        buffers = arena
-        metadata_count = len(metadata_specs)
-        # Decode layers sharing cache groups map identical pages, so the first
-        # layer of each group keeps its metadata for the rest of the forward.
-        # Every replay rewrites it before use, so it is an ordinary graph-pool
-        # activation: retaining it would pin one copy per captured graph.
-        if mode == "decode":
-            key = (
-                id(swa),
-                id(main),
-                self.is_draft,
-                self.is_ced_decoder,
-                rows,
-                metadata_specs,
-            )
-            context = get_forward_context()
-            shared = context.__dict__.setdefault("_ds41_decode_metadata", {})
-            entry = shared.get(key)
-            if entry is None or entry[0] is not swa or entry[1] is not main:
-                metadata_buffers = tuple(
-                    torch.empty(shape, dtype=dtype, device=q.device)
-                    for shape, dtype in metadata_specs
+        scratch_specs = self._attention_scratch_specs(mode, rows)
+        # Layers sharing cache groups map identical pages, so the first layer of
+        # each group keeps its metadata for the rest of the forward on decode and
+        # decode-sized extend steps. Every replay rewrites it before use, so it
+        # is an ordinary graph-pool activation: retaining it would pin one copy
+        # per captured graph.
+        if mode == "decode" or rows <= self._decode_capacity:
+            shared_specs = (
+                metadata_specs
+                if mode == "decode"
+                else tuple(
+                    ((rows, *shape[1:]), dtype) for shape, dtype in metadata_specs
                 )
-                self._write_decode_metadata(metadata_buffers, swa, main, rows)
-                entry = shared[key] = (swa, main, metadata_buffers)
-            buffers = [*entry[2], *arena[metadata_count:]]
+            )
+            metadata_buffers = self._shared_decode_metadata(
+                swa, main, rows, shared_specs, q.device
+            )
+            arena = current_workspace_manager().get_simultaneous(*scratch_specs)
+            scratch = list(arena)
         else:
-            self._write_decode_metadata(buffers, swa, main, rows)
-        swa_indices, swa_lengths, top_lengths = buffers[:3]
+            arena = current_workspace_manager().get_simultaneous(
+                *metadata_specs, *scratch_specs
+            )
+            metadata_count = len(metadata_specs)
+            self._write_decode_metadata(arena, swa, main, rows)
+            metadata_buffers = arena[:metadata_count]
+            scratch = arena[metadata_count:]
+        swa_indices, swa_lengths, top_lengths = metadata_buffers[:3]
         kwargs = {}
         if main is not None:
             kwargs = dict(
                 indexed_indices=owner.topk_indices_buffer[:rows],
                 indexed_lengths=top_lengths[:rows],
-                indexed_page_table=buffers[3][:rows],
+                indexed_page_table=metadata_buffers[3][:rows],
             )
         # Keep the borrowed arena, not aliases of the transient query storage.
         retain_cuda_graph_capture_resource(arena)
@@ -1544,26 +1591,89 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             mode,
             q,
             output,
-            scratch=buffers[metadata_count:],
+            scratch=scratch,
             positions=positions,
             swa_indices=swa_indices[:rows],
             swa_lengths=swa_lengths[:rows],
             **kwargs,
         )
 
+    def _shared_decode_metadata(self, swa, main, rows, specs, device):
+        replay = self._replay_start(swa)
+        key = (
+            id(swa),
+            id(main),
+            id(replay),
+            self.is_draft,
+            self.is_ced_decoder,
+            rows,
+            specs,
+        )
+        context = get_forward_context()
+        shared = context.__dict__.setdefault("_ds41_decode_metadata", {})
+        entry = shared.get(key)
+        if (
+            entry is None
+            or entry[0] is not swa
+            or entry[1] is not main
+            or entry[2] is not replay
+        ):
+            metadata_buffers = tuple(
+                torch.empty(shape, dtype=dtype, device=device)
+                for shape, dtype in specs
+            )
+            self._write_decode_metadata(metadata_buffers, swa, main, rows)
+            entry = shared[key] = (swa, main, replay, metadata_buffers)
+        return entry[3]
+
     def _attend_split(self, q, output, positions, swa, main, owner, rows, decode_rows):
         """A mixed step's attention: its decode requests' rows on the decode plan,
         the rest on the extend plan. Mixed steps run eagerly, so the per-row
-        metadata is an ordinary allocation and each plan borrows the workspace in
-        turn (stream order keeps the second from overwriting the first's scratch
-        while it runs)."""
+        metadata is an ordinary allocation shared across contiguous layers of the
+        same cache group and each plan borrows the workspace in turn (stream order
+        keeps the second from overwriting the first's scratch while it runs)."""
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("V4.1 mixed-step attention is never captured")
-        metadata = tuple(
-            torch.empty((rows, *shape[1:]), dtype=dtype, device=q.device)
+        extend_specs = tuple(
+            ((rows, *shape[1:]), dtype)
             for shape, dtype in self._attention_workspace_specs["extend"]
         )
-        self._write_decode_metadata(metadata, swa, main, rows)
+        replay = self._replay_start(swa)
+        key = (
+            id(swa),
+            id(main),
+            id(replay),
+            self.is_draft,
+            self.is_ced_decoder,
+            rows,
+            extend_specs,
+        )
+        context = get_forward_context()
+        entry = context.__dict__.get("_ds41_split_metadata")
+        if (
+            entry is None
+            or entry[0] != key
+            or entry[1] is not swa
+            or entry[2] is not main
+            or entry[3] is not replay
+        ):
+            if entry is not None and entry[4] == extend_specs:
+                metadata = entry[5]
+            else:
+                metadata = tuple(
+                    torch.empty(shape, dtype=dtype, device=q.device)
+                    for shape, dtype in extend_specs
+                )
+            self._write_decode_metadata(metadata, swa, main, rows)
+            entry = context.__dict__["_ds41_split_metadata"] = (
+                key,
+                swa,
+                main,
+                replay,
+                extend_specs,
+                metadata,
+            )
+        metadata = entry[5]
         swa_indices, swa_lengths, top_lengths = metadata[:3]
         for mode, lo, hi in (("decode", 0, decode_rows), ("extend", decode_rows, rows)):
             if hi == lo:
@@ -1642,7 +1752,69 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 **window,
             )
 
+    def _trim_padded_groups(self) -> None:
+        """Drop trailing TP-padded output groups whose loaded weights are all zero."""
+        hf = getattr(getattr(self.config, "model_config", None), "hf_config", None)
+        orig_groups = getattr(hf, "original_o_groups", self.n_groups)
+        if orig_groups >= self.n_groups:
+            return
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+        padded_groups = self.n_groups // tp_size
+        real_groups = max(0, min(orig_groups - tp_rank * padded_groups, padded_groups))
+        groups = self.n_local_groups
+        if not 0 < real_groups < groups:
+            return
+        heads_per_group = self.n_local_heads // groups
+        real_heads = real_groups * heads_per_group
+        q_rows = real_heads * self.head_dim
+        wo_rows = real_groups * self.o_lora_rank
+        from vllm.models.deepseek_v4_1.tilelang.gemm import unpack_weight_tiles
+        from vllm.models.deepseek_v4_1.tilelang.linear import _block32_scale_words
+
+        if getattr(self.wq_b, "tilelang_weight_packed", False):
+            w_q = unpack_weight_tiles(
+                self.wq_b.tilelang_weight, *self.wq_b.weight.shape
+            )
+            self.wq_b.tilelang_weight_packed = False
+        else:
+            w_q = self.wq_b.weight
+        self.wq_b.weight = nn.Parameter(w_q[:q_rows].contiguous(), requires_grad=False)
+        self.wq_b.weight_scale_inv = nn.Parameter(
+            self.wq_b.weight_scale_inv[: q_rows // 32].contiguous(),
+            requires_grad=False,
+        )
+        self.wq_b.output_size_per_partition = q_rows
+        if hasattr(self.wq_b, "tilelang_weight_sf"):
+            _block32_scale_words(self.wq_b)
+
+        self.attn_sink = nn.Parameter(
+            self.attn_sink[:real_heads].contiguous(), requires_grad=False
+        )
+        self.wo_a.weight = nn.Parameter(
+            self.wo_a.weight[:wo_rows].contiguous(), requires_grad=False
+        )
+        self.wo_a.weight_scale_inv = nn.Parameter(
+            self.wo_a.weight_scale_inv[: wo_rows // 32].contiguous(),
+            requires_grad=False,
+        )
+        self.wo_a.bmm_batch_size = real_groups
+        self.wo_a.output_size_per_partition = wo_rows
+
+        self.wo_b.weight = nn.Parameter(
+            self.wo_b.weight[:, :wo_rows].contiguous(), requires_grad=False
+        )
+        self.wo_b.weight_scale_inv = nn.Parameter(
+            self.wo_b.weight_scale_inv[:, : wo_rows // 32].contiguous(),
+            requires_grad=False,
+        )
+        self.wo_b.input_size_per_partition = wo_rows
+
+        self.n_local_groups = real_groups
+        self.n_local_heads = real_heads
+
     def setup_wo_projection(self):
+        self._trim_padded_groups()
         groups = self.n_local_groups
         heads_per_group = self.n_local_heads // groups
         group_width = heads_per_group * self.head_dim

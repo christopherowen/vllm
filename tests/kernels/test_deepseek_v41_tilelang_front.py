@@ -39,7 +39,7 @@ from vllm.models.deepseek_v4_1.tilelang.rope import rope_  # noqa: E402
 DEVICE = "cuda"
 EPS = 1e-6
 POSITIONS = 4096
-PAGES, PAGE_SIZE = 4, 128
+PAGES, PAGE_SIZE = 6, 128
 
 
 def _table():
@@ -63,7 +63,7 @@ def _assert_bytes_equal(actual, expected, what):
 
 
 @pytest.mark.parametrize("slot_dtype", [torch.int64, torch.int32])
-@pytest.mark.parametrize("rows", [1, 2, 3, 6, 8, 9, 16, 24, 48, 64, 65])
+@pytest.mark.parametrize("rows", [1, 2, 3, 6, 8, 9, 16, 24, 48, 64, 65, 512])
 def test_front_gives_the_five_kernels_bits(rows, slot_dtype):
     """Every output byte: the BF16 q latent, its E4M3 values and UE8M0 scales, the
     rotated kv latent and the cache pages (records at the slots, skipped slots and

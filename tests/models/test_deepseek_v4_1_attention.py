@@ -163,11 +163,11 @@ def test_global_preparation_populates_caches_before_forward():
         torch.testing.assert_close(backing, torch.cat((hidden * 2, hidden * 3)))
 
 
-def test_decode_front_is_one_kernel_at_decode_rows(monkeypatch):
-    """At decode rows with cache pages, the front after the fused projection is
-    ``attention_front``'s one launch, at the SWA slots and page size, and Q-B gets its
-    cast; sequence-parallel rows, rows past a decode tile and memory profiling (no
-    cache pages) run the separate kernels."""
+def test_front_is_one_kernel_across_row_counts(monkeypatch):
+    """With cache pages, the front after the fused projection is ``attention_front``'s
+    one launch across decode and prefill row counts, at the SWA slots and page size,
+    and Q-B gets its cast; memory profiling (no cache pages) and breakable graphs run
+    the separate kernels."""
     from vllm.models.deepseek_v4_1 import attention
     from vllm.models.deepseek_v4_1.tilelang import front
 
@@ -180,25 +180,25 @@ def test_decode_front_is_one_kernel_at_decode_rows(monkeypatch):
     )
     launches = []
     monkeypatch.setattr(front, "attention_front", lambda *args: launches.append(args))
-    slots = torch.arange(100, dtype=torch.int64)
+    slots = torch.arange(600, dtype=torch.int64)
     metadata = {"swa": SimpleNamespace(slot_mapping=slots)}
     monkeypatch.setattr(
         attention,
         "get_forward_context",
         lambda: SimpleNamespace(attn_metadata=metadata),
     )
-    positions = torch.zeros(6, dtype=torch.int64)
-    qr, kv, cast = module._front(torch.zeros(6, 1792), positions, None)
-    (args,) = launches
-    assert args[7].tolist() == list(range(6)) and args[8] == 128
-    assert args[9] is qr and args[12] is kv
-    assert cast.rows is qr and args[10] is cast.values and args[11] is cast.scales
-    assert qr.shape == (6, 1280) and kv.shape == (6, 512)
-    assert module._front(torch.zeros(6, 1792), positions, object()) is None
-    assert module._front(torch.zeros(65, 1792), positions, None) is None
+    for rows in (6, 65, 512):
+        positions = torch.zeros(rows, dtype=torch.int64)
+        qr, kv, cast = module._front(torch.zeros(rows, 1792), positions)
+        args = launches[-1]
+        assert args[7].tolist() == list(range(rows)) and args[8] == 128
+        assert args[9] is qr and args[12] is kv
+        assert cast.rows is qr and args[10] is cast.values and args[11] is cast.scales
+        assert qr.shape == (rows, 1280) and kv.shape == (rows, 512)
+    assert module._front(torch.zeros(0, 1792), torch.zeros(0, dtype=torch.int64)) is None
     metadata = None
-    assert module._front(torch.zeros(6, 1792), positions, None) is None
-    assert len(launches) == 1
+    assert module._front(torch.zeros(6, 1792), torch.zeros(6, dtype=torch.int64)) is None
+    assert len(launches) == 3
 
 
 def test_index_query_reuses_q_cast_and_fuses_rope_quantize(monkeypatch):
@@ -324,7 +324,7 @@ def test_attention_forward_releases_intermediates_before_o_proj(monkeypatch):
         return tensor
 
     module.fused_wqa_wkv = lambda h: (track("qr_kv", torch.ones(4, 528)), None)
-    module._front = lambda qr_kv, pos, sp: None
+    module._front = lambda qr_kv, pos: None
     module.q_norm = lambda x: track("qr", x.clone())
     module.kv_norm = lambda x: track("kv", x.clone())
     monkeypatch.setattr(
@@ -626,36 +626,66 @@ def test_padded_merged_column_parallel_linear_shards_contiguously(
             layer.weight_scale_inv.weight_loader(layer.weight_scale_inv, skv, 1)
             ranks.append(layer)
 
-    cat_w = torch.cat([r.weight.view(torch.uint8) for r in ranks], dim=0)
-    cat_s = torch.cat([r.weight_scale_inv.view(torch.uint8) for r in ranks], dim=0)
+    cat_w = torch.cat([r.shard_weight.view(torch.uint8) for r in ranks], dim=0)
+    cat_s = torch.cat([r.shard_weight_scale_inv.view(torch.uint8) for r in ranks], dim=0)
     assert torch.equal(cat_w[:1792], full_w)
     assert torch.equal(cat_s[:56], full_s)
+    for r in ranks:
+        assert torch.equal(r.full_weight.view(torch.uint8), full_w)
+        assert torch.equal(r.full_weight_scale_inv.view(torch.uint8), full_s)
+        assert r.shard_weight.data_ptr() == (
+            r.weight.data_ptr() + r.tp_rank * expected_part * k
+        )
     if tp_size == 3:
         assert not cat_w[1792:].any()
         assert (cat_s[56:] == 0x7F).all()
 
     for r in ranks:
         r.quant_method = SimpleNamespace(
-            apply=lambda lyr, x, bias=None: x @ lyr.weight.view(torch.uint8).float().T
+            apply=lambda lyr, x, bias=None: (
+                x
+                @ (
+                    lyr.shard_weight
+                    if x.shape[0] <= 64
+                    else lyr.full_weight
+                )
+                .view(torch.uint8)
+                .float()
+                .T
+            )
         )
+    gather_calls = []
     monkeypatch.setattr(
         linear_mod,
         "tensor_model_parallel_all_gather",
-        lambda local_out: torch.cat(
-            [
-                r.quant_method.apply(r, torch.ones(5, k))
-                for r in ranks
-            ],
-            dim=-1,
-        ),
+        lambda local_out: (
+            gather_calls.append(local_out.shape[0]),
+            torch.cat(
+                [
+                    r.quant_method.apply(r, torch.ones(local_out.shape[0], k))
+                    for r in ranks
+                ],
+                dim=-1,
+            ),
+        )[1],
     )
     out, bias = ranks[0](torch.ones(5, k))
     assert bias is None
     assert out.shape == (5, 1792)
+    assert gather_calls == ([5] if tp_size > 1 else [])
     if tp_size == 3:
         assert out.stride() == (1824, 1)
     expected = torch.ones(5, k) @ full_w.float().T
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+    # Prefill / wide-decode (rows > 64) runs the full view locally without all-gather.
+    gather_calls.clear()
+    out_prefill, _ = ranks[0](torch.ones(65, k))
+    assert out_prefill.shape == (65, 1792)
+    assert gather_calls == []
+    torch.testing.assert_close(
+        out_prefill, torch.ones(65, k) @ full_w.float().T, rtol=0, atol=0
+    )
 
 
 def test_sp_prefill_with_sharded_fused_wqa_wkv_gathers_mxfp8(monkeypatch):
@@ -707,7 +737,7 @@ def test_sp_prefill_with_sharded_fused_wqa_wkv_gathers_mxfp8(monkeypatch):
 
     sharded_wqa_wkv.tp_size = 4
     module.fused_wqa_wkv = sharded_wqa_wkv
-    module._front = lambda qr_kv, pos, sp: None
+    module._front = lambda qr_kv, pos: None
     module.q_norm = lambda x: x.contiguous()
     module.kv_norm = lambda x: x.contiguous()
     monkeypatch.setattr(
@@ -760,3 +790,90 @@ def test_sp_prefill_with_sharded_fused_wqa_wkv_gathers_mxfp8(monkeypatch):
     ]
     assert len(seen_index_weights) == 1
     torch.testing.assert_close(seen_index_weights[0], gathered_w[4:8], rtol=0, atol=0)
+
+
+def test_tp3_rank2_trims_zero_padded_output_group(monkeypatch):
+    """On TP3 (8 output groups padded to 9), rank 2 trims its zero-padded 3rd group
+    (heads 16..23) in ``setup_wo_projection`` before kernel declaration, while ranks
+    0 and 1 keep all 3 real groups (24 heads)."""
+    from torch import nn
+
+    from vllm.models.deepseek_v4_1 import attention
+    from vllm.models.deepseek_v4_1.tilelang import wo
+
+    monkeypatch.setattr(
+        wo,
+        "TileLangWOProjection",
+        lambda wo_a, wo_b, groups: SimpleNamespace(
+            wo_a=wo_a, wo_b=wo_b, groups=groups
+        ),
+    )
+
+    def make_layer():
+        module = _tilelang_layer(layer_id=0)
+        module.config.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(original_o_groups=8, o_groups=9)
+        )
+        module.n_groups = 9
+        module.n_local_groups = 3
+        module.n_local_heads = 24
+        module.head_dim = 512
+        module.o_lora_rank = 1024
+        module.hidden_size = 5120
+        module.attn_sink = nn.Parameter(
+            torch.arange(24, dtype=torch.float32), requires_grad=False
+        )
+        module.wq_b = nn.Module()
+        module.wq_b.weight = nn.Parameter(
+            torch.zeros((24 * 512, 1280), dtype=torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+        module.wq_b.weight_scale_inv = nn.Parameter(
+            torch.ones((24 * 512 // 32, 1280 // 32), dtype=torch.uint8),
+            requires_grad=False,
+        )
+        module.wo_a = nn.Module()
+        module.wo_a.weight = nn.Parameter(
+            torch.zeros((3 * 1024, 4096), dtype=torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+        module.wo_a.weight_scale_inv = nn.Parameter(
+            torch.ones((3 * 1024 // 32, 4096 // 32), dtype=torch.uint8),
+            requires_grad=False,
+        )
+        module.wo_b = nn.Module()
+        module.wo_b.weight = nn.Parameter(
+            torch.zeros((5120, 3 * 1024), dtype=torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+        module.wo_b.weight_scale_inv = nn.Parameter(
+            torch.ones((5120 // 32, 3 * 1024 // 32), dtype=torch.uint8),
+            requires_grad=False,
+        )
+        return module
+
+    monkeypatch.setattr(attention, "get_tensor_model_parallel_world_size", lambda: 3)
+
+    for rank in (0, 1):
+        monkeypatch.setattr(attention, "get_tensor_model_parallel_rank", lambda: rank)
+        layer = make_layer()
+        layer.setup_wo_projection()
+        assert layer.n_local_groups == 3
+        assert layer.n_local_heads == 24
+        assert layer.wq_b.weight.shape == (12288, 1280)
+        assert layer._wo_projection_weights.groups == 3
+
+    monkeypatch.setattr(attention, "get_tensor_model_parallel_rank", lambda: 2)
+    layer_r2 = make_layer()
+    layer_r2.setup_wo_projection()
+    layer_r2.setup_wo_projection()  # idempotent
+    assert layer_r2.n_local_groups == 2
+    assert layer_r2.n_local_heads == 16
+    assert layer_r2.attn_sink.shape == (16,)
+    assert layer_r2.wq_b.weight.shape == (8192, 1280)
+    assert layer_r2.wq_b.weight_scale_inv.shape == (8192 // 32, 1280 // 32)
+    assert layer_r2.wo_a.weight.shape == (2048, 4096)
+    assert layer_r2.wo_a.weight_scale_inv.shape == (2048 // 32, 4096 // 32)
+    assert layer_r2.wo_b.weight.shape == (5120, 2048)
+    assert layer_r2.wo_b.weight_scale_inv.shape == (5120 // 32, 2048 // 32)
+    assert layer_r2._wo_projection_weights.groups == 2

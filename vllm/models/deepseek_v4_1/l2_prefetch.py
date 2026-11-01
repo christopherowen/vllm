@@ -76,16 +76,21 @@ BUDGET_NEXT = _l2pf._mb("VLLM_DS41_L2_PREFETCH_NEXT_MB", "20")
 
 
 def linear_segments(name: str, linear: torch.nn.Module | None) -> list[Segment]:
-    """Bytes read by a V4.1 linear: its weight, and its scale words."""
+    """Bytes read by a V4.1 linear at decode: its weight (or TP decode shard), and
+    its scale words."""
     if linear is None:
         return []
+    weight = getattr(linear, "shard_weight", getattr(linear, "weight", None))
+    weight_sf = getattr(
+        linear, "shard_weight_sf", getattr(linear, "tilelang_weight_sf", None)
+    )
     segments = [
-        _l2pf.tensor_segment(f"{name}.weight", getattr(linear, "weight", None)),
+        _l2pf.tensor_segment(f"{name}.weight", weight),
         # Scale bytes beside the weight: packed 32-row block words, or WO-A's
         # raw 32x32 exponent grid. The GEMM indexes either with row // 32.
         _l2pf.tensor_segment(
             f"{name}.tilelang_weight_sf",
-            getattr(linear, "tilelang_weight_sf", None),
+            weight_sf,
             min_bytes=0,
         ),
     ]
