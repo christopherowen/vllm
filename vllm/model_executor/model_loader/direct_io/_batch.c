@@ -68,10 +68,43 @@ static PyObject *py_batch_executor(PyObject *self, PyObject *args) {
     return capsule;
 }
 
+static uintptr_t job_end(const read_job_t *job) {
+    return (uintptr_t)job->destination +
+           (uint64_t)job->bytes * (1 + job->expand_bf16) +
+           (uint64_t)(job->rows - 1) * (uint64_t)job->destination_stride;
+}
+
 static int job_destination_order(const void *a, const void *b) {
-    uintptr_t x = (uintptr_t)((const read_job_t *)a)->destination;
-    uintptr_t y = (uintptr_t)((const read_job_t *)b)->destination;
-    return (x > y) - (x < y);
+    const read_job_t *ja = a, *jb = b;
+    uintptr_t x = (uintptr_t)ja->destination;
+    uintptr_t y = (uintptr_t)jb->destination;
+    if (x != y) return (x > y) - (x < y);
+    uintptr_t ex = job_end(ja);
+    uintptr_t ey = job_end(jb);
+    return (ex > ey) - (ex < ey);
+}
+
+static bool jobs_overlap(const read_job_t *a, const read_job_t *b) {
+    uintptr_t start_a = (uintptr_t)a->destination;
+    uintptr_t start_b = (uintptr_t)b->destination;
+    uintptr_t end_a = job_end(a);
+    if (end_a <= start_b) return false;
+    uint64_t width_a = (uint64_t)a->bytes * (1 + a->expand_bf16);
+    uint64_t stride_a = (uint64_t)a->destination_stride;
+    if (a->rows == 1 || stride_a <= width_a) return true;
+    uint64_t width_b = (uint64_t)b->bytes * (1 + b->expand_bf16);
+    uint64_t stride_b = (uint64_t)b->destination_stride;
+    if (b->rows == 1 || stride_b == stride_a) {
+        uint64_t rem = (start_b - start_a) % stride_a;
+        return rem < width_a || rem + width_b > stride_a;
+    }
+    for (int64_t row = 0; row < b->rows; row++) {
+        uintptr_t pos = start_b + (uint64_t)row * stride_b;
+        if (pos >= end_a) break;
+        uint64_t rem = (pos - start_a) % stride_a;
+        if (rem < width_a || rem + width_b > stride_a) return true;
+    }
+    return false;
 }
 
 static int job_source_order(const void *a, const void *b) {
@@ -132,8 +165,10 @@ static PyObject *py_batch_execute(PyObject *self, PyObject *args) {
                 capacity = next;
             }
             int64_t chunk = bytes > BATCH_CHUNK_BYTES ? BATCH_CHUNK_BYTES : (int64_t)bytes;
+            uint64_t row_bytes = bytes * (1 + expand_bf16);
             uint64_t chunk_rows = 1;
-            if (bytes <= BATCH_CHUNK_BYTES && destination_stride == bytes * (1 + expand_bf16)) {
+            if (bytes <= BATCH_CHUNK_BYTES && source_stride >= bytes &&
+                destination_stride >= row_bytes) {
                 uint64_t stride = source_stride > destination_stride ? source_stride : destination_stride;
                 chunk_rows = stride ? BATCH_CHUNK_BYTES / stride : 1;
                 if (!chunk_rows) chunk_rows = 1;
@@ -161,14 +196,25 @@ static PyObject *py_batch_execute(PyObject *self, PyObject *args) {
         }
     }
     qsort(jobs, count, sizeof(*jobs), job_destination_order);
+    size_t active_start = 0;
+    uintptr_t max_end = count ? job_end(&jobs[0]) : 0;
     for (size_t i = 1; i < count; i++) {
-        read_job_t *previous = &jobs[i - 1];
-        if ((uintptr_t)previous->destination + previous->bytes * (1 + previous->expand_bf16) +
-            (previous->rows - 1) * previous->destination_stride >
-            (uintptr_t)jobs[i].destination) {
-            snprintf(failure.message, sizeof(failure.message), "overlapping batch destinations need an explicit dependency");
-            goto done;
+        uintptr_t start_i = (uintptr_t)jobs[i].destination;
+        uintptr_t end_i = job_end(&jobs[i]);
+        if (start_i >= max_end) {
+            active_start = i;
+            max_end = end_i;
+            continue;
         }
+        while (active_start < i && job_end(&jobs[active_start]) <= start_i)
+            active_start++;
+        for (size_t k = active_start; k < i; k++) {
+            if (jobs_overlap(&jobs[k], &jobs[i])) {
+                snprintf(failure.message, sizeof(failure.message), "overlapping batch destinations need an explicit dependency");
+                goto done;
+            }
+        }
+        if (end_i > max_end) max_end = end_i;
     }
     qsort(jobs, count, sizeof(*jobs), job_source_order);
     Py_BEGIN_ALLOW_THREADS

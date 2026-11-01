@@ -77,9 +77,8 @@ def test_tp_column_slices_preserve_padding_and_expand_bf16(
         target = backing[:, :, 1:-1] if padded else backing
         assert session(target, source)
         stats = session.stats()
-        if not padded:
-            assert stats["strided_copy_bytes"] == source.nbytes
-            assert stats["reads"] < 8
+        assert stats["strided_copy_bytes"] == source.nbytes
+        assert stats["reads"] < 8
         assert stats["descriptors"] == 2
     torch.testing.assert_close(
         target.cpu(),
@@ -638,3 +637,36 @@ def test_file_backed_tables_stay_descriptors_beside_routed_weights(tmp_path):
         checkpoint.seek(descriptor.offset)
         assert checkpoint.read(table.nbytes) == table.numpy().tobytes()
     torch.testing.assert_close(destination.cpu(), weight, rtol=0, atol=0)
+
+
+def test_padded_2d_destinations_batch_strided_rows_and_detect_overlaps(tmp_path):
+    """Column-padded 2D destinations (such as TP5/TP7/TP8 MoE w2 shards) must
+    coalesce multi-row strided reads while still rejecting overlapping 2D slices."""
+    expected = torch.arange(2560 * 1152, dtype=torch.int32).to(torch.uint8).reshape(
+        2560, 1152
+    )
+    path = tmp_path / "w2.safetensors"
+    save_file({"w2": expected}, path)
+    with DirectWeightSession() as session:
+        source = dict(session.weights([path]))["w2"]
+        backing = torch.full((2560, 160), 255, dtype=torch.uint8, device="cuda")
+        assert session(backing[:, :72], source[:, :72])
+        assert session(backing[:, 80:152], source[:, 72:144])
+        stats = session.stats()
+        assert stats["descriptors"] == 2
+        assert stats["strided_copy_bytes"] == 2560 * 144
+        assert stats["reads"] <= 8
+    actual = backing.cpu()
+    assert torch.equal(actual[:, :72], expected[:, :72])
+    assert torch.equal(actual[:, 80:152], expected[:, 72:144])
+    assert torch.all(actual[:, 72:80] == 255)
+    assert torch.all(actual[:, 152:] == 255)
+
+    with DirectWeightSession() as session:
+        source = dict(session.weights([path]))["w2"]
+        overlap_target = torch.zeros((2560, 160), dtype=torch.uint8, device="cuda")
+        assert session(overlap_target[:, :80], source[:, :80])
+        assert session(overlap_target[:, 64:144], source[:, 64:144])
+        with pytest.raises(RuntimeError, match="overlapping batch destinations"):
+            session.flush()
+    assert torch.count_nonzero(overlap_target) == 0
