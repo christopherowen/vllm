@@ -560,3 +560,203 @@ def test_prepare_global_kv_fuses_compressor_indexed_kv_and_wk_partials(monkeypat
     assert comp_calls[0]["kv_page_size"] == 64
     assert len(key_writes) == 1
     assert key_writes[0][0] is partials
+
+
+@pytest.mark.parametrize("tp_size,expected_part", [(1, 1792), (3, 608), (4, 448)])
+def test_padded_merged_column_parallel_linear_shards_contiguously(
+    monkeypatch, tp_size, expected_part
+):
+    """``_PaddedMergedColumnParallelLinear`` stacks ``[wq_a (1280), wkv (512)]`` into one
+    contiguous 1792-row logical matrix, pads to a multiple of ``tp_size * 32`` (1824 at
+    TP3 with zero weights and 0x7F unit UE8M0 scales in the trailing 32 rows), and
+    all-gathers + slices back to 1792 columns."""
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.distributed import parallel_state
+    from vllm.model_executor.layers import linear as linear_mod
+    from vllm.models.deepseek_v4_1.attention import _PaddedMergedColumnParallelLinear
+    from vllm.models.deepseek_v4_1.quant_config import DeepseekV41FP8Config
+
+    quant_config = DeepseekV41FP8Config(
+        is_checkpoint_fp8_serialized=True, weight_block_size=[32, 32]
+    )
+    k = 64
+    wq_a = torch.arange(1280 * k, dtype=torch.uint8).reshape(1280, k).view(
+        torch.float8_e4m3fn
+    )
+    wkv = torch.arange(512 * k, dtype=torch.uint8).reshape(512, k).view(
+        torch.float8_e4m3fn
+    )
+    sq_a = (
+        torch.arange(40 * 2, dtype=torch.uint8)
+        .reshape(40, 2)
+        .clamp(1, 250)
+        .view(torch.float8_e8m0fnu)
+    )
+    skv = (
+        torch.arange(16 * 2, dtype=torch.uint8)
+        .reshape(16, 2)
+        .clamp(1, 250)
+        .view(torch.float8_e8m0fnu)
+    )
+    full_w = torch.cat([wq_a.view(torch.uint8), wkv.view(torch.uint8)], dim=0)
+    full_s = torch.cat([sq_a.view(torch.uint8), skv.view(torch.uint8)], dim=0)
+
+    ranks = []
+    with set_current_vllm_config(VllmConfig()):
+        for rank in range(tp_size):
+            monkeypatch.setattr(
+                parallel_state,
+                "_TP",
+                SimpleNamespace(rank_in_group=rank, world_size=tp_size),
+            )
+            layer = _PaddedMergedColumnParallelLinear(
+                k,
+                [1280, 512],
+                bias=False,
+                gather_output=True,
+                quant_config=quant_config,
+                tp_rank=rank,
+                tp_size=tp_size,
+                prefix=f"test.r{rank}.fused_wqa_wkv",
+            )
+            assert layer.output_size_per_partition == expected_part
+            layer.weight.weight_loader(layer.weight, wq_a, 0)
+            layer.weight.weight_loader(layer.weight, wkv, 1)
+            layer.weight_scale_inv.weight_loader(layer.weight_scale_inv, sq_a, 0)
+            layer.weight_scale_inv.weight_loader(layer.weight_scale_inv, skv, 1)
+            ranks.append(layer)
+
+    cat_w = torch.cat([r.weight.view(torch.uint8) for r in ranks], dim=0)
+    cat_s = torch.cat([r.weight_scale_inv.view(torch.uint8) for r in ranks], dim=0)
+    assert torch.equal(cat_w[:1792], full_w)
+    assert torch.equal(cat_s[:56], full_s)
+    if tp_size == 3:
+        assert not cat_w[1792:].any()
+        assert (cat_s[56:] == 0x7F).all()
+
+    for r in ranks:
+        r.quant_method = SimpleNamespace(
+            apply=lambda lyr, x, bias=None: x @ lyr.weight.view(torch.uint8).float().T
+        )
+    monkeypatch.setattr(
+        linear_mod,
+        "tensor_model_parallel_all_gather",
+        lambda local_out: torch.cat(
+            [
+                r.quant_method.apply(r, torch.ones(5, k))
+                for r in ranks
+            ],
+            dim=-1,
+        ),
+    )
+    out, bias = ranks[0](torch.ones(5, k))
+    assert bias is None
+    assert out.shape == (5, 1792)
+    if tp_size == 3:
+        assert out.stride() == (1824, 1)
+    expected = torch.ones(5, k) @ full_w.float().T
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+def test_sp_prefill_with_sharded_fused_wqa_wkv_gathers_mxfp8(monkeypatch):
+    """When ``fused_wqa_wkv`` is column-sharded across TP (``tp_size > 1``), SP prefill
+    without a compressor gathers the already-cast local ``MXFP8Rows`` and local
+    ``indexer.weights_proj`` in one ``gather_mxfp8`` call, skipping ``sp_rows.gather``
+    and a second ``cast_mxfp8`` on ``hidden_states``."""
+    from vllm.models.deepseek_v4_1 import attention, kernels, sp_prefill
+    from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows, provided_mxfp8
+
+    module = _tilelang_layer(layer_id=5)
+    module._ready = True
+    module.q_lora_rank = 16
+    module.n_local_heads = 2
+    module._l2pf_wo = None
+    module._l2pf_comp = None
+    module.swa_cache_layer = SimpleNamespace(prefix="swa")
+
+    local_x = torch.ones((4, 32), dtype=torch.bfloat16)
+    local_q = MXFP8Rows(
+        rows=local_x,
+        values=torch.ones((64, 32), dtype=torch.uint8),
+        scales=torch.ones((64, 1), dtype=torch.uint8),
+    )
+    gathered_x = torch.ones((10, 32), dtype=torch.bfloat16)
+    gathered_q = MXFP8Rows(
+        rows=gathered_x,
+        values=torch.ones((64, 32), dtype=torch.uint8),
+        scales=torch.ones((64, 1), dtype=torch.uint8),
+    )
+    gathered_w = torch.full((10, 4), 3.0, dtype=torch.bfloat16)
+    events = []
+
+    class _FakeSPRows:
+        num_tokens = 10
+        start = 4
+        real_rows = 4
+
+        def gather(self, _):
+            raise AssertionError("BF16 gather should not run when local MXFP8 is provided")
+
+        def gather_mxfp8(self, x_q, *extra):
+            events.append(("gather_mxfp8", x_q is local_q, len(extra)))
+            return (gathered_q, gathered_w)
+
+    def sharded_wqa_wkv(h):
+        events.append(("fused_wqa_wkv", h is gathered_x, provided_mxfp8(h) is gathered_q))
+        return torch.ones((10, 16 + 512), dtype=torch.bfloat16), None
+
+    sharded_wqa_wkv.tp_size = 4
+    module.fused_wqa_wkv = sharded_wqa_wkv
+    module._front = lambda qr_kv, pos, sp: None
+    module.q_norm = lambda x: x.contiguous()
+    module.kv_norm = lambda x: x.contiguous()
+    monkeypatch.setattr(
+        kernels,
+        "cast_mxfp8",
+        lambda rows: (
+            events.append(("cast_mxfp8", tuple(rows.shape))),
+            MXFP8Rows(
+                rows,
+                torch.ones((64, rows.shape[1]), dtype=torch.uint8),
+                torch.ones((64, 1), dtype=torch.uint8),
+            ),
+        )[1],
+    )
+    module.wq_b = lambda qr: torch.ones((qr.shape[0], 2 * 512), dtype=torch.bfloat16)
+    module._rope = lambda x, pos, role: x
+    module._cache_context_kv = lambda kv, pos: None
+    module.indexer = SimpleNamespace(
+        heads=4,
+        wq_b=lambda qr: torch.ones((qr.shape[0], 4 * 128), dtype=torch.bfloat16),
+        weights_proj=lambda h: (
+            events.append(("weights_proj", tuple(h.shape))),
+            torch.ones((h.shape[0], 4), dtype=torch.bfloat16),
+        )[1],
+    )
+    module._quantize_index_query = lambda mode, iq, data, scale, positions=None: None
+    seen_index_weights = []
+
+    def check_forward_mqa(q, kv, pos, output, *, index_query=None):
+        seen_index_weights.append(index_query[2])
+        output.zero_()
+
+    module.forward_mqa = check_forward_mqa
+    module._o_proj = lambda output, sp_rows=None: torch.zeros((4, 32), dtype=torch.bfloat16)
+    metadata = {"swa": SimpleNamespace(is_decode=False)}
+    monkeypatch.setattr(
+        attention,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=metadata),
+    )
+    monkeypatch.setattr(sp_prefill, "current", lambda: _FakeSPRows())
+    with kernels.mxfp8_inputs(local_q):
+        out = module._forward(torch.arange(10), local_x)
+    assert out.shape == (4, 32)
+    assert events == [
+        ("weights_proj", (4, 32)),
+        ("gather_mxfp8", True, 1),
+        ("fused_wqa_wkv", True, True),
+        ("cast_mxfp8", (10, 16)),
+    ]
+    assert len(seen_index_weights) == 1
+    torch.testing.assert_close(seen_index_weights[0], gathered_w[4:8], rtol=0, atol=0)

@@ -99,6 +99,13 @@ def mxfp8_inputs(rows) -> contextlib.AbstractContextManager:
     return provide_mxfp8(rows)
 
 
+def try_provided_mxfp8(rows: torch.Tensor):
+    """The handed-over MXFP8 cast of ``rows`` if active, else None."""
+    from .tilelang.linear import try_provided_mxfp8
+
+    return try_provided_mxfp8(rows)
+
+
 @contextlib.contextmanager
 def sp_moe_inputs(
     sp_rows,

@@ -551,3 +551,107 @@ def test_tile_contiguous_fp8_matches_row_major(default_vllm_config, n, k):
         for rows in ROWS:
             out = method.apply(layer, x[:rows])
             assert torch.equal(out, full_ref[:rows]), f"linear apply rows={rows}"
+
+
+@pytest.mark.parametrize("tp_size,part_n", [(4, 448), (3, 608)])
+def test_sharded_wqa_wkv_and_strided_attention_front_match_replicated(tp_size, part_n):
+    """Column-sharded target ``fused_wqa_wkv`` (448 rows/rank at TP4; 608 rows/rank
+    padded to 1824 at TP3 with a zero-copy ``[:, :1792]`` strided slice) matches the
+    replicated 1792-row projection and ``attention_front`` bit for bit."""
+    from vllm.models.deepseek_v4_1.tilelang.front import attention_front
+    from vllm.models.deepseek_v4_1.tilelang.linear import empty_mxfp8
+
+    k = 5120
+    weight, exps, _ = _block32_weight(1792, k, 29)
+    weight_sf = pack_scale_words(exps)
+    if tp_size * part_n > 1792:
+        pad = tp_size * part_n - 1792
+        w_pad = torch.cat(
+            [
+                weight,
+                torch.zeros((pad, k), dtype=weight.dtype, device=DEVICE),
+            ],
+            dim=0,
+        )
+        s_pad = torch.cat(
+            [
+                exps,
+                torch.full((pad // 32, exps.shape[1]), 0x7F, dtype=exps.dtype, device=DEVICE),
+            ],
+            dim=0,
+        )
+    else:
+        w_pad, s_pad = weight, exps
+
+    shards = [
+        (
+            w_pad[r * part_n : (r + 1) * part_n].contiguous(),
+            pack_scale_words(s_pad[r * (part_n // 32) : (r + 1) * (part_n // 32)].contiguous()),
+        )
+        for r in range(tp_size)
+    ]
+
+    x = torch.randn((256, k), generator=_gen(31), device=DEVICE).bfloat16()
+    xq, sf, _ = _mxfp8(x)
+    words = sf.contiguous().view(torch.uint32)
+
+    ref_prefill = mxfp8_gemm(1792, k, **fp8_prefill_config(1792, k))
+    shard_prefill = mxfp8_gemm(part_n, k, **fp8_prefill_config(part_n, k))
+    full_ref = torch.empty((256, 1792), dtype=torch.bfloat16, device=DEVICE)
+    ref_prefill(xq, weight, words, weight_sf, full_ref)
+    shard_outs = []
+    for w_s, sf_s in shards:
+        o = torch.empty((256, part_n), dtype=torch.bfloat16, device=DEVICE)
+        shard_prefill(xq, w_s, words, sf_s, o)
+        shard_outs.append(o)
+    cat_prefill = torch.cat(shard_outs, dim=1)[:, :1792]
+    assert torch.equal(cat_prefill, full_ref)
+
+    for block_M in DECODE_TILE_ROWS:
+        k_ref = mxfp8_gemm_decode(
+            1792, k, **fp8_decode_config(1792, k, block_M), padded_rows=True
+        )
+        k_shard = mxfp8_gemm_decode(
+            part_n, k, **fp8_decode_config(part_n, k, block_M), padded_rows=True
+        )
+        rows = min(6, block_M)
+        out_ref = torch.empty((rows, 1792), dtype=torch.bfloat16, device=DEVICE)
+        k_ref(xq[:DECODE_ROWS], weight, words[:DECODE_ROWS], weight_sf, out_ref)
+        parts = []
+        for w_s, sf_s in shards:
+            o = torch.empty((rows, part_n), dtype=torch.bfloat16, device=DEVICE)
+            k_shard(xq[:DECODE_ROWS], w_s, words[:DECODE_ROWS], sf_s, o)
+            parts.append(o)
+        cat_decode = torch.cat(parts, dim=1)[:, :1792]
+        assert torch.equal(cat_decode, out_ref)
+
+    # Verify attention_front on the strided TP3 view (stride 1824) matches contiguous.
+    rows = 6
+    gen = _gen(37)
+    qw = (torch.rand((1280,), generator=gen, device=DEVICE) + 0.5).bfloat16()
+    kvw = (torch.rand((512,), generator=gen, device=DEVICE) + 0.5).bfloat16()
+    positions = torch.arange(rows, dtype=torch.int64, device=DEVICE)
+    cos_sin = torch.randn((32, 64), generator=gen, device=DEVICE, dtype=torch.float32)
+    slots = torch.arange(rows, dtype=torch.int64, device=DEVICE)
+    cache_ref = torch.zeros((2, 128 * 528), dtype=torch.uint8, device=DEVICE)
+    cache_shd = torch.zeros_like(cache_ref)
+    qn_ref = torch.empty((rows, 1280), dtype=torch.bfloat16, device=DEVICE)
+    qn_shd = torch.empty_like(qn_ref)
+    kv_ref = torch.empty((rows, 512), dtype=torch.bfloat16, device=DEVICE)
+    kv_shd = torch.empty_like(kv_ref)
+    qc_ref = empty_mxfp8(qn_ref)
+    qc_shd = empty_mxfp8(qn_shd)
+
+    attention_front(
+        out_ref, qw, kvw, 1e-6, positions, cos_sin, cache_ref, slots, 128,
+        qn_ref, qc_ref.values, qc_ref.scales, kv_ref,
+    )
+    attention_front(
+        cat_decode, qw, kvw, 1e-6, positions, cos_sin, cache_shd, slots, 128,
+        qn_shd, qc_shd.values, qc_shd.scales, kv_shd,
+    )
+    assert torch.equal(qn_shd, qn_ref)
+    assert torch.equal(kv_shd, kv_ref)
+    assert torch.equal(qc_shd.values[:rows], qc_ref.values[:rows])
+    assert torch.equal(qc_shd.scales[:rows], qc_ref.scales[:rows])
+    assert torch.equal(cache_shd, cache_ref)

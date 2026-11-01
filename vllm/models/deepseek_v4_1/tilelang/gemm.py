@@ -1260,6 +1260,19 @@ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
         32: dict(block_N=32, block_K=256, num_stages=3),
         64: dict(block_N=64, block_K=128, num_stages=2),
     },
+    # TP4 (448 x 5120) and TP3 (608 x 5120, 1792 padded to 1824) column-sharded
+    # target fused Q-A/KV.
+    (448, 5120): {
+        16: dict(block_N=32, block_K=256, num_stages=4),
+        32: dict(block_N=32, block_K=256, num_stages=4),
+        64: dict(block_N=32, block_K=256, num_stages=4),
+    },
+    (608, 5120): {
+        16: dict(block_N=32, block_K=256, num_stages=4),
+        32: dict(block_N=32, block_K=256, num_stages=4),
+        64: dict(block_N=32, block_K=256, num_stages=4),
+    },
+    # TP4 shared expert: gate/up and down.
     (1152, 5120): {
         16: dict(block_N=32, block_K=256, num_stages=3),
         32: dict(block_N=32, block_K=256, num_stages=3),
@@ -1453,6 +1466,8 @@ def split_row_tile(rows: int) -> int:
 WIDE_DECODE: dict[tuple[int, int], dict[int, int]] = {
     (1792, 5120): {96: 32, 128: 64},
     (1536, 5120): {128: 64},
+    (448, 5120): {96: 32, 128: 64},
+    (608, 5120): {96: 32, 128: 64},
     (1152, 5120): {128: 64},
     (1024, 5120): {128: 64},
     (768, 5120): {128: 64},

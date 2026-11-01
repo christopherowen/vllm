@@ -110,7 +110,7 @@ def attention_front_kernel(eps: float, page_size: int, slot_dtype: str = "int64"
     last = k["num_thread_vec"] - 1  # the vector index (of four) holding the rotation
     record = RECORD_BYTES["swa"]
     width = Q_LATENT + KV_LATENT
-    M, Mq = T.dynamic("M, Mq")
+    M, Mq, qa_stride = T.dynamic("M, Mq, qa_stride")
     sf_shape = get_sf_shape((M, Q_LATENT), out_config)
     positions_max = T.dynamic("positions_max")
     pages, page_bytes, page_stride = T.dynamic("pages, page_bytes, page_stride")
@@ -198,7 +198,7 @@ def attention_front_kernel(eps: float, page_size: int, slot_dtype: str = "int64"
 
     @T.prim_func
     def attention_front(
-        qa_kv: T.Tensor((M, width), T.bfloat16),
+        qa_kv: T.StridedTensor((M, width), (qa_stride, 1), T.bfloat16),
         q_weight: T.Tensor((Q_LATENT,), T.bfloat16),
         kv_weight: T.Tensor((KV_LATENT,), T.bfloat16),
         positions: T.Tensor((M,), T.int64),

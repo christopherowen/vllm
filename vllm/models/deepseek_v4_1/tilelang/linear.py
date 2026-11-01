@@ -187,6 +187,9 @@ def optional_provided_mxfp8(x: torch.Tensor) -> MXFP8Rows | None:
     return None
 
 
+try_provided_mxfp8 = optional_provided_mxfp8
+
+
 def provided_mxfp8(x: torch.Tensor) -> MXFP8Rows:
     """The handed-over cast of ``x``: rows at ``x``'s address, of ``x``'s shape. The
     holder keeps them alive, so no other tensor can be at that address. A projection
@@ -861,4 +864,5 @@ __all__ = [
     "provide_mxfp8",
     "provided_mxfp8",
     "slice_mxfp8",
+    "try_provided_mxfp8",
 ]
