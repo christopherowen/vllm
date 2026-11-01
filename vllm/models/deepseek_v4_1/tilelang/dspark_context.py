@@ -18,8 +18,10 @@ from functools import cache
 
 import torch
 
+from vllm.models.deepseek_v4_1.tilelang import pdl
 from vllm.tilelang_utils import T, tilelang
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+
 
 NUM_SOURCES = 3  # dspark_target_layer_ids of DeepSeek V4.1 Flash
 _THREADS = 128
@@ -77,7 +79,9 @@ def context_inputs_kernel(width: int, dtype: str):
             bx,
             row,
         ):
+            pdl.chain()
             T.import_source(_HEADER)
+
             tx = T.get_thread_binding()
             col = bx * span + tx * vector
             if col < width:

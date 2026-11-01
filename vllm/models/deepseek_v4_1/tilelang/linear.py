@@ -178,17 +178,27 @@ def provide_mxfp8(rows: MXFP8Rows):
         _PROVIDED.pop()
 
 
+def optional_provided_mxfp8(x: torch.Tensor) -> MXFP8Rows | None:
+    """The handed-over cast of ``x`` when a producer provided one via
+    ``provide_mxfp8``, else ``None``."""
+    for rows in reversed(_PROVIDED):
+        if rows.rows.data_ptr() == x.data_ptr() and rows.rows.shape == x.shape:
+            return rows
+    return None
+
+
 def provided_mxfp8(x: torch.Tensor) -> MXFP8Rows:
     """The handed-over cast of ``x``: rows at ``x``'s address, of ``x``'s shape. The
     holder keeps them alive, so no other tensor can be at that address. A projection
     whose input arrives without its cast fails here: it has no cast of its own."""
-    for rows in reversed(_PROVIDED):
-        if rows.rows.data_ptr() == x.data_ptr() and rows.rows.shape == x.shape:
-            return rows
+    rows = optional_provided_mxfp8(x)
+    if rows is not None:
+        return rows
     raise RuntimeError(
         f"no MXFP8 cast was handed over for these {tuple(x.shape)} rows: the "
         "projection reads its input's cast from the input's producer (provide_mxfp8)"
     )
+
 
 
 # Row tiles of the split-K partials kernel. A 64-row tile computes one decode
@@ -255,8 +265,12 @@ def _block32_linear(
         x = x.reshape(-1, k)
         out = out.view(x.shape[0], n)
     rows = x.shape[0]
-    if layer.tilelang_mxfp8_input:
-        provided = provided_mxfp8(x)
+    provided = (
+        provided_mxfp8(x)
+        if layer.tilelang_mxfp8_input
+        else (optional_provided_mxfp8(x) if layer.tilelang_groups == 1 else None)
+    )
+    if provided is not None:
         if layer.tilelang_shards > 1 and rows <= layer.tilelang_split_rows:
             _block32_split_mxfp8(
                 layer, provided.values, provided.scales, out.view(rows, n), scratch
@@ -266,6 +280,7 @@ def _block32_linear(
                 layer, provided.values, provided.scales, out.view(rows, n), rows
             )
         return
+
     if layer.tilelang_shards > 1 and rows <= layer.tilelang_split_rows:
         _block32_split(layer, x, out, scratch)
         return

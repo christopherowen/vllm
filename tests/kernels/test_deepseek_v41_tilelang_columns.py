@@ -79,6 +79,36 @@ def test_join_columns_like_torch_cat(parts, rows):
     assert torch.equal(_bits(out), _bits(torch.cat(states, dim=-1)))
 
 
+@pytest.mark.parametrize("parts", [3, 2])
+@pytest.mark.parametrize("rows", [1, 5, 96, 512])
+def test_join_columns_and_cast_mxfp8_matches_join_then_cast(parts, rows):
+    """Fused join_columns_and_cast_mxfp8 produces identical BF16 joined rows
+    and identical MXFP8 values and packed UE8M0 scales to join_columns + cast_mxfp8."""
+    from vllm.models.deepseek_v4_1 import kernels
+
+    width = 5120
+    states = []
+    for i in range(parts):
+        gen = torch.Generator(device=DEVICE).manual_seed(rows + 19 * i)
+        x = torch.randn(rows, width, generator=gen, device=DEVICE, dtype=torch.bfloat16)
+        if rows:
+            x[0, :3] = torch.tensor(
+                [0.0, 128.0, -0.00390625], device=DEVICE, dtype=torch.bfloat16
+            )
+        states.append(x)
+    out_ref = _rows(rows, parts * width, rows + 77)
+    out_fused = out_ref.clone()
+    ref_joined = columns.join_columns(states, out_ref)
+    ref_cast = kernels.cast_mxfp8(ref_joined)
+    fused_cast = columns.join_columns_and_cast_mxfp8(states, out_fused)
+    assert fused_cast.rows.data_ptr() == out_fused.data_ptr()
+    assert torch.equal(_bits(out_fused), _bits(ref_joined))
+    assert torch.equal(
+        fused_cast.values[:rows].view(torch.uint8), ref_cast.values[:rows].view(torch.uint8)
+    )
+    assert torch.equal(fused_cast.scales[:rows], ref_cast.scales[:rows])
+
+
 @pytest.mark.parametrize(
     "shape, dtype",
     [

@@ -23,6 +23,12 @@ reader.
 import re
 
 CHAIN = {
+    "zero_packs",
+    "vocab_greedy_finish",
+    "split_columns",
+    "join_columns_and_cast_mxfp8",
+    "copy_columns",
+    "context_inputs",
     "activation_swiglu_clamp",
     "activation_swiglu_clamp_cast",
     "attention_front",

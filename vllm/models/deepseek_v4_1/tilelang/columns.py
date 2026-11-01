@@ -19,6 +19,7 @@ from functools import cache
 
 import torch
 
+from vllm.models.deepseek_v4_1.tilelang import pdl
 from vllm.tilelang_utils import T, tilelang
 
 _THREADS = 128
@@ -36,6 +37,9 @@ _PASS = {
 # The destinations are const-qualified pointers: TileLang declares a buffer written
 # only through these calls read-only.
 _HEADER = r"""
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+
 __device__ __forceinline__ void vllm_columns_b128(const void* d, const void* s) {
   *reinterpret_cast<uint4*>(const_cast<void*>(d)) = *reinterpret_cast<const uint4*>(s);
 }
@@ -43,7 +47,64 @@ __device__ __forceinline__ void vllm_columns_b128(const void* d, const void* s) 
 __device__ __forceinline__ void vllm_columns_zero_b128(const void* d) {
   *reinterpret_cast<uint4*>(const_cast<void*>(d)) = make_uint4(0u, 0u, 0u, 0u);
 }
+
+__device__ __forceinline__ void vllm_columns_join_and_cast_8(
+    const void* dst_bf16_ptr,
+    const void* src_bf16_ptr,
+    const void* dst_fp8_ptr,
+    const void* dst_sf_u32_ptr,
+    int lane) {
+  const uint4 raw = *reinterpret_cast<const uint4*>(src_bf16_ptr);
+  *reinterpret_cast<uint4*>(const_cast<void*>(dst_bf16_ptr)) = raw;
+
+  const __nv_bfloat162* bf2 = reinterpret_cast<const __nv_bfloat162*>(&raw);
+  const float2 f01 = __bfloat1622float2(bf2[0]);
+  const float2 f23 = __bfloat1622float2(bf2[1]);
+  const float2 f45 = __bfloat1622float2(bf2[2]);
+  const float2 f67 = __bfloat1622float2(bf2[3]);
+
+  float amax0 = fmaxf(fmaxf(fabsf(f01.x), fabsf(f01.y)),
+                      fmaxf(fabsf(f23.x), fabsf(f23.y)));
+  float amax1 = fmaxf(fmaxf(fabsf(f45.x), fabsf(f45.y)),
+                      fmaxf(fabsf(f67.x), fabsf(f67.y)));
+  float amax = fmaxf(amax0, amax1);
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+
+  const float scale_inv = fmaxf(amax, 1e-4f) * (1.0f / 448.0f);
+  const unsigned int bits = __float_as_uint(scale_inv);
+  const unsigned int rounded_bits = (bits + 0x007FFFFFu) & 0x7F800000u;
+  const unsigned int ue8m0_byte = (rounded_bits >> 23) & 0xFFu;
+  const float inv_scale = __uint_as_float((254u - ue8m0_byte) << 23);
+
+  const float2 q01 = make_float2(f01.x * inv_scale, f01.y * inv_scale);
+  const float2 q23 = make_float2(f23.x * inv_scale, f23.y * inv_scale);
+  const float2 q45 = make_float2(f45.x * inv_scale, f45.y * inv_scale);
+  const float2 q67 = make_float2(f67.x * inv_scale, f67.y * inv_scale);
+  const __nv_fp8x2_storage_t p01 =
+      __nv_cvt_float2_to_fp8x2(q01, __NV_SATFINITE, __NV_E4M3);
+  const __nv_fp8x2_storage_t p23 =
+      __nv_cvt_float2_to_fp8x2(q23, __NV_SATFINITE, __NV_E4M3);
+  const __nv_fp8x2_storage_t p45 =
+      __nv_cvt_float2_to_fp8x2(q45, __NV_SATFINITE, __NV_E4M3);
+  const __nv_fp8x2_storage_t p67 =
+      __nv_cvt_float2_to_fp8x2(q67, __NV_SATFINITE, __NV_E4M3);
+  *reinterpret_cast<uint2*>(const_cast<void*>(dst_fp8_ptr)) = make_uint2(
+      (unsigned int)p01 | ((unsigned int)p23 << 16),
+      (unsigned int)p45 | ((unsigned int)p67 << 16));
+
+  const int half_base = lane & 16;
+  const unsigned int b0 = __shfl_sync(0xffffffffu, ue8m0_byte, half_base + 0);
+  const unsigned int b1 = __shfl_sync(0xffffffffu, ue8m0_byte, half_base + 4);
+  const unsigned int b2 = __shfl_sync(0xffffffffu, ue8m0_byte, half_base + 8);
+  const unsigned int b3 = __shfl_sync(0xffffffffu, ue8m0_byte, half_base + 12);
+  if ((lane & 15) == 0) {
+    *reinterpret_cast<unsigned int*>(const_cast<void*>(dst_sf_u32_ptr)) =
+        b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+  }
+}
 """
+
 
 
 def _vector(dtype: str) -> int:
@@ -70,6 +131,7 @@ def copy_columns_kernel(width: int, dtype: str):
     ):
         # Rows on the grid's x axis (no 65535 limit), column blocks on y.
         with T.Kernel(rows, T.ceildiv(width, span), threads=_THREADS) as (row, bx):
+            pdl.chain()
             T.import_source(_HEADER)
             col = bx * span + T.get_thread_binding() * vector
             if col < width:
@@ -92,6 +154,7 @@ def zero_packs_kernel():
     @T.prim_func
     def zero_packs(out: T.Tensor((words,), T.int32), packs: T.int32):
         with T.Kernel(T.ceildiv(packs, _THREADS), threads=_THREADS) as bx:
+            pdl.chain()
             T.import_source(_HEADER)
             p = bx * _THREADS + T.get_thread_binding()
             if p < packs:
@@ -141,6 +204,7 @@ def split_columns_kernel(widths: tuple[int, int, int], dtype: str, join: bool = 
         rows: T.int32,
     ):
         with T.Kernel(rows, T.ceildiv(total, span), threads=_THREADS) as (row, bx):
+            pdl.chain()
             T.import_source(_HEADER)
             col = bx * span + T.get_thread_binding() * vector
             # The whole row's address inline in each call: bound to a variable it
@@ -163,11 +227,85 @@ def split_columns_kernel(widths: tuple[int, int, int], dtype: str, join: bool = 
     return split_columns
 
 
+@tilelang.jit(pass_configs=_PASS)
+def join_columns_and_cast_mxfp8_kernel(widths: tuple[int, int, int]):
+    """Join two or three BF16 parts side by side into ``out`` while emitting
+    ``out``'s MXFP8 (E4M3 + packed UE8M0) cast in the same launch."""
+    if any(width % 128 for width in widths) or not widths[0] or not widths[1]:
+        raise ValueError(f"widths {widths} must be 128-element aligned")
+    w0, w1, w2 = widths
+    total = w0 + w1 + w2
+    sf_words = total // 128
+    span = _THREADS * 8
+    out_rows, rows0, rows1, rows2, val_rows, sf_rows = T.dynamic(
+        "out_rows, rows0, rows1, rows2, val_rows, sf_rows"
+    )
+
+    @T.prim_func
+    def join_columns_and_cast_mxfp8(
+        out: T.Tensor((out_rows, total), T.bfloat16),
+        in0: T.Tensor((rows0, w0), T.bfloat16),
+        in1: T.Tensor((rows1, w1), T.bfloat16),
+        in2: T.Tensor((rows2, max(w2, 128)), T.bfloat16),
+        values: T.Tensor((val_rows, total), T.float8_e4m3fn),
+        scales: T.Tensor((sf_rows, sf_words), T.uint32),
+        rows: T.int32,
+    ):
+        with T.Kernel(rows, T.ceildiv(total, span), threads=_THREADS) as (row, bx):
+            pdl.wait()
+            T.import_source(_HEADER)
+            tx = T.get_thread_binding()
+            col = bx * span + tx * 8
+            sf_col = bx * 8 + (tx >> 4)
+            lane = tx & 31
+            if col < w0:
+                T.call_extern(
+                    "handle",
+                    "vllm_columns_join_and_cast_8",
+                    T.address_of(out[row, col]),
+                    T.address_of(in0[row, col]),
+                    T.address_of(values[row, col]),
+                    T.address_of(scales[row, sf_col]),
+                    lane,
+                )
+            elif col < w0 + w1:
+                T.call_extern(
+                    "handle",
+                    "vllm_columns_join_and_cast_8",
+                    T.address_of(out[row, col]),
+                    T.address_of(in1[row, col - w0]),
+                    T.address_of(values[row, col]),
+                    T.address_of(scales[row, sf_col]),
+                    lane,
+                )
+            elif col < total:
+                T.call_extern(
+                    "handle",
+                    "vllm_columns_join_and_cast_8",
+                    T.address_of(out[row, col]),
+                    T.address_of(in2[row, col - w0 - w1]),
+                    T.address_of(values[row, col]),
+                    T.address_of(scales[row, sf_col]),
+                    lane,
+                )
+
+            if rows == 1:
+                pdl.trigger()
+
+    return join_columns_and_cast_mxfp8
+
+
 @cache
 def _bound(split: bool, *key):
     """The kernel of ``key``, resolved once (after the kernel cache freezes, an
     undeclared key raises by name). TileLang's JIT functions are not hashable."""
     return (split_columns_kernel if split else copy_columns_kernel)(*key)
+
+
+@cache
+def _bound_join_cast(*key):
+    """The ``join_columns_and_cast_mxfp8_kernel`` of ``key``, resolved once."""
+    return join_columns_and_cast_mxfp8_kernel(*key)
 
 
 def _check(*tensors: torch.Tensor) -> str:
@@ -193,6 +331,10 @@ def split_columns_key(
     widths: tuple[int, ...], dtype: torch.dtype, join: bool = False
 ) -> tuple:
     return (tuple(widths) + (0,) * (3 - len(widths)), _DTYPES[dtype], join)
+
+
+def join_columns_and_cast_mxfp8_key(widths: tuple[int, ...]) -> tuple:
+    return (tuple(widths) + (0,) * (3 - len(widths)),)
 
 
 def copy_columns(src: torch.Tensor, dst: torch.Tensor) -> None:
@@ -242,6 +384,41 @@ def join_columns(parts: list[torch.Tensor], out: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def join_columns_and_cast_mxfp8(parts: list[torch.Tensor], out: torch.Tensor):
+    """``join_columns(parts, out)`` fused with ``cast_mxfp8(out)`` in one launch."""
+    from .linear import empty_mxfp8
+
+    widths = tuple(part.shape[-1] for part in parts)
+    if len(parts) not in (2, 3) or out.shape != (parts[0].shape[0], sum(widths)):
+        raise ValueError(f"cannot join {widths} into {tuple(out.shape)}")
+    if not all(t.is_contiguous() for t in (out, *parts)) or any(
+        part.shape[0] != out.shape[0] for part in parts
+    ):
+        raise ValueError(
+            "join_columns_and_cast_mxfp8 joins contiguous parts of the same rows"
+        )
+    if out.dtype != torch.bfloat16 or any(w % 128 for w in widths):
+        raise ValueError(
+            "join_columns_and_cast_mxfp8 requires 128-element aligned BF16 parts"
+        )
+    _check(out, *parts)
+    cast = empty_mxfp8(out)
+    rows = out.shape[0]
+    if rows:
+        third = parts[2] if len(parts) == 3 else parts[0].view(-1, 128)
+        key = join_columns_and_cast_mxfp8_key(widths)
+        _bound_join_cast(*key)(
+            out,
+            parts[0],
+            parts[1],
+            third,
+            cast.values[:rows],
+            cast.scales[:rows].view(torch.uint32),
+            rows,
+        )
+    return cast
+
+
 __all__ = [
     "zero_",
     "zero_packs_kernel",
@@ -249,6 +426,9 @@ __all__ = [
     "copy_columns_kernel",
     "copy_columns_key",
     "join_columns",
+    "join_columns_and_cast_mxfp8",
+    "join_columns_and_cast_mxfp8_kernel",
+    "join_columns_and_cast_mxfp8_key",
     "split_columns",
     "split_columns_kernel",
     "split_columns_key",

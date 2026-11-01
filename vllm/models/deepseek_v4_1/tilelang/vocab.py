@@ -34,7 +34,7 @@ from vllm.v1.worker.workspace import (
     is_workspace_manager_initialized,
 )
 
-from . import prepare
+from . import pdl, prepare
 from .gemm import bf16_gemm, bf16_gemm_decode
 
 GROUP = 128  # columns per code group
@@ -507,6 +507,59 @@ def _decode_e2m1(nibble):
 _GREEDY_HEADER = r"""
 #include <math_constants.h>
 
+template <int BASE_MINUS_ONE>
+__device__ __forceinline__ void vllm_vocab_decode_vec16(
+    const void* __restrict__ low_a_ptr,
+    const void* __restrict__ low_b_ptr,
+    const void* __restrict__ codes_ptr,
+    void* __restrict__ out_a_ptr,
+    void* __restrict__ out_b_ptr) {
+  const uint4 low_a4 = *reinterpret_cast<const uint4*>(low_a_ptr);
+  const uint4 low_b4 = *reinterpret_cast<const uint4*>(low_b_ptr);
+  const uint4 codes4 = *reinterpret_cast<const uint4*>(codes_ptr);
+  const unsigned int* la = reinterpret_cast<const unsigned int*>(&low_a4);
+  const unsigned int* lb = reinterpret_cast<const unsigned int*>(&low_b4);
+  const unsigned int* cd = reinterpret_cast<const unsigned int*>(&codes4);
+  unsigned int* oa = reinterpret_cast<unsigned int*>(out_a_ptr);
+  unsigned int* ob = reinterpret_cast<unsigned int*>(out_b_ptr);
+  constexpr unsigned int BASE_SCALAR = (unsigned int)(BASE_MINUS_ONE & 0xFFFF);
+
+  #pragma unroll
+  for (int w = 0; w < 4; ++w) {
+    const unsigned int c_word = cd[w];
+    const unsigned int la_word = la[w];
+    const unsigned int lb_word = lb[w];
+
+    const unsigned int c01 = __byte_perm(c_word, 0u, 0x4140u);
+    const unsigned int c23 = __byte_perm(c_word, 0u, 0x4342u);
+
+    const unsigned int ca01 = c01 & 0x000F000Fu;
+    const unsigned int cb01 = (c01 >> 4) & 0x000F000Fu;
+    const unsigned int ca23 = c23 & 0x000F000Fu;
+    const unsigned int cb23 = (c23 >> 4) & 0x000F000Fu;
+
+    const unsigned int nza01 = ((ca01 + 0x000F000Fu) >> 4) & 0x00010001u;
+    const unsigned int nzb01 = ((cb01 + 0x000F000Fu) >> 4) & 0x00010001u;
+    const unsigned int nza23 = ((ca23 + 0x000F000Fu) >> 4) & 0x00010001u;
+    const unsigned int nzb23 = ((cb23 + 0x000F000Fu) >> 4) & 0x00010001u;
+
+    const unsigned int expa01 = (ca01 + nza01 * BASE_SCALAR) << 7;
+    const unsigned int expb01 = (cb01 + nzb01 * BASE_SCALAR) << 7;
+    const unsigned int expa23 = (ca23 + nza23 * BASE_SCALAR) << 7;
+    const unsigned int expb23 = (cb23 + nzb23 * BASE_SCALAR) << 7;
+
+    const unsigned int la01 = __byte_perm(la_word, 0u, 0x1100u);
+    const unsigned int la23 = __byte_perm(la_word, 0u, 0x3322u);
+    const unsigned int lb01 = __byte_perm(lb_word, 0u, 0x1100u);
+    const unsigned int lb23 = __byte_perm(lb_word, 0u, 0x3322u);
+
+    oa[2 * w + 0] = (la01 & 0x807F807Fu) | expa01;
+    oa[2 * w + 1] = (la23 & 0x807F807Fu) | expa23;
+    ob[2 * w + 0] = (lb01 & 0x807F807Fu) | expb01;
+    ob[2 * w + 1] = (lb23 & 0x807F807Fu) | expb23;
+  }
+}
+
 __device__ __forceinline__ int vllm_vocab_first_argmax_keep(
     float av, int ai, float bv, int bi) {
   const bool a_nan = av != av;
@@ -663,6 +716,7 @@ def packed_vocab_projection(
         with T.Kernel(
             T.ceildiv(M, block_M), T.ceildiv(N, block_N), threads=threads
         ) as (by, bx):
+            T.import_source(_GREEDY_HEADER)
             A_shared = T.alloc_shared((block_M, STEP), T.bfloat16)
             low_shared = T.alloc_shared((block_N, STEP), T.uint8)
             code_shared = T.alloc_shared((block_N, STEP // 2), T.uint8)
@@ -689,7 +743,7 @@ def packed_vocab_projection(
                 # 16 of its high half, which share 16 code bytes.
                 for step in T.serial(T.ceildiv(items, threads)):
                     item = step * threads + tx
-                    if item < items:
+                    if items % threads == 0 or item < items:
                         j = item // (step_groups * slices)
                         g = item // slices % step_groups
                         c = item % slices * VEC
@@ -699,9 +753,15 @@ def packed_vocab_projection(
                             low_b[v] = low_shared[j, g * GROUP + HALF + c + v]
                         for v in T.vectorized(VEC):
                             codes[v] = code_shared[j, g * HALF + c + v]
-                        for v in T.unroll(VEC):
-                            out_a[v] = _decode(low_a[v], codes[v] & 0xF, base_minus_one)
-                            out_b[v] = _decode(low_b[v], codes[v] >> 4, base_minus_one)
+                        T.call_extern(
+                            "handle",
+                            f"vllm_vocab_decode_vec16<{base_minus_one}>",
+                            T.address_of(low_a[0]),
+                            T.address_of(low_b[0]),
+                            T.address_of(codes[0]),
+                            T.address_of(out_a[0]),
+                            T.address_of(out_b[0]),
+                        )
                         for v in T.vectorized(VEC):
                             B_shared[j, g * GROUP + c + v] = out_a[v]
                         for v in T.vectorized(VEC):
@@ -791,6 +851,7 @@ def packed_vocab_greedy_partials(
             B_shared = T.alloc_shared((block_N, STEP), T.bfloat16)
             C_shared = T.alloc_shared((block_M, block_N), T.float32)
             C_local = T.alloc_fragment((block_M, block_N), T.float32)
+            C_round = T.alloc_fragment((block_M, block_N), out_dtype)
             low_a = T.alloc_local((VEC,), T.uint8)
             low_b = T.alloc_local((VEC,), T.uint8)
             codes = T.alloc_local((VEC,), T.uint8)
@@ -808,7 +869,7 @@ def packed_vocab_greedy_partials(
                 T.copy(W[bx * block_N, K + s * (STEP // 2)], code_shared)
                 for step in T.serial(T.ceildiv(items, threads)):
                     item = step * threads + tx
-                    if item < items:
+                    if items % threads == 0 or item < items:
                         j = item // (step_groups * slices)
                         g = item // slices % step_groups
                         c = item % slices * VEC
@@ -818,9 +879,15 @@ def packed_vocab_greedy_partials(
                             low_b[v] = low_shared[j, g * GROUP + HALF + c + v]
                         for v in T.vectorized(VEC):
                             codes[v] = code_shared[j, g * HALF + c + v]
-                        for v in T.unroll(VEC):
-                            out_a[v] = _decode(low_a[v], codes[v] & 0xF, base_minus_one)
-                            out_b[v] = _decode(low_b[v], codes[v] >> 4, base_minus_one)
+                        T.call_extern(
+                            "handle",
+                            f"vllm_vocab_decode_vec16<{base_minus_one}>",
+                            T.address_of(low_a[0]),
+                            T.address_of(low_b[0]),
+                            T.address_of(codes[0]),
+                            T.address_of(out_a[0]),
+                            T.address_of(out_b[0]),
+                        )
                         for v in T.vectorized(VEC):
                             B_shared[j, g * GROUP + c + v] = out_a[v]
                         for v in T.vectorized(VEC):
@@ -847,11 +914,9 @@ def packed_vocab_greedy_partials(
                             C_local[i, j] = C_local[i, j] + value * T.Cast(
                                 T.float32, A[token, column]
                             )
-            if out_dtype == T.bfloat16:
-                for i, j in T.Parallel(block_M, block_N):
-                    C_local[i, j] = T.Cast(
-                        T.float32, T.Cast(T.bfloat16, C_local[i, j])
-                    )
+            if out_dtype != T.float32:
+                T.copy(C_local, C_round)
+                T.copy(C_round, C_local)
             T.copy(C_local, C_shared)
             T.call_extern(
                 "handle",
@@ -893,6 +958,7 @@ def finish_vocab_greedy_pairs(
         vocab_start: T.int32,
     ):
         with T.Kernel(M, threads=threads) as (row,):
+            pdl.chain()
             T.import_source(_GREEDY_HEADER)
             smem_v = T.alloc_shared((warps,), T.float32)
             smem_i = T.alloc_shared((warps,), T.int32)

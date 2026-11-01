@@ -303,3 +303,65 @@ def test_combine_and_precompute_context_kv_fuses_cast_into_main_norm(monkeypatch
         assert layer_idx == i
         assert torch.equal(kv_raw, main_x[:, :512] + i)
         assert pos is positions and slot is slots[i]
+
+def test_combine_aux_hidden_states_into_fuses_join_and_cast_mxfp8(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm.models.deepseek_v4_1 import kernels
+    from vllm.models.deepseek_v4_1.nvidia.dspark import DSparkDeepseekV4Model
+    from vllm.models.deepseek_v4_1.tilelang.linear import provided_mxfp8
+    from vllm.models.deepseek_v4_1.tilelang.norm import TileLangRMSNorm
+
+    gen = torch.Generator(device=DEVICE).manual_seed(42)
+    norm = TileLangRMSNorm(WIDTH, 1e-6).to(DEVICE)
+    norm.with_cast = True
+    norm.weight.data.copy_(torch.rand(WIDTH, generator=gen, device=DEVICE) + 0.5)
+
+    seen_provided = []
+
+    class MainProj:
+        tilelang_mxfp8_input = True
+
+        def __call__(self, x):
+            seen_provided.append(provided_mxfp8(x))
+            return x[:, :WIDTH] * 0.5 + x[:, WIDTH : 2 * WIDTH] * 0.25
+
+    class KvProj:
+        tilelang_mxfp8_input = True
+
+        def __call__(self, x):
+            seen_provided.append(provided_mxfp8(x))
+            return x[:, :512]
+
+    model = DSparkDeepseekV4Model.__new__(DSparkDeepseekV4Model)
+    torch.nn.Module.__init__(model)
+    model.hidden_size = WIDTH
+    model.main_proj = MainProj()
+    model.main_norm = norm
+    model._context_kv_projections = [KvProj()]
+    model._context_main_cast = None
+    model.layers = [
+        SimpleNamespace(
+            attn=SimpleNamespace(insert_raw_context_kv=lambda kv_raw, pos, slots: None)
+        )
+    ]
+
+    casts = []
+    monkeypatch.setattr(kernels, "cast_mxfp8", lambda x: casts.append(x))
+
+    rows = 12
+    aux_states = [
+        torch.randn(rows, WIDTH, generator=gen, device=DEVICE, dtype=torch.bfloat16)
+        for _ in range(3)
+    ]
+    out = torch.empty(rows, WIDTH, dtype=torch.bfloat16, device=DEVICE)
+    model.combine_aux_hidden_states_into(aux_states, out)
+    assert model._context_main_cast is not None
+    assert model._context_main_cast.rows.data_ptr() == out.data_ptr()
+    assert seen_provided[0].values.shape[1] == 3 * WIDTH
+
+    positions = torch.arange(rows, dtype=torch.int64, device=DEVICE)
+    slots = [torch.arange(rows, dtype=torch.int64, device=DEVICE)]
+    model.precompute_and_store_context_kv(out, positions, slots)
+    assert not casts
+    assert seen_provided[1].values.shape[1] == WIDTH

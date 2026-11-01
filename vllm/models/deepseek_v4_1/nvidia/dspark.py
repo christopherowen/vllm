@@ -215,17 +215,27 @@ class DSparkDeepseekV4Model(nn.Module):
             self.hidden_size, vllm_config.model_config.dtype
         )
         # combine_aux_hidden_states_into: the eager context step's join.
+        join_widths = (self.hidden_size,) * len(self.target_layer_ids)
         join_key = columns.split_columns_key(
-            (self.hidden_size,) * len(self.target_layer_ids),
+            join_widths,
             vllm_config.model_config.dtype,
             join=True,
         )
-        prepare.declare(
-            lambda: [
-                prepare.call(dspark_context.context_inputs_kernel, *context_key),
-                prepare.call(columns.split_columns_kernel, *join_key),
-            ]
-        )
+        calls = [
+            prepare.call(dspark_context.context_inputs_kernel, *context_key),
+            prepare.call(columns.split_columns_kernel, *join_key),
+        ]
+        if (
+            vllm_config.model_config.dtype == torch.bfloat16
+            and self.hidden_size % 128 == 0
+        ):
+            join_cast_key = columns.join_columns_and_cast_mxfp8_key(join_widths)
+            calls.append(
+                prepare.call(
+                    columns.join_columns_and_cast_mxfp8_kernel, *join_cast_key
+                )
+            )
+        prepare.declare(lambda: calls)
         self._context_kv_projections: list = []
 
         self.num_dspark_layers = (
@@ -364,7 +374,17 @@ class DSparkDeepseekV4Model(nn.Module):
         speculator's copy into its context buffer, gone)."""
         rows = out.shape[0]
         joined = out.new_empty(rows, len(aux_hidden_states) * self.hidden_size)
-        columns.join_columns([aux[:rows] for aux in aux_hidden_states], joined)
+        parts = [aux[:rows] for aux in aux_hidden_states]
+        if (
+            joined.dtype == torch.bfloat16
+            and self.hidden_size % 128 == 0
+            and _casts_main_proj_input(self)
+        ):
+            joined_cast = columns.join_columns_and_cast_mxfp8(parts, joined)
+            with kernels.mxfp8_inputs(joined_cast):
+                self.combine_hidden_states(joined, out=out)
+            return
+        columns.join_columns(parts, joined)
         self.combine_hidden_states(joined, out=out)
 
     @torch.inference_mode()
@@ -458,6 +478,14 @@ class DSparkDeepseekV4Model(nn.Module):
         # compute_logits applies self.norm.
         hidden_states = layer.mhc.collapse(hidden_states, pre_mix)
         return hidden_states
+
+
+def _casts_main_proj_input(model: object) -> bool:
+    main_proj = getattr(model, "main_proj", None)
+    if getattr(main_proj, "tilelang_mxfp8_input", False):
+        return True
+    quant_method = getattr(main_proj, "quant_method", None)
+    return type(quant_method).__name__ == "TileLangFP8LinearMethod"
 
 
 def _casts_context_main_x(model: object) -> bool:
