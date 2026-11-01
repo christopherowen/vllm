@@ -278,7 +278,7 @@ def test_moe_combine_writes_the_exchange_slots(
 
 
 @pytest.mark.parametrize("tokens", [37, 40, 205])
-@pytest.mark.parametrize("world", [3, 4])
+@pytest.mark.parametrize("world", [3, 4, 5, 6, 7, 8])
 def test_row_exchange_gives_each_rank_its_rows_of_every_block(
     monkeypatch, tokens, world
 ):
@@ -355,7 +355,7 @@ class _Fabric:
         self.barrier.wait()
 
 
-@pytest.mark.parametrize("world", [3, 4])
+@pytest.mark.parametrize("world", [3, 4, 5, 6, 7, 8])
 @pytest.mark.parametrize("short", [0, 3, 9, 10, 25])
 def test_row_all_to_all_over_cabled_pairs(world, short, rows=10):
     """PyNCCL's ``all_to_all_rows``, every rank a thread: each rank receives every
