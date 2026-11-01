@@ -353,20 +353,33 @@ class DeepseekV4DecoderLayer(nn.Module):
         apply_engram = self.engram is not None and engram_hashes is not None
         if residual is None:
             residual = x
-        elif apply_engram:
-            # Engram mutates the reconstructed residual; do not fuse across it.
-            residual = self.mhc.post(x, residual, post_mix, res_mix)
-            previous_output = None
         if apply_engram:
+            fuse_engram_post = (
+                previous_output is not None
+                and residual.ndim == 3
+                and getattr(self.engram, "supports_fused_post", False)
+            )
+            if previous_output is not None and not fuse_engram_post:
+                # Fallback when Engram is a mock or 2D residual.
+                residual = self.mhc.post(x, residual, post_mix, res_mix)
+                previous_output = None
             if residual.ndim == 2:
                 residual = (
                     residual[:, None, :].expand(-1, self.hc_mult, -1).contiguous()
                 )
+            engram_kwargs = {"sp_rows": sp_rows}
+            if fuse_engram_post:
+                engram_kwargs.update(
+                    previous_output=previous_output,
+                    post_mix=post_mix,
+                    res_mix=res_mix,
+                )
+                previous_output = None
             residual = self.engram(
                 residual,
                 engram_hashes[:, self.engram.layer_hash_index],
                 engram_mask,
-                sp_rows=sp_rows,
+                **engram_kwargs,
             )
         fn = self.hc_attn_fn_broadcast if residual.ndim == 2 else self.hc_attn_fn
         pre_kwargs = {}

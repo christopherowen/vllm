@@ -1168,3 +1168,114 @@ def test_interleaved_rows_restore_column_order(tp_size, monkeypatch):
     assert torch.equal(rows.view(torch.int16), full.view(torch.int16))
     if 24 % tp_size == 0:
         assert rows.data_ptr() == gathered[0].data_ptr()
+
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.inference_mode()
+def test_engram_forward_fuses_mhc_post_and_gate(dist_init):
+    """Engram.forward with previous_output, post_mix, and res_mix fuses mhc.post
+    into engram_post_gate and produces bit-identical output to standalone mhc.post
+    followed by Engram.forward."""
+    from vllm.models.deepseek_v4_1 import sp_prefill
+    from vllm.models.deepseek_v4_1.tilelang.collectives import RankOrderParts
+    from vllm.models.deepseek_v4_1.tilelang.engram_hash import IMAGE_SENTINEL
+    from vllm.models.deepseek_v4_1.tilelang.mhc import _mhc_post
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    capacity, hidden, streams = 9, HIDDEN, 4
+    geometry = native.build_geometry(base_table_size=19, compressed_vocab_size=32)
+    caps = native.Caps(
+        device=device,
+        max_tokens=capacity,
+        max_seqs=2,
+        max_requests=2,
+        vocab_size=32,
+        layer_id=1,
+        tp_size=1,
+        tp_rank=0,
+    )
+    layout = SimpleNamespace(
+        caps=(caps,),
+        lookup_plans=(None,),
+        geometry=geometry,
+        table_memory="device",
+        projection_tp=False,
+    )
+    config = SimpleNamespace(hidden_size=hidden, hc_mult=streams, rms_norm_eps=1e-3)
+    old_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.bfloat16)
+        with torch.device(device):
+            module = Engram(config, None, layout, 0, False, "engram_fused_post_test")
+    finally:
+        torch.set_default_dtype(old_dtype)
+    module.q_weight.fill_(0.5)
+    module.k_weight.fill_(0.25)
+    module.wkv.weight.normal_(std=0.01)
+    module.embed_tokens.weight.fill_(2)
+    module.embed_tokens.weight_scale_inv.fill_(127)
+    module.process_weights_after_loading()
+
+    ids = torch.arange(24, device=device).expand(capacity, -1).contiguous()
+    module.prepare_embeddings(ids)
+    gen = torch.Generator(device=device).manual_seed(43)
+    layer_out = torch.randn(
+        (capacity, hidden), generator=gen, device=device, dtype=torch.bfloat16
+    )
+    residual = torch.randn(
+        (capacity, streams, hidden), generator=gen, device=device, dtype=torch.bfloat16
+    )
+    post_mix = torch.rand(
+        (capacity, streams), generator=gen, device=device, dtype=torch.float32
+    )
+    res_mix = torch.rand(
+        (capacity, streams, streams), generator=gen, device=device, dtype=torch.float32
+    )
+    token_ids = torch.full((capacity,), 7, dtype=torch.int32, device=device)
+    token_ids[2] = IMAGE_SENTINEL
+    token_ids[6] = IMAGE_SENTINEL
+
+    reconstructed = torch.empty_like(residual)
+    _mhc_post(layer_out, residual, post_mix, res_mix, reconstructed)
+    expected = module(reconstructed, ids, token_ids)
+    actual = module(
+        residual,
+        ids,
+        token_ids,
+        previous_output=layer_out,
+        post_mix=post_mix,
+        res_mix=res_mix,
+    )
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+    # Also verify RankOrderParts input and SP prefill with trailing pad rows.
+    half = (layer_out.float() * 0.5).bfloat16()
+    parts = RankOrderParts(torch.stack((half, layer_out - half)))
+    reconstructed_parts = torch.empty_like(residual)
+    _mhc_post(parts.sum(), residual, post_mix, res_mix, reconstructed_parts)
+    for rank in range(2):
+        sp_layout = sp_prefill.SPRows(capacity, 2, rank)
+        local_rec = sp_layout.local_slice(reconstructed_parts)
+        local_res = sp_layout.local_slice(residual)
+        local_post = sp_layout.local_slice(post_mix)
+        local_comb = sp_layout.local_slice(res_mix)
+        local_parts = RankOrderParts(
+            torch.stack(
+                (
+                    sp_layout.local_slice(parts.packed[0]),
+                    sp_layout.local_slice(parts.packed[1]),
+                )
+            )
+        )
+        expected_sp = module(local_rec, ids, token_ids, sp_rows=sp_layout)
+        actual_sp = module(
+            local_res,
+            ids,
+            token_ids,
+            sp_rows=sp_layout,
+            previous_output=local_parts,
+            post_mix=local_post,
+            res_mix=local_comb,
+        )
+        assert torch.equal(actual_sp.view(torch.int16), expected_sp.view(torch.int16))

@@ -24,9 +24,14 @@ from vllm.models.deepseek_v4_1.tilelang.engram import (  # noqa: E402
     CLAMP,
     engram_gate,
     engram_gate_blocked,
+    engram_post_gate,
+    engram_post_gate_blocked,
 )
 from vllm.models.deepseek_v4_1.tilelang.engram_hash import (  # noqa: E402
     IMAGE_SENTINEL,
+)
+from vllm.models.deepseek_v4_1.tilelang.mhc import (  # noqa: E402
+    _mhc_post,
 )
 
 DEVICE = "cuda"
@@ -131,5 +136,83 @@ def test_blocked_kv_gives_the_packed_bits(images, blocks, block_cols, rows):
     blocked_out = torch.empty_like(x)
     engram_gate(x, kv, weight, ids, packed_out, EPS, HC)
     engram_gate_blocked(x, blocked, weight, ids, blocked_out, EPS, HC)
+    torch.cuda.synchronize()
+    assert torch.equal(packed_out.view(torch.int16), blocked_out.view(torch.int16))
+
+
+
+def _post_inputs(rows, seed=19):
+    gen = torch.Generator(device=DEVICE).manual_seed(seed)
+    layer_out = torch.randn((rows, DIM), generator=gen, device=DEVICE).bfloat16()
+    residual = torch.randn((rows, HC, DIM), generator=gen, device=DEVICE).bfloat16()
+    post = torch.rand((rows, HC), generator=gen, device=DEVICE, dtype=torch.float32) * 2
+    comb = torch.rand(
+        (rows, HC, HC), generator=gen, device=DEVICE, dtype=torch.float32
+    )
+    comb = comb / comb.sum(dim=-1, keepdim=True)
+    return layer_out, residual, post, comb
+
+
+@pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("images", [True, False])
+def test_engram_post_gate_matches_post_then_gate_bits(images, ids_dtype):
+    """Fused ``engram_post_gate`` produces bit-identical output to ``mhc.post``
+    followed by ``engram_gate`` across all token counts and image sentinel masks."""
+    max_rows = max(ROWS)
+    _, kv, weight, ids = _inputs(max_rows, seed=23, images=images, ids_dtype=ids_dtype)
+    layer_out, residual, post, comb = _post_inputs(max_rows, seed=29)
+    reconstructed = torch.empty_like(residual)
+    _mhc_post(layer_out, residual, post, comb, reconstructed)
+    expected = torch.empty_like(residual)
+    engram_gate(
+        reconstructed.view(max_rows, HC * DIM),
+        kv,
+        weight,
+        ids,
+        expected.view(max_rows, HC * DIM),
+        EPS,
+        HC,
+    )
+    for rows in ROWS:
+        actual = torch.full_like(residual, float("nan"))
+        engram_post_gate(
+            layer_out[:rows],
+            residual[:rows],
+            post[:rows],
+            comb[:rows],
+            kv[:rows],
+            weight,
+            ids[:rows],
+            actual[:rows],
+            EPS,
+            HC,
+        )
+        assert torch.equal(
+            actual[:rows].view(torch.int16), expected[:rows].view(torch.int16)
+        ), f"rows={rows}"
+        assert actual[rows:].isnan().all(), f"rows={rows} wrote past its rows"
+
+
+@pytest.mark.parametrize("images", [False, True])
+@pytest.mark.parametrize("blocks, block_cols", [(3, 8544), (4, 6400)])
+@pytest.mark.parametrize("rows", [6, 300])
+def test_engram_post_gate_blocked_matches_packed_bits(images, blocks, block_cols, rows):
+    """Fused ``engram_post_gate_blocked`` produces bit-identical output to
+    ``engram_post_gate`` on packed ``kv``."""
+    _, kv, weight, ids = _inputs(rows, seed=31, images=images)
+    layer_out, residual, post, comb = _post_inputs(rows, seed=37)
+    width = (HC + 1) * DIM
+    padded = torch.zeros((rows + 3, blocks * block_cols), device=DEVICE).bfloat16()
+    padded[:rows, :width] = kv
+    padded[rows:] = NAN
+    blocked = padded.view(rows + 3, blocks, block_cols).transpose(0, 1).contiguous()
+    packed_out = torch.empty_like(residual)
+    blocked_out = torch.empty_like(residual)
+    engram_post_gate(
+        layer_out, residual, post, comb, kv, weight, ids, packed_out, EPS, HC
+    )
+    engram_post_gate_blocked(
+        layer_out, residual, post, comb, blocked, weight, ids, blocked_out, EPS, HC
+    )
     torch.cuda.synchronize()
     assert torch.equal(packed_out.view(torch.int16), blocked_out.view(torch.int16))

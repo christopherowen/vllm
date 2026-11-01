@@ -25,10 +25,40 @@ import tilelang
 import tilelang.language as T
 import torch
 
+from vllm.models.deepseek_v4_1.tilelang import pdl
 from vllm.models.deepseek_v4_1.tilelang.engram_hash import IMAGE_SENTINEL
 
 # Gate magnitudes below this clamp to it before the square root.
 CLAMP = 1e-6
+
+
+@T.macro
+def _reconstruct_stream(
+    layer_out, residual, post, comb, xs, t, h, tx, chunks, threads, vec, hc_mult
+):
+    """Reconstruct stream ``h`` of token ``t`` from ``layer_out`` and ``residual`` in
+    registers using ``post_streams``' exact FP32 FMA sequence, rounded to BF16."""
+    xv = T.alloc_local((vec,), T.bfloat16)
+    rv = T.alloc_local((hc_mult * vec,), T.bfloat16)
+    pm = T.alloc_local((1,), T.float32)
+    cm = T.alloc_local((hc_mult,), T.float32)
+    p_acc = T.alloc_var(T.float32)
+    pm[0] = post[t, h]
+    for m in T.unroll(hc_mult):
+        cm[m] = comb[t, m, h]
+    for c in T.serial(chunks):
+        col = (c * threads + tx) * vec
+        for i in T.vectorized(vec):
+            xv[i] = layer_out[t, col + i]
+        for m in T.unroll(hc_mult):
+            for i in T.vectorized(vec):
+                rv[m * vec + i] = residual[t, m, col + i]
+        for i in T.unroll(vec):
+            p_acc = cm[0] * T.cast(rv[i], T.float32)
+            p_acc = T.fma(pm[0], T.cast(xv[i], T.float32), p_acc)
+            for m in T.unroll(1, hc_mult):
+                p_acc = T.fma(cm[m], T.cast(rv[m * vec + i], T.float32), p_acc)
+            xs[c * vec + i] = T.cast(T.cast(p_acc, T.bfloat16), T.float32)
 
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
@@ -55,6 +85,7 @@ def engram_gate_kernel(
         out: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
     ):
         with T.Kernel(hc_mult, tokens, threads=threads) as (h, t):
+            pdl.chain()
             tx = T.get_thread_binding()
             xs = T.alloc_local((chunks * vec,), T.float32)
             vs = T.alloc_local((chunks * vec,), T.float32)
@@ -180,6 +211,7 @@ def engram_gate_blocked_kernel(
         out: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
     ):
         with T.Kernel(hc_mult, tokens, threads=threads) as (h, t):
+            pdl.chain()
             tx = T.get_thread_binding()
             xs = T.alloc_local((chunks * vec,), T.float32)
             vs = T.alloc_local((chunks * vec,), T.float32)
@@ -279,10 +311,291 @@ def engram_gate_blocked(
     )
 
 
+@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+def engram_post_gate_kernel(
+    hc_mult: int,
+    hidden: int,
+    eps: float,
+    ids_dtype: str,
+    threads: int = 256,
+    vec: int = 4,
+):
+    assert hidden % (threads * vec) == 0 and threads % 32 == 0
+    chunks = hidden // (threads * vec)
+    warps = threads // 32
+    scalar = hidden**-0.5
+    tokens = T.dynamic("tokens")
+
+    @T.prim_func
+    def engram_post_gate(
+        layer_out: T.Tensor((tokens, hidden), T.bfloat16),
+        residual: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
+        post: T.Tensor((tokens, hc_mult), T.float32),
+        comb: T.Tensor((tokens, hc_mult, hc_mult), T.float32),
+        kv: T.Tensor((tokens, hc_mult + 1, hidden), T.bfloat16),
+        weight: T.Tensor((hc_mult, hidden), T.float32),
+        ids: T.Tensor((tokens,), ids_dtype),
+        out: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
+    ):
+        with T.Kernel(hc_mult, tokens, threads=threads) as (h, t):
+            pdl.chain()
+            tx = T.get_thread_binding()
+            xs = T.alloc_local((chunks * vec,), T.float32)
+            vs = T.alloc_local((chunks * vec,), T.float32)
+            ks = T.alloc_local((vec,), T.float32)
+            ws = T.alloc_local((vec,), T.float32)
+            acc = T.alloc_local((3,), T.float32)
+            partial = T.alloc_shared((3, warps), T.float32)
+            gate = T.alloc_shared((1,), T.float32)
+            _reconstruct_stream(
+                layer_out,
+                residual,
+                post,
+                comb,
+                xs,
+                t,
+                h,
+                tx,
+                chunks,
+                threads,
+                vec,
+                hc_mult,
+            )
+            if T.cast(ids[t], T.int64) == IMAGE_SENTINEL:
+                for c in T.serial(chunks):
+                    for i in T.vectorized(vec):
+                        out[t, h, (c * threads + tx) * vec + i] = T.cast(
+                            xs[c * vec + i], T.bfloat16
+                        )
+            else:
+                for j in T.serial(3):
+                    acc[j] = T.float32(0)
+                for c in T.serial(chunks):
+                    for i in T.vectorized(vec):
+                        vs[c * vec + i] = kv[t, hc_mult, (c * threads + tx) * vec + i]
+                    for i in T.vectorized(vec):
+                        ks[i] = kv[t, h, (c * threads + tx) * vec + i]
+                    for i in T.vectorized(vec):
+                        ws[i] = weight[h, (c * threads + tx) * vec + i]
+                    for i in T.serial(vec):
+                        acc[0] += xs[c * vec + i] * xs[c * vec + i]
+                        acc[1] += ks[i] * ks[i]
+                        acc[2] += xs[c * vec + i] * ws[i] * ks[i]
+                for j in T.serial(3):
+                    acc[j] = T.warp_reduce_sum(acc[j])
+                if tx % 32 == 0:
+                    for j in T.serial(3):
+                        partial[j, tx // 32] = acc[j]
+                T.sync_threads()
+                if tx == 0:
+                    for j in T.serial(3):
+                        acc[j] = T.float32(0)
+                        for warp in T.serial(warps):
+                            acc[j] += partial[j, warp]
+                    dot = (
+                        acc[2]
+                        * T.rsqrt(acc[0] / hidden + eps)
+                        * T.rsqrt(acc[1] / hidden + eps)
+                        * scalar
+                    )
+                    magnitude = T.abs(dot)
+                    floored = T.if_then_else(
+                        magnitude < CLAMP, T.float32(CLAMP), magnitude
+                    )
+                    gate[0] = T.sigmoid(T.copysign(T.sqrt(floored), dot))
+                T.sync_threads()
+                for c in T.serial(chunks):
+                    for i in T.vectorized(vec):
+                        out[t, h, (c * threads + tx) * vec + i] = T.cast(
+                            xs[c * vec + i] + gate[0] * vs[c * vec + i], T.bfloat16
+                        )
+
+    return engram_post_gate
+
+
+def engram_post_gate(
+    layer_out: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    kv: torch.Tensor,
+    weight: torch.Tensor,
+    ids: torch.Tensor,
+    out: torch.Tensor,
+    eps: float,
+    hc_mult: int,
+) -> None:
+    """Reconstruct ``residual`` via ``mhc.post(layer_out, residual, post, comb)`` and
+    gate it with ``kv`` and ``weight`` into ``out`` in a single launch, without
+    writing or reading the intermediate multi-stream residual."""
+    tokens = residual.shape[0]
+    if tokens == 0:
+        return
+    hidden = weight.numel() // hc_mult
+    kernel = engram_post_gate_kernel(hc_mult, hidden, eps, _dtype(ids))
+    kernel(
+        layer_out.view(tokens, hidden),
+        residual.view(tokens, hc_mult, hidden),
+        post.view(tokens, hc_mult),
+        comb.view(tokens, hc_mult, hc_mult),
+        kv.view(tokens, hc_mult + 1, hidden),
+        weight.view(hc_mult, hidden),
+        ids,
+        out.view(tokens, hc_mult, hidden),
+    )
+
+
+@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+def engram_post_gate_blocked_kernel(
+    hc_mult: int,
+    hidden: int,
+    eps: float,
+    ids_dtype: str,
+    blocks: int,
+    block_cols: int,
+    threads: int = 256,
+    vec: int = 4,
+):
+    assert hidden % (threads * vec) == 0 and threads % 32 == 0
+    assert block_cols % vec == 0 and blocks * block_cols >= (hc_mult + 1) * hidden
+    chunks = hidden // (threads * vec)
+    warps = threads // 32
+    scalar = hidden**-0.5
+    tokens = T.dynamic("tokens")
+    rows = T.dynamic("rows")
+
+    @T.prim_func
+    def engram_post_gate_blocked(
+        layer_out: T.Tensor((tokens, hidden), T.bfloat16),
+        residual: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
+        post: T.Tensor((tokens, hc_mult), T.float32),
+        comb: T.Tensor((tokens, hc_mult, hc_mult), T.float32),
+        kv: T.Tensor((blocks, rows, block_cols), T.bfloat16),
+        weight: T.Tensor((hc_mult, hidden), T.float32),
+        ids: T.Tensor((tokens,), ids_dtype),
+        out: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
+    ):
+        with T.Kernel(hc_mult, tokens, threads=threads) as (h, t):
+            pdl.chain()
+            tx = T.get_thread_binding()
+            xs = T.alloc_local((chunks * vec,), T.float32)
+            vs = T.alloc_local((chunks * vec,), T.float32)
+            ks = T.alloc_local((vec,), T.float32)
+            ws = T.alloc_local((vec,), T.float32)
+            acc = T.alloc_local((3,), T.float32)
+            partial = T.alloc_shared((3, warps), T.float32)
+            gate = T.alloc_shared((1,), T.float32)
+            _reconstruct_stream(
+                layer_out,
+                residual,
+                post,
+                comb,
+                xs,
+                t,
+                h,
+                tx,
+                chunks,
+                threads,
+                vec,
+                hc_mult,
+            )
+            if T.cast(ids[t], T.int64) == IMAGE_SENTINEL:
+                for c in T.serial(chunks):
+                    for i in T.vectorized(vec):
+                        out[t, h, (c * threads + tx) * vec + i] = T.cast(
+                            xs[c * vec + i], T.bfloat16
+                        )
+            else:
+                for j in T.serial(3):
+                    acc[j] = T.float32(0)
+                for c in T.serial(chunks):
+                    value = hc_mult * hidden + (c * threads + tx) * vec
+                    key = h * hidden + (c * threads + tx) * vec
+                    for i in T.vectorized(vec):
+                        vs[c * vec + i] = kv[
+                            value // block_cols, t, value % block_cols + i
+                        ]
+                    for i in T.vectorized(vec):
+                        ks[i] = kv[key // block_cols, t, key % block_cols + i]
+                    for i in T.vectorized(vec):
+                        ws[i] = weight[h, (c * threads + tx) * vec + i]
+                    for i in T.serial(vec):
+                        acc[0] += xs[c * vec + i] * xs[c * vec + i]
+                        acc[1] += ks[i] * ks[i]
+                        acc[2] += xs[c * vec + i] * ws[i] * ks[i]
+                for j in T.serial(3):
+                    acc[j] = T.warp_reduce_sum(acc[j])
+                if tx % 32 == 0:
+                    for j in T.serial(3):
+                        partial[j, tx // 32] = acc[j]
+                T.sync_threads()
+                if tx == 0:
+                    for j in T.serial(3):
+                        acc[j] = T.float32(0)
+                        for warp in T.serial(warps):
+                            acc[j] += partial[j, warp]
+                    dot = (
+                        acc[2]
+                        * T.rsqrt(acc[0] / hidden + eps)
+                        * T.rsqrt(acc[1] / hidden + eps)
+                        * scalar
+                    )
+                    magnitude = T.abs(dot)
+                    floored = T.if_then_else(
+                        magnitude < CLAMP, T.float32(CLAMP), magnitude
+                    )
+                    gate[0] = T.sigmoid(T.copysign(T.sqrt(floored), dot))
+                T.sync_threads()
+                for c in T.serial(chunks):
+                    for i in T.vectorized(vec):
+                        out[t, h, (c * threads + tx) * vec + i] = T.cast(
+                            xs[c * vec + i] + gate[0] * vs[c * vec + i], T.bfloat16
+                        )
+
+    return engram_post_gate_blocked
+
+
+def engram_post_gate_blocked(
+    layer_out: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    kv: torch.Tensor,
+    weight: torch.Tensor,
+    ids: torch.Tensor,
+    out: torch.Tensor,
+    eps: float,
+    hc_mult: int,
+) -> None:
+    """``engram_post_gate`` with ``kv`` as column blocks ``[N, rows, C]``."""
+    tokens = residual.shape[0]
+    if tokens == 0:
+        return
+    hidden = weight.numel() // hc_mult
+    blocks, _, block_cols = kv.shape
+    kernel = engram_post_gate_blocked_kernel(
+        hc_mult, hidden, eps, _dtype(ids), blocks, block_cols
+    )
+    kernel(
+        layer_out.view(tokens, hidden),
+        residual.view(tokens, hc_mult, hidden),
+        post.view(tokens, hc_mult),
+        comb.view(tokens, hc_mult, hc_mult),
+        kv,
+        weight.view(hc_mult, hidden),
+        ids,
+        out.view(tokens, hc_mult, hidden),
+    )
+
+
 __all__ = [
     "CLAMP",
     "engram_gate",
     "engram_gate_blocked",
     "engram_gate_blocked_kernel",
     "engram_gate_kernel",
+    "engram_post_gate",
+    "engram_post_gate_blocked",
+    "engram_post_gate_blocked_kernel",
+    "engram_post_gate_kernel",
 ]

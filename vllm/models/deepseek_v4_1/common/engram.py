@@ -704,6 +704,8 @@ class ParallelEngramEmbedding(nn.Module):
 
 
 class Engram(nn.Module):
+    supports_fused_post = True
+
     def __init__(
         self,
         config,
@@ -798,18 +800,24 @@ class Engram(nn.Module):
         return ()
 
     def declare_kernels(self) -> None:
-        """Declare the TileLang gate: on packed rows always, and on the column blocks
-        of a column-parallel projection when the model runs prefill sequence
-        parallel (the blocked gate, one block per rank). The model passes the
-        step's int32 token ids, the gate finding the image sentinel itself."""
+        """Declare the TileLang gate (both standalone and fused with ``mhc.post``):
+        on packed rows always, and on the column blocks of a column-parallel
+        projection when the model runs prefill sequence parallel (the blocked gate,
+        one block per rank). The model passes the step's int32 token ids, the gate
+        finding the image sentinel itself."""
         from vllm.models.deepseek_v4_1.tilelang import prepare
         from vllm.models.deepseek_v4_1.tilelang.engram import (
             engram_gate_blocked_kernel,
             engram_gate_kernel,
+            engram_post_gate_blocked_kernel,
+            engram_post_gate_kernel,
         )
 
         calls = [
-            prepare.call(engram_gate_kernel, self.hc_mult, self.dim, self.eps, "int32")
+            prepare.call(engram_gate_kernel, self.hc_mult, self.dim, self.eps, "int32"),
+            prepare.call(
+                engram_post_gate_kernel, self.hc_mult, self.dim, self.eps, "int32"
+            ),
         ]
         sequence_parallel = (
             0 < self.prefill_sp_min_rows <= self.embed_tokens.caps.max_tokens
@@ -821,6 +829,8 @@ class Engram(nn.Module):
             key = columns.copy_columns_key(self.hc_mult * self.dim, torch.bfloat16)
             calls.append(prepare.call(columns.copy_columns_kernel, *key))
         if sequence_parallel and isinstance(self.wkv, _PaddedColumnParallelLinear):
+            world_size = get_tensor_model_parallel_world_size()
+            block_cols = self.wkv.output_size_per_partition
             calls.append(
                 prepare.call(
                     engram_gate_blocked_kernel,
@@ -828,8 +838,19 @@ class Engram(nn.Module):
                     self.dim,
                     self.eps,
                     "int32",
-                    get_tensor_model_parallel_world_size(),
-                    self.wkv.output_size_per_partition,
+                    world_size,
+                    block_cols,
+                )
+            )
+            calls.append(
+                prepare.call(
+                    engram_post_gate_blocked_kernel,
+                    self.hc_mult,
+                    self.dim,
+                    self.eps,
+                    "int32",
+                    world_size,
+                    block_cols,
                 )
             )
         prepare.declare(lambda: calls)
@@ -863,11 +884,24 @@ class Engram(nn.Module):
         self._disk_prepared_tokens = num_tokens
         self._disk_prepared = True
 
-    def forward(self, hidden_states, hash_ids, token_mask=None, sp_rows=None):
+    def forward(
+        self,
+        hidden_states,
+        hash_ids,
+        token_mask=None,
+        sp_rows=None,
+        *,
+        previous_output=None,
+        post_mix=None,
+        res_mix=None,
+    ):
         """Gate ``hidden_states`` with this layer's Engram rows.
 
         ``token_mask`` is the step's token ids (the image sentinel's rows pass
-        through).
+        through). When ``previous_output``, ``post_mix`` and ``res_mix`` are
+        given, reconstructs ``hidden_states`` via ``mhc.post`` inside the gate
+        kernel in a single launch without writing or reading an intermediate
+        multi-stream residual tensor.
 
         With ``sp_rows`` (prefill sequence parallelism) ``hidden_states`` holds
         this rank's rows while ``hash_ids`` and ``token_mask`` cover every
@@ -903,6 +937,55 @@ class Engram(nn.Module):
             kv = project_rows(self.wkv, rows, self.l2_prefetch_after_projection)
             del rows
             kv_start = 0 if sp_rows is None else sp_rows.start
+        if previous_output is not None:
+            from vllm.models.deepseek_v4_1.tilelang.collectives import RankOrderParts
+            from vllm.models.deepseek_v4_1.tilelang.engram import (
+                engram_post_gate,
+                engram_post_gate_blocked,
+            )
+
+            if isinstance(previous_output, RankOrderParts):
+                previous_output = previous_output.sum()
+            out = torch.empty_like(hidden_states)
+            residual_in = hidden_states
+            mix_out = out
+            if sp_rows is not None:
+                start, real = sp_rows.start, sp_rows.real_rows
+                if real < hidden_states.shape[0]:
+                    from vllm.models.deepseek_v4_1.tilelang.mhc import _mhc_post
+
+                    _mhc_post(
+                        previous_output[real:],
+                        hidden_states[real:],
+                        post_mix[real:],
+                        res_mix[real:],
+                        out[real:],
+                    )
+                if real == 0:
+                    return out
+                previous_output = previous_output[:real]
+                residual_in = hidden_states[:real]
+                post_mix = post_mix[:real]
+                res_mix = res_mix[:real]
+                mix_out = out[:real]
+                if not blocked:
+                    kv = kv[kv_start : kv_start + real]
+                if token_mask is not None:
+                    token_mask = token_mask[start : start + real]
+            post_gate = engram_post_gate_blocked if blocked else engram_post_gate
+            post_gate(
+                previous_output,
+                residual_in,
+                post_mix,
+                res_mix,
+                kv,
+                self.norm_weights,
+                token_mask,
+                mix_out,
+                self.eps,
+                self.hc_mult,
+            )
+            return out
         state = hidden_states.flatten(1)
         out = torch.empty_like(state)
         mix_out = out
