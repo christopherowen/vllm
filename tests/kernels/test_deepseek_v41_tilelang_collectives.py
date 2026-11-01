@@ -10,12 +10,16 @@ import pytest
 import torch
 
 from vllm.models.deepseek_v4_1.tilelang.collectives import (
+    MAX_RANK_ORDER_WORLD,
     RankOrderParts,
     all_reduce_rank_order,
     exchange_into,
     rank_order_sum,
     reduce_scatter_rank_order,
 )
+
+WORLDS = [2, 3, 4, 5, 6, 7, 8]
+assert WORLDS[-1] == MAX_RANK_ORDER_WORLD
 
 
 class _Fabric:
@@ -116,7 +120,7 @@ def _reference(values):
     return total.to(values[0].dtype)
 
 
-@pytest.mark.parametrize("world", [2, 3, 4])
+@pytest.mark.parametrize("world", WORLDS)
 @pytest.mark.parametrize("local", [1, 4, 7])
 def test_rows_add_as_the_one_shot_all_reduce(world, local):
     torch.manual_seed(world * 10 + local)
@@ -145,7 +149,7 @@ def _exchange_in_slices(bounds):
     return collective
 
 
-@pytest.mark.parametrize("world", [2, 3, 4])
+@pytest.mark.parametrize("world", WORLDS)
 @pytest.mark.parametrize("bounds", [(0, 7), (0, 3, 7), (0, 1, 2, 7)])
 def test_sliced_exchange_into_parts_sums_alike(world, bounds):
     torch.manual_seed(world * 100 + len(bounds))
@@ -163,7 +167,7 @@ def test_sliced_exchange_into_parts_sums_alike(world, bounds):
         assert torch.equal(sliced[rank].sum(), whole[rank])
 
 
-@pytest.mark.parametrize("world", [2, 3, 4])
+@pytest.mark.parametrize("world", WORLDS)
 @pytest.mark.parametrize("rows", [1, 5, 8, 13])
 def test_all_reduce_adds_as_the_one_shot_all_reduce(world, rows):
     # Every rank gets every row, each summed in rank order with one rounding,
@@ -178,7 +182,7 @@ def test_all_reduce_adds_as_the_one_shot_all_reduce(world, rows):
         assert torch.equal(out[rank], want)
 
 
-@pytest.mark.parametrize("world", [2, 3, 4])
+@pytest.mark.parametrize("world", WORLDS)
 @pytest.mark.parametrize("rows", [1, 5, 13])
 def test_all_reduce_pads_with_tilelang_zeros(monkeypatch, world, rows):
     """The padding rows are zeroed by TileLang's fill (stood in for on the host),
@@ -215,11 +219,12 @@ def test_all_reduce_pads_with_tilelang_zeros(monkeypatch, world, rows):
         assert torch.equal(out[rank], want)
 
 
-def test_row_bits_do_not_depend_on_owner_or_batch():
+@pytest.mark.parametrize("world", [4, 5, 6, 7, 8])
+def test_row_bits_do_not_depend_on_owner_or_batch(world):
     # One row's partials at every position of batches of two sizes: the reduced
     # row has the same bits wherever it lands and whichever rank owns it.
-    torch.manual_seed(1)
-    world, width = 4, 64
+    torch.manual_seed(world)
+    width = 64
     row = [torch.randn(width).to(torch.bfloat16) * 10**k for k in range(world)]
     results = set()
     for local in (3, 6):
@@ -244,6 +249,12 @@ def test_torch_sum_leaves_its_inputs(dtype):
     assert torch.equal(rank_order_sum(parts), first)
 
 
+def test_nine_or_more_parts_fall_back_to_torch_in_rank_order():
+    torch.manual_seed(9)
+    parts = [torch.randn(5, 16).to(torch.bfloat16) * 10**k for k in range(9)]
+    assert torch.equal(rank_order_sum(parts), _reference(parts))
+
+
 def test_one_rounding_differs_from_rounding_each_add():
     # FP32 accumulation is observable: rounding after each BF16 add (as NCCL does
     # per hop) gives other bits, so the tests above would catch it.
@@ -256,7 +267,7 @@ def test_one_rounding_differs_from_rounding_each_add():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
-@pytest.mark.parametrize("world", [2, 3, 4])
+@pytest.mark.parametrize("world", WORLDS)
 def test_tilelang_sum_rounds_as_float32_in_rank_order(world):
     torch.manual_seed(world)
     parts = [
@@ -311,7 +322,7 @@ def _assert_same_bits(got, want):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
-@pytest.mark.parametrize("world", [2, 3, 4])
+@pytest.mark.parametrize("world", WORLDS)
 @pytest.mark.parametrize(
     "shard, dtype",
     [

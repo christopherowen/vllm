@@ -3,17 +3,17 @@
 """A reduce-scatter with the one-shot all-reduce's arithmetic.
 
 sparknet's one-shot all-reduce adds the ranks' BF16 partials in FP32 in rank order
-(source 0, then 1, 2, 3) and rounds once, so a row has the same bits whatever the
-message size, the row's position or the rank. NCCL's reduce-scatter, which prefill
-sequence parallelism uses from 205 rows, adds a chunk around the ring starting
-after its owner and rounds to BF16 after every hop: a row's bits change with the
-step's row count. ``reduce_scatter_rank_order`` exchanges the chunks unreduced
+(source 0, then 1, 2, ..., world - 1) and rounds once, so a row has the same bits
+whatever the message size, the row's position or the rank. NCCL's reduce-scatter,
+which prefill sequence parallelism uses from 205 rows, adds a chunk around the ring
+starting after its owner and rounds to BF16 after every hop: a row's bits change with
+the step's row count. ``reduce_scatter_rank_order`` exchanges the chunks unreduced
 (NCCL send/recv on the same communicator, the same bytes) and adds them as the
 one-shot all-reduce does, so a row reduces to the same bits on every path.
 
 At four ranks only the neighbours (rank +-1, the ring4 cable order sparknet and
 NCCL use) exchange: each half of the opposite rank's chunk is relayed through one
-neighbour, so the four links carry equal bytes. Fewer ranks exchange directly.
+neighbour, so the four links carry equal bytes. Other world sizes exchange directly.
 """
 
 # No `from __future__ import annotations`: TileLang reads the prim_func
@@ -28,13 +28,14 @@ import torch
 from vllm.models.deepseek_v4_1.tilelang import prepare
 
 _VEC = 8  # BF16 per thread: one 16-byte access
+MAX_RANK_ORDER_WORLD = 8
 
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
 def rank_order_sum_kernel(world: int, threads: int = 256):
-    """``out = bf16(((s0 + s1) + s2) + s3)`` in FP32, element by element; the
+    """``out = bf16(((s0 + s1) + s2) + ...)`` in FP32, element by element; the
     first source is taken as is (not added to zero), so signed zeros survive."""
-    assert 2 <= world <= 4
+    assert 2 <= world <= MAX_RANK_ORDER_WORLD
     m = T.dynamic("m")  # groups of _VEC elements
 
     @T.macro
@@ -54,6 +55,18 @@ def rank_order_sum_kernel(world: int, threads: int = 256):
         for i in T.vectorized(_VEC):
             out[row, i] = xs[i]
 
+    @T.macro
+    def sum_rows(sources, out):
+        with T.Kernel(T.ceildiv(m, threads), threads=threads) as bx:
+            row = bx * threads + T.get_thread_binding()
+            xs = T.alloc_local((_VEC,), T.bfloat16)
+            total = T.alloc_local((_VEC,), T.float32)
+            if row < m:
+                load(sources[0], xs, total, row, True)
+                for src in sources[1:]:
+                    load(src, xs, total, row, False)
+                store(out, xs, total, row)
+
     if world == 2:
 
         @T.prim_func
@@ -62,14 +75,7 @@ def rank_order_sum_kernel(world: int, threads: int = 256):
             s1: T.Tensor((m, _VEC), T.bfloat16),
             out: T.Tensor((m, _VEC), T.bfloat16),
         ):
-            with T.Kernel(T.ceildiv(m, threads), threads=threads) as bx:
-                row = bx * threads + T.get_thread_binding()
-                xs = T.alloc_local((_VEC,), T.bfloat16)
-                total = T.alloc_local((_VEC,), T.float32)
-                if row < m:
-                    load(s0, xs, total, row, True)
-                    load(s1, xs, total, row, False)
-                    store(out, xs, total, row)
+            sum_rows((s0, s1), out)
 
     elif world == 3:
 
@@ -80,17 +86,9 @@ def rank_order_sum_kernel(world: int, threads: int = 256):
             s2: T.Tensor((m, _VEC), T.bfloat16),
             out: T.Tensor((m, _VEC), T.bfloat16),
         ):
-            with T.Kernel(T.ceildiv(m, threads), threads=threads) as bx:
-                row = bx * threads + T.get_thread_binding()
-                xs = T.alloc_local((_VEC,), T.bfloat16)
-                total = T.alloc_local((_VEC,), T.float32)
-                if row < m:
-                    load(s0, xs, total, row, True)
-                    load(s1, xs, total, row, False)
-                    load(s2, xs, total, row, False)
-                    store(out, xs, total, row)
+            sum_rows((s0, s1, s2), out)
 
-    else:
+    elif world == 4:
 
         @T.prim_func
         def collectives_rank_order_sum(
@@ -100,16 +98,65 @@ def rank_order_sum_kernel(world: int, threads: int = 256):
             s3: T.Tensor((m, _VEC), T.bfloat16),
             out: T.Tensor((m, _VEC), T.bfloat16),
         ):
-            with T.Kernel(T.ceildiv(m, threads), threads=threads) as bx:
-                row = bx * threads + T.get_thread_binding()
-                xs = T.alloc_local((_VEC,), T.bfloat16)
-                total = T.alloc_local((_VEC,), T.float32)
-                if row < m:
-                    load(s0, xs, total, row, True)
-                    load(s1, xs, total, row, False)
-                    load(s2, xs, total, row, False)
-                    load(s3, xs, total, row, False)
-                    store(out, xs, total, row)
+            sum_rows((s0, s1, s2, s3), out)
+
+    elif world == 5:
+
+        @T.prim_func
+        def collectives_rank_order_sum(
+            s0: T.Tensor((m, _VEC), T.bfloat16),
+            s1: T.Tensor((m, _VEC), T.bfloat16),
+            s2: T.Tensor((m, _VEC), T.bfloat16),
+            s3: T.Tensor((m, _VEC), T.bfloat16),
+            s4: T.Tensor((m, _VEC), T.bfloat16),
+            out: T.Tensor((m, _VEC), T.bfloat16),
+        ):
+            sum_rows((s0, s1, s2, s3, s4), out)
+
+    elif world == 6:
+
+        @T.prim_func
+        def collectives_rank_order_sum(
+            s0: T.Tensor((m, _VEC), T.bfloat16),
+            s1: T.Tensor((m, _VEC), T.bfloat16),
+            s2: T.Tensor((m, _VEC), T.bfloat16),
+            s3: T.Tensor((m, _VEC), T.bfloat16),
+            s4: T.Tensor((m, _VEC), T.bfloat16),
+            s5: T.Tensor((m, _VEC), T.bfloat16),
+            out: T.Tensor((m, _VEC), T.bfloat16),
+        ):
+            sum_rows((s0, s1, s2, s3, s4, s5), out)
+
+    elif world == 7:
+
+        @T.prim_func
+        def collectives_rank_order_sum(
+            s0: T.Tensor((m, _VEC), T.bfloat16),
+            s1: T.Tensor((m, _VEC), T.bfloat16),
+            s2: T.Tensor((m, _VEC), T.bfloat16),
+            s3: T.Tensor((m, _VEC), T.bfloat16),
+            s4: T.Tensor((m, _VEC), T.bfloat16),
+            s5: T.Tensor((m, _VEC), T.bfloat16),
+            s6: T.Tensor((m, _VEC), T.bfloat16),
+            out: T.Tensor((m, _VEC), T.bfloat16),
+        ):
+            sum_rows((s0, s1, s2, s3, s4, s5, s6), out)
+
+    else:
+
+        @T.prim_func
+        def collectives_rank_order_sum(
+            s0: T.Tensor((m, _VEC), T.bfloat16),
+            s1: T.Tensor((m, _VEC), T.bfloat16),
+            s2: T.Tensor((m, _VEC), T.bfloat16),
+            s3: T.Tensor((m, _VEC), T.bfloat16),
+            s4: T.Tensor((m, _VEC), T.bfloat16),
+            s5: T.Tensor((m, _VEC), T.bfloat16),
+            s6: T.Tensor((m, _VEC), T.bfloat16),
+            s7: T.Tensor((m, _VEC), T.bfloat16),
+            out: T.Tensor((m, _VEC), T.bfloat16),
+        ):
+            sum_rows((s0, s1, s2, s3, s4, s5, s6, s7), out)
 
     return collectives_rank_order_sum
 
@@ -124,7 +171,9 @@ def rank_order_sum_calls() -> list[prepare.TileLangCall]:
     group = get_tp_group()
     world = group.world_size
     comm = group.device_communicator
-    if not 2 <= world <= 4 or not getattr(comm, "rank_order_reduce_scatter", False):
+    if not 2 <= world <= MAX_RANK_ORDER_WORLD or not getattr(
+        comm, "rank_order_reduce_scatter", False
+    ):
         return []
     return [prepare.call(rank_order_sum_kernel, world)]
 
@@ -224,7 +273,7 @@ def rank_order_sum(
     if (
         parts[0].is_cuda
         and parts[0].dtype == torch.bfloat16
-        and 2 <= len(parts) <= 4
+        and 2 <= len(parts) <= MAX_RANK_ORDER_WORLD
         and n % _VEC == 0
         and all(p.is_contiguous() for p in parts)
         and out.is_contiguous()
@@ -367,6 +416,7 @@ def _recv(comm, tensor: torch.Tensor, peer: int) -> None:
 
 
 __all__ = [
+    "MAX_RANK_ORDER_WORLD",
     "RankOrderParts",
     "all_reduce_rank_order",
     "exchange_into",
