@@ -681,3 +681,21 @@ def test_fadvise_dontneed_evicts_page_cache_on_registration_and_load(monkeypatch
     _read_table_rows(dest, source, 0)
     assert torch.equal(dest, codes)
     assert _cached_pages(weight_path) <= 2
+def test_mlock_pinned_and_mapped_host_buffers():
+    from vllm.v1.utils import CpuGpuBuffer
+
+    buf = CpuGpuBuffer(256, dtype=torch.int32, device=torch.device("cuda"), pin_memory=True)
+    assert buf._mlocked is True
+    buf.np[:4] = [11, 22, 33, 44]
+    out = buf.copy_to_gpu(4)
+    assert out.tolist() == [11, 22, 33, 44]
+
+    _, _, paths = _write_table(_table_dir(), seed=30)
+    rows = _rows(paths, tokens=4)
+    assert rows._ids_mlocked is True
+    assert rows.weights._mlocked is True
+    assert rows.scales._mlocked is True
+    assert rows.control._mlocked is True
+    rows.close()
+    assert rows._ids_mlocked is False
+    assert rows.weights._mlocked is False

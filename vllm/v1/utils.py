@@ -2,8 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
 import contextlib
+import ctypes
 import json
 import multiprocessing
+import os
+import resource
 import threading
 import time
 import weakref
@@ -107,6 +110,75 @@ class ConstantList(Generic[T], Sequence):
         return self._x.copy()
 
 
+_mlock_state_lock = threading.Lock()
+_mlock_fn: Any = None
+_munlock_fn: Any = None
+_mlock_warned: bool = False
+_MIN_MEMLOCK_LIMIT = 64 << 20  # reserve tight (<64 MiB) RLIMIT_MEMLOCK for io_uring
+
+
+def _ensure_mlock_fns() -> tuple[Any, Any]:
+    global _mlock_fn, _munlock_fn
+    if _mlock_fn is not None:
+        return _mlock_fn, _munlock_fn
+    with _mlock_state_lock:
+        if _mlock_fn is None:
+            with contextlib.suppress(ValueError, OSError):
+                resource.setrlimit(
+                    resource.RLIMIT_MEMLOCK,
+                    (resource.RLIM_INFINITY, resource.RLIM_INFINITY),
+                )
+            with contextlib.suppress(ValueError, OSError):
+                soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+                if soft != resource.RLIM_INFINITY and (
+                    hard == resource.RLIM_INFINITY or soft < hard
+                ):
+                    resource.setrlimit(resource.RLIMIT_MEMLOCK, (hard, hard))
+            libc = ctypes.CDLL(None, use_errno=True)
+            mlock = libc.mlock
+            mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            mlock.restype = ctypes.c_int
+            munlock = libc.munlock
+            munlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            munlock.restype = ctypes.c_int
+            _munlock_fn = munlock
+            _mlock_fn = mlock
+    return _mlock_fn, _munlock_fn
+
+
+def mlock_memory(addr: int, nbytes: int) -> bool:
+    """Lock a host virtual address range into RAM via ``mlock(2)``."""
+    global _mlock_warned
+    if addr <= 0 or nbytes <= 0:
+        return False
+    mlock, _ = _ensure_mlock_fns()
+    with contextlib.suppress(ValueError, OSError):
+        soft, _ = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+        if soft != resource.RLIM_INFINITY and soft < _MIN_MEMLOCK_LIMIT:
+            return False
+    if mlock(ctypes.c_void_p(addr), ctypes.c_size_t(nbytes)) == 0:
+        return True
+    if not _mlock_warned:
+        err = ctypes.get_errno()
+        _mlock_warned = True
+        logger.debug(
+            "mlock(%#x, %d) failed: %s (errno=%d)",
+            addr,
+            nbytes,
+            os.strerror(err),
+            err,
+        )
+    return False
+
+
+def munlock_memory(addr: int, nbytes: int) -> None:
+    """Unlock a host virtual address range previously locked with ``mlock_memory``."""
+    if addr <= 0 or nbytes <= 0:
+        return
+    _, munlock = _ensure_mlock_fns()
+    munlock(ctypes.c_void_p(addr), ctypes.c_size_t(nbytes))
+
+
 class CpuGpuBuffer:
     """Buffer to easily copy tensors between CPU and GPU."""
 
@@ -118,12 +190,18 @@ class CpuGpuBuffer:
         pin_memory: bool = PIN_MEMORY,
         with_numpy: bool = True,
     ) -> None:
+        self.pin_memory = pin_memory
         # these buffers are mutable runtime state, so allocate them as normal
         with torch.inference_mode(False):
             self.cpu = torch.zeros(
                 *size, dtype=dtype, device="cpu", pin_memory=pin_memory
             )
             self.gpu = torch.zeros_like(self.cpu, device=device)
+        self._mlocked = (
+            mlock_memory(self.cpu.data_ptr(), self.cpu.nbytes)
+            if pin_memory and self.cpu.numel() > 0
+            else False
+        )
         self.np: np.ndarray
         # To keep type hints simple (avoiding generics and subclasses), we
         # only conditionally create the numpy array attribute. This can cause
@@ -140,7 +218,7 @@ class CpuGpuBuffer:
         cpu, gpu = self.cpu, self.gpu
         if n is not None:
             cpu, gpu = cpu[:n], gpu[:n]
-        return gpu.copy_(cpu.pin_memory() if PIN_MEMORY else cpu, non_blocking=True)
+        return gpu.copy_(cpu, non_blocking=True)
 
     def copy_to_cpu(self, n: int | None = None) -> torch.Tensor:
         """NOTE: Because this method is non-blocking, explicit synchronization

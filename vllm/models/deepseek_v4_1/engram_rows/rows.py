@@ -26,6 +26,7 @@ import numpy as np
 import torch
 
 from vllm.models.deepseek_v4_1.engram_rows._native import load
+from vllm.v1.utils import mlock_memory, munlock_memory
 
 ROW_BYTES = 256  # E4M3 values of one row
 SCALE_BYTES = 8  # E8M0 scales of one row, one per 32 values
@@ -73,6 +74,7 @@ class MappedHostAllocation:
             flags |= cudart.cudaHostAllocWriteCombined
         self.device = device = _indexed(device)
         self.nbytes = math.prod(shape) * dtype.itemsize
+        self._mlocked = False
         with torch.cuda.device(device):
             self.pointer = int(_check(cudart.cudaHostAlloc(self.nbytes, flags), "cudaHostAlloc"))
             try:
@@ -80,6 +82,7 @@ class MappedHostAllocation:
                                         "cudaHostGetDevicePointer")
                 self.host = _tensor_at(self.pointer, shape, dtype, torch.device("cpu"))
                 self.device_view = _tensor_at(int(device_pointer), shape, dtype, device)
+                self._mlocked = mlock_memory(self.pointer, self.nbytes)
             except Exception:
                 cudart.cudaFreeHost(self.pointer)
                 self.pointer = 0
@@ -89,6 +92,9 @@ class MappedHostAllocation:
         from cuda.bindings import runtime as cudart
 
         if self.pointer:
+            if self._mlocked:
+                munlock_memory(self.pointer, self.nbytes)
+                self._mlocked = False
             _check(cudart.cudaFreeHost(self.pointer), "cudaFreeHost")
             self.pointer = 0
 
@@ -127,6 +133,7 @@ class EngramDiskRows:
         self.timeline_enabled = bool(timeline)
         self._allocations = []
         self.ids = torch.empty(self.max_lookups, dtype=torch.int64, pin_memory=True)
+        self._ids_mlocked = mlock_memory(self.ids.data_ptr(), self.ids.nbytes)
         self.weights = self._mapped((self.max_lookups, ROW_BYTES), torch.uint8, True)
         self.scales = self._mapped((self.max_lookups, SCALE_BYTES), torch.uint8, True)
         self.control = self._mapped((self.native.CTRL_WORDS,), torch.int32, False)
@@ -237,6 +244,9 @@ class EngramDiskRows:
         """Stop the reader, then free the buffers; the GPU must be done with them."""
         self._reader = None
         torch.cuda.synchronize(self.device)
+        if getattr(self, "_ids_mlocked", False):
+            munlock_memory(self.ids.data_ptr(), self.ids.nbytes)
+            self._ids_mlocked = False
         for allocation in self._allocations:
             allocation.close()
         self._allocations = []
