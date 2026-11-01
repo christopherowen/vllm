@@ -158,6 +158,9 @@ class Scheduler(SchedulerInterface):
     # environment; off for a scheduler built without it).
     sink_config: SinkConfig | None = None
     sink_rejection: bool = False
+    reasoning_start_token_ids: tuple[int, ...] = ()
+    natural_reasoning_end_token_ids: tuple[int, ...] = ()
+    thinking_loop_break: bool = False
 
     def __init__(
         self,
@@ -448,6 +451,22 @@ class Scheduler(SchedulerInterface):
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
+        reasoning_config = vllm_config.reasoning_config
+        if reasoning_config is not None and reasoning_config.enabled:
+            self.reasoning_start_token_ids = tuple(
+                reasoning_config.reasoning_start_token_ids or ()
+            )
+            self.natural_reasoning_end_token_ids = tuple(
+                reasoning_config.natural_reasoning_end_token_ids or ()
+            )
+        else:
+            self.reasoning_start_token_ids = ()
+            self.natural_reasoning_end_token_ids = ()
+        self.thinking_loop_break = bool(
+            self.use_v2_model_runner
+            and self.reasoning_start_token_ids
+            and self.natural_reasoning_end_token_ids
+        )
         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
         # cadence (`next_decode_eligible_step`).
         self.current_step = 0
@@ -2513,6 +2532,14 @@ class Scheduler(SchedulerInterface):
                     )
                     sink_draft_zero_req_ids.add(request.request_id)
 
+        force_thinking_end_req_ids: set[str] | None = None
+        if self.reasoning_start_token_ids:
+            for request in self.running:
+                if request.force_thinking_end:
+                    if force_thinking_end_req_ids is None:
+                        force_thinking_end_req_ids = set()
+                    force_thinking_end_req_ids.add(request.request_id)
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             boundary_logits_only=bool(
@@ -2543,6 +2570,7 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             skip_drafts=not drafts_needed,
             sink_draft_zero_req_ids=sink_draft_zero_req_ids,
+            force_thinking_end_req_ids=force_thinking_end_req_ids,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
             compute_service_class=compute_service_class,
             # Execution feedback is only useful while both classes can run.
@@ -2893,6 +2921,7 @@ class Scheduler(SchedulerInterface):
         # Current streaming input behaviour: Keep only computed output tokens
         # (discard final sampled output token).
         self._drop_sink_provisional(session)
+        session.reset_reasoning_markers()
         num_computed_tokens = session.num_computed_tokens
         kept_output_tokens = session._all_token_ids[
             session.num_prompt_tokens : num_computed_tokens
@@ -3894,12 +3923,32 @@ class Scheduler(SchedulerInterface):
         # a request is still being prefilled, we expect the model runner
         # to return empty token ids for the request.
         stopped = False
+        start_ids = self.reasoning_start_token_ids
+        end_ids = self.natural_reasoning_end_token_ids
+        track_reasoning = bool(start_ids and end_ids)
         for num_new, output_token_id in enumerate(new_token_ids, 1):
+            prev_num_output = len(request._output_token_ids)
             request.append_output_token_ids(output_token_id)
+            if track_reasoning and not request.thinking_disabled:
+                request.update_reasoning_markers(
+                    start_ids, end_ids, prev_num_output=prev_num_output
+                )
 
             # Check for stop and update request state.
             # This must be called before we make the EngineCoreOutput.
-            stopped = check_stop(request, self.max_model_len)
+            was_forced = request.force_thinking_end
+            stopped = check_stop(
+                request,
+                self.max_model_len,
+                thinking_loop_break=self.thinking_loop_break,
+            )
+            if not was_forced and request.force_thinking_end:
+                logger.info(
+                    "Detected reasoning loop in request %s at %d output tokens; "
+                    "forcing reasoning end token.",
+                    request.request_id,
+                    request.num_output_tokens,
+                )
             if stopped:
                 del new_token_ids[num_new:]  # Trim new tokens if needed.
                 break

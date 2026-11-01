@@ -25,14 +25,135 @@ def _has_repeating_pattern(
     return True
 
 
+def _has_windowed_repeating_pattern(
+    token_ids: Sequence[int],
+    min_pattern_size: int,
+    max_pattern_size: int,
+    min_count: int,
+    start_idx: int = 0,
+    window_size: int = 160,
+    min_density: float = 0.6,
+) -> bool:
+    """Check if the tail of token_ids ends with a phrase that repeats at least
+    ``min_count`` times within the last ``window_size`` tokens (allowing short
+    interspersed variations such as ``3xA + B + 2xA``) and covers at least
+    ``min_density`` of the span from its first matched occurrence to the end.
+    """
+    seq = getattr(token_ids, "_x", token_ids)
+    n = len(seq)
+    avail = n - start_idx
+    eff_min = max(min_pattern_size, 5)
+    if avail < eff_min * min_count or eff_min > max_pattern_size:
+        return False
+
+    win_start = max(start_idx, n - window_size)
+    last_tok = seq[n - 1]
+    checked_patterns = 0
+
+    for i in range(n - 2, win_start - 1, -1):
+        if seq[i] != last_tok:
+            continue
+        gap = n - 1 - i
+        if gap < eff_min:
+            continue
+        lcs = 1
+        while (
+            lcs <= max_pattern_size
+            and i - lcs >= start_idx
+            and seq[i - lcs] == seq[n - 1 - lcs]
+        ):
+            lcs += 1
+        if lcs < eff_min:
+            continue
+
+        phrase = seq[n - lcs : n]
+        cand_lens = [lcs]
+        for b in range(1, lcs - eff_min + 1):
+            if phrase[:b] == phrase[lcs - b :]:
+                cand_lens.append(lcs - b)
+
+        for cand_len in cand_lens:
+            if cand_len * min_count > avail:
+                continue
+            cand = seq[n - cand_len : n]
+            count = 1
+            pos = n - cand_len
+            while pos - cand_len >= win_start:
+                nxt = pos - 1
+                while nxt >= win_start and seq[nxt] != last_tok:
+                    nxt -= 1
+                if nxt - cand_len + 1 < win_start:
+                    break
+                if seq[nxt - cand_len + 1 : nxt + 1] == cand:
+                    count += 1
+                    pos = nxt - cand_len + 1
+                    if (
+                        count >= min_count
+                        and count * cand_len >= (n - pos) * min_density
+                    ):
+                        return True
+                else:
+                    pos = nxt
+
+        checked_patterns += 1
+        if checked_patterns >= 2:
+            break
+
+    return False
+
+
+def has_thinking_loop(
+    token_ids: Sequence[int],
+    start_idx: int = 0,
+) -> bool:
+    """Detect degenerate repetition loops inside a ``<think>`` block.
+
+    Catches:
+    1. Short contiguous token loops (pattern length 1..3 repeated >= 8 times
+       with total repeated span >= 16 tokens).
+    2. Phrase/sentence contiguous loops (pattern length 4..64 repeated >= 4
+       times contiguously).
+    3. Interspersed/windowed phrase loops (pattern length 5..64 repeated >= 5
+       times within a 160-token window covering >= 60% of the span).
+    """
+    seq = getattr(token_ids, "_x", token_ids)
+    avail = len(seq) - start_idx
+    if avail < 16:
+        return False
+
+    for pattern_len in range(1, 4):
+        min_count = max(8, (16 + pattern_len - 1) // pattern_len)
+        if pattern_len * min_count <= avail and _has_repeating_pattern(
+            seq, pattern_len, min_count
+        ):
+            return True
+
+    max_len = min(64, avail // 4)
+    for pattern_len in range(4, max_len + 1):
+        if _has_repeating_pattern(seq, pattern_len, 4):
+            return True
+
+    return _has_windowed_repeating_pattern(
+        seq,
+        min_pattern_size=5,
+        max_pattern_size=64,
+        min_count=5,
+        start_idx=start_idx,
+        window_size=160,
+        min_density=0.6,
+    )
+
+
 def check_sequence_repetition(
     token_ids: Sequence[int],
     params: RepetitionDetectionParams,
+    start_idx: int = 0,
 ) -> bool:
     """Check if a sequence of token IDs has a repetition pattern.
     Args:
         token_ids: List of token IDs
         params: Repetition detection parameters.
+        start_idx: Minimum starting index in token_ids to inspect.
     Returns:
         True if a repetition pattern is found, False otherwise.
     """
@@ -46,15 +167,29 @@ def check_sequence_repetition(
     if max_pattern_size <= 0 or min_count < 2 or min_pattern_size > max_pattern_size:
         return False
 
+    seq = getattr(token_ids, "_x", token_ids)
+    avail = len(seq) - start_idx
+    if avail <= 0:
+        return False
+
     for pattern_len in range(
         min_pattern_size,
         max_pattern_size + 1,
     ):
-        if pattern_len * min_count > len(token_ids):
-            return False
+        if pattern_len * min_count > avail:
+            break
 
-        if _has_repeating_pattern(token_ids, pattern_len, min_count):
+        if _has_repeating_pattern(seq, pattern_len, min_count):
             return True
+
+    if max_pattern_size >= 5 and min_count >= 3:
+        return _has_windowed_repeating_pattern(
+            seq,
+            min_pattern_size=max(min_pattern_size, 5),
+            max_pattern_size=max_pattern_size,
+            min_count=max(min_count, 5),
+            start_idx=start_idx,
+        )
 
     return False
 
@@ -105,7 +240,11 @@ def stops_on_next_token(request: Request, token_id: int, max_model_len: int) -> 
     )
 
 
-def check_stop(request: Request, max_model_len: int) -> bool:
+def check_stop(
+    request: Request,
+    max_model_len: int,
+    thinking_loop_break: bool = False,
+) -> bool:
     assert not request.pooling_params
 
     sampling_params = request.sampling_params
@@ -136,12 +275,48 @@ def check_stop(request: Request, max_model_len: int) -> bool:
     if request.num_output_tokens < sampling_params.min_tokens:
         return False
 
+    if request.thinking_disabled:
+        return False
+
     repetition_detection = sampling_params.repetition_detection
-    if repetition_detection is not None and (
-        check_sequence_repetition(
-            request.output_token_ids,
-            repetition_detection,
-        )
+    if request.thinking_output_start >= 0:
+        if request.force_thinking_end:
+            return False
+        start_idx = request.thinking_output_start
+        loop_detected = False
+        if thinking_loop_break and request.thinking_loop_breaks == 0:
+            loop_detected = has_thinking_loop(
+                request._output_token_ids, start_idx=start_idx
+            )
+        if not loop_detected and repetition_detection is not None:
+            loop_detected = check_sequence_repetition(
+                request._output_token_ids,
+                repetition_detection,
+                start_idx=start_idx,
+            )
+        if loop_detected:
+            if thinking_loop_break and request.thinking_loop_breaks == 0:
+                request.force_thinking_end = True
+                request.thinking_loop_breaks += 1
+                request.copy_draft_alloc = 0
+                return False
+            request.status = RequestStatus.FINISHED_REPETITION
+            request.stop_reason = "repetition_detected"
+            return True
+        return False
+
+    start_idx = request.thinking_end_output_idx
+    if repetition_detection is not None and check_sequence_repetition(
+        request._output_token_ids,
+        repetition_detection,
+        start_idx=start_idx,
+    ):
+        request.status = RequestStatus.FINISHED_REPETITION
+        request.stop_reason = "repetition_detected"
+        return True
+
+    if request.thinking_loop_breaks > 0 and has_thinking_loop(
+        request._output_token_ids, start_idx=start_idx
     ):
         request.status = RequestStatus.FINISHED_REPETITION
         request.stop_reason = "repetition_detected"

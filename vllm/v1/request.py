@@ -258,6 +258,26 @@ class Request:
         # none. The scheduler widens the request's draft placeholders to it.
         self.copy_draft_alloc = 0
 
+        # Reasoning marker tracking for thinking loop breaking and post-thinking
+        # repetition detection:
+        # - thinking_output_start >= 0: index in _output_token_ids where the
+        #   current open <think> block started (0 if opened in prompt).
+        # - thinking_output_start == -1: not currently inside <think>.
+        # - thinking_end_output_idx: index in _output_token_ids immediately
+        #   after the most recent </think> marker.
+        # - thinking_disabled: True when thinking is disabled for this request
+        #   so the repetition guard and marker tracking do not run.
+        self._reasoning_ended_init: bool | None = reasoning_ended
+        self._reasoning_parser_kwargs_init: dict[str, Any] | None = (
+            reasoning_parser_kwargs
+        )
+        self.thinking_output_start: int = -1
+        self.thinking_end_output_idx: int = 0
+        self.force_thinking_end: bool = False
+        self.thinking_loop_breaks: int = 0
+        self._reasoning_markers_initialized: bool = False
+        self.thinking_disabled: bool = self._compute_thinking_disabled()
+
         self.block_hashes: list[BlockHash] = []
         # Store the block hasher without binding self to avoid creating a
         # reference cycle (Request -> partial -> Request) that prevents
@@ -322,6 +342,110 @@ class Request:
         """Compute block hashes for any new full blocks and append them."""
         if self._block_hasher is not None:
             self.block_hashes.extend(self._block_hasher(self))
+
+    def _compute_thinking_disabled(self) -> bool:
+        if self._reasoning_ended_init is True:
+            return True
+        if (
+            self.sampling_params is not None
+            and self.sampling_params.thinking_token_budget is not None
+            and self.sampling_params.thinking_token_budget == 0
+        ):
+            return True
+        if self._reasoning_parser_kwargs_init:
+            chat_kwargs = self._reasoning_parser_kwargs_init.get("chat_template_kwargs")
+            dicts = (
+                (chat_kwargs, self._reasoning_parser_kwargs_init)
+                if isinstance(chat_kwargs, dict)
+                else (self._reasoning_parser_kwargs_init,)
+            )
+            for kw in dicts:
+                if "thinking" in kw and not bool(kw["thinking"]):
+                    return True
+                if "enable_thinking" in kw and not bool(kw["enable_thinking"]):
+                    return True
+                if kw.get("thinking_mode") == "chat":
+                    return True
+                if kw.get("reasoning_effort") == "none":
+                    return True
+        return False
+
+    def reset_reasoning_markers(self) -> None:
+        self.thinking_output_start = -1
+        self.thinking_end_output_idx = 0
+        self.force_thinking_end = False
+        self.thinking_loop_breaks = 0
+        self._reasoning_markers_initialized = False
+        self.thinking_disabled = self._compute_thinking_disabled()
+
+    def update_reasoning_markers(
+        self,
+        start_ids: tuple[int, ...],
+        end_ids: tuple[int, ...],
+        prev_num_output: int = 0,
+    ) -> None:
+        if self.thinking_disabled:
+            return
+        start_len = len(start_ids)
+        end_len = len(end_ids)
+        if start_len == 0 or end_len == 0:
+            return
+        all_ids = self._all_token_ids
+        num_prompt = self.num_prompt_tokens
+        if not self._reasoning_markers_initialized:
+            self._reasoning_markers_initialized = True
+            start_last = start_ids[-1]
+            end_last = end_ids[-1]
+            closed_in_prompt = False
+            for pos in range(num_prompt, 0, -1):
+                tok = all_ids[pos - 1]
+                if tok == end_last and pos >= end_len:
+                    if end_len == 1 or tuple(all_ids[pos - end_len : pos]) == end_ids:
+                        self.thinking_output_start = -1
+                        closed_in_prompt = True
+                        break
+                if tok == start_last and pos >= start_len:
+                    if (
+                        start_len == 1
+                        or tuple(all_ids[pos - start_len : pos]) == start_ids
+                    ):
+                        self.thinking_output_start = 0
+                        break
+            if closed_in_prompt:
+                self.thinking_disabled = True
+                return
+
+        cur_num_output = len(self._output_token_ids)
+        if cur_num_output <= prev_num_output:
+            return
+        start_last = start_ids[-1]
+        end_last = end_ids[-1]
+        for out_pos in range(prev_num_output + 1, cur_num_output + 1):
+            all_pos = num_prompt + out_pos
+            tok = all_ids[all_pos - 1]
+            if tok == end_last and all_pos >= end_len:
+                if (
+                    end_len == 1
+                    or tuple(all_ids[all_pos - end_len : all_pos]) == end_ids
+                ):
+                    self.thinking_output_start = -1
+                    self.thinking_end_output_idx = out_pos
+                    self.force_thinking_end = False
+                    continue
+            if tok == start_last and all_pos >= start_len:
+                if (
+                    start_len == 1
+                    or tuple(all_ids[all_pos - start_len : all_pos]) == start_ids
+                ):
+                    self.thinking_output_start = out_pos
+                    self.force_thinking_end = False
+
+        if (
+            self.thinking_output_start < 0
+            and self.thinking_end_output_idx == 0
+            and cur_num_output >= start_len
+        ):
+            self.thinking_disabled = True
 
     @property
     def use_structured_output(self) -> bool:

@@ -720,6 +720,22 @@ class ChatCompletionRequest(OpenAIBaseModel):
             self.response_format,
         )
 
+    def _is_thinking_disabled(self, thinking_token_budget: int | None) -> bool:
+        if thinking_token_budget is not None and thinking_token_budget == 0:
+            return True
+        user_kwargs = self.chat_template_kwargs or {}
+        if "thinking" in user_kwargs:
+            return not bool(user_kwargs["thinking"])
+        if "enable_thinking" in user_kwargs:
+            return not bool(user_kwargs["enable_thinking"])
+        if user_kwargs.get("thinking_mode") == "chat":
+            return True
+        if self.thinking is not None:
+            return self.thinking.type != "enabled"
+        if self.reasoning_effort is not None:
+            return self.reasoning_effort == "none"
+        return False
+
     def to_sampling_params(
         self,
         max_tokens: int,
@@ -747,6 +763,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
             min_p = default_sampling_params.get(
                 "min_p", self._DEFAULT_SAMPLING_PARAMS["min_p"]
             )
+        if (thinking_token_budget := self.thinking_token_budget) is None:
+            thinking_token_budget = default_sampling_params.get("thinking_token_budget")
+        if (repetition_detection := self.repetition_detection) is None and not (
+            self._is_thinking_disabled(thinking_token_budget)
+        ):
+            repetition_detection = default_sampling_params.get("repetition_detection")
 
         # Merge server-default stop_token_ids (e.g., model-specific tokens
         # like </call> for gpt-oss) with any request-specified ones
@@ -804,11 +826,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
             structured_outputs=self.extract_structured_outputs(),
             logit_bias=self.logit_bias,
             bad_words=self.bad_words,
-            thinking_token_budget=self.thinking_token_budget,
+            thinking_token_budget=thinking_token_budget,
             allowed_token_ids=self.allowed_token_ids,
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
-            repetition_detection=self.repetition_detection,
+            repetition_detection=repetition_detection,
             routed_experts_prompt_start=self.routed_experts_prompt_start,
         )
 

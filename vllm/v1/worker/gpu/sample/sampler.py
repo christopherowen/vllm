@@ -90,6 +90,9 @@ class Sampler:
         if self.trace_replay_state is not None:
             self.trace_replay_state.add_request(req_idx, sampling_params)
 
+        self._update_needs_logits_processing(req_idx)
+
+    def _update_needs_logits_processing(self, req_idx: int) -> None:
         states = self.sampling_states
         temperature = states.temperature.np[req_idx]
         non_temperature = (
@@ -118,6 +121,17 @@ class Sampler:
             self.needs_logits_processing,
         )
         return bool(np.any(flags[idx_mapping_np]))
+
+    def set_forced_thinking_end(self, req_indices: set[int]) -> set[int]:
+        changed, newly_forced = self.thinking_budget_state.set_forced_end_requests(
+            req_indices
+        )
+        if not changed:
+            return newly_forced
+        for req_idx in changed:
+            self._update_needs_logits_processing(req_idx)
+        self.thinking_budget_state.apply_staged_writes()
+        return newly_forced
 
     def register_warmups(
         self,

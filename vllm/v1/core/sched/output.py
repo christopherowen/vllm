@@ -327,6 +327,10 @@ class SchedulerOutput:
     # sampled, ahead of the drafter's tokens. None with rejection off.
     sink_draft_zero_req_ids: set[str] | None = None
 
+    # Requests currently inside <think> that triggered reasoning loop breaking
+    # and must have their reasoning end token forced on the worker.
+    force_thinking_end_req_ids: set[str] | None = None
+
     # Explicit model-execution class used by adaptive compute fairness.
     # None identifies a transfer-only or otherwise empty model step.
     compute_service_class: ComputeServiceClass | None = None

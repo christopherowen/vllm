@@ -56,7 +56,9 @@ class ThinkingBudgetState:
         )
         self.thinking_token_budget.np.fill(-1)
         self.thinking_token_budget.copy_to_uva()
+        self.configured_budget = np.full(self.max_num_reqs, -1, dtype=np.int32)
         self.use_thinking_budget = np.zeros(self.max_num_reqs, dtype=bool)
+        self._forced_reqs: set[int] = set()
 
         self.cached_last_start = torch.full(
             (self.max_num_reqs,), -1, dtype=torch.int32, device=self.device
@@ -83,6 +85,7 @@ class ThinkingBudgetState:
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
         if not self.enabled:
             return
+        self._forced_reqs.discard(req_idx)
         budget = sampling_params.thinking_token_budget
         self.use_thinking_budget[req_idx] = budget is not None
         if budget is None:
@@ -90,9 +93,38 @@ class ThinkingBudgetState:
         else:
             budget = min(budget, _INT32_MAX)
             self._reset_reqs.append(req_idx)
+        self.configured_budget[req_idx] = budget
         if self.thinking_token_budget.np[req_idx] != budget:
             self.thinking_token_budget.np[req_idx] = budget
             self._budget_dirty = True
+
+    def set_forced_end_requests(
+        self, req_indices: set[int]
+    ) -> tuple[set[int], set[int]]:
+        """Force immediate reasoning termination (budget=0) for ``req_indices``
+        and restore configured budgets for any slots removed from the set."""
+        if not self.enabled or (not req_indices and not self._forced_reqs):
+            return set(), set()
+        newly_forced = req_indices - self._forced_reqs
+        unforced = self._forced_reqs - req_indices
+        changed = newly_forced | unforced
+        if not changed:
+            return set(), set()
+        self._forced_reqs = set(req_indices)
+        for req_idx in newly_forced:
+            self.use_thinking_budget[req_idx] = True
+            if self.configured_budget[req_idx] < 0:
+                self._reset_reqs.append(req_idx)
+            if self.thinking_token_budget.np[req_idx] != 0:
+                self.thinking_token_budget.np[req_idx] = 0
+                self._budget_dirty = True
+        for req_idx in unforced:
+            cfg_budget = int(self.configured_budget[req_idx])
+            self.use_thinking_budget[req_idx] = cfg_budget >= 0
+            if self.thinking_token_budget.np[req_idx] != cfg_budget:
+                self.thinking_token_budget.np[req_idx] = cfg_budget
+                self._budget_dirty = True
+        return changed, newly_forced
 
     def apply_staged_writes(self) -> None:
         if not self.enabled:

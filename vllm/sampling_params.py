@@ -501,6 +501,10 @@ class SamplingParams(
         self.thinking_token_budget = validate_thinking_token_budget(
             self.thinking_token_budget
         )
+        if isinstance(self.repetition_detection, dict):
+            self.repetition_detection = RepetitionDetectionParams(
+                **self.repetition_detection
+            )
 
         if self.stop is None:
             self.stop = []

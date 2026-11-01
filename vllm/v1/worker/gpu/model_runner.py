@@ -1683,6 +1683,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 scheduler_output.kv_cache_block_copies,
             )
 
+        if self.sampler is not None:
+            forced_req_ids = scheduler_output.force_thinking_end_req_ids
+            forced_indices = (
+                {
+                    idx
+                    for req_id in forced_req_ids
+                    if (idx := self.req_states.req_id_to_index.get(req_id))
+                    is not None
+                }
+                if forced_req_ids
+                else set()
+            )
+            newly_forced = self.sampler.set_forced_thinking_end(forced_indices)
+            if newly_forced and self.copy_drafter is not None:
+                for idx in newly_forced:
+                    self.copy_drafter.add_request(idx)
+                self.copy_drafter.apply_staged_writes()
+
     def gather_batch_req_state(
         self, scheduler_output: SchedulerOutput, dummy_run: bool
     ) -> tuple["BatchReqState | None", int | None]:

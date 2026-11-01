@@ -439,3 +439,66 @@ def test_new_budgeted_requests_reset_only_their_marker_cache():
     assert state.cached_last_start.tolist() == [7, -1, -1, 10]
     assert state.cached_last_end.tolist() == [7, -1, -1, 10]
     assert state.cached_scan_pos.tolist() == [7, 0, 0, 10]
+
+
+def test_v2_forced_thinking_end_toggles_without_steady_state_overhead():
+    """Forcing reasoning end dynamically enables ThinkingBudgetState(budget=0)
+    and needs_logits_processing only while forced, then restores both to False."""
+    req_states = _make_req_states([1, START, 10, 11, 12], prompt_len=2)
+    sampler = Sampler(
+        max_num_reqs=4,
+        vocab_size=VOCAB_SIZE,
+        device=DEVICE,
+        req_states=req_states,
+        reasoning_config=MockReasoningConfig(),
+    )
+    sampler.add_request(
+        req_idx=3,
+        prompt_len=2,
+        sampling_params=SamplingParams(temperature=0.0),
+    )
+    sampler.apply_staged_writes()
+
+    # Normal decode state: zero overhead (needs_logits_processing is False)
+    assert not sampler.needs_logits_processing[3]
+    assert not sampler.thinking_budget_state.use_thinking_budget[3]
+
+    # Trigger forced thinking end for slot 3
+    newly_forced = sampler.set_forced_thinking_end({3})
+    assert newly_forced == {3}
+    assert sampler.needs_logits_processing[3]
+    assert sampler.thinking_budget_state.use_thinking_budget[3]
+
+    idx_mapping = torch.tensor([3], dtype=torch.int32, device=DEVICE)
+    idx_mapping_np = idx_mapping.cpu().numpy()
+    expanded_idx_mapping = idx_mapping.clone()
+    input_ids = torch.tensor([12], dtype=torch.int32, device=DEVICE)
+    logits = torch.zeros((1, VOCAB_SIZE), device=DEVICE)
+    out = sampler.apply_sampling_params(
+        logits,
+        expanded_idx_mapping,
+        idx_mapping,
+        idx_mapping_np,
+        torch.tensor([4], dtype=torch.int32, device=DEVICE),
+        input_ids,
+        torch.tensor([0], dtype=torch.int32, device=DEVICE),
+    )
+    assert out[0, END].item() == pytest.approx(1.0e9)
+
+    # Clear forced thinking end for slot 3: restores zero-overhead fast path
+    newly_forced = sampler.set_forced_thinking_end(set())
+    assert newly_forced == set()
+    assert not sampler.needs_logits_processing[3]
+    assert not sampler.thinking_budget_state.use_thinking_budget[3]
+
+    logits_after = torch.zeros((1, VOCAB_SIZE), device=DEVICE)
+    out_after = sampler.apply_sampling_params(
+        logits_after,
+        expanded_idx_mapping,
+        idx_mapping,
+        idx_mapping_np,
+        torch.tensor([4], dtype=torch.int32, device=DEVICE),
+        input_ids,
+        torch.tensor([0], dtype=torch.int32, device=DEVICE),
+    )
+    assert torch.all(out_after == 0)
