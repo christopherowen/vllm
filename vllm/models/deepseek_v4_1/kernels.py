@@ -40,7 +40,9 @@ def moe_output_dtype() -> torch.dtype:
     return torch.float32
 
 
-def shared_expert_activation(act_fn: nn.Module, width: int) -> nn.Module:
+def shared_expert_activation(
+    act_fn: nn.Module, width: int, *, mxfp8_output: bool = False
+) -> nn.Module:
     """The shared expert's clamped SwiGLU on ``width``-wide gate and up halves,
     at the reference's FP32 product (one BF16 rounding) where vLLM's rounds
     ``silu(gate)`` first."""
@@ -49,7 +51,9 @@ def shared_expert_activation(act_fn: nn.Module, width: int) -> nn.Module:
     if isinstance(act_fn, SiluAndMulWithClamp):
         from .tilelang.activation import SiluAndMulClampFP32
 
-        return SiluAndMulClampFP32(act_fn.swiglu_limit, width)
+        return SiluAndMulClampFP32(
+            act_fn.swiglu_limit, width, mxfp8_output=mxfp8_output
+        )
     return act_fn
 
 

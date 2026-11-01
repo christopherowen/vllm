@@ -145,9 +145,15 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
 
         shared = getattr(self.ffn, "shared_experts", None)
+        shared_mxfp8 = False
         if shared is not None:
+            shared_width = shared.gate_up_proj.output_size_per_partition // 2
+            shared_mxfp8 = (
+                shared_width % 32 == 0
+                and kernels.is_native_linear_method(shared.down_proj.quant_method)
+            )
             shared.act_fn = kernels.shared_expert_activation(
-                shared.act_fn, shared.gate_up_proj.output_size_per_partition // 2
+                shared.act_fn, shared_width, mxfp8_output=shared_mxfp8
             )
             if (
                 getattr(
@@ -165,6 +171,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.attn.fused_wqa_wkv.tilelang_mxfp8_input = True
         if shared is not None:
             shared.gate_up_proj.tilelang_mxfp8_input = True
+            shared.down_proj.tilelang_mxfp8_input = shared_mxfp8
 
         # A CED decoder layer routes the compact decoder rows, whose padding
         # mask differs from the step's. Tag its router by layer, never by the

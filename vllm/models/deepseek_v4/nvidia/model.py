@@ -160,6 +160,16 @@ class DeepseekV4MLP(nn.Module):
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
+        forward_mxfp8 = getattr(self.act_fn, "forward_mxfp8", None)
+        if forward_mxfp8 is not None and getattr(
+            self.down_proj, "tilelang_mxfp8_input", False
+        ):
+            from vllm.models.deepseek_v4_1.tilelang.linear import provide_mxfp8
+
+            act_q = forward_mxfp8(gate_up)
+            with provide_mxfp8(act_q):
+                out, _ = self.down_proj(act_q.rows)
+            return out.view(*gate_up.shape[:-1], out.shape[-1])
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x

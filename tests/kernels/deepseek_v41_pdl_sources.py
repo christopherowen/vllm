@@ -24,6 +24,7 @@ import re
 
 CHAIN = {
     "activation_swiglu_clamp",
+    "activation_swiglu_clamp_cast",
     "attention_front",
     "cache_writer",
     "compress",
