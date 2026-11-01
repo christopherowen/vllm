@@ -655,3 +655,45 @@ def test_process_weights_replaces_w13_before_preparing_w2(monkeypatch):
     experts.fold_shared = True
     experts.process_weights_after_loading(layer)
     assert calls == [0, 1]
+
+
+@pytest.mark.parametrize(
+    "k, loaded_cols",
+    [
+        (512, 8),   # TP5 rank 4: 256 of 512 columns loaded (8 of 16 scale blocks)
+        (384, 2),   # TP7 rank 6: 64 of 384 columns loaded (2 of 12 scale blocks)
+        (320, 9),   # TP8 all ranks: 288 of 320 columns loaded (9 of 10 scale blocks)
+    ],
+)
+def test_tp_zero_padded_scale_columns_preserve_loaded_exponents_and_narrow_flag(
+    k: int, loaded_cols: int
+):
+    """When TP pads ``moe_intermediate_size`` to a multiple of ``tp_size * 64``
+    (TP5, TP7, TP8), ``RoutedExperts._load_w2`` leaves trailing ``w2_weight`` and
+    ``w2_weight_scale`` columns zero-filled. ``_row_deltas`` ignores those zero
+    scale bytes when computing ``base`` and ``deltas`` so loaded columns expand
+    byte-for-byte, zero-padded columns expand to ``base`` (multiplying zero weights),
+    and narrow/wide expert classification depends only on the loaded columns."""
+    exponents = _experts(k)
+    exponents[:, :, loaded_cols:] = 0
+    n_exp = k // 32
+
+    got = pack_expert_scale_codes(exponents)
+    assert got.narrow.tolist() == [1, 0]
+
+    narrow_words = expand_scale_codes_2bit(got.codes_2bit[0], got.base[0])
+    assert torch.equal(narrow_words, expand_scale_codes(got.codes[0], got.base[0]))
+    raw0 = narrow_words.view(torch.uint8).reshape(exponents.shape[1], -1)
+    assert torch.equal(raw0[:, :loaded_cols], exponents[0, :, :loaded_cols])
+    assert torch.equal(
+        raw0[:, loaded_cols:n_exp],
+        got.base[0].unsqueeze(1).expand(-1, n_exp - loaded_cols),
+    )
+
+    wide_words = expand_scale_codes(got.codes[1], got.base[1])
+    raw1 = wide_words.view(torch.uint8).reshape(exponents.shape[1], -1)
+    assert torch.equal(raw1[:, :loaded_cols], exponents[1, :, :loaded_cols])
+    assert torch.equal(
+        raw1[:, loaded_cols:n_exp],
+        got.base[1].unsqueeze(1).expand(-1, n_exp - loaded_cols),
+    )

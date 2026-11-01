@@ -32,10 +32,20 @@ class ExpertScaleCodes(NamedTuple):
 def _row_deltas(
     exponents: torch.Tensor, max_delta: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Row minimum ``base`` and padded 4-tuples of uint8 deltas ``e - base``."""
+    """Row minimum ``base`` and padded 4-tuples of uint8 deltas ``e - base``.
+
+    Zero bytes on a row that also holds non-zero UE8M0 exponents come from TP
+    column zero-padding on ``w2_weight_scale`` (where the corresponding
+    ``w2_weight`` columns are zero); they take delta 0 so their expanded scale is
+    ``base`` and the row's base and span reflect only the loaded checkpoint scales.
+    """
     e = exponents.view(torch.uint8)
-    base = e.amin(dim=-1).contiguous()
-    deltas = e - base.unsqueeze(-1)
+    nonzero = e > 0
+    min_nonzero = torch.where(nonzero, e, torch.full_like(e, 255)).amin(dim=-1)
+    base = torch.where(
+        nonzero.any(dim=-1), min_nonzero, torch.zeros_like(min_nonzero)
+    ).contiguous()
+    deltas = torch.where(nonzero, e - base.unsqueeze(-1), torch.zeros_like(e))
     span = int(deltas.max()) if deltas.numel() else 0
     if span > max_delta:
         bits = 2 if max_delta == 3 else 4

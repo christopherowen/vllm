@@ -511,9 +511,22 @@ class DeepseekV41ForCausalLMConfig(VerifyAndUpdateConfig):
             )
 
         padded_groups = round_up(original_groups, tp_size)
-        if padded_groups == original_groups:
-            return
         padded_heads = padded_groups * (original_heads // original_groups)
+        original_moe_intermediate = getattr(
+            text_config,
+            "original_moe_intermediate_size",
+            getattr(text_config, "moe_intermediate_size", None),
+        )
+        padded_moe_intermediate = (
+            round_up(original_moe_intermediate, tp_size * 64)
+            if original_moe_intermediate is not None
+            else None
+        )
+        if (
+            padded_groups == original_groups
+            and padded_moe_intermediate == original_moe_intermediate
+        ):
+            return
 
         seen: set[int] = set()
         for config in (
@@ -525,23 +538,46 @@ class DeepseekV41ForCausalLMConfig(VerifyAndUpdateConfig):
                 continue
             seen.add(id(config))
             config_with_originals: Any = config
-            if hasattr(config, "num_attention_heads"):
-                config_with_originals.original_num_attention_heads = original_heads
-                config.num_attention_heads = padded_heads
-            if hasattr(config, "o_groups"):
-                config_with_originals.original_o_groups = original_groups
-                config.o_groups = padded_groups
+            if padded_groups != original_groups:
+                if hasattr(config, "num_attention_heads"):
+                    config_with_originals.original_num_attention_heads = original_heads
+                    config.num_attention_heads = padded_heads
+                if hasattr(config, "o_groups"):
+                    config_with_originals.original_o_groups = original_groups
+                    config.o_groups = padded_groups
+            if (
+                padded_moe_intermediate is not None
+                and padded_moe_intermediate != original_moe_intermediate
+                and hasattr(config, "moe_intermediate_size")
+            ):
+                config_with_originals.original_moe_intermediate_size = (
+                    original_moe_intermediate
+                )
+                config.moe_intermediate_size = padded_moe_intermediate
 
         model_config.model_arch_config = model_config.get_model_arch_config()
-        logger.warning(
-            "Padded DeepSeek V4.1 attention for TP%d: heads %d -> %d, "
-            "output groups %d -> %d.",
-            tp_size,
-            original_heads,
-            padded_heads,
-            original_groups,
-            padded_groups,
-        )
+        if padded_groups != original_groups:
+            logger.warning(
+                "Padded DeepSeek V4.1 attention for TP%d: heads %d -> %d, "
+                "output groups %d -> %d.",
+                tp_size,
+                original_heads,
+                padded_heads,
+                original_groups,
+                padded_groups,
+            )
+        if (
+            padded_moe_intermediate is not None
+            and padded_moe_intermediate != original_moe_intermediate
+        ):
+            logger.warning(
+                "Padded DeepSeek V4.1 MoE intermediate size for TP%d: "
+                "%d -> %d (%d per rank).",
+                tp_size,
+                original_moe_intermediate,
+                padded_moe_intermediate,
+                padded_moe_intermediate // tp_size,
+            )
 
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:

@@ -36,6 +36,7 @@ from vllm.model_executor.models.utils import (
     is_pp_missing_parameter,
     make_layers,
 )
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.model_executor.weight_transfer import copy_weight
 from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MoE
 from vllm.models.deepseek_v41.nvidia.model import (
@@ -148,6 +149,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             shared.act_fn = kernels.shared_expert_activation(
                 shared.act_fn, shared.gate_up_proj.output_size_per_partition // 2
             )
+            if (
+                getattr(
+                    config,
+                    "original_moe_intermediate_size",
+                    config.moe_intermediate_size,
+                )
+                != config.moe_intermediate_size
+            ):
+                for proj in (shared.gate_up_proj, shared.down_proj):
+                    for param in proj.parameters():
+                        set_weight_attrs(param, {"allow_tp_padding": True})
         # The mHC entries write these projections' MXFP8 input (the routed
         # experts' too): ``forward`` hands it over and they cast nothing.
         self.attn.fused_wqa_wkv.tilelang_mxfp8_input = True

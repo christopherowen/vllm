@@ -67,3 +67,50 @@ def test_deepseek_v41_tp3_padding_uses_generic_parallel_hook() -> None:
     assert text_config.num_attention_heads == 72
     assert text_config.o_groups == 9
     assert model_config.model_arch_config.total_num_attention_heads == 72
+
+
+@pytest.mark.parametrize(
+    "tp_size, expected_heads, expected_groups, expected_moe_intermediate",
+    [
+        (3, 72, 9, 2304),
+        (4, 64, 8, 2304),
+        (5, 80, 10, 2560),
+        (6, 96, 12, 2304),
+        (7, 112, 14, 2688),
+        (8, 64, 8, 2560),
+    ],
+)
+def test_deepseek_v41_tp3_to_tp8_padding_aligns_heads_and_moe_intermediate(
+    tp_size: int,
+    expected_heads: int,
+    expected_groups: int,
+    expected_moe_intermediate: int,
+) -> None:
+    text_config = SimpleNamespace(
+        num_attention_heads=64,
+        o_groups=8,
+        moe_intermediate_size=2304,
+    )
+    model_config = SimpleNamespace(
+        architecture="DeepseekV41ForCausalLM",
+        hf_config=text_config,
+        hf_text_config=text_config,
+        model_arch_config=SimpleNamespace(total_num_attention_heads=64),
+    )
+    model_config.get_model_arch_config = lambda: SimpleNamespace(
+        total_num_attention_heads=text_config.num_attention_heads
+    )
+    parallel_config = SimpleNamespace(tensor_parallel_size=tp_size)
+
+    ModelConfig._update_model_config_for_parallelism(model_config, parallel_config)
+    ModelConfig._update_model_config_for_parallelism(model_config, parallel_config)
+
+    assert text_config.num_attention_heads == expected_heads
+    assert text_config.o_groups == expected_groups
+    assert text_config.moe_intermediate_size == expected_moe_intermediate
+    assert (text_config.moe_intermediate_size // tp_size) % 64 == 0
+    if expected_heads != 64:
+        assert text_config.original_num_attention_heads == 64
+        assert text_config.original_o_groups == 8
+    if expected_moe_intermediate != 2304:
+        assert text_config.original_moe_intermediate_size == 2304
