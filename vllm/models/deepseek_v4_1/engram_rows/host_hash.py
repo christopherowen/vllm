@@ -20,6 +20,7 @@ from pathlib import Path
 import numpy as np
 
 HEADS = 24
+ALL_COLUMNS = (1 << HEADS) - 1
 LAGS = 4
 PAD_TOKEN = 2
 IMAGE_SENTINEL = 129264
@@ -114,7 +115,6 @@ class HostEngramHash:
             self.token_map = np.asarray(token_map_arr, dtype=np.int64)
         self.multipliers = np.asarray(multipliers, dtype=np.int64)  # [layers, 4]
         self.primes = np.asarray(primes, dtype=np.int64)  # [layers, 24]
-        self.offsets = np.asarray(offsets, dtype=np.int64)  # [layers, 24]
         self.layers = self.multipliers.shape[0]
         if self.multipliers.shape != (self.layers, LAGS) or self.primes.shape != (
             self.layers,
@@ -124,8 +124,25 @@ class HostEngramHash:
                 "Engram hash geometry must be [layers, 4] multipliers and "
                 "[layers, 24] primes"
             )
+        self.offsets = np.broadcast_to(
+            np.asarray(offsets, dtype=np.int64), (self.layers, HEADS)
+        )
         self.pad = self.token_map[PAD_TOKEN]
         self.vocab = self.token_map.shape[0]
+        self._lags = np.arange(LAGS, dtype=np.int64)[None, :]
+        self._multipliers_u64 = np.ascontiguousarray(
+            self.multipliers[:, None, :], dtype=np.uint64
+        )
+        self._primes_3x8 = np.ascontiguousarray(
+            self.primes.reshape(self.layers, 1, 3, 8)
+        )
+        self._offsets_3x8 = np.ascontiguousarray(
+            self.offsets.reshape(self.layers, 1, 3, 8)
+        )
+        self._column_plans: dict[
+            int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+        ] = {}
+
         if os.environ.get("SPARK_DS41F_ENGRAM_HOST_HASH_AFFINITY", "1") != "0":
             pin_to_max_l2_cpus(0)
 
@@ -135,56 +152,124 @@ class HostEngramHash:
         missing = self.token_map.dtype.type(-1)
         return np.where(valid, self.token_map[np.where(valid, raw, 0)], missing)
 
+    def _column_plan(
+        self, columns: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        plan = self._column_plans.get(columns)
+        if plan is None:
+            if not 0 < columns <= ALL_COLUMNS:
+                raise ValueError(
+                    f"Engram host hash columns must be a nonzero 24-bit mask: {columns:#x}"
+                )
+            cols = np.array(
+                [c for c in range(HEADS) if (columns >> c) & 1], dtype=np.intp
+            )
+            orders = cols // 8
+            primes_sub = np.ascontiguousarray(self.primes[:, cols][:, None, :])
+            offsets_sub = np.ascontiguousarray(self.offsets[:, cols][:, None, :])
+            plan = (cols, orders, primes_sub, offsets_sub)
+            self._column_plans[columns] = plan
+        return plan
+
     def compress(self, raw: np.ndarray) -> np.ndarray:
         """Compressed ids of raw token ids; -1 for a missing token (negative), an
         image token or one outside the tokenizer map."""
         return self._compress_compact(raw).astype(np.int64, copy=False)
 
-    def hash_positions(self, tokens: np.ndarray, positions: np.ndarray) -> np.ndarray:
-        """Row ids ``[len(positions), layers, 24]`` of the tokens at ``positions``
-        of one request whose token ids up to the last position are ``tokens`` (prompt
-        order; the GPU's query tokens and committed history are the same ids)."""
+    def _hash_positions_into(
+        self,
+        planes: np.ndarray,
+        first_row: int,
+        tokens: np.ndarray,
+        positions: np.ndarray,
+        columns: int = ALL_COLUMNS,
+    ) -> None:
         positions = np.asarray(positions, dtype=np.int64)
-        lags = positions[:, None] - np.arange(LAGS, dtype=np.int64)[None, :]  # [T, 4]
+        n = positions.shape[0]
+        lags = positions[:, None] - self._lags  # [T, 4]
         raw = np.where(lags >= 0, tokens[np.maximum(lags, 0)], -1)
         sources = self._compress_compact(raw)
         # From the first missing source on, every lag takes the pad id.
         blocked = np.logical_or.accumulate(sources == -1, axis=1)
-        values = np.where(blocked, self.pad, sources)
+        values_u64 = np.where(blocked, self.pad, sources).astype(np.uint64)
         # value * multiplier in wrapping int64, as the GPU computes it.
-        products = (
-            values[:, None, :].astype(np.uint64)
-            * self.multipliers[None, :, :].astype(np.uint64)
-        ).view(np.int64)  # [T, layers, 4]
+        products = (values_u64[None, :, :] * self._multipliers_u64).view(
+            np.int64
+        )  # [layers, T, 4]
         mixed2 = products[..., 0] ^ products[..., 1]
         mixed3 = mixed2 ^ products[..., 2]
         mixed4 = mixed3 ^ products[..., 3]
         # Heads 0-7 hash 2-grams, 8-15 3-grams, 16-23 4-grams.
-        mixed = np.concatenate(
-            [np.repeat(m[..., None], 8, axis=-1) for m in (mixed2, mixed3, mixed4)],
-            axis=-1,
-        )  # [T, layers, 24]
         # The floor remainder (the sign of the divisor), as TileLang's int64 %. The
         # model's bounded multipliers keep ``mixed`` non-negative, where it equals
         # C's truncating one.
-        return np.remainder(mixed, self.primes[None]) + self.offsets[None]
+        if columns == ALL_COLUMNS:
+            mixed_orders = np.stack((mixed2, mixed3, mixed4), axis=-1)[
+                ..., None
+            ]  # [layers, T, 3, 1]
+            planes[:, first_row : first_row + n, :] = (
+                np.remainder(mixed_orders, self._primes_3x8) + self._offsets_3x8
+            ).reshape(self.layers, n, HEADS)
+        else:
+            cols, orders, primes_sub, offsets_sub = self._column_plan(columns)
+            mixed_orders = np.stack((mixed2, mixed3, mixed4), axis=-1)
+            mixed_sub = mixed_orders[:, :, orders]
+            planes[:, first_row : first_row + n, :] = -1
+            planes[:, first_row : first_row + n, cols] = (
+                np.remainder(mixed_sub, primes_sub) + offsets_sub
+            )
 
-    def step_ids(self, num_tokens: int, requests) -> np.ndarray:
+    def hash_positions(
+        self,
+        tokens: np.ndarray,
+        positions: np.ndarray,
+        *,
+        columns: int = ALL_COLUMNS,
+    ) -> np.ndarray:
+        """Row ids ``[len(positions), layers, 24]`` of the tokens at ``positions``
+        of one request whose token ids up to the last position are ``tokens`` (prompt
+        order; the GPU's query tokens and committed history are the same ids).
+        Returned as a view over a layer-major ``[layers, len(positions), 24]`` buffer
+        so each layer's slice ``[:, layer]`` is C-contiguous."""
+        n = len(positions)
+        planes = np.empty((self.layers, n, HEADS), dtype=np.int64)
+        if n:
+            self._hash_positions_into(planes, 0, tokens, positions, int(columns))
+        return planes.transpose(1, 0, 2)
+
+    def step_ids(
+        self,
+        num_tokens: int,
+        requests,
+        *,
+        columns: int = ALL_COLUMNS,
+    ) -> np.ndarray:
         """A step's row ids ``[num_tokens, layers, 24]``: ``requests`` yields, per
         request in the step's token order, ``(first_row, rows, tokens, positions)``:
         the request's first row and row count in the step, its token ids, and the
         positions of its leading rows whose ids the host has (the rest of its rows are
         ``UNKNOWN``). Rows past the last request's rows are padding, -1 as the GPU
-        writes them."""
-        out = np.full((num_tokens, self.layers, HEADS), UNKNOWN, dtype=np.int64)
+        writes them. Returned as a view over a layer-major ``[layers, num_tokens, 24]``
+        buffer so each layer's slice ``[:, layer]`` is C-contiguous."""
+        columns = int(columns)
+        if columns != ALL_COLUMNS:
+            self._column_plan(columns)
+        planes = np.full((self.layers, num_tokens, HEADS), UNKNOWN, dtype=np.int64)
+        out = planes.transpose(1, 0, 2)
+        custom_hash = "hash_positions" in self.__dict__
         live = 0
         for first_row, rows, tokens, positions in requests:
             live = max(live, first_row + rows)
             if len(positions):
-                out[first_row : first_row + len(positions)] = self.hash_positions(
-                    tokens, positions
-                )
-        out[live:] = -1
+                if custom_hash and columns == ALL_COLUMNS:
+                    out[first_row : first_row + len(positions)] = self.hash_positions(
+                        tokens, positions
+                    )
+                else:
+                    self._hash_positions_into(
+                        planes, first_row, tokens, positions, columns
+                    )
+        planes[:, live:, :] = -1
         return out
 
 
@@ -213,6 +298,7 @@ def placed_by_host(requests: list, drafts: np.ndarray | None) -> list:
 
 
 __all__ = [
+    "ALL_COLUMNS",
     "HEADS",
     "UNKNOWN",
     "HostEngramHash",

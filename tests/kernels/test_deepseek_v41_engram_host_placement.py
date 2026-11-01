@@ -121,3 +121,31 @@ def test_max_l2_cpus_selects_big_l2_cores(tmp_path, monkeypatch):
 
     monkeypatch.setenv("SPARK_DS41F_ENGRAM_CPU_AFFINITY", "0")
     assert host_hash.pin_to_max_l2_cpus(sysfs_root=tmp_path) == []
+def test_step_ids_layer_slices_are_contiguous_and_column_mask_matches_full_hash():
+    from vllm.models.deepseek_v4_1.engram_rows.host_hash import HostEngramHash
+
+    rng = np.random.default_rng(7)
+    token_map = rng.integers(0, 1000, size=256, dtype=np.int64)
+    multipliers = rng.integers(1, 1 << 30, size=(2, 4), dtype=np.int64)
+    primes = rng.integers(1000, 10000, size=(2, 24), dtype=np.int64)
+    offsets = rng.integers(0, 100000, size=(2, 24), dtype=np.int64)
+    host = HostEngramHash(token_map, multipliers, primes, offsets)
+
+    tokens = rng.integers(0, 256, size=32, dtype=np.int64)
+    reqs = [(0, 16, tokens, np.arange(16, dtype=np.int64))]
+    full = host.step_ids(20, reqs)
+    assert full.shape == (20, 2, 24)
+    for layer in range(2):
+        assert full[:, layer].flags.c_contiguous
+
+    for tp_size in (3, 4):
+        for tp_rank in range(tp_size):
+            owned = [c for c in range(24) if c % tp_size == tp_rank]
+            unowned = [c for c in range(24) if c % tp_size != tp_rank]
+            mask = sum(1 << c for c in owned)
+            masked = host.step_ids(20, reqs, columns=mask)
+            for layer in range(2):
+                assert masked[:, layer].flags.c_contiguous
+            assert np.array_equal(masked[:, :, owned], full[:, :, owned])
+            assert (masked[:16, :, unowned] == -1).all()
+            assert (masked[16:] == -1).all()

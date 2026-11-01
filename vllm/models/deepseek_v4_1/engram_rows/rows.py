@@ -174,18 +174,29 @@ class EngramDiskRows:
         self.raise_if_failed()
         from cuda.bindings import driver
 
+        has_unknown = True
         if early is not None:
-            early = np.ascontiguousarray(early, dtype=np.int64).reshape(-1)
+            if not (
+                isinstance(early, np.ndarray)
+                and early.dtype == np.int64
+                and early.flags.c_contiguous
+            ):
+                early = np.ascontiguousarray(early, dtype=np.int64)
+            early = early.reshape(-1)
             if early.shape[0] != count:
                 raise ValueError(
                     f"Engram early IDs: {early.shape[0]} for a step of {count} lookups"
                 )
+            has_unknown = bool(self.native.has_unknown(early))
         self._sequence = (self._sequence + 1) & 0xFFFFFFFF or 1
-        with torch.cuda.stream(stream):
-            self.ids[:count].copy_(ids.view(-1)[:count], non_blocking=True)
+        if has_unknown or self.check_early:
+            with torch.cuda.stream(stream):
+                self.ids[:count].copy_(ids.view(-1)[:count], non_blocking=True)
         _check(driver.cuStreamWriteValue32(stream.cuda_stream, self._ids_seq_device, self._sequence, 0),
                "cuStreamWriteValue32")
-        self.native.submit(self._reader, self._sequence, count, 60.0, early)
+        self.native.submit(
+            self._reader, self._sequence, count, 60.0, early, int(has_unknown)
+        )
 
     def gather(self, out: torch.Tensor, ids: torch.Tensor, num_tokens: torch.Tensor) -> None:
         """Wait for the staged step's rows and dequantize the first ``num_tokens``

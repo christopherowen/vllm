@@ -699,3 +699,45 @@ def test_mlock_pinned_and_mapped_host_buffers():
     rows.close()
     assert rows._ids_mlocked is False
     assert rows.weights._mlocked is False
+
+def test_column_masked_early_ids_skip_d2h_ids_copy_and_match_reference():
+    """When all early lookups are known (including column-masked host hashes where
+    unowned columns are -1) and check_early is False, stage() skips the D2H copy into
+    rows.ids while still gathering bit-identical BF16 rows."""
+    from vllm.models.deepseek_v4_1.engram_rows.host_hash import UNKNOWN
+
+    codes, scales, paths = _write_table(_table_dir(), seed=35)
+    rows = _rows(paths, tokens=8, columns=TP3_RANK1, check_early=False)
+    try:
+        rows.ids.fill_(-42)
+        gen = torch.Generator().manual_seed(36)
+        ids = torch.randint(0, TABLE_ROWS, (8, HEADS), generator=gen)
+        early = ids.clone().numpy()
+        unowned = [c for c in range(HEADS) if not ((TP3_RANK1 >> c) & 1)]
+        early[:, unowned] = -1
+
+        out = torch.full(
+            (8, 8 * 256), 7, dtype=torch.bfloat16, device="cuda"
+        )
+        num_tokens = torch.tensor([7], dtype=torch.int32, device="cuda")
+        stream = torch.cuda.current_stream()
+        rows.stage(stream, ids.cuda(), ids.numel(), early)
+        rows.gather(out, ids.cuda(), num_tokens)
+        torch.cuda.synchronize()
+
+        expected = _reference(codes, scales, ids, 7, 0, TABLE_ROWS, TP3_RANK1)
+        torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0, equal_nan=True)
+        # Because early had no UNKNOWN entries and check_early=False, rows.ids was not
+        # overwritten by a D2H copy.
+        assert (rows.ids == -42).all()
+
+        # When early contains an UNKNOWN entry, stage() copies the GPU IDs into rows.ids.
+        early_partial = early.copy()
+        early_partial[3, 1] = UNKNOWN
+        rows.stage(stream, ids.cuda(), ids.numel(), early_partial)
+        rows.gather(out, ids.cuda(), num_tokens)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0, equal_nan=True)
+        assert torch.equal(rows.ids[: ids.numel()], ids.view(-1))
+    finally:
+        rows.close()

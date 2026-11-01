@@ -388,7 +388,9 @@ class DeepseekV41ModelState(DefaultModelState):
         or None when the step has no prefill chunk to hash."""
         if not input_batch.has_prefill:
             return None
+        from vllm.models.deepseek_v4_1.common import engram as engram_module
         from vllm.models.deepseek_v4_1.engram_rows.host_hash import (
+            ALL_COLUMNS,
             HostEngramHash,
             placed_by_host,
         )
@@ -417,7 +419,24 @@ class DeepseekV41ModelState(DefaultModelState):
         requests = placed_by_host(requests, input_batch.num_draft_tokens_per_req)
         if not any(len(positions) for *_, positions in requests):
             return None
-        return self._host_engram_hash.step_ids(input_batch.input_ids.shape[0], requests)
+        columns = ALL_COLUMNS
+        if not engram_module.ENGRAM_CHECK_EARLY_IDS:
+            masks = {
+                layer.engram.embed_tokens.column_mask
+                for layer in model.layers[model.start_layer : model.end_layer]
+                if getattr(layer, "engram", None) is not None
+            }
+            check_early = any(
+                layer.engram.embed_tokens.disk_rows is not None
+                and layer.engram.embed_tokens.disk_rows.check_early
+                for layer in model.layers[model.start_layer : model.end_layer]
+                if getattr(layer, "engram", None) is not None
+            )
+            if len(masks) == 1 and not check_early:
+                columns = next(iter(masks))
+        return self._host_engram_hash.step_ids(
+            input_batch.input_ids.shape[0], requests, columns=columns
+        )
 
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
         model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)

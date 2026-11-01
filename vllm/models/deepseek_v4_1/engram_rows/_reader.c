@@ -742,8 +742,30 @@ static PyObject *py_add(PyObject *self, PyObject *args) {
     Py_RETURN_NONE;
 }
 
-/* submit(reader, sequence, count, wait_s, early): queue one step behind every step
- * already queued. ``early`` is None or ``count`` int64 IDs the host hashed
+/* has_unknown(early): whether any int64 element of ``early`` equals UNKNOWN_ID. */
+static PyObject *py_has_unknown(PyObject *self, PyObject *early_object) {
+    (void)self;
+    Py_buffer view;
+    if (PyObject_GetBuffer(early_object, &view, PyBUF_C_CONTIGUOUS) < 0) return NULL;
+    if (view.len < 0 || view.len % (Py_ssize_t)sizeof(int64_t) != 0) {
+        PyBuffer_Release(&view);
+        return PyErr_Format(PyExc_ValueError, "Engram early IDs must be int64 values");
+    }
+    const int64_t *early = (const int64_t *)view.buf;
+    size_t count = (size_t)view.len / sizeof(int64_t);
+    bool found = false;
+    for (size_t i = 0; i < count; i++) {
+        if (early[i] == UNKNOWN_ID) {
+            found = true;
+            break;
+        }
+    }
+    PyBuffer_Release(&view);
+    return PyBool_FromLong(found);
+}
+
+/* submit(reader, sequence, count, wait_s, early, has_unknown): queue one step behind every
+ * step already queued. ``early`` is None or ``count`` int64 IDs the host hashed
  * (UNKNOWN_ID where only the GPU knows the ID), copied here. Returns at once unless
  * the queue is full; then it waits for space, without the GIL. */
 static PyObject *py_submit(PyObject *self, PyObject *args) {
@@ -751,8 +773,11 @@ static PyObject *py_submit(PyObject *self, PyObject *args) {
     PyObject *capsule, *early_object = Py_None;
     unsigned int sequence, count;
     double wait;
+    int has_unknown_arg = -1;
     uint64_t submitted = now_ns();
-    if (!PyArg_ParseTuple(args, "OIId|O", &capsule, &sequence, &count, &wait, &early_object)) return NULL;
+    if (!PyArg_ParseTuple(args, "OIId|Oi", &capsule, &sequence, &count, &wait, &early_object,
+                          &has_unknown_arg))
+        return NULL;
     reader_t *reader = get_reader(capsule);
     if (!reader) return NULL;
     if (count > reader->plan.max_lookups)
@@ -773,8 +798,12 @@ static PyObject *py_submit(PyObject *self, PyObject *args) {
         }
         memcpy(early, view.buf, (size_t)count * sizeof(*early));
         PyBuffer_Release(&view);
-        has_unknown = false;
-        for (uint32_t i = 0; i < count && !has_unknown; i++) has_unknown = early[i] == UNKNOWN_ID;
+        if (has_unknown_arg >= 0) {
+            has_unknown = has_unknown_arg != 0;
+        } else {
+            has_unknown = false;
+            for (uint32_t i = 0; i < count && !has_unknown; i++) has_unknown = early[i] == UNKNOWN_ID;
+        }
     }
     const char *problem = NULL;
     failure_t failure = {{0}};
@@ -903,6 +932,7 @@ static PyObject *py_timeline(PyObject *self, PyObject *capsule) {
 static PyMethodDef methods[] = {
     {"reader", py_reader, METH_VARARGS, NULL},
     {"add", py_add, METH_VARARGS, NULL},
+    {"has_unknown", py_has_unknown, METH_O, NULL},
     {"submit", py_submit, METH_VARARGS, NULL},
     {"status", py_status, METH_O, NULL},
     {"timeline", py_timeline, METH_O, NULL},
