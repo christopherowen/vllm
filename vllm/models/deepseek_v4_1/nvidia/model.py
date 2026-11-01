@@ -574,7 +574,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self.engram_layout is not None
             and self.engram_layout.table_memory in ("ram", "disk")
         )
-        if self.disk_engram:
+        if self.disk_engram or self.engram_hash is not None:
             self.register_engram_hashes()
 
         if get_pp_group().is_last_rank:
@@ -841,11 +841,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 query_start_loc[1] = input_ids.shape[0]
                 lookback_token_ids = input_ids.new_full((1, 3), -1)
             engram_mask = input_ids
-            engram_hashes = self.engram_hash(
+            engram_hashes = self.prepared_engram_hashes[: input_ids.shape[0]]
+            self.engram_hash.run_native(
                 input_ids,
-                positions,
                 query_start_loc,
                 lookback_token_ids,
+                engram_hashes,
             )
             for layer in islice(self.layers, self.start_layer, self.end_layer):
                 engram = getattr(layer, "engram", None)

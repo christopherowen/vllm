@@ -1233,7 +1233,12 @@ TILE_CONTIGUOUS_FP8: set[tuple[int, int]] = {
 }
 
 DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
-    # TP4 attention: Q-B, indexer Q-B, fused Q-A/KV.
+    # Attention: Q-B (TP3, TP4..7, TP8 / indexer Q-B) and fused Q-A/KV.
+    (12288, 1280): {
+        16: dict(block_N=128, block_K=128, num_stages=3),
+        32: dict(block_N=64, block_K=128, num_stages=3),
+        64: dict(block_N=64, block_K=128, num_stages=2),
+    },
     (8192, 1280): {
         16: dict(block_N=128, block_K=128, num_stages=3),
         32: dict(block_N=64, block_K=128, num_stages=3),
@@ -1249,46 +1254,130 @@ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
         32: dict(block_N=64, block_K=256, num_stages=3),
         64: dict(block_N=64, block_K=256, num_stages=2),
     },
-    # TP4 shared expert: gate/up and down.
+    # Shared expert gate/up (TP3, TP4, TP5, TP6/TP7, TP8).
+    (1536, 5120): {
+        16: dict(block_N=32, block_K=256, num_stages=3),
+        32: dict(block_N=32, block_K=256, num_stages=3),
+        64: dict(block_N=64, block_K=128, num_stages=2),
+    },
     (1152, 5120): {
         16: dict(block_N=32, block_K=256, num_stages=3),
         32: dict(block_N=32, block_K=256, num_stages=3),
         64: dict(block_N=64, block_K=256, num_stages=2),
+    },
+    (1024, 5120): {
+        16: dict(block_N=32, block_K=256, num_stages=3),
+        32: dict(block_N=32, block_K=256, num_stages=3),
+        64: dict(block_N=64, block_K=256, num_stages=2),
+    },
+    (768, 5120): {
+        16: dict(block_N=32, block_K=256, num_stages=3),
+        32: dict(block_N=32, block_K=256, num_stages=3),
+        64: dict(block_N=32, block_K=256, num_stages=2),
+    },
+    (640, 5120): {
+        16: dict(block_N=32, block_K=256, num_stages=3),
+        32: dict(block_N=32, block_K=256, num_stages=3),
+        64: dict(block_N=32, block_K=256, num_stages=2),
+    },
+    # Shared expert down (TP3, TP4, TP5, TP6/TP7, TP8).
+    (5120, 768): {
+        16: dict(block_N=128, block_K=64, num_stages=2, threads=64),
+        32: dict(block_N=128, block_K=64, num_stages=2),
+        64: dict(block_N=64, block_K=64, num_stages=2),
     },
     (5120, 576): {
         16: dict(block_N=128, block_K=64, num_stages=2, threads=64),
         32: dict(block_N=128, block_K=64, num_stages=2),
         64: dict(block_N=64, block_K=64, num_stages=2),
     },
-    # TP4 attention output: the grouped WO-A (2 groups) and WO-B (window 3's WO
-    # sweep, ranked against the default tile; WO-B keeps it from 32 rows).
+    (5120, 512): {
+        16: dict(block_N=128, block_K=64, num_stages=2, threads=64),
+        32: dict(block_N=128, block_K=64, num_stages=2),
+        64: dict(block_N=64, block_K=64, num_stages=2),
+    },
+    (5120, 384): {
+        16: dict(block_N=128, block_K=64, num_stages=2, threads=64),
+        32: dict(block_N=128, block_K=64, num_stages=2),
+        64: dict(block_N=64, block_K=64, num_stages=2),
+    },
+    (5120, 320): {
+        16: dict(block_N=128, block_K=64, num_stages=2, threads=64),
+        32: dict(block_N=128, block_K=64, num_stages=2),
+        64: dict(block_N=64, block_K=64, num_stages=2),
+    },
+    # Attention output: grouped WO-A (TP3 3 groups, TP4..7 2 groups, TP8 1 group)
+    # and WO-B (TP3, TP4..7, TP8).
+    (1024, 4096, 3): {
+        16: dict(block_N=64, block_K=128, num_stages=4),
+        32: dict(block_N=64, block_K=128, num_stages=4),
+        64: dict(block_N=64, block_K=128, num_stages=2),
+    },
     (1024, 4096, 2): {
         16: dict(block_N=64, block_K=128, num_stages=4),
         32: dict(block_N=64, block_K=128, num_stages=4),
         64: dict(block_N=64, block_K=256, num_stages=2),
     },
+    (1024, 4096): {
+        16: dict(block_N=32, block_K=128, num_stages=4),
+        32: dict(block_N=32, block_K=128, num_stages=4),
+        64: dict(block_N=32, block_K=256, num_stages=2),
+    },
+    (5120, 3072): {
+        16: dict(block_N=128, block_K=128, num_stages=3),
+        32: dict(block_N=128, block_K=128, num_stages=3),
+        64: dict(block_N=128, block_K=128, num_stages=2),
+        96: dict(block_N=64, block_K=128, num_stages=2),
+    },
     (5120, 2048): {
         16: dict(block_N=128, block_K=128, num_stages=3),
+        32: dict(block_N=128, block_K=128, num_stages=3),
         # 2026-10-13 sweep (experiments/2026-10-13-tilelang-fp8-cast): 0.87 of the
         # default tile at 48-64 rows; a 96-row tile 0.91 of the prefill tile at 72-96.
         64: dict(block_N=128, block_K=128, num_stages=2),
         96: dict(block_N=64, block_K=128, num_stages=2),
     },
-    # DSpark main projection (replicated, TP4 shard, and TP3 padded shard).
+    (5120, 1024): {
+        16: dict(block_N=128, block_K=128, num_stages=3),
+        32: dict(block_N=128, block_K=128, num_stages=3),
+        64: dict(block_N=128, block_K=128, num_stages=2),
+        96: dict(block_N=64, block_K=128, num_stages=2),
+    },
+    # DSpark main projection (replicated and TP3..TP8 shards).
     (6400, 6144): {
         16: dict(block_N=32, block_K=256, num_stages=4, threads=64),
         32: dict(block_N=32, block_K=256, num_stages=4, threads=64),
         64: dict(block_N=64, block_K=256, num_stages=2),
+    },
+    (1728, 15360): {
+        16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+        32: dict(block_N=64, block_K=256, num_stages=3, threads=128),
+        64: dict(block_N=64, block_K=256, num_stages=3, threads=128),
     },
     (1280, 15360): {
         16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
         32: dict(block_N=64, block_K=256, num_stages=3, threads=128),
         64: dict(block_N=32, block_K=256, num_stages=3, threads=128),
     },
-    (1728, 15360): {
+    (1024, 15360): {
         16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
-        32: dict(block_N=64, block_K=256, num_stages=3, threads=128),
-        64: dict(block_N=64, block_K=256, num_stages=3, threads=128),
+        32: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+        64: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+    },
+    (896, 15360): {
+        16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+        32: dict(block_N=32, block_K=256, num_stages=4, threads=128),
+        64: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+    },
+    (768, 15360): {
+        16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+        32: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+        64: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+    },
+    (640, 15360): {
+        16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+        32: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+        64: dict(block_N=32, block_K=256, num_stages=3, threads=128),
     },
 }
 
@@ -1363,9 +1452,19 @@ def split_row_tile(rows: int) -> int:
 # projection run faster on their prefill tiles.
 WIDE_DECODE: dict[tuple[int, int], dict[int, int]] = {
     (1792, 5120): {96: 32, 128: 64},
+    (1536, 5120): {128: 64},
     (1152, 5120): {128: 64},
+    (1024, 5120): {128: 64},
+    (768, 5120): {128: 64},
+    (640, 5120): {128: 64},
+    (5120, 768): {96: 32},
     (5120, 576): {96: 32},
+    (5120, 512): {96: 32},
+    (5120, 384): {96: 32},
+    (5120, 320): {96: 32},
+    (5120, 3072): {96: 96},
     (5120, 2048): {96: 96},
+    (5120, 1024): {96: 96},
 }
 
 # BF16 projections whose split-K decode path serves rows past DECODE_ROWS, by

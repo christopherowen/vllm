@@ -376,25 +376,28 @@ def column_shard(geometry, layer_index: int, tp_size: int, tp_rank: int):
     0-7 hash 2-grams, 8-15 3-grams and 16-23 4-grams, and a longer n-gram repeats
     less, so a step reads more distinct rows of it (1 : 1.35 : 1.54 on source text).
     Interleaving gives every rank columns of each order (TP3: 3/3/2, 3/2/3, 2/3/3;
-    TP4: 2/2/2), where contiguous columns gave one rank every 4-gram head and the
-    slowest reads. A rank's gathered columns are joined by an all-gather and put back
-    in column order (``interleaved_rows``). Requires a TP size that divides 24."""
+    TP4: 2/2/2; TP5: 2/2/1, 2/1/2, 1/2/2, 1/2/2, 2/1/1), where contiguous columns
+    gave one rank every 4-gram head and the slowest reads. A rank's gathered columns
+    are joined by an all-gather and put back in column order (``interleaved_rows``)."""
     columns = len(geometry.offsets[layer_index])
-    if columns % tp_size:
+    if tp_size <= 0 or tp_size > columns:
         return None
     return tuple(range(tp_rank, columns, tp_size))
 
 
 def interleaved_rows(local: torch.Tensor) -> torch.Tensor:
     """Rows ``[T, 24 * 256]`` in column order from every rank's columns: ``local`` is
-    this rank's ``[T, (24 / tp) * 256]``, columns ``rank, rank + tp, ...`` side by
+    this rank's ``[T, ceil(24 / tp) * 256]``, columns ``rank, rank + tp, ...`` side by
     side. All-gathered as 256-wide rows along the last dimension, rank r's k-th block
     of token t lands at column k * tp + r of the token's row: the column order, with
-    no copy before or after the collective (the one-shot all-gather writes the layout
-    directly). Exact copies: the same values as one reader's rows."""
+    no copy before or after the collective when ``tp`` divides 24 (and a narrow slice
+    of the trailing padded columns when ``24 % tp != 0``)."""
     tokens = local.shape[0]
     gathered = tensor_model_parallel_all_gather(local.view(-1, 256), dim=-1)
-    return gathered.view(tokens, 24 * 256)
+    rows = gathered.view(tokens, -1)
+    if rows.shape[1] == 24 * 256:
+        return rows
+    return rows[:, : 24 * 256].contiguous()
 
 
 class ParallelEngramEmbedding(nn.Module):
@@ -412,7 +415,11 @@ class ParallelEngramEmbedding(nn.Module):
         # divides them, so the ranks' rows are joined by an all-gather of their
         # columns, not summed (resident tables keep equal row shards).
         self.columns = None
+        self.max_columns = 0
         self.column_mask = (1 << 24) - 1
+        total_columns = len(
+            geometry.offsets[geometry.layer_ids.index(caps.layer_id)]
+        )
         columns = (
             column_shard(
                 geometry,
@@ -426,6 +433,7 @@ class ParallelEngramEmbedding(nn.Module):
         if columns is not None:
             self.shard_start, self.shard_end = 0, self.table_rows
             self.columns = columns
+            self.max_columns = (total_columns + caps.tp_size - 1) // caps.tp_size
             self.column_mask = sum(1 << column for column in columns)
         self.weight_shape = (self.shard_rows, 256)
         self.scale_shape = (self.shard_rows, 8)
@@ -600,7 +608,7 @@ class ParallelEngramEmbedding(nn.Module):
         from vllm.models.deepseek_v4_1.tilelang import prepare
         from vllm.models.deepseek_v4_1.tilelang.engram_rows import row_kernel_calls
 
-        calls = row_kernel_calls(**self._disk_shard())
+        calls = row_kernel_calls(**self._disk_shard(), out_cols=self.max_columns)
         prepare.declare(lambda: calls)
 
     def open_disk_rows(self) -> None:
@@ -654,13 +662,14 @@ class ParallelEngramEmbedding(nn.Module):
         """Wait for the staged step's rows and dequantize them into ``out``."""
         self.disk_rows.gather(out, self.hashes, self.num_tokens)
 
-    def lookup_native(self, indices, out):
+    def lookup_native(self, indices, out, *, clear_tail: bool = True):
         if self.plan.prepared is None:
             raise PreparationResourceUnavailableError(
                 "Engram lookup plan must be prepared before forwarding"
             )
-        self.hashes[: indices.shape[0]].copy_(indices)
-        self.num_tokens.fill_(indices.shape[0])
+        if indices.data_ptr() != self.hashes.data_ptr():
+            self.hashes[: indices.shape[0]].copy_(indices)
+            self.num_tokens.fill_(indices.shape[0])
         binding = native.bind_lookup(
             self.plan,
             weight=self.weight,
@@ -672,10 +681,10 @@ class ParallelEngramEmbedding(nn.Module):
         retain_cuda_graph_capture_resource(binding)
         if self.mapped_host_nbytes:
             retain_cuda_graph_capture_resource(self)
-        native.run_lookup(binding)
+        native.run_lookup(binding, indices.shape[0], clear_tail=clear_tail)
 
-    def lookup(self, indices, out):
-        self.lookup_native(indices, out)
+    def lookup(self, indices, out, *, clear_tail: bool = True):
+        self.lookup_native(indices, out, clear_tail=clear_tail)
 
 
 class Engram(nn.Module):
@@ -739,9 +748,12 @@ class Engram(nn.Module):
         # gather and immediately project within their own forward, so they share one
         # staged_rows buffer across layers on the layout.
         columns = self.embed_tokens.columns
+        max_columns = self.embed_tokens.max_columns or (
+            len(columns) if columns is not None else 0
+        )
         staged_rows_shape = (
             caps.max_tokens,
-            6144 if columns is None else len(columns) * 256,
+            6144 if columns is None else max_columns * 256,
         )
         shared_staged_rows = (
             getattr(layout, "_shared_disk_staged_rows", None)
@@ -878,7 +890,7 @@ class Engram(nn.Module):
         self._disk_prepared = True
 
     def prepare_embeddings(self, hash_ids):
-        self.embed_tokens.lookup(hash_ids, self.staged_rows)
+        self.embed_tokens.lookup(hash_ids, self.staged_rows, clear_tail=False)
 
     def invalidate_disk_output(self, *, clear=False):
         self._disk_prepared = False

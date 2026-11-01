@@ -1138,12 +1138,12 @@ def test_disk_rows_read_whole_table_sources(tmp_path, dist_init, tp_rank):
         embed.close()
 
 
-@pytest.mark.parametrize("tp_size", [1, 2, 3, 4, 6])
+@pytest.mark.parametrize("tp_size", [1, 2, 3, 4, 5, 6, 7, 8])
 def test_disk_shards_interleave_hash_columns(tp_size):
-    """When the TP size divides the 24 hash columns, rank r reads every tp-th column
-    from r: the ranks' columns tile all 24 once, and each rank holds heads of every
-    n-gram order (heads 0-7 2-grams, 8-15 3-grams, 16-23 4-grams) as evenly as the
-    split allows, so no rank reads only the longest n-grams' distinct rows."""
+    """For every TP size up to 24, rank r reads every tp-th column from r: the
+    ranks' columns tile all 24 once, and each rank holds heads of every n-gram order
+    (heads 0-7 2-grams, 8-15 3-grams, 16-23 4-grams) as evenly as the split allows,
+    so no rank reads only the longest n-grams' distinct rows."""
     from vllm.models.deepseek_v4_1.common.engram import column_shard
 
     geometry = native.build_geometry(base_table_size=19, compressed_vocab_size=32)
@@ -1154,29 +1154,34 @@ def test_disk_shards_interleave_hash_columns(tp_size):
             assert shard == tuple(range(rank, 24, tp_size))
             orders = [sum(1 for c in shard if c // 8 == order) for order in range(3)]
             assert max(orders) - min(orders) <= 1, (tp_size, rank, orders)
-    assert column_shard(geometry, 0, 5, 0) is None  # 24 columns do not split five ways
+    assert column_shard(geometry, 0, 25, 0) is None
 
 
-@pytest.mark.parametrize("tp_size", [1, 2, 3, 4, 6])
+@pytest.mark.parametrize("tp_size", [1, 2, 3, 4, 5, 6, 7, 8])
 def test_interleaved_rows_restore_column_order(tp_size, monkeypatch):
     """Every rank's columns, all-gathered as 256-wide rows along the last dimension,
-    are the column order exactly, with no copy after the collective."""
+    restore the 24-column order (with no copy when tp_size divides 24, and slicing
+    off the trailing padded columns when 24 % tp_size != 0)."""
     import vllm.models.deepseek_v4_1.common.engram as engram_module
 
     tokens = 5
+    max_cols = (24 + tp_size - 1) // tp_size
+    padded = torch.zeros(tokens, max_cols * tp_size * 256, dtype=torch.bfloat16)
     full = torch.randn(tokens, 24 * 256).bfloat16()
+    padded[:, : 24 * 256] = full
     locals_ = [
-        full.view(tokens, 24 // tp_size, tp_size, 256)[:, :, r, :].reshape(tokens, -1)
+        padded.view(tokens, max_cols, tp_size, 256)[:, :, r, :].reshape(tokens, -1)
         for r in range(tp_size)
     ]
     gathered = []
 
     def all_gather(local, dim):
-        assert local.shape == (tokens * 24 // tp_size, 256) and dim == -1
+        assert local.shape == (tokens * max_cols, 256) and dim == -1
         gathered.append(torch.cat([part.view(-1, 256) for part in locals_], dim=dim))
         return gathered[-1]
 
     monkeypatch.setattr(engram_module, "tensor_model_parallel_all_gather", all_gather)
     rows = engram_module.interleaved_rows(locals_[0])
     assert torch.equal(rows.view(torch.int16), full.view(torch.int16))
-    assert rows.data_ptr() == gathered[0].data_ptr()
+    if 24 % tp_size == 0:
+        assert rows.data_ptr() == gathered[0].data_ptr()

@@ -499,15 +499,34 @@ def test_timeline_records_each_step_and_the_gpu_wait():
 
 def test_the_gather_takes_every_nth_column():
     """The gather writes a rank's columns side by side: every n-th from the first
-    (``column_shard``), or it refuses the mask."""
-    from vllm.models.deepseek_v4_1.tilelang.engram_rows import column_span
+    (``column_shard``), including padded column strides when 24 % tp_size != 0."""
+    from vllm.models.deepseek_v4_1.tilelang.engram_rows import column_span, row_kernel_calls
 
     assert column_span(ALL_COLUMNS) == (0, 1, HEADS)
     assert column_span(TP3_RANK1) == (1, 3, 8)
+    tp5_rank4 = sum(1 << column for column in range(4, HEADS, 5))
+    assert column_span(tp5_rank4) == (4, 5, 4)
     assert column_span(1 << 23) == (23, 1, 1)
     for columns in (0, 0b1011, (1 << 2) | (1 << 5) | (1 << 9)):
         with pytest.raises(ValueError, match="every n-th"):
             column_span(columns)
+    codes, scales, paths = _write_table(_table_dir(), seed=31)
+    rows = _rows(paths, 0, TABLE_ROWS, tokens=4, columns=tp5_rank4)
+    ids = torch.randint(0, TABLE_ROWS, (4, HEADS), device="cuda")
+    num_tokens = torch.tensor([3], dtype=torch.int32, device="cuda")
+    out = torch.zeros((4, 5 * 256), dtype=torch.bfloat16, device="cuda")
+    rows.stage(torch.cuda.current_stream(), ids, ids.numel())
+    rows.gather(out, ids, num_tokens)
+    torch.testing.assert_close(
+        out[:, : 4 * 256].cpu(),
+        _reference(codes, scales, ids, 3, 0, TABLE_ROWS, tp5_rank4),
+        rtol=0,
+        atol=0,
+        equal_nan=True,
+    )
+    assert torch.count_nonzero(out[:, 4 * 256 :]) == 0
+    assert row_kernel_calls(4 * HEADS, 0, TABLE_ROWS, tp5_rank4, out_cols=5)[1][1][-1] == 5
+    rows.close()
 
 
 @pytest.mark.parametrize("columns", [0, 1 << HEADS])

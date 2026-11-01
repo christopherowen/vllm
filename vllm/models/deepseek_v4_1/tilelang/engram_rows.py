@@ -176,11 +176,14 @@ def engram_rows_gather_kernel(
     shard_start: int,
     shard_end: int,
     columns: int = (1 << HEADS) - 1,
+    out_cols: int = 0,
     threads: int = 64,
     vec: int = 4,
 ):
     assert threads * vec == ROW and 32 % vec == 0
     first, step, count = column_span(columns)
+    stride_cols = out_cols or count
+    assert stride_cols >= count
     tokens = T.dynamic("tokens")
 
     @T.prim_func
@@ -189,7 +192,7 @@ def engram_rows_gather_kernel(
         num_tokens: T.Tensor((1,), T.int32),
         rows: T.Tensor((max_lookups, ROW), T.float8_e4m3fn),
         scales: T.Tensor((max_lookups, SCALES), T.uint8),
-        out: T.Tensor((tokens, count * ROW), T.bfloat16),
+        out: T.Tensor((tokens, stride_cols * ROW), T.bfloat16),
     ):
         with T.Kernel(count, tokens, threads=threads) as (column, t):
             tx = T.get_thread_binding()
@@ -215,15 +218,26 @@ def engram_rows_gather_kernel(
 
 
 def row_kernel_calls(
-    max_lookups: int, shard_start: int, shard_end: int, columns: int
+    max_lookups: int,
+    shard_start: int,
+    shard_end: int,
+    columns: int,
+    out_cols: int = 0,
 ) -> list[prepare.TileLangCall]:
     """The kernel calls ``engram_rows_gather`` makes for a reader of ``max_lookups``
     rows a step (``rows.shape[0]``) and the rank's rows ``[shard_start, shard_end)``
     of the hash columns in the mask ``columns``."""
+    _, _, count = column_span(columns)
+    extra = (out_cols,) if out_cols and out_cols != count else ()
     return [
         prepare.call(engram_rows_wait_kernel),
         prepare.call(
-            engram_rows_gather_kernel, max_lookups, shard_start, shard_end, columns
+            engram_rows_gather_kernel,
+            max_lookups,
+            shard_start,
+            shard_end,
+            columns,
+            *extra,
         ),
         prepare.call(engram_rows_release_kernel),
     ]
@@ -249,8 +263,11 @@ def engram_rows_gather(
     engram_rows_wait_kernel()(control)
     tokens = out.shape[0]
     if tokens:
+        _, _, count = column_span(columns)
+        stride_cols = out.shape[1] // ROW
+        extra = (stride_cols,) if stride_cols != count else ()
         kernel = engram_rows_gather_kernel(
-            rows.shape[0], shard_start, shard_end, columns
+            rows.shape[0], shard_start, shard_end, columns, *extra
         )
         kernel(ids[:tokens], num_tokens, rows, scales, out)
     engram_rows_release_kernel()(control)
