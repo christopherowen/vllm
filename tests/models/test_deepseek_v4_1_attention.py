@@ -375,3 +375,105 @@ def test_attention_forward_releases_intermediates_before_o_proj(monkeypatch):
     positions = torch.arange(4)
     out = module._forward(positions, track("hidden", torch.ones(4, 32)))
     assert out.shape == (4, 32)
+
+
+def test_forward_mqa_shares_index_pages_without_mixed_step_clobber(monkeypatch):
+    """Single-chunk index page tables are shared across layers sharing ``im``,
+    and mixed decode+prefill steps never clobber the cached decode slice."""
+    from vllm.models.deepseek_v4_1 import attention
+    from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    def make_layer(layer_id):
+        layer = _tilelang_layer(layer_id=layer_id)
+        layer.compress_ratio = 0
+        layer.candidate_source_layer = 99
+        layer._attention_geometry()
+        layer._short_index_shape = None
+        layer.topk_indices_buffer = torch.zeros(128, 512, dtype=torch.int32)
+        layer._index_pages = torch.full((64, 16), -1, dtype=torch.int32)
+        layer._active = torch.tensor([16 * 64], dtype=torch.int32)
+        layer._ready = True
+        layer.swa_cache_layer = SimpleNamespace(prefix="swa")
+        layer.indexer = SimpleNamespace(
+            heads=4,
+            k_cache=SimpleNamespace(prefix="idx"),
+        )
+        layer._attend_split = lambda *args, **kwargs: None
+        return layer
+
+    l0, l1 = make_layer(0), make_layer(1)
+    im = SimpleNamespace(
+        req_id_per_token=torch.arange(128, dtype=torch.int32),
+        cache_lengths=torch.full((128,), 128, dtype=torch.int32),
+        block_table=torch.arange(128 * 16, dtype=torch.int32).view(128, 16),
+        max_seq_len=32768,
+    )
+
+    pages_calls = []
+
+    def fake_pages(reqs, lengths, table, out, offset, rows, read_width, *, page):
+        pages_calls.append((offset, rows))
+        out[:rows] = table[offset : offset + rows, : out.shape[1]]
+
+    monkeypatch.setattr(tl_metadata, "pages", fake_pages)
+
+    seen = {0: [], 1: []}
+    for lid, layer in ((0, l0), (1, l1)):
+        layer._index_chunk = (
+            lambda mode, count, *, page_table, _lid=lid, **kw: seen[_lid].append(
+                (mode, count, page_table.clone())
+            )
+        )
+
+    # Case 1: Mixed step with total rows (6) <= INDEX_CHUNK (64).
+    # Decode uses _index_pages[:2] and rest uses _index_pages[2:6]; both are cached
+    # on l0 and reused on l1 without clobbering.
+    ctx = SimpleNamespace(
+        attn_metadata={
+            "swa": SimpleNamespace(is_decode=False, num_decode_tokens=2),
+            "idx": im,
+        }
+    )
+    monkeypatch.setattr(attention, "get_forward_context", lambda: ctx)
+    q = torch.zeros(6, 2, 512)
+    iq = (
+        torch.zeros(6, 4, 64, dtype=torch.uint8),
+        torch.zeros(6, 4, 4, dtype=torch.uint8),
+        torch.zeros(6, 4),
+        None,
+        None,
+    )
+    l0.forward_mqa(q, None, torch.arange(6), q.clone(), index_query=iq)
+    l1.forward_mqa(q, None, torch.arange(6), q.clone(), index_query=iq)
+    assert pages_calls == [(0, 2), (2, 4)]
+    assert torch.equal(seen[0][0][2], im.block_table[0:2])
+    assert torch.equal(seen[0][1][2], im.block_table[2:6])
+    assert torch.equal(seen[1][0][2], im.block_table[0:2])
+    assert torch.equal(seen[1][1][2], im.block_table[2:6])
+
+    # Case 2: Mixed step with total rows (70) > INDEX_CHUNK (64) and shared buffer.
+    # Decode slice must not be cached across rest multi-chunk overwrite of _index_pages.
+    pages_calls.clear()
+    seen[0].clear()
+    seen[1].clear()
+    ctx2 = SimpleNamespace(
+        attn_metadata={
+            "swa": SimpleNamespace(is_decode=False, num_decode_tokens=2),
+            "idx": im,
+        }
+    )
+    monkeypatch.setattr(attention, "get_forward_context", lambda: ctx2)
+    q70 = torch.zeros(70, 2, 512)
+    iq70 = (
+        torch.zeros(70, 4, 64, dtype=torch.uint8),
+        torch.zeros(70, 4, 4, dtype=torch.uint8),
+        torch.zeros(70, 4),
+        None,
+        None,
+    )
+    l0.forward_mqa(q70, None, torch.arange(70), q70.clone(), index_query=iq70)
+    l1.forward_mqa(q70, None, torch.arange(70), q70.clone(), index_query=iq70)
+    assert torch.equal(seen[0][0][2], im.block_table[0:2])
+    assert torch.equal(seen[1][0][2], im.block_table[0:2])

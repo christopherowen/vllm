@@ -1141,19 +1141,38 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 count = query[0].shape[0]
                 cut = min(max(decode_rows - first, 0), count)
                 if cut:
-                    select_rows([t[:cut] for t in query], first, selected[:cut], decode)
+                    keep = (
+                        cut == count
+                        or rest[2] is not decode[2]
+                        or first + count <= decode[2].shape[0]
+                    )
+                    select_rows(
+                        [t[:cut] for t in query],
+                        first,
+                        selected[:cut],
+                        decode,
+                        keep=keep,
+                    )
                 if cut < count:
                     select_rows(
-                        [t[cut:] for t in query], first + cut, selected[cut:], rest
+                        [t[cut:] for t in query],
+                        first + cut,
+                        selected[cut:],
+                        rest,
                     )
 
-            def select_rows(query, first, selected, params):
+            def select_rows(query, first, selected, params, keep=True):
                 # Query rows start at global row `first`; metadata and
                 # candidates are indexed by global row, `selected` by query row.
                 index_mode, chunk_rows, index_pages, score_width = params
                 index_width = index_pages.shape[1]
                 iq_data, iq_scale, iw = query
                 index_rows = iq_data.shape[0]
+                buf = (
+                    index_pages[first:]
+                    if first and first + index_rows <= index_pages.shape[0]
+                    else index_pages
+                )
                 for offset in range(0, index_rows, chunk_rows):
                     end = min(offset + chunk_rows, index_rows)
                     count = end - offset
@@ -1162,16 +1181,30 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                         metadata as tl_metadata,
                     )
 
-                    tl_metadata.pages(
-                        im.req_id_per_token,
-                        im.cache_lengths,
-                        im.block_table,
-                        index_pages,
-                        row,
-                        count,
-                        min(im.block_table.shape[1], index_width),
-                        page=self._index_page,
-                    )
+                    page_table = None
+                    cacheable = split is None and index_rows <= chunk_rows
+                    if cacheable:
+                        key = (id(im), row, count, index_width, self._index_page)
+                        shared = get_forward_context().__dict__.setdefault(
+                            "_ds41_index_pages", {}
+                        )
+                        entry = shared.get(key)
+                        if entry is not None and entry[0] is im:
+                            page_table = entry[1]
+                    if page_table is None:
+                        tl_metadata.pages(
+                            im.req_id_per_token,
+                            im.cache_lengths,
+                            im.block_table,
+                            buf,
+                            row,
+                            count,
+                            min(im.block_table.shape[1], index_width),
+                            page=self._index_page,
+                        )
+                        page_table = buf[:count]
+                        if cacheable and keep:
+                            shared[key] = (im, page_table)
                     candidate_args = {}
                     if self.layer_id == self.candidate_source_layer:
                         candidate_args = dict(
@@ -1192,7 +1225,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                         q_mxfp4=iq_data[offset:end],
                         q_scales=iq_scale[offset:end],
                         query_weights=iw[offset:end],
-                        page_table=index_pages[:count],
+                        page_table=page_table,
                         cache_lengths=im.cache_lengths[row:row_end],
                         score_width=score_width,
                         output_indices=selected[offset:end],

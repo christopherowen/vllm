@@ -358,6 +358,7 @@ def pages_kernel(width: int, page: int):
     table_rows = T.dynamic("table_rows")
     table_cols = T.dynamic("table_cols")
     table_stride = T.dynamic("table_stride")
+    groups = (width + _GROUP * _BLOCK - 1) // (_GROUP * _BLOCK)
 
     @T.prim_func
     def metadata_pages(
@@ -368,16 +369,33 @@ def pages_kernel(width: int, page: int):
         offset: T.int32,
         read_width: T.int32,
     ):
-        with T.Kernel(rows, T.ceildiv(width, _BLOCK), threads=_BLOCK) as (row, cb):
+        with T.Kernel(rows, threads=_BLOCK) as (row,):
             pdl.chain()
-            entry = T.alloc_var(T.int32)  # one load (decode_metadata_kernel's entry)
-            col = cb * _BLOCK + T.get_thread_binding()
+            tx = T.get_thread_binding()
+            live = T.alloc_var(T.int32)
+            entries = T.alloc_local((groups * _GROUP,), T.int32)
             req = reqs[offset + row]
             live = _live_pages(lengths[offset + row], page, T.min(read_width, width))
-            if (req >= 0) & (col < live):
-                # vLLM reserves physical block zero; page tables use -1 for holes.
-                entry = table[req, col]
-                out[row, col] = T.if_then_else(entry > 0, entry, -1)
+            if req < 0:
+                live = 0
+            for g in T.unroll(groups):
+                if g * _GROUP * _BLOCK < live:
+                    for k in T.unroll(_GROUP):
+                        col = (g * _GROUP + k) * _BLOCK + tx
+                        entries[g * _GROUP + k] = T.if_then_else(
+                            col < live, table[req, col], 0
+                        )
+            for g in T.unroll(groups):
+                if g * _GROUP * _BLOCK < live:
+                    for k in T.unroll(_GROUP):
+                        col = (g * _GROUP + k) * _BLOCK + tx
+                        if col < live:
+                            # vLLM reserves physical block zero; page tables use -1 for holes.
+                            out[row, col] = T.if_then_else(
+                                entries[g * _GROUP + k] > 0,
+                                entries[g * _GROUP + k],
+                                -1,
+                            )
 
     return metadata_pages
 
