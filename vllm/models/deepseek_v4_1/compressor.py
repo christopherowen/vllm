@@ -107,6 +107,14 @@ class DeepseekCompressor(nn.Module):
         self.prefix, self.compress_ratio = prefix, compress_ratio
         self.capacity = vllm_config.scheduler_config.max_num_batched_tokens
         self.requests = vllm_config.scheduler_config.max_num_seqs
+        cache_cfg = getattr(vllm_config, "cache_config", None)
+        block_size = (
+            getattr(cache_cfg, "block_size", 64) if cache_cfg is not None else 64
+        )
+        self._main_page = block_size // compress_ratio
+        model_cfg = getattr(vllm_config, "model_config", None)
+        hf = getattr(model_cfg, "hf_config", None) if model_cfg is not None else None
+        self._rope_dim = int(getattr(hf, "qk_rope_head_dim", 64))
         self.fused_wkv_wgate = MergedColumnParallelLinear(
             hidden_size,
             [512] * compress_ratio,
@@ -182,14 +190,36 @@ class DeepseekCompressor(nn.Module):
         from vllm.models.deepseek_v4_1.tilelang import compress as tl
         from vllm.models.deepseek_v4_1.tilelang import prepare
 
+        main_page = getattr(self, "_main_page", 64 // self.compress_ratio)
+        rope_dim = getattr(self, "_rope_dim", 64)
         if self.compress_ratio == 1:
-            return [prepare.call(tl.compress_kernel, 1, self.requests, 1)]
+            return [
+                prepare.call(tl.compress_kernel, 1, self.requests, 1),
+                prepare.call(
+                    tl.compress_kernel,
+                    1,
+                    self.requests,
+                    1,
+                    write_kv=True,
+                    kv_page_size=main_page,
+                    rope_dim=rope_dim,
+                ),
+            ]
         # The ring holds one state per token, so its metadata's page
         # (``state_metadata.block_size``) is its block size.
         page = self.state_cache.block_size
         return [
             prepare.call(tl.gather_partial_state_kernel, self.requests, page),
             prepare.call(tl.compress_kernel, 2, self.requests, page),
+            prepare.call(
+                tl.compress_kernel,
+                2,
+                self.requests,
+                page,
+                write_kv=True,
+                kv_page_size=main_page,
+                rope_dim=rope_dim,
+            ),
         ]
 
     def declare_kernels(self) -> None:
@@ -208,17 +238,35 @@ class DeepseekCompressor(nn.Module):
 
         prepare.declare(self._tilelang_calls, bind=bind)
 
-    def _forward_tilelang(self, rows, metadata, state_metadata):
+    def _forward_tilelang(
+        self,
+        rows,
+        metadata,
+        state_metadata,
+        *,
+        kv_cache=None,
+        token_positions=None,
+        cos_sin=None,
+        kv_page_size=None,
+    ):
         """The TileLang compression: at ratio 2 the requests' carries from the state
         ring, then one launch over the step's rows that also saves the ring."""
         from vllm.models.deepseek_v4_1.tilelang import compress as tl
 
+        kv_kwargs = {}
+        if kv_cache is not None and token_positions is not None and cos_sin is not None:
+            kv_kwargs = dict(
+                kv_cache=kv_cache,
+                token_positions=token_positions,
+                cos_sin=cos_sin,
+                kv_page_size=kv_page_size or self._main_page,
+            )
         if self.compress_ratio == 1:
             tl.compress(
                 rows, 1, self._values, None, self.norm.weight,
                 metadata.query_start_loc, metadata.request_positions, self._row_ids,
                 metadata.slot_mapping, metadata.live_counts, self._latent,
-                self._emitted, self._slots,
+                self._emitted, self._slots, **kv_kwargs,
             )  # fmt: skip
             return
         if state_metadata is None:
@@ -236,13 +284,31 @@ class DeepseekCompressor(nn.Module):
             metadata.slot_mapping, metadata.live_counts, self._latent, self._emitted,
             self._slots, pending_values=self._pending_values,
             pending_gates=self._pending_gates, tags=self._pending_tags, pool=pool,
-            state_slots=state_metadata.slot_mapping, page=page,
+            state_slots=state_metadata.slot_mapping, page=page, **kv_kwargs,
         )  # fmt: skip
 
-    def forward(self, hidden_states, metadata, state_metadata=None):
+    def forward(
+        self,
+        hidden_states,
+        metadata,
+        state_metadata=None,
+        *,
+        kv_cache=None,
+        token_positions=None,
+        cos_sin=None,
+        kv_page_size=None,
+    ):
         rows = hidden_states.shape[0]
         if self._values is None:
             raise RuntimeError("compressor kernels must be bound before forwarding")
         self._project(hidden_states)
-        self._forward_tilelang(rows, metadata, state_metadata)
+        self._forward_tilelang(
+            rows,
+            metadata,
+            state_metadata,
+            kv_cache=kv_cache,
+            token_positions=token_positions,
+            cos_sin=cos_sin,
+            kv_page_size=kv_page_size,
+        )
         return self._latent[:rows], self._slots[:rows]

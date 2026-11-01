@@ -304,6 +304,45 @@ def test_norm_rope_write_index_keys(ratio, slot_dtype, page_size=64, pages=5):
     assert bool((pool._base[:, [0, 2]] == 0xAB).all())
 
 
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("slot_dtype", [torch.int64, torch.int32])
+def test_norm_rope_write_index_keys_fuses_splitk_shards(
+    ratio, slot_dtype, page_size=64, pages=3
+):
+    """Passing ``[4, rows, 128]`` FP32 split-K partials to
+    ``norm_rope_write_index_keys`` reduces the 4 shards in registers in shard order
+    and writes the exact same paged MXFP4 records as ``splitk_reduce`` followed by
+    2D ``norm_rope_write_index_keys``."""
+    n = 37
+    gen = _gen(19 + ratio)
+    partials = torch.randn(
+        (4, n, INDEX_DIM), generator=gen, device=DEVICE, dtype=torch.float32
+    )
+    reduced = (partials[0] + partials[1] + partials[2] + partials[3]).to(
+        torch.bfloat16
+    )
+    weight = torch.randn((INDEX_DIM,), generator=gen, device=DEVICE).bfloat16()
+    eps = 1e-6
+    positions = torch.randint(
+        0, 512, (n,), generator=gen, device=DEVICE, dtype=torch.int64
+    )
+    table = rope_table(512)
+    slots = torch.randperm(pages * page_size, generator=gen, device=DEVICE)[:n].to(
+        slot_dtype
+    )
+    slots[:2] = -1
+    pool_fused = _page_buffer(pages, page_bytes(page_size))
+    pool_sep = pool_fused.clone()
+
+    norm_rope_write_index_keys(
+        partials, weight, eps, positions, table, pool_fused, slots, page_size, ratio
+    )
+    norm_rope_write_index_keys(
+        reduced, weight, eps, positions, table, pool_sep, slots, page_size, ratio
+    )
+    assert torch.equal(pool_fused, pool_sep)
+
+
 def _ref_scores(inp, page_size, extent, positions_of):
     """Staged BF16 score: BF16 dot, ReLU, BF16 weighted product, ordered head sum."""
     rows = inp["q_values"].shape[0]

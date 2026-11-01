@@ -377,6 +377,29 @@ def _bf16_linear(
         layer.tilelang_gemm(x, layer.weight, out)
 
 
+def project_bf16_partials(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Project ``x`` through a BF16 layer, returning 3D FP32 split-K ``partials``
+    (``[shards, rows, N]``) at decode sizes so a fused consumer (``norm_rope_write_index_keys``)
+    reduces the shards in registers without launching ``splitk_reduce``."""
+    n, k = layer.weight.shape
+    rows = x.numel() // k if x.ndim != 2 else x.shape[0]
+    if x.ndim != 2:
+        x = x.reshape(rows, k)
+    scratch = current_preallocated_workspace()
+    specs = _partial_specs(layer, rows)
+    if specs:
+        (partials,) = _scratch(specs, scratch)
+        partials_kernel(layer, rows)(x, layer.weight, partials)
+        return partials
+    out = torch.empty(
+        (rows, n),
+        dtype=getattr(layer, "out_dtype", torch.bfloat16),
+        device=x.device,
+    )
+    layer.tilelang_gemm(x, layer.weight, out)
+    return out
+
+
 def _block32_kernels(n: int, k: int, groups: int = 1) -> dict:
     """Every kernel of a block-32 FP8 projection of an E4M3 ``[n, k]`` weight, as the
     calls ``_bind_block32`` makes.
@@ -833,6 +856,7 @@ __all__ = [
     "cast_mxfp8",
     "empty_mxfp8",
     "mxfp8_rows",
+    "project_bf16_partials",
     "project_parts",
     "provide_mxfp8",
     "provided_mxfp8",

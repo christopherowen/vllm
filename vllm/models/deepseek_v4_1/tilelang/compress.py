@@ -33,6 +33,7 @@ import tilelang.language as T
 import torch
 
 from . import pdl
+from .cache_writer import _CVT_HEADER, _E4M3_MAX, RECORD_BYTES
 
 DIM = 512
 STATE = 2 * DIM  # a ring slot: the value, then the gate
@@ -40,6 +41,8 @@ EPS = 1e-20
 _VEC = 4  # FP32 per 16-byte access
 _CHUNKS = DIM // (32 * _VEC)  # 16-byte accesses per lane
 _PASS = {tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
+_INDEXED_RECORD = RECORD_BYTES["indexed"]
+_INDEXED_PAYLOAD = DIM // 2
 
 
 @tilelang.jit(pass_configs=_PASS)
@@ -101,37 +104,60 @@ def gather_partial_state_kernel(max_requests: int, page: int):
 
 
 @tilelang.jit(pass_configs=_PASS)
-def compress_kernel(ratio: int, max_requests: int, page: int, warps: int = 4):
+def compress_kernel(
+    ratio: int,
+    max_requests: int,
+    page: int,
+    warps: int = 4,
+    write_kv: bool = False,
+    kv_page_size: int = 64,
+    rope_dim: int = 64,
+):
     """Rows ``[0, rows)`` of the step: latents, emitted flags and slots (zero, false
-    and -1 past the live tokens), and at ratio 2 the live tokens' ring saves."""
+    and -1 past the live tokens), at ratio 2 the live tokens' ring saves, and with
+    ``write_kv`` the rotated 288-byte ``indexed`` KV-cache records in the same launch."""
     assert ratio in (1, 2)
     rows = T.dynamic("rows")
     gate_rows = T.dynamic("gate_rows")  # rows at ratio 2; any buffer at ratio 1
     blocks = T.dynamic("blocks")
     width = T.dynamic("width")
     pool_stride = T.dynamic("pool_stride")  # the allocator pads its pages
+    positions_max = T.dynamic("positions_max")
+    kv_pages = T.dynamic("kv_pages")
+    kv_page_bytes = T.dynamic("kv_page_bytes")
+    kv_page_stride = T.dynamic("kv_page_stride")
+    kv_page_words = T.dynamic("kv_page_words")
+    kv_word_stride = T.dynamic("kv_word_stride")
     value_dtype = T.float32 if ratio == 2 else T.bfloat16
+    rope_start = DIM - rope_dim
+    rope_half = rope_dim // 2
 
-    @T.prim_func
-    def compress(
-        values: T.Tensor((rows, DIM), value_dtype),
-        gates: T.Tensor((gate_rows, DIM), T.float32),
-        weight: T.Tensor((DIM,), T.float32),
-        starts: T.Tensor((max_requests + 1,), T.int32),
-        positions: T.Tensor((max_requests,), T.int64),
-        state_ids: T.Tensor((max_requests,), T.int64),
-        slots: T.Tensor((rows,), T.int64),
-        state_slots: T.Tensor((rows,), T.int64),
-        counts: T.Tensor((2,), T.int32),
-        pending_values: T.Tensor((max_requests, DIM), T.float32),
-        pending_gates: T.Tensor((max_requests, DIM), T.float32),
-        tags: T.Tensor((max_requests,), T.int64),
-        pool: T.StridedTensor((blocks, width), (pool_stride, 1), T.float32),
-        out: T.Tensor((rows, DIM), T.bfloat16),
-        emitted: T.Tensor((rows,), T.bool),
-        emitted_slots: T.Tensor((rows,), T.int64),
+    @T.macro
+    def body(
+        values,
+        gates,
+        weight,
+        starts,
+        positions,
+        state_ids,
+        slots,
+        state_slots,
+        counts,
+        pending_values,
+        pending_gates,
+        tags,
+        pool,
+        out,
+        emitted,
+        emitted_slots,
+        token_positions,
+        cos_sin,
+        kv_cache,
+        kv_words,
     ):
         with T.Kernel(T.ceildiv(rows, warps), threads=warps * 32) as bx:
+            if write_kv:
+                T.import_source(_CVT_HEADER)
             tx = T.get_thread_binding()
             token = bx * warps + tx // 32
             lane = tx % 32
@@ -142,10 +168,12 @@ def compress_kernel(ratio: int, max_requests: int, page: int, warps: int = 4):
             g0 = T.alloc_local((_VEC,), T.float32)
             w = T.alloc_local((_CHUNKS * _VEC,), T.float32)
             y = T.alloc_local((_VEC,), T.bfloat16)
+            rv = T.alloc_local((_VEC,), T.float32)
             # request, first, position, valid, pending carry, request end, nt
             info = T.alloc_local((7,), T.int64)
-            slot_info = T.alloc_local((2,), T.int64)
+            slot_info = T.alloc_local((3,), T.int64)
             ss = T.alloc_local((1,), T.float32)
+            amax = T.alloc_var(T.float32)
             for c in T.unroll(_CHUNKS):
                 col = (c * 32 + lane) * _VEC
                 for i in T.vectorized(_VEC):
@@ -154,6 +182,8 @@ def compress_kernel(ratio: int, max_requests: int, page: int, warps: int = 4):
                 slot_info[0] = slots[token]
                 if ratio == 2:
                     slot_info[1] = state_slots[token]
+                if write_kv:
+                    slot_info[2] = token_positions[token]
                 nt = counts[0]
                 nr = counts[1]
                 info[0] = T.int64(-1)
@@ -257,6 +287,8 @@ def compress_kernel(ratio: int, max_requests: int, page: int, warps: int = 4):
                                 pool[slot // page, base + DIM + i] = g1[i]
                 total = T.warp_reduce_sum(ss[0])
                 inverse = T.rsqrt(total / DIM + EPS)
+                kv_slot = T.if_then_else(valid, slot_info[0], T.int64(-1))
+                kv_page = kv_slot // kv_page_size
                 for c in T.unroll(_CHUNKS):
                     col = (c * 32 + lane) * _VEC
                     for i in T.unroll(_VEC):
@@ -265,11 +297,161 @@ def compress_kernel(ratio: int, max_requests: int, page: int, warps: int = 4):
                         )
                     for i in T.vectorized(_VEC):
                         out[token, col + i] = y[i]
+                    if write_kv:
+                        for i in T.unroll(_VEC):
+                            rv[i] = T.Cast(T.float32, y[i])
+                        if rope_dim > 0 and c == _CHUNKS - 1:
+                            if col >= rope_start:
+                                pos = (
+                                    slot_info[2] // ratio * ratio
+                                    if ratio > 1
+                                    else slot_info[2]
+                                )
+                                pair_base = (col - rope_start) // 2
+                                for p in T.unroll(_VEC // 2):
+                                    first = rv[2 * p]
+                                    second = rv[2 * p + 1]
+                                    cosine = cos_sin[pos, pair_base + p]
+                                    sine = cos_sin[pos, rope_half + pair_base + p]
+                                    rv[2 * p] = T.Cast(
+                                        T.float32,
+                                        T.Cast(
+                                            T.bfloat16,
+                                            T.ieee_fmaf(first, cosine, -(second * sine)),
+                                        ),
+                                    )
+                                    rv[2 * p + 1] = T.Cast(
+                                        T.float32,
+                                        T.Cast(
+                                            T.bfloat16,
+                                            T.ieee_fmaf(first, sine, second * cosine),
+                                        ),
+                                    )
+                        amax = 0.0
+                        for i in T.unroll(_VEC):
+                            amax = T.max(amax, T.abs(rv[i]))
+                        amax = T.max(amax, T.shfl_xor(amax, 1))
+                        amax = T.max(amax, T.shfl_xor(amax, 2))
+                        if (kv_slot >= 0) & (kv_page < kv_pages):
+                            kv_base = (kv_slot % kv_page_size) * _INDEXED_RECORD
+                            scale = T.max(amax, 6.0 * 2.0**-9) / 6.0
+                            scale_code = T.cast(
+                                T.min(scale, _E4M3_MAX), T.float8_e4m3fn
+                            )
+                            decoded = T.cast(scale_code, T.float32)
+                            word = T.call_extern(
+                                "uint16",
+                                "dsv41_e2m1x4",
+                                rv[0] / decoded,
+                                rv[1] / decoded,
+                                rv[2] / decoded,
+                                rv[3] / decoded,
+                            )
+                            kv_words[kv_page, (kv_base + col // 2) // 2] = word
+                            if lane % 4 == 0:
+                                group = c * 8 + lane // 4
+                                kv_cache[
+                                    kv_page, kv_base + _INDEXED_PAYLOAD + group
+                                ] = T.reinterpret(scale_code, T.uint8)
                 if lane == 0:
                     emitted[token] = valid
-                    emitted_slots[token] = T.if_then_else(
-                        valid, slot_info[0], T.int64(-1)
-                    )
+                    emitted_slots[token] = kv_slot
+
+    if write_kv:
+
+        @T.prim_func
+        def compress(
+            values: T.Tensor((rows, DIM), value_dtype),
+            gates: T.Tensor((gate_rows, DIM), T.float32),
+            weight: T.Tensor((DIM,), T.float32),
+            starts: T.Tensor((max_requests + 1,), T.int32),
+            positions: T.Tensor((max_requests,), T.int64),
+            state_ids: T.Tensor((max_requests,), T.int64),
+            slots: T.Tensor((rows,), T.int64),
+            state_slots: T.Tensor((rows,), T.int64),
+            counts: T.Tensor((2,), T.int32),
+            pending_values: T.Tensor((max_requests, DIM), T.float32),
+            pending_gates: T.Tensor((max_requests, DIM), T.float32),
+            tags: T.Tensor((max_requests,), T.int64),
+            pool: T.StridedTensor((blocks, width), (pool_stride, 1), T.float32),
+            out: T.Tensor((rows, DIM), T.bfloat16),
+            emitted: T.Tensor((rows,), T.bool),
+            emitted_slots: T.Tensor((rows,), T.int64),
+            token_positions: T.Tensor((rows,), T.int64),
+            cos_sin: T.Tensor((positions_max, rope_dim), T.float32),
+            kv_cache: T.StridedTensor(
+                (kv_pages, kv_page_bytes), (kv_page_stride, 1), T.uint8
+            ),
+            kv_words: T.StridedTensor(
+                (kv_pages, kv_page_words), (kv_word_stride, 1), T.uint16
+            ),
+        ):
+            body(
+                values,
+                gates,
+                weight,
+                starts,
+                positions,
+                state_ids,
+                slots,
+                state_slots,
+                counts,
+                pending_values,
+                pending_gates,
+                tags,
+                pool,
+                out,
+                emitted,
+                emitted_slots,
+                token_positions,
+                cos_sin,
+                kv_cache,
+                kv_words,
+            )
+
+        return compress
+
+    @T.prim_func
+    def compress(
+        values: T.Tensor((rows, DIM), value_dtype),
+        gates: T.Tensor((gate_rows, DIM), T.float32),
+        weight: T.Tensor((DIM,), T.float32),
+        starts: T.Tensor((max_requests + 1,), T.int32),
+        positions: T.Tensor((max_requests,), T.int64),
+        state_ids: T.Tensor((max_requests,), T.int64),
+        slots: T.Tensor((rows,), T.int64),
+        state_slots: T.Tensor((rows,), T.int64),
+        counts: T.Tensor((2,), T.int32),
+        pending_values: T.Tensor((max_requests, DIM), T.float32),
+        pending_gates: T.Tensor((max_requests, DIM), T.float32),
+        tags: T.Tensor((max_requests,), T.int64),
+        pool: T.StridedTensor((blocks, width), (pool_stride, 1), T.float32),
+        out: T.Tensor((rows, DIM), T.bfloat16),
+        emitted: T.Tensor((rows,), T.bool),
+        emitted_slots: T.Tensor((rows,), T.int64),
+    ):
+        body(
+            values,
+            gates,
+            weight,
+            starts,
+            positions,
+            state_ids,
+            slots,
+            state_slots,
+            counts,
+            pending_values,
+            pending_gates,
+            tags,
+            pool,
+            out,
+            emitted,
+            emitted_slots,
+            None,
+            None,
+            None,
+            None,
+        )
 
     return compress
 
@@ -290,9 +472,13 @@ def compress(
     rows, ratio, values, gates, weight, starts, positions, state_ids, slots, counts,
     out, emitted, emitted_slots, *, pending_values=None, pending_gates=None,
     tags=None, pool=None, state_slots=None, page=1,
+    kv_cache=None, token_positions=None, cos_sin=None, kv_page_size=64,
 ):  # fmt: skip
     """Rows ``[0, rows)`` of one compression call (``out``, ``emitted`` and
-    ``emitted_slots`` keep their contents past them)."""
+    ``emitted_slots`` keep their contents past them). When ``kv_cache``,
+    ``token_positions`` and ``cos_sin`` are provided, also rotates the trailing
+    ``cos_sin.shape[1]`` columns in registers and writes the 288-byte ``indexed``
+    KV-cache records at ``emitted_slots`` in the same launch."""
     max_requests = positions.shape[0]
     if ratio == 1:
         # Ratio 1 reads no gates, ring or carry: a placeholder of the shapes.
@@ -301,6 +487,40 @@ def compress(
         tags, state_slots = state_ids, slots
     else:
         gates = gates[:rows]
+    if kv_cache is not None and token_positions is not None and cos_sin is not None:
+        pages = kv_cache.view(torch.uint8)
+        if pages.dim() > 2:
+            pages = pages.flatten(1)
+        compress_kernel(
+            ratio,
+            max_requests,
+            page,
+            write_kv=True,
+            kv_page_size=kv_page_size,
+            rope_dim=cos_sin.shape[1],
+        )(
+            values[:rows],
+            gates,
+            weight,
+            starts,
+            positions,
+            state_ids,
+            slots[:rows],
+            state_slots[:rows],
+            counts,
+            pending_values,
+            pending_gates,
+            tags,
+            pool,
+            out[:rows],
+            emitted[:rows],
+            emitted_slots[:rows],
+            token_positions[:rows],
+            cos_sin,
+            pages,
+            pages.view(torch.uint16),
+        )
+        return out[:rows], emitted_slots[:rows]
     compress_kernel(ratio, max_requests, page)(
         values[:rows], gates, weight, starts, positions, state_ids, slots[:rows],
         state_slots[:rows], counts, pending_values, pending_gates, tags, pool,

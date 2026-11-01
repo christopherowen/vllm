@@ -356,3 +356,126 @@ def test_a_short_ring_loses_a_wide_blocks_carry():
         (value, _, _), (want_v, _, _) = _verify_block_then_resume(16, 8, accepted)
         lost += not torch.equal(value, want_v)
     assert lost > 0
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("lengths", [[1], [6] * 8, [3, 0, 5, 1, 2, 6]])
+def test_compress_fuses_indexed_kv_cache_write(ratio, lengths):
+    """Fused ``compress(..., kv_cache=..., token_positions=..., cos_sin=...,
+    kv_page_size=...)`` writes the exact same pre-RoPE ``out`` (consumed by
+    ``indexer.wk``) AND the exact same 288-byte rotated ``indexed`` KV-cache records
+    as running ``compress`` followed by ``write_cache("indexed")``."""
+    from tests.kernels.deepseek_v41_contracts import rope_table
+    from vllm.models.deepseek_v4_1.tilelang.cache_writer import write_cache
+
+    step, rows, starts = _step(lengths, ratio, seed=500 + len(lengths) * 10 + ratio)
+    kv_pages, kv_page_size = 32, 16
+    gen = torch.Generator(device="cpu").manual_seed(700 + ratio)
+    unique_slots = torch.randperm(kv_pages * kv_page_size, generator=gen)[:rows].to(
+        dtype=torch.int64, device=DEVICE
+    )
+    step["slots"][:rows] = unique_slots
+    carry = _ring(step)
+    carry_fused = tuple(t.clone() for t in carry)
+    pool_sep = step["pool"].clone()
+    pool_fused = step["pool"].clone()
+
+    token_positions = torch.zeros(CAPACITY, dtype=torch.int64, device=DEVICE)
+    for r in range(len(starts) - 1):
+        for token in range(starts[r], starts[r + 1]):
+            token_positions[token] = int(step["positions"][r]) + token - starts[r]
+    cos_sin = rope_table(512)
+
+    kv_sep = torch.full(
+        (kv_pages, kv_page_size * 288 + 64), 0xAB, dtype=torch.uint8, device=DEVICE
+    )[:, : kv_page_size * 288]
+    kv_fused = kv_sep.clone()
+
+    out_sep = torch.full((CAPACITY, DIM), 5.0, dtype=torch.bfloat16, device=DEVICE)
+    emitted_sep = torch.ones(CAPACITY, dtype=torch.bool, device=DEVICE)
+    eslots_sep = torch.full((CAPACITY,), 77, dtype=torch.int64, device=DEVICE)
+    state_ids = carry[3] if ratio == 2 else torch.arange(REQUESTS, device=DEVICE)
+    kwargs_sep = (
+        dict(
+            pending_values=carry[0],
+            pending_gates=carry[1],
+            tags=carry[2],
+            pool=pool_sep,
+            state_slots=step["state_slots"],
+            page=PAGE,
+        )
+        if ratio == 2
+        else {}
+    )
+    compress(
+        rows,
+        ratio,
+        step["values"],
+        step["gates"] if ratio == 2 else None,
+        step["weight"],
+        step["starts"],
+        step["positions"],
+        state_ids,
+        step["slots"],
+        step["counts"],
+        out_sep,
+        emitted_sep,
+        eslots_sep,
+        **kwargs_sep,
+    )
+    write_cache(
+        out_sep[:rows].clone(),
+        kv_sep,
+        eslots_sep[:rows],
+        page_size=kv_page_size,
+        cache_kind="indexed",
+        positions=token_positions[:rows],
+        cos_sin=cos_sin,
+        ratio=ratio,
+    )
+
+    out_fused = torch.full((CAPACITY, DIM), 5.0, dtype=torch.bfloat16, device=DEVICE)
+    emitted_fused = torch.ones(CAPACITY, dtype=torch.bool, device=DEVICE)
+    eslots_fused = torch.full((CAPACITY,), 77, dtype=torch.int64, device=DEVICE)
+    state_ids_fused = (
+        carry_fused[3] if ratio == 2 else torch.arange(REQUESTS, device=DEVICE)
+    )
+    kwargs_fused = (
+        dict(
+            pending_values=carry_fused[0],
+            pending_gates=carry_fused[1],
+            tags=carry_fused[2],
+            pool=pool_fused,
+            state_slots=step["state_slots"],
+            page=PAGE,
+        )
+        if ratio == 2
+        else {}
+    )
+    compress(
+        rows,
+        ratio,
+        step["values"],
+        step["gates"] if ratio == 2 else None,
+        step["weight"],
+        step["starts"],
+        step["positions"],
+        state_ids_fused,
+        step["slots"],
+        step["counts"],
+        out_fused,
+        emitted_fused,
+        eslots_fused,
+        kv_cache=kv_fused,
+        token_positions=token_positions[:rows],
+        cos_sin=cos_sin,
+        kv_page_size=kv_page_size,
+        **kwargs_fused,
+    )
+
+    assert torch.equal(out_fused.view(torch.int16), out_sep.view(torch.int16))
+    assert torch.equal(emitted_fused, emitted_sep)
+    assert torch.equal(eslots_fused, eslots_sep)
+    assert torch.equal(kv_fused, kv_sep)
+    if ratio == 2:
+        assert torch.equal(pool_fused, pool_sep)

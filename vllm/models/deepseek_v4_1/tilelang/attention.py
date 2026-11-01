@@ -148,14 +148,25 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
                 )
             )  # _quantize_index_query
         if self.compressor is not None:
-            calls.append(
-                norm_quantize_call(
-                    self.indexer.k_norm.variance_epsilon,
-                    self._index_page,
-                    self.compress_ratio,
-                    SLOT_DTYPE,
-                )
-            )  # _write_index_keys
+            from .gemm import bf16_shards
+
+            shards_set = {1}
+            if (
+                self.indexer is not None
+                and hasattr(self.indexer, "wk")
+                and hasattr(self.indexer.wk, "weight")
+            ):
+                shards_set.add(bf16_shards(*self.indexer.wk.weight.shape))
+            for shards in sorted(shards_set):
+                calls.append(
+                    norm_quantize_call(
+                        self.indexer.k_norm.variance_epsilon,
+                        self._index_page,
+                        self.compress_ratio,
+                        SLOT_DTYPE,
+                        shards=shards,
+                    )
+                )  # _write_index_keys
         return calls
 
     def _bind_plans(self) -> None:

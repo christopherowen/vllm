@@ -41,6 +41,7 @@ CHAIN = {
     "gemm_fp8w_bf16_cast",
     "gemm_fp8w_bf16_partials",
     "gemm_mxfp8_partials",
+    "gemm_mxfp8_rope_mxfp4",
     "gemm_splitk_reduce",
     "gemm_splitk_reduce_cast",
     "gemm_splitk_reduce_two",
@@ -77,7 +78,15 @@ EXEMPT = {"pdl_early_reader"}
 # before cudaGridDependencySynchronize().
 EARLY_PARAMETERS: dict[str, set[str]] = {
     "attention_front": {"cos_sin", "kv_weight", "positions", "q_weight", "slots"},
-    "compress": {"counts", "positions", "slots", "starts", "state_slots", "weight"},
+    "compress": {
+        "counts",
+        "positions",
+        "slots",
+        "starts",
+        "state_slots",
+        "token_positions",
+        "weight",
+    },
     "compress_gather_partial_state": {"counts", "positions", "starts", "table"},
     "indexer_mxfp4_quantize": {"CosSin", "Positions", "Slots", "Weight"},
     "mhc_finalize": {"base", "scale", "weight"},

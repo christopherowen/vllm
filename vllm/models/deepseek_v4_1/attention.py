@@ -771,21 +771,51 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             if self.compressor.state_cache is not None
             else None
         )
-        latent, slots = self.compressor(hidden_states, main, state)
+        fuse_kv_write = (
+            type(self.compressor) is DeepseekCompressor
+            and "_write_v41_cache" not in self.__dict__
+            and self.kv_cache.ndim == 2
+            and self.kv_cache.dtype == torch.uint8
+            and self.kv_cache.shape[1] >= self._main_page * 288
+        )
+        if fuse_kv_write:
+            latent, slots = self.compressor(
+                hidden_states,
+                main,
+                state,
+                kv_cache=self.kv_cache,
+                token_positions=positions,
+                cos_sin=self.rotary_emb.cos_sin_cache,
+                kv_page_size=self._main_page,
+            )
+        else:
+            latent, slots = self.compressor(hidden_states, main, state)
         self._issue_wo_prefetch(rows, after="compressor")
         # Index K consumes the ordinary-normalized PRE-RoPE latent; norm, RoPE
-        # and the paged MXFP4 write run in one kernel.
-        key = indexer.wk(latent)
+        # and the paged MXFP4 write run in one kernel. At decode sizes, wk's
+        # split-K FP32 partials are reduced in registers inside _write_index_keys.
+        if (
+            hasattr(indexer.wk, "tilelang_partials")
+            and "_write_index_keys" not in self.__dict__
+        ):
+            from vllm.models.deepseek_v4_1.tilelang.linear import (
+                project_bf16_partials,
+            )
+
+            key = project_bf16_partials(indexer.wk, latent)
+        else:
+            key = indexer.wk(latent)
         index_meta = cast(DeepseekV41B12xMetadata, metadata[indexer.k_cache.prefix])
         self._write_index_keys(key, index_meta.slot_mapping[:rows], positions=positions)
-        self._write_v41_cache(
-            latent,
-            self.kv_cache,
-            slots,
-            page_size=self._main_page,
-            cache_kind="indexed",
-            positions=positions,
-        )
+        if not fuse_kv_write:
+            self._write_v41_cache(
+                latent,
+                self.kv_cache,
+                slots,
+                page_size=self._main_page,
+                cache_kind="indexed",
+                positions=positions,
+            )
 
     def forward(self, positions, hidden_states, llama_4_scaling=None):
         if hidden_states.shape[0] == 0:
@@ -1119,7 +1149,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             ):
                 score_width = min(
                     self._index_width * self._index_page,
-                    max(1, cdiv(im.max_seq_len, self.compress_ratio)),
+                    max(1, cdiv(im.max_seq_len, self.compress_ratio or 1)),
                 )
             chunk_rows = self.DECODE_CHUNK if mode == "decode" else self.INDEX_CHUNK
             index_pages = self._index_pages

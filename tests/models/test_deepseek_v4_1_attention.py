@@ -392,6 +392,7 @@ def test_forward_mqa_shares_index_pages_without_mixed_step_clobber(monkeypatch):
         layer._attention_geometry()
         layer._short_index_shape = None
         layer.topk_indices_buffer = torch.zeros(128, 512, dtype=torch.int32)
+        layer.INDEX_CHUNK = 64
         layer._index_pages = torch.full((64, 16), -1, dtype=torch.int32)
         layer._active = torch.tensor([16 * 64], dtype=torch.int32)
         layer._ready = True
@@ -400,6 +401,7 @@ def test_forward_mqa_shares_index_pages_without_mixed_step_clobber(monkeypatch):
             heads=4,
             k_cache=SimpleNamespace(prefix="idx"),
         )
+        layer._check_attention_rows = lambda *args, **kwargs: None
         layer._attend_split = lambda *args, **kwargs: None
         return layer
 
@@ -477,3 +479,84 @@ def test_forward_mqa_shares_index_pages_without_mixed_step_clobber(monkeypatch):
     l1.forward_mqa(q70, None, torch.arange(70), q70.clone(), index_query=iq70)
     assert torch.equal(seen[0][0][2], im.block_table[0:2])
     assert torch.equal(seen[1][0][2], im.block_table[0:2])
+
+
+def test_prepare_global_kv_fuses_compressor_indexed_kv_and_wk_partials(monkeypatch):
+    """When ``self.compressor`` is a ``DeepseekCompressor`` with a full-width
+    ``kv_cache`` and ``indexer.wk`` exposes ``tilelang_partials``,
+    ``_prepare_global_kv`` fuses the ``indexed`` KV write into ``compressor(...)``
+    and passes 3D split-K partials from ``project_bf16_partials`` to
+    ``_write_index_keys`` without launching ``_write_v41_cache``."""
+    from vllm.models.deepseek_v4_1 import attention
+    from vllm.models.deepseek_v4_1.compressor import DeepseekCompressor
+    from vllm.models.deepseek_v4_1.tilelang import attention as tl_attention
+    from vllm.models.deepseek_v4_1.tilelang import linear as tl_linear
+
+    module = _tilelang_layer(layer_id=0)
+    module._ready = True
+    module._owner = lambda: module
+    module._main_page = 64
+    module.kv_cache = torch.empty(2, 64 * 288, dtype=torch.uint8)
+    latent = torch.zeros(4, 512, dtype=torch.bfloat16)
+    slots = torch.arange(4, dtype=torch.int64)
+    comp_calls = []
+
+    comp = DeepseekCompressor.__new__(DeepseekCompressor)
+    torch.nn.Module.__init__(comp)
+    comp.state_cache = None
+    monkeypatch.setattr(
+        DeepseekCompressor,
+        "forward",
+        lambda self, hidden, main, state=None, **kw: (
+            comp_calls.append(kw),
+            (latent, slots),
+        )[1],
+    )
+    module.compressor = comp
+
+    partials = torch.zeros(4, 4, 128, dtype=torch.float32)
+    monkeypatch.setattr(
+        tl_linear,
+        "project_bf16_partials",
+        lambda layer, x: partials,
+    )
+    wk = SimpleNamespace(tilelang_partials={16: object()})
+    module.indexer = SimpleNamespace(
+        heads=32,
+        wk=wk,
+        k_norm=SimpleNamespace(weight=torch.ones(128), variance_epsilon=1e-6),
+        k_cache=SimpleNamespace(
+            prefix="k_cache", kv_cache=torch.empty(2, 8, dtype=torch.uint8)
+        ),
+    )
+    idx_slots = torch.arange(10, 14, dtype=torch.int64)
+    metadata = {
+        module.prefix: SimpleNamespace(),
+        "k_cache": SimpleNamespace(slot_mapping=idx_slots),
+    }
+    monkeypatch.setattr(
+        attention,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=metadata),
+    )
+    key_writes = []
+    monkeypatch.setattr(
+        tl_attention,
+        "norm_rope_write_index_keys",
+        lambda *args: key_writes.append(args),
+    )
+    monkeypatch.setattr(
+        attention.DeepseekV4Attention,
+        "_write_v41_cache",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("unexpected separate _write_v41_cache")
+        ),
+    )
+    positions = torch.arange(4, dtype=torch.int64)
+    module._prepare_global_kv(positions, torch.zeros(4, 5120, dtype=torch.bfloat16))
+    assert len(comp_calls) == 1
+    assert comp_calls[0]["kv_cache"] is module.kv_cache
+    assert comp_calls[0]["token_positions"] is positions
+    assert comp_calls[0]["kv_page_size"] == 64
+    assert len(key_writes) == 1
+    assert key_writes[0][0] is partials

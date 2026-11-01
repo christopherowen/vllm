@@ -91,16 +91,23 @@ def quantize_call(
 
 
 def norm_quantize_call(
-    eps: float, page_size: int, ratio: int = 1, slot_dtype: torch.dtype = torch.int64
+    eps: float,
+    page_size: int,
+    ratio: int = 1,
+    slot_dtype: torch.dtype = torch.int64,
+    *,
+    shards: int = 1,
 ):
     """The fused ``k_norm + rope + write_index_keys`` kernel ``norm_rope_write_index_keys``
     launches, as a ``prepare.call``."""
+    kwargs = {"shards": shards} if shards > 1 else {}
     return prepare.call(
         mxfp4_norm_rope_quantize_v41,
         eps,
         page_size,
         ratio,
         str(slot_dtype).removeprefix("torch."),
+        **kwargs,
     )
 
 
@@ -618,10 +625,12 @@ def mxfp4_norm_rope_quantize_v41(
     page_size: int = 64,
     ratio: int = 1,
     slot_dtype: str = "int64",
+    shards: int = 1,
 ):
-    """Fused 128-column RMSNorm (TileKernels' ``norm_forward`` reduction), trailing
-    64-column GPT-J RoPE (``rope_kernel``) and paged MXFP4 key write
-    (``mxfp4_quantize_v41(paged=True)``) in one launch, bit for bit."""
+    """Fused (optional split-K ``shards`` reduction +) 128-column RMSNorm
+    (TileKernels' ``norm_forward`` reduction), trailing 64-column GPT-J RoPE
+    (``rope_kernel``) and paged MXFP4 key write (``mxfp4_quantize_v41(paged=True)``)
+    in one launch, bit for bit."""
     from .front import ROPE_DIM, _THREADS, _VEC, _row_split
 
     k = _row_split(INDEX_DIM)
@@ -638,17 +647,8 @@ def mxfp4_norm_rope_quantize_v41(
     rows, positions_max = T.dynamic("rows, positions_max")
     pool_pages, pool_stride = T.dynamic("pool_pages, pool_stride")
 
-    @T.prim_func
-    def indexer_mxfp4_quantize(
-        X: T.Tensor([rows, INDEX_DIM], T.bfloat16),
-        Weight: T.Tensor([INDEX_DIM], T.bfloat16),
-        Positions: T.Tensor([rows], T.int64),
-        CosSin: T.Tensor([positions_max, ROPE_DIM], T.float32),
-        Slots: T.Tensor([rows], slot_dtype),
-        Pool: T.StridedTensor(
-            [pool_pages, page_bytes(page_size)], [pool_stride, 1], T.uint8
-        ),
-    ):
+    @T.macro
+    def body(X, Weight, Positions, CosSin, Slots, Pool):
         with T.Kernel(T.ceildiv(rows, kb), threads=_THREADS) as bx:
             tid = T.get_thread_binding()
             k_sum_partial = T.alloc_fragment((kb, kt), T.float32)
@@ -668,11 +668,12 @@ def mxfp4_norm_rope_quantize_v41(
             )
             k_x = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
             k_y = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
-            k_w = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
+            acc_local = T.alloc_local((_VEC,), T.float32)
             y_fp32_local = T.alloc_local((_VEC,), T.float32)
             sum_local = T.alloc_local((2,), T.float32)
+            weight_local = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
             cs = T.alloc_local((_VEC,), T.float32)
-            slot_l = T.alloc_local((1,), T.int64)
+            slot_local = T.alloc_local((1,), T.int64)
 
             row_id = tid // kt
             lane = tid % kt
@@ -680,9 +681,9 @@ def mxfp4_norm_rope_quantize_v41(
             for vi in T.unroll(k["num_thread_vec"]):
                 token_offset = (vi * kt + lane) * _VEC
                 for j in T.vectorized(_VEC):
-                    k_w[vi, j] = Weight[token_offset + j]
+                    weight_local[vi, j] = Weight[token_offset + j]
             if token_id < rows:
-                slot_l[0] = T.cast(Slots[token_id], T.int64)
+                slot_local[0] = T.cast(Slots[token_id], T.int64)
                 pos = (
                     Positions[token_id] // ratio * ratio
                     if ratio > 1
@@ -692,15 +693,24 @@ def mxfp4_norm_rope_quantize_v41(
                     cs[i] = CosSin[pos, lane * pairs + i]
                 for i in T.vectorized(pairs):
                     cs[pairs + i] = CosSin[pos, half + lane * pairs + i]
-
+            else:
+                slot_local[0] = T.int64(-1)
             pdl.chain()
-
             T.clear(sum_local)
             for vi in T.unroll(k["num_thread_vec"]):
                 token_offset = (vi * kt + lane) * _VEC
                 if token_id < rows:
-                    for j in T.vectorized(_VEC):
-                        k_x[vi, j] = X[token_id, token_offset + j]
+                    if shards > 1:
+                        for j in T.vectorized(_VEC):
+                            acc_local[j] = X[0, token_id, token_offset + j]
+                        for s in T.serial(1, shards):
+                            for j in T.vectorized(_VEC):
+                                acc_local[j] += X[s, token_id, token_offset + j]
+                        for j in T.unroll(_VEC):
+                            k_x[vi, j] = T.cast(acc_local[j], T.bfloat16)
+                    else:
+                        for j in T.vectorized(_VEC):
+                            k_x[vi, j] = X[token_id, token_offset + j]
                 else:
                     T.clear(k_x[vi, :])
                 for j in T.vectorized(_VEC):
@@ -731,7 +741,7 @@ def mxfp4_norm_rope_quantize_v41(
                     y_fp32_local[j] = (
                         T.float32(k_x[vi, j])
                         * rstd_value
-                        * (T.float32(k_w[vi, j]) * out_scale)
+                        * (T.float32(weight_local[vi, j]) * out_scale)
                     )
                 for j in T.vectorized(_VEC):
                     k_y[vi, j] = y_fp32_local[j]
@@ -758,7 +768,7 @@ def mxfp4_norm_rope_quantize_v41(
                 amax = T.max(amax, T.shfl_xor(amax, 1))
                 amax = T.max(amax, T.shfl_xor(amax, 2))
                 if token_id < rows:
-                    slot = slot_l[0]
+                    slot = slot_local[0]
                     page = slot // page_size
                     tok = slot % page_size
                     if (slot >= 0) & (page < pool_pages):
@@ -791,16 +801,50 @@ def mxfp4_norm_rope_quantize_v41(
                                 page_size * (INDEX_DIM // 2) + tok * 4 + group,
                             ] = T.cast(sf, T.uint8)
 
+    if shards > 1:
+
+        @T.prim_func
+        def indexer_mxfp4_quantize(
+            P: T.Tensor([shards, rows, INDEX_DIM], T.float32),
+            Weight: T.Tensor([INDEX_DIM], T.bfloat16),
+            Positions: T.Tensor([rows], T.int64),
+            CosSin: T.Tensor([positions_max, ROPE_DIM], T.float32),
+            Slots: T.Tensor([rows], slot_dtype),
+            Pool: T.StridedTensor(
+                [pool_pages, page_bytes(page_size)], [pool_stride, 1], T.uint8
+            ),
+        ):
+            body(P, Weight, Positions, CosSin, Slots, Pool)
+
+        return indexer_mxfp4_quantize
+
+    @T.prim_func
+    def indexer_mxfp4_quantize(
+        X: T.Tensor([rows, INDEX_DIM], T.bfloat16),
+        Weight: T.Tensor([INDEX_DIM], T.bfloat16),
+        Positions: T.Tensor([rows], T.int64),
+        CosSin: T.Tensor([positions_max, ROPE_DIM], T.float32),
+        Slots: T.Tensor([rows], slot_dtype),
+        Pool: T.StridedTensor(
+            [pool_pages, page_bytes(page_size)], [pool_stride, 1], T.uint8
+        ),
+    ):
+        body(X, Weight, Positions, CosSin, Slots, Pool)
+
     return indexer_mxfp4_quantize
 
 
 def norm_rope_write_index_keys(
     raw_keys, weight, eps: float, positions, cos_sin, pool, slots, page_size: int, ratio: int = 1
 ):
-    """Fused RMSNorm + RoPE + paged MXFP4 quantize/write of ``[rows, 128]`` keys."""
-    if raw_keys.shape[0] == 0:
+    """Fused (optional split-K reduction +) RMSNorm + RoPE + paged MXFP4 quantize/write
+    of ``[rows, 128]`` BF16 keys or ``[shards, rows, 128]`` FP32 split-K partials."""
+    if raw_keys.shape[-2] == 0:
         return
-    kernel = _make(norm_quantize_call(eps, page_size, ratio, slots.dtype))
+    shards = raw_keys.shape[0] if raw_keys.ndim == 3 else 1
+    kernel = _make(
+        norm_quantize_call(eps, page_size, ratio, slots.dtype, shards=shards)
+    )
     kernel(
         raw_keys,
         weight,
