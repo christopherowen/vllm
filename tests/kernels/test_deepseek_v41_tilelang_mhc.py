@@ -45,6 +45,7 @@ from vllm.models.deepseek_v4_1.tilelang.mhc import (  # noqa: E402
     TileKernelsMHC,
     collapse_streams,
     finalize,
+    post_collapse_norm_streams,
     post_collapse_streams,
     post_streams,
     project_and_finalize_streams,
@@ -215,6 +216,20 @@ def test_post_pre_adds_rank_order_parts(mhc, world, tokens):
     assert torch.equal(
         mhc.post(RankOrderParts(parts), residual, post, comb),
         mhc.post(summed, residual, post, comb),
+    )
+    assert torch.equal(
+        mhc.post_collapse(RankOrderParts(parts), residual, post, comb, incoming),
+        mhc.post_collapse(summed, residual, post, comb, incoming),
+    )
+    assert torch.equal(
+        mhc.post_collapse(RankOrderParts(parts), residual, post, comb),
+        mhc.post_collapse(summed, residual, post, comb),
+    )
+    assert torch.equal(
+        mhc.post_collapse_norm(
+            RankOrderParts(parts), residual, post, comb, incoming, weight
+        ),
+        mhc.post_collapse_norm(summed, residual, post, comb, incoming, weight),
     )
 
 
@@ -658,30 +673,46 @@ def test_post_collapse_bits_match_post_then_collapse(mhc, tokens):
 
 
 def test_declared_calls_are_the_forwards(mhc, monkeypatch):
-    """The post, the collapse and the fused post_collapse are declared exactly as the
-    forward launches them, and nothing is left to warm: TileKernels' kernels no longer
-    run."""
+    """The post, the collapse and the fused post_collapse / post_collapse_norm are
+    declared exactly as the forward launches them, and nothing is left to warm:
+    TileKernels' kernels no longer run."""
+    monkeypatch.setattr(mhc_module.sp_prefill, "unreduced_enabled", lambda: True)
+    monkeypatch.setattr(mhc_module, "get_tensor_model_parallel_world_size", lambda: 2)
     registry = JitWarmupRegistry(vllm_config=None)
     with registry.activate():
         mhc.declare_kernels()
     declared = prepare.declared_calls(registry)
     assert prepare.warm_declared(registry) == 0
-    factories = (post_streams, collapse_streams, post_collapse_streams)
+    factories = (
+        post_streams,
+        collapse_streams,
+        post_collapse_streams,
+        post_collapse_norm_streams,
+    )
     ours = [call for call in declared if call[0] in factories]
     assert ours == [
         (post_streams, (HIDDEN,), {}),
+        (post_streams, (HIDDEN,), {"world": 2}),
         (collapse_streams, (HIDDEN,), {}),
         (post_collapse_streams, (HIDDEN,), {}),
+        (post_collapse_streams, (HIDDEN,), {"world": 2}),
+        (post_collapse_norm_streams, (HIDDEN, CONFIG.rms_norm_eps), {}),
+        (post_collapse_norm_streams, (HIDDEN, CONFIG.rms_norm_eps), {"world": 2}),
     ]
 
     def by_factory(call):
         # TileLang's JIT objects have no __name__; order by the factory itself.
         found = (i for i, factory in enumerate(factories) if factory is call[0])
-        return next(found, len(factories))
+        return (next(found, len(factories)), call[2].get("world", 1))
 
     # The forward's calls, recorded as its cached lookups make them.
     launched = []
-    for name in ("post_streams", "collapse_streams", "post_collapse_streams"):
+    for name in (
+        "post_streams",
+        "collapse_streams",
+        "post_collapse_streams",
+        "post_collapse_norm_streams",
+    ):
         factory = getattr(mhc_module, name)
 
         def record(*args, _factory=factory, **kwargs):
@@ -689,10 +720,11 @@ def test_declared_calls_are_the_forwards(mhc, monkeypatch):
             return _factory(*args, **kwargs)
 
         monkeypatch.setattr(mhc_module, name, record)
-    for name in ("_post", "_collapse", "_post_collapse"):
+    for name in ("_post", "_collapse", "_post_collapse", "_post_collapse_norm"):
         lookup = getattr(mhc_module, name)
         monkeypatch.setattr(mhc_module, name, functools.cache(lookup.__wrapped__))
     x, residual, post, comb = _post_inputs(6, seed=71)
+    weight = torch.ones(HIDDEN, dtype=torch.bfloat16, device=DEVICE)
     mhc.post(x, residual, post, comb)
     mhc.post(RankOrderParts(torch.stack((x, x))), residual, post, comb)
     mhc.collapse(residual, _pre_mix(6, seed=72))
@@ -701,11 +733,20 @@ def test_declared_calls_are_the_forwards(mhc, monkeypatch):
     mhc.post_collapse(
         RankOrderParts(torch.stack((x, x))), residual, post, comb, _pre_mix(6, seed=72)
     )
+    mhc.post_collapse_norm(x, residual, post, comb, _pre_mix(6, seed=72), weight)
+    mhc.post_collapse_norm(
+        RankOrderParts(torch.stack((x, x))),
+        residual,
+        post,
+        comb,
+        _pre_mix(6, seed=72),
+        weight,
+    )
     assert sorted(launched, key=by_factory) == ours
 
 
 @pytest.mark.parametrize("mode", ["pre", "post_pre", "broadcast"])
-@pytest.mark.parametrize("tokens", [1, 6, 16, 33, 64])
+@pytest.mark.parametrize("tokens", [1, 2, 6, 15, 16, 17, 33, 64])
 def test_project_and_finalize_bits_match_split(tokens, mode):
     """project_and_finalize_streams produces bit-identical outputs to project_streams
     plus finalize across all modes and token counts, and resets its counters to zero."""
@@ -816,3 +857,118 @@ def test_single_row_entry_launches_fused_kernel(mhc, monkeypatch):
     residual2, fn2, scale2, base2, weight2, incoming2 = _inputs(2, seed=2302)
     mhc.pre(residual2, fn2, scale2, base2, weight2, incoming2)
     assert len(called) == 1
+
+
+@pytest.mark.parametrize("world", [1, 2, 4])
+@pytest.mark.parametrize("tokens", [1, 6, 16, 33, 96])
+def test_post_pre_with_aux_matches_post_collapse(mhc, world, tokens):
+    """Fused aux_out in post_pre matches standalone mhc.post_collapse bit for bit."""
+    residual, fn, scale, base, weight, incoming = _inputs(tokens, seed=2400 + tokens)
+    g = torch.Generator(device=DEVICE).manual_seed(world * 100 + tokens)
+    if world == 1:
+        x_in = torch.randn(tokens, HIDDEN, generator=g, device=DEVICE).bfloat16()
+        x_in[:, :8] = -0.0
+    else:
+        parts = torch.randn(
+            world, tokens, HIDDEN, generator=g, device=DEVICE
+        ).bfloat16()
+        parts[0, 0, :8] = -0.0
+        x_in = RankOrderParts(parts)
+    post = torch.rand(tokens, 4, generator=g, device=DEVICE) * 2
+    comb = torch.softmax(torch.randn(tokens, 4, 4, generator=g, device=DEVICE), -1)
+
+    expected_aux = mhc.post_collapse(x_in, residual, post, comb)
+    expected_entry = mhc.post_pre(
+        x_in, residual, post, comb, fn, scale, base, weight, incoming
+    )
+    aux_out = torch.empty((tokens, HIDDEN), dtype=torch.bfloat16, device=DEVICE)
+    actual_entry = mhc.post_pre(
+        x_in,
+        residual,
+        post,
+        comb,
+        fn,
+        scale,
+        base,
+        weight,
+        incoming,
+        aux_out=aux_out,
+    )
+    _assert_bits_equal(aux_out, expected_aux, "aux: ")
+    for a, b in zip(actual_entry[:5], expected_entry[:5]):
+        assert torch.equal(a, b)
+    _assert_bytes_equal(
+        actual_entry[5].values[:tokens], expected_entry[5].values[:tokens]
+    )
+    _assert_bytes_equal(
+        actual_entry[5].scales[:tokens], expected_entry[5].scales[:tokens]
+    )
+
+
+@pytest.mark.parametrize("column", [-1, 0, 7, 1029, HIDDEN - 1])
+@pytest.mark.parametrize("tokens", [1, 6, 96, 2048])
+def test_post_collapse_norm_matches_separate_kernels(mhc, tokens, column):
+    """Fused post_collapse_norm matches norm_forward(post_collapse(...)) and
+    collapse(..., column=column) bit for bit."""
+    from vllm.models.deepseek_v4_1.tilelang import pdl
+
+    x, residual, post, comb = _post_inputs(tokens, seed=2500 + tokens)
+    if column >= 0:
+        residual[0, 2, column] = float("nan")
+        residual[-1, 1, column] = -0.0
+    mix = _pre_mix(tokens, seed=2600 + tokens)
+    g = torch.Generator(device=DEVICE).manual_seed(2700 + tokens)
+    weight = (torch.randn(HIDDEN, generator=g, device=DEVICE) * 0.1 + 1.0).bfloat16()
+
+    streams = mhc.post(x, residual, post, comb)
+    expected_cols = None
+    if column >= 0:
+        expected_cols = torch.full((tokens, 4), -7.0, device=DEVICE)
+        collapsed = mhc.collapse(
+            streams, mix, columns=expected_cols, column=column
+        )
+    else:
+        collapsed = mhc.post_collapse(x, residual, post, comb, mix)
+    expected_out = torch.empty_like(collapsed)
+    pdl.norm_forward(collapsed, weight, CONFIG.rms_norm_eps, out=expected_out)
+
+    cols_out = (
+        torch.full((tokens, 4), -9.0, device=DEVICE) if column >= 0 else None
+    )
+    out_buf = torch.empty_like(expected_out)
+    got = mhc.post_collapse_norm(
+        x,
+        residual,
+        post,
+        comb,
+        mix,
+        weight,
+        CONFIG.rms_norm_eps,
+        columns=cols_out,
+        column=column,
+        out=out_buf,
+    )
+    assert got is out_buf
+    assert_same_nonfinite(got, expected_out)
+    _assert_bits_equal(got, expected_out, "norm: ")
+    if column >= 0:
+        assert_same_nonfinite(cols_out, expected_cols)
+        _assert_bits_equal(cols_out, expected_cols, "columns: ")
+
+
+def test_rank_order_parts_device_and_compacted_final_collapse_sink_columns(
+    mhc, monkeypatch
+):
+    """When ``not rows_here`` (SP or compacted CED rows) and ``_sink_columns`` is
+    active on a multi-rank step whose last layer returns ``RankOrderParts``,
+    ``DeepseekV4Model.forward`` allocates local ``columns`` on ``residual.device`` /
+    ``RankOrderParts.device`` and scatters them into ``_sink_columns``."""
+    from types import SimpleNamespace
+    from vllm.models.deepseek_v4_1.nvidia import model as native
+
+    residual, fn, scale, base, weight, incoming = _inputs(6, seed=2501)
+    parts = RankOrderParts(
+        torch.randn(2, 6, HIDDEN, device=DEVICE, dtype=torch.bfloat16)
+    )
+    assert parts.device == residual.device
+    assert parts.dtype == torch.bfloat16

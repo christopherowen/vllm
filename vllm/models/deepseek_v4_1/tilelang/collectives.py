@@ -309,6 +309,14 @@ class RankOrderParts:
     def shape(self) -> torch.Size:
         return self.packed.shape[1:]
 
+    @property
+    def device(self) -> torch.device:
+        return self.packed.device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.packed.dtype
+
     def sum(self, out: torch.Tensor | None = None) -> torch.Tensor:
         return rank_order_sum(list(self.packed.unbind(0)), out)
 

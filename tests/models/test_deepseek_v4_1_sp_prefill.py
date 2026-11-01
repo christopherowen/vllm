@@ -995,3 +995,75 @@ def test_dspark_tp_defaults_enabled_for_multi_rank(monkeypatch):
     monkeypatch.setattr(dspark, "get_tensor_model_parallel_world_size", lambda: 4)
     assert dspark._vocab_parallel_greedy()
     assert not hasattr(dspark, "_use_sequence_parallel")
+
+
+def test_model_forward_sp_sink_columns_with_rank_order_parts(monkeypatch):
+    pytest.importorskip("b12x")
+    from vllm.models.deepseek_v4_1.nvidia import model as native
+    from vllm.models.deepseek_v4_1.tilelang.collectives import RankOrderParts
+
+    world = _World(3)
+    monkeypatch.setattr(
+        native,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(native, "get_tensor_model_parallel_world_size", lambda: 3)
+    monkeypatch.setattr(native, "get_tensor_model_parallel_rank", lambda: world.rank)
+    monkeypatch.setattr(native.l2_prefetch, "ENABLED", False)
+    monkeypatch.setattr(
+        sp_prefill, "tensor_model_parallel_all_gather", world.all_gather
+    )
+    monkeypatch.setattr(
+        sp_prefill, "tensor_model_parallel_reduce_scatter", world.reduce_scatter
+    )
+    table = torch.randn(16, 2, dtype=torch.float32)
+    ids = torch.arange(9)
+
+    def run(_rank):
+        layers = nn.ModuleList(_Layer(i, world, []) for i in range(2))
+        orig_ffn = layers[-1].ffn.forward
+        layers[-1].ffn.forward = lambda hidden, i, **kw: RankOrderParts(
+            orig_ffn(hidden, i, **kw).unsqueeze(0)
+        )
+
+        def post_collapse_norm(
+            x, residual, post, comb, pre, weight, eps, *, columns=None, column=0, out=None
+        ):
+            if isinstance(x, RankOrderParts):
+                x = x.packed.sum(dim=0)
+            recon = layers[-1].mhc.post(x, residual, post, comb)
+            if columns is not None:
+                columns.copy_(recon[:, :, column].float())
+            return layers[-1].mhc.collapse(recon, pre) * 2
+
+        layers[-1].mhc.post_collapse_norm = post_collapse_norm
+        sink = torch.zeros((16, 4), dtype=torch.float32)
+        target = SimpleNamespace(
+            embed_input_ids=lambda input_ids: table[input_ids],
+            embed_tokens=_Embedding(table, world),
+            prefill_sp_min_rows=4,
+            prefill_sp_unreduced=False,
+            disk_engram=False,
+            engram_hash=None,
+            start_layer=0,
+            end_layer=2,
+            ced_decoder_start=None,
+            layers=layers,
+            aux_hidden_state_layers=set(),
+            _l2pf_ready=True,
+            _sink_columns=sink,
+            _sink_column=0,
+            hc_mult=4,
+            rms_norm_eps=1e-6,
+            _graph_out=lambda index, rows: None,
+            glp=None,
+            norm=SimpleNamespace(weight=torch.ones(2)),
+        )
+        out = native.DeepseekV4Model.forward(target, ids, ids, None)
+        return out, sink[:9].clone()
+
+    results = world.run(run)
+    for out, sink in results:
+        assert out.shape == (9, 2)
+        assert sink.abs().sum() > 0

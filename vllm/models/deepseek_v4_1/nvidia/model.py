@@ -317,6 +317,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         *,
         ced_positions: torch.Tensor | None = None,
         ced_input_ids: torch.Tensor | None = None,
+        aux_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if isinstance(x, list):
             # Pop the caller's carry list in place so nn.Module.__call__'s *args
@@ -349,6 +350,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                 sp_rows=sp_rows,
             )
         fn = self.hc_attn_fn_broadcast if residual.ndim == 2 else self.hc_attn_fn
+        pre_kwargs = {}
+        if aux_out is not None:
+            pre_kwargs["aux_out"] = aux_out
         # x_q: x's MXFP8 cast for the sublayer's projections.
         residual, post_mix, res_mix, x, attn_pre, x_q = self.mhc.pre(
             residual,
@@ -360,6 +364,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             previous_output=previous_output,
             previous_post=post_mix if previous_output is not None else None,
             previous_comb=res_mix if previous_output is not None else None,
+            **pre_kwargs,
         )
         del previous_output, pre_mix
         if ced_indices is not None:
@@ -733,7 +738,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # The last collapse with the sink detector's column (forward).
         collapse = (
             TileKernelsMHC.collapse_column_calls(
-                self.config.hidden_size, self._sink_column
+                self.config.hidden_size, self._sink_column, self.rms_norm_eps
             )
             if self._sink_columns is not None
             else []
@@ -869,6 +874,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             decoder_compacted = True
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
+        pending_aux_out: torch.Tensor | None = None
         if l2_prefetch.ENABLED and not self._l2pf_ready:
             self._build_l2_prefetch()
         for idx, layer in enumerate(
@@ -910,7 +916,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 sp_rows=sp,
                 ced_positions=ced_positions,
                 ced_input_ids=ced_input_ids,
+                aux_out=pending_aux_out,
             )
+            if pending_aux_out is not None:
+                aux_hidden_state = pending_aux_out
+                pending_aux_out = None
+                if sp is not None:
+                    aux_hidden_state = sp.gather(aux_hidden_state)
+                if decoder_compacted:
+                    aux_hidden_state = scatter_rows(
+                        aux_hidden_state, ced_indices, full_num_tokens
+                    )
+                aux_hidden_states.append(aux_hidden_state)
             if boundary_indices is not None:
                 assert ced_positions is not None
                 positions = ced_positions
@@ -931,41 +948,106 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     if sp is None and not decoder_compacted
                     else None
                 )
-                if idx + 1 != self.end_layer and callable(
-                    getattr(layer.mhc, "post_collapse", None)
-                ):
-                    aux_hidden_state = layer.mhc.post_collapse(
-                        hidden_states, residual, post_mix, res_mix, out=aux_out
+                next_layer = (
+                    self.layers[idx + 1] if idx + 1 < self.end_layer else None
+                )
+                can_fuse_into_next_pre = (
+                    next_layer is not None
+                    and getattr(next_layer.mhc, "supports_fused_aux", False)
+                    and (
+                        getattr(next_layer, "engram", None) is None
+                        or engram_hashes is None
                     )
+                    and (
+                        ced_indices is None
+                        or idx + 1 != self.ced_decoder_start
+                    )
+                )
+                if can_fuse_into_next_pre:
+                    if aux_out is None:
+                        aux_out = torch.empty(
+                            (residual.shape[0], self.config.hidden_size),
+                            dtype=residual.dtype,
+                            device=residual.device,
+                        )
+                    pending_aux_out = aux_out
                 else:
-                    aux_recon = layer.mhc.post(
-                        hidden_states, residual, post_mix, res_mix
-                    )
-                    aux_hidden_state = (
-                        layer.mhc.collapse(aux_recon)
-                        if aux_out is None
-                        else layer.mhc.collapse(aux_recon, out=aux_out)
-                    )
-                    if idx + 1 == self.end_layer:
-                        final_aux_recon = aux_recon
-                    del aux_recon
-                if sp is not None:
-                    aux_hidden_state = sp.gather(aux_hidden_state)
-                if decoder_compacted:
-                    aux_hidden_state = scatter_rows(
-                        aux_hidden_state, ced_indices, full_num_tokens
-                    )
-                aux_hidden_states.append(aux_hidden_state)
+                    if idx + 1 != self.end_layer and callable(
+                        getattr(layer.mhc, "post_collapse", None)
+                    ):
+                        aux_hidden_state = layer.mhc.post_collapse(
+                            hidden_states, residual, post_mix, res_mix, out=aux_out
+                        )
+                    else:
+                        aux_recon = layer.mhc.post(
+                            hidden_states, residual, post_mix, res_mix
+                        )
+                        aux_hidden_state = (
+                            layer.mhc.collapse(aux_recon)
+                            if aux_out is None
+                            else layer.mhc.collapse(aux_recon, out=aux_out)
+                        )
+                        if idx + 1 == self.end_layer:
+                            final_aux_recon = aux_recon
+                        del aux_recon
+                    if sp is not None:
+                        aux_hidden_state = sp.gather(aux_hidden_state)
+                    if decoder_compacted:
+                        aux_hidden_state = scatter_rows(
+                            aux_hidden_state, ced_indices, full_num_tokens
+                        )
+                    aux_hidden_states.append(aux_hidden_state)
         l2_prefetch.join()
         last_rank = get_pp_group().is_last_rank
-        fused_final_collapse = (
+        rows_here = sp is None and not decoder_compacted
+        columns: torch.Tensor | None = None
+        if last_rank and self._sink_columns is not None:
+            local_tokens = (
+                residual.shape[0]
+                if residual is not None
+                else hidden_states.shape[0]
+            )
+            columns = (
+                self._sink_columns[:full_num_tokens]
+                if rows_here
+                else torch.empty(
+                    (local_tokens, self.hc_mult),
+                    dtype=torch.float32,
+                    device=residual.device
+                    if residual is not None
+                    else hidden_states.device,
+                )
+            )
+        fused_final_collapse_norm = (
             layer is not None
+            and last_rank
+            and self.end_layer not in self.aux_hidden_state_layers
+            and callable(getattr(layer.mhc, "post_collapse_norm", None))
+        )
+        fused_final_collapse = (
+            not fused_final_collapse_norm
+            and layer is not None
             and last_rank
             and self.end_layer not in self.aux_hidden_state_layers
             and self._sink_columns is None
             and callable(getattr(layer.mhc, "post_collapse", None))
         )
-        if fused_final_collapse:
+        out = self._graph_out(None, full_num_tokens) if last_rank and rows_here else None
+        if fused_final_collapse_norm:
+            hidden_states = layer.mhc.post_collapse_norm(
+                hidden_states,
+                residual,
+                post_mix,
+                res_mix,
+                pre_mix,
+                self.norm.weight,
+                self.rms_norm_eps,
+                columns=columns,
+                column=self._sink_column,
+                out=out,
+            )
+            del final_aux_recon, residual, post_mix, res_mix, pre_mix
+        elif fused_final_collapse:
             hidden_states = layer.mhc.post_collapse(
                 hidden_states, residual, post_mix, res_mix, pre_mix
             )
@@ -990,25 +1072,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 {"hidden_states": hidden_states, "pre_mix": pre_mix}
             )
 
-        # The sink detector's column of every residual stream comes from the last
-        # collapse, which reads the streams anyway: straight into its buffer when
-        # every row is here, else gathered after.
-        columns: torch.Tensor | None = None
-        rows_here = sp is None and not decoder_compacted
-        if self._sink_columns is not None:
-            columns = (
-                self._sink_columns[:full_num_tokens]
-                if rows_here
-                else torch.empty(
-                    (hidden_states.shape[0], self.hc_mult),
-                    dtype=torch.float32,
-                    device=hidden_states.device,
-                )
-            )
         # Collapse the hc copies with the pre-mix from the last layer's FFN
         # mixes — the mix the reference applies via
         # ``last_layer.hc_pre(h, pre_mix)`` (v4.1 has no learned hc_head).
-        if not fused_final_collapse:
+        if not fused_final_collapse_norm and not fused_final_collapse:
             hidden_states = (
                 layer.mhc.collapse(hidden_states, pre_mix)
                 if columns is None
@@ -1023,10 +1090,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if decoder_compacted:
                 columns = scatter_rows(columns, ced_indices, full_num_tokens)
             self._sink_columns[:full_num_tokens].copy_(columns)
-        out = self._graph_out(None, full_num_tokens) if rows_here else None
-        hidden_states = (
-            self.norm(hidden_states) if out is None else self.norm(hidden_states, out)
-        )
+        if not fused_final_collapse_norm:
+            hidden_states = (
+                self.norm(hidden_states)
+                if out is None
+                else self.norm(hidden_states, out)
+            )
         if sp is not None:
             hidden_states = sp.gather(hidden_states)
         if decoder_compacted:

@@ -81,7 +81,6 @@ _PASS_CONFIGS = {
 }
 
 _FUSE_HEADER = r"""
-#include <math_constants.h>
 #include <tl_templates/cuda/common.h>
 #include <tl_templates/cuda/cuda_fp8.h>
 __device__ __forceinline__ void mhc_fence() { __threadfence(); }
@@ -95,6 +94,7 @@ def project_streams(
     block_M: int = 16,
     block_H: int = BLOCK_H,
     world: int = 1,
+    with_aux: bool = False,
 ):
     """The streams' projection partials and their collapse, for one hidden block.
 
@@ -105,7 +105,10 @@ def project_streams(
     ``X`` is ``(world, M, H)``: with ``world`` > 1 (``"post_pre"`` only) the
     previous output arrives as the ranks' unreduced partials, which each thread
     adds in FP32 in rank order and rounds once, as the rank-order reduce-scatter
-    does, so the output has the same bits as that sum read back.
+    does, so the output has the same bits as that sum read back. With
+    ``with_aux=True`` (``"post_pre"`` only), each thread also accumulates the
+    unweighted mean (``0.25``) of the four updated streams and writes ``Aux``
+    (``[M, H]`` BF16), matching ``post_collapse_streams`` to the bit.
 
     Each CTA owns ``block_H`` hidden columns of every stream, a K split of the
     projection, for ``block_M`` tokens. Each thread owns one token's
@@ -121,6 +124,7 @@ def project_streams(
     """
     assert hidden_size % block_H == 0 and mode in ("pre", "post_pre", "broadcast")
     assert 1 <= world <= 4 and (world == 1 or mode == "post_pre")
+    assert not with_aux or mode == "post_pre"
     splits = hidden_size // block_H
     streams = 1 if mode == "broadcast" else MULT
     K = streams * hidden_size
@@ -148,6 +152,182 @@ def project_streams(
             F_mid[i, j] = middle
             F_low[i, j] = rest - middle
 
+    @T.macro
+    def _project_body(
+        X, R, post, comb, pre_in, Fn, R_out, P, S, C, Q, Aux, sp, by
+    ):
+        pdl.chain()
+        h0 = sp * block_H
+        A_shared = T.alloc_shared((block_M, block_H), T.float32)
+        F_shared = T.alloc_shared((N, block_H), T.float32)
+        F_mid = T.alloc_shared((N, block_H), T.float32)
+        F_low = T.alloc_shared((N, block_H), T.float32)
+        C_local = T.alloc_fragment((block_M, N), T.float32)
+        xv = T.alloc_local((COLS,), T.bfloat16)
+        xp = T.alloc_local((world * COLS,), T.bfloat16)
+        rv = T.alloc_local((MULT * COLS,), T.bfloat16)
+        nv = T.alloc_local((COLS,), T.bfloat16)
+        av = T.alloc_local((COLS,), T.float32)
+        sq = T.alloc_local((COLS,), T.float32)
+        col = T.alloc_local((COLS,), T.float32)
+        aux_col = T.alloc_local((COLS,), T.float32)
+        coef = T.alloc_local((2 * MULT + MULT * MULT,), T.float32)
+        red = T.alloc_local((1,), T.float32)
+        tx = T.get_thread_binding()
+        row = tx // LANES
+        c0 = (tx % LANES) * COLS
+        token = by * block_M + row
+        src = T.min(token, M - 1)
+        T.clear(C_local)
+        # The padding mixes stay zero; each stream's copy fills the rest.
+        for i, j in T.Parallel(N - MIXES, block_H):
+            F_shared[MIXES + i, j] = 0.0
+            F_mid[MIXES + i, j] = 0.0
+            F_low[MIXES + i, j] = 0.0
+        # This thread's token: its mixes, then its columns of x and the streams.
+        for k in T.unroll(MULT):
+            coef[k] = pre_in[src, k]
+        if mode == "post_pre":
+            for k in T.unroll(MULT):
+                coef[MULT + k] = post[src, k]
+            for k in T.unroll(MULT * MULT):
+                coef[2 * MULT + k] = comb[src, k // MULT, k % MULT]
+        if mode != "broadcast":
+            for m in T.unroll(MULT):
+                for v in T.vectorized(COLS):
+                    rv[m * COLS + v] = R[src, m * H + h0 + c0 + v]
+        if mode != "pre" and world == 1:
+            for v in T.vectorized(COLS):
+                xv[v] = X[0, src, h0 + c0 + v]
+        if world > 1:
+            # The first part as is (signed zeros survive), then the others.
+            for r in T.unroll(world):
+                for v in T.vectorized(COLS):
+                    xp[r * COLS + v] = X[r, src, h0 + c0 + v]
+            for r in T.unroll(world):
+                for v in T.unroll(COLS):
+                    if r == 0:
+                        av[v] = T.Cast(T.float32, xp[v])
+                    else:
+                        av[v] = av[v] + T.Cast(T.float32, xp[r * COLS + v])
+            for v in T.unroll(COLS):
+                xv[v] = T.Cast(T.bfloat16, av[v])
+        for v in T.unroll(COLS):
+            sq[v] = 0.0
+            col[v] = 0.0
+            if with_aux:
+                aux_col[v] = 0.0
+
+        if mode == "broadcast":
+            # Four copies of the embedding; fn already sums the blocks.
+            load_split_tf32(Fn, h0, F_shared, F_mid, F_low)
+            for v in T.unroll(COLS):
+                av[v] = T.Cast(T.float32, xv[v])
+                A_shared[row, c0 + v] = av[v]
+                sq[v] = av[v] * av[v]
+            for n in T.unroll(MULT):
+                if token < M:
+                    for v in T.vectorized(COLS):
+                        R_out[token, n * H + h0 + c0 + v] = xv[v]
+                for v in T.unroll(COLS):
+                    col[v] += coef[n] * av[v]
+            T.sync_threads()
+            T.gemm(A_shared, F_shared, C_local, transpose_B=True)
+            T.gemm(A_shared, F_mid, C_local, transpose_B=True)
+            T.gemm(A_shared, F_low, C_local, transpose_B=True)
+        else:
+            for n in T.unroll(MULT):
+                load_split_tf32(Fn, n * H + h0, F_shared, F_mid, F_low)
+                if mode == "post_pre":
+                    # post[n] * x + sum_m comb[m, n] * streams[m] in FP32, with
+                    # post_streams' (TileKernels') instruction sequence.
+                    for v in T.unroll(COLS):
+                        av[v] = coef[2 * MULT + n] * T.Cast(T.float32, rv[v])
+                        av[v] = T.fma(
+                            coef[MULT + n], T.Cast(T.float32, xv[v]), av[v]
+                        )
+                        for m in T.unroll(1, MULT):
+                            av[v] = T.fma(
+                                coef[2 * MULT + m * MULT + n],
+                                T.Cast(T.float32, rv[m * COLS + v]),
+                                av[v],
+                            )
+                        nv[v] = T.Cast(T.bfloat16, av[v])
+                    if token < M:
+                        for v in T.vectorized(COLS):
+                            R_out[token, n * H + h0 + c0 + v] = nv[v]
+                else:
+                    for v in T.unroll(COLS):
+                        nv[v] = rv[n * COLS + v]
+                for v in T.unroll(COLS):
+                    av[v] = T.Cast(T.float32, nv[v])
+                    A_shared[row, c0 + v] = av[v]
+                    sq[v] += av[v] * av[v]
+                    col[v] += coef[n] * av[v]
+                    if with_aux:
+                        aux_col[v] = T.fma(T.float32(0.25), av[v], aux_col[v])
+                T.sync_threads()
+                T.gemm(A_shared, F_shared, C_local, transpose_B=True)
+                T.gemm(A_shared, F_mid, C_local, transpose_B=True)
+                T.gemm(A_shared, F_low, C_local, transpose_B=True)
+                T.sync_threads()
+
+        if with_aux:
+            for v in T.unroll(COLS):
+                nv[v] = T.Cast(T.bfloat16, aux_col[v])
+            if token < M:
+                for v in T.vectorized(COLS):
+                    Aux[token, h0 + c0 + v] = nv[v]
+
+        # The collapse in BF16 and its sum of squares, then the streams'.
+        for v in T.unroll(COLS):
+            nv[v] = T.Cast(T.bfloat16, col[v])
+        if token < M:
+            for v in T.vectorized(COLS):
+                C[token, h0 + c0 + v] = nv[v]
+        red[0] = 0.0
+        for v in T.unroll(COLS):
+            red[0] += T.Cast(T.float32, nv[v]) * T.Cast(T.float32, nv[v])
+        red[0] += T.shfl_xor(red[0], 4)
+        red[0] += T.shfl_xor(red[0], 2)
+        red[0] += T.shfl_xor(red[0], 1)
+        if tx % LANES == 0 and token < M:
+            Q[sp, token] = red[0]
+        red[0] = 0.0
+        for v in T.unroll(COLS):
+            red[0] += sq[v]
+        red[0] += T.shfl_xor(red[0], 4)
+        red[0] += T.shfl_xor(red[0], 2)
+        red[0] += T.shfl_xor(red[0], 1)
+        if tx % LANES == 0 and token < M:
+            S[sp, token, 0] = red[0]
+        for i, j in T.Parallel(block_M, MIXES):
+            if by * block_M + i < M:
+                P[sp, by * block_M + i, 0, j] = C_local[i, j]
+
+    if not with_aux:
+
+        @T.prim_func
+        def mhc_project_streams(
+            X: T.Tensor((world, M, H), T.bfloat16),
+            R: T.Tensor((M, MULT * H), T.bfloat16),
+            post: T.Tensor((M, MULT), T.float32),
+            comb: T.Tensor((M, MULT, MULT), T.float32),
+            pre_in: T.Tensor((M, MULT), T.float32),
+            Fn: T.Tensor((MIXES, K), T.float32),
+            R_out: T.Tensor((M, MULT * H), T.bfloat16),
+            P: T.Tensor((splits, M, 1, MIXES), T.float32),
+            S: T.Tensor((splits, M, 1), T.float32),
+            C: T.Tensor((M, H), T.bfloat16),
+            Q: T.Tensor((splits, M), T.float32),
+        ):
+            with T.Kernel(splits, T.ceildiv(M, block_M), threads=threads) as (sp, by):
+                _project_body(
+                    X, R, post, comb, pre_in, Fn, R_out, P, S, C, Q, C, sp, by
+                )
+
+        return mhc_project_streams
+
     @T.prim_func
     def mhc_project_streams(
         X: T.Tensor((world, M, H), T.bfloat16),
@@ -161,142 +341,12 @@ def project_streams(
         S: T.Tensor((splits, M, 1), T.float32),
         C: T.Tensor((M, H), T.bfloat16),
         Q: T.Tensor((splits, M), T.float32),
+        Aux: T.Tensor((M, H), T.bfloat16),
     ):
         with T.Kernel(splits, T.ceildiv(M, block_M), threads=threads) as (sp, by):
-            pdl.chain()
-            h0 = sp * block_H
-            A_shared = T.alloc_shared((block_M, block_H), T.float32)
-            F_shared = T.alloc_shared((N, block_H), T.float32)
-            F_mid = T.alloc_shared((N, block_H), T.float32)
-            F_low = T.alloc_shared((N, block_H), T.float32)
-            C_local = T.alloc_fragment((block_M, N), T.float32)
-            xv = T.alloc_local((COLS,), T.bfloat16)
-            rv = T.alloc_local((MULT * COLS,), T.bfloat16)
-            nv = T.alloc_local((COLS,), T.bfloat16)
-            av = T.alloc_local((COLS,), T.float32)
-            sq = T.alloc_local((COLS,), T.float32)
-            col = T.alloc_local((COLS,), T.float32)
-            coef = T.alloc_local((2 * MULT + MULT * MULT,), T.float32)
-            red = T.alloc_local((1,), T.float32)
-            tx = T.get_thread_binding()
-            row = tx // LANES
-            c0 = (tx % LANES) * COLS
-            token = by * block_M + row
-            src = T.min(token, M - 1)
-            T.clear(C_local)
-            # The padding mixes stay zero; each stream's copy fills the rest.
-            for i, j in T.Parallel(N - MIXES, block_H):
-                F_shared[MIXES + i, j] = 0.0
-                F_mid[MIXES + i, j] = 0.0
-                F_low[MIXES + i, j] = 0.0
-            # This thread's token: its mixes, then its columns of x and the streams.
-            for k in T.unroll(MULT):
-                coef[k] = pre_in[src, k]
-            if mode == "post_pre":
-                for k in T.unroll(MULT):
-                    coef[MULT + k] = post[src, k]
-                for k in T.unroll(MULT * MULT):
-                    coef[2 * MULT + k] = comb[src, k // MULT, k % MULT]
-            if mode != "pre" and world == 1:
-                for v in T.vectorized(COLS):
-                    xv[v] = X[0, src, h0 + c0 + v]
-            if world > 1:
-                # The first part as is (signed zeros survive), then the others.
-                for r in T.unroll(world):
-                    for v in T.vectorized(COLS):
-                        xv[v] = X[r, src, h0 + c0 + v]
-                    for v in T.unroll(COLS):
-                        if r == 0:
-                            av[v] = T.Cast(T.float32, xv[v])
-                        else:
-                            av[v] = av[v] + T.Cast(T.float32, xv[v])
-                for v in T.unroll(COLS):
-                    xv[v] = T.Cast(T.bfloat16, av[v])
-            if mode != "broadcast":
-                for m in T.unroll(MULT):
-                    for v in T.vectorized(COLS):
-                        rv[m * COLS + v] = R[src, m * H + h0 + c0 + v]
-            for v in T.unroll(COLS):
-                sq[v] = 0.0
-                col[v] = 0.0
-
-            if mode == "broadcast":
-                # Four copies of the embedding; fn already sums the blocks.
-                for v in T.unroll(COLS):
-                    av[v] = T.Cast(T.float32, xv[v])
-                    A_shared[row, c0 + v] = av[v]
-                    sq[v] = av[v] * av[v]
-                for n in T.unroll(MULT):
-                    if token < M:
-                        for v in T.vectorized(COLS):
-                            R_out[token, n * H + h0 + c0 + v] = xv[v]
-                    for v in T.unroll(COLS):
-                        col[v] += coef[n] * av[v]
-                load_split_tf32(Fn, h0, F_shared, F_mid, F_low)
-                T.sync_threads()
-                T.gemm(A_shared, F_shared, C_local, transpose_B=True)
-                T.gemm(A_shared, F_mid, C_local, transpose_B=True)
-                T.gemm(A_shared, F_low, C_local, transpose_B=True)
-            else:
-                for n in T.unroll(MULT):
-                    if mode == "post_pre":
-                        # post[n] * x + sum_m comb[m, n] * streams[m] in FP32, with
-                        # post_streams' (TileKernels') instruction sequence.
-                        for v in T.unroll(COLS):
-                            av[v] = coef[2 * MULT + n] * T.Cast(T.float32, rv[v])
-                            av[v] = T.fma(
-                                coef[MULT + n], T.Cast(T.float32, xv[v]), av[v]
-                            )
-                            for m in T.unroll(1, MULT):
-                                av[v] = T.fma(
-                                    coef[2 * MULT + m * MULT + n],
-                                    T.Cast(T.float32, rv[m * COLS + v]),
-                                    av[v],
-                                )
-                            nv[v] = T.Cast(T.bfloat16, av[v])
-                        if token < M:
-                            for v in T.vectorized(COLS):
-                                R_out[token, n * H + h0 + c0 + v] = nv[v]
-                    else:
-                        for v in T.unroll(COLS):
-                            nv[v] = rv[n * COLS + v]
-                    for v in T.unroll(COLS):
-                        av[v] = T.Cast(T.float32, nv[v])
-                        A_shared[row, c0 + v] = av[v]
-                        sq[v] += av[v] * av[v]
-                        col[v] += coef[n] * av[v]
-                    load_split_tf32(Fn, n * H + h0, F_shared, F_mid, F_low)
-                    T.sync_threads()
-                    T.gemm(A_shared, F_shared, C_local, transpose_B=True)
-                    T.gemm(A_shared, F_mid, C_local, transpose_B=True)
-                    T.gemm(A_shared, F_low, C_local, transpose_B=True)
-                    T.sync_threads()
-
-            # The collapse in BF16 and its sum of squares, then the streams'.
-            for v in T.unroll(COLS):
-                nv[v] = T.Cast(T.bfloat16, col[v])
-            if token < M:
-                for v in T.vectorized(COLS):
-                    C[token, h0 + c0 + v] = nv[v]
-            red[0] = 0.0
-            for v in T.unroll(COLS):
-                red[0] += T.Cast(T.float32, nv[v]) * T.Cast(T.float32, nv[v])
-            red[0] += T.shfl_xor(red[0], 4)
-            red[0] += T.shfl_xor(red[0], 2)
-            red[0] += T.shfl_xor(red[0], 1)
-            if tx % LANES == 0 and token < M:
-                Q[sp, token] = red[0]
-            red[0] = 0.0
-            for v in T.unroll(COLS):
-                red[0] += sq[v]
-            red[0] += T.shfl_xor(red[0], 4)
-            red[0] += T.shfl_xor(red[0], 2)
-            red[0] += T.shfl_xor(red[0], 1)
-            if tx % LANES == 0 and token < M:
-                S[sp, token, 0] = red[0]
-            for i, j in T.Parallel(block_M, MIXES):
-                if by * block_M + i < M:
-                    P[sp, by * block_M + i, 0, j] = C_local[i, j]
+            _project_body(
+                X, R, post, comb, pre_in, Fn, R_out, P, S, C, Q, Aux, sp, by
+            )
 
     return mhc_project_streams
 
@@ -327,6 +377,7 @@ def finalize(
     splits = hidden_size // block_H
     chunks = hidden_size // VEC
     workers = threads - 32
+    steps = (chunks + workers - 1) // workers
     # Every warp's lanes take part in a step or none do, so the shuffles of a step's
     # blocks are warp-uniform; a block's four lanes sit in one warp.
     assert chunks % 32 == 0 and workers % 32 == 0
@@ -350,93 +401,106 @@ def finalize(
         ysf: T.Tensor((Mq, sf_width), T.uint8),
     ):
         with T.Kernel(M, threads=threads) as pid:
-            pdl.chain()
             tx = T.get_thread_binding()
             xv = T.alloc_local((VEC,), T.bfloat16)
-            wv = T.alloc_local((VEC,), T.bfloat16)
-            yv = T.alloc_local((VEC,), T.bfloat16)
+            wv = T.alloc_local((steps * VEC,), T.bfloat16)
+            yv = T.alloc_local((steps * VEC,), T.bfloat16)
             xf = T.alloc_local((VEC,), T.float32)
             xq = T.alloc_local((VEC,), T.float8_e4m3fn)
             total = T.alloc_local((1,), T.float32)
             amax = T.alloc_local((1,), T.float32)
-            mix_val = T.alloc_local((1,), T.float32)
-            post_val = T.alloc_local((1,), T.float32)
-            cm_val = T.alloc_local((1,), T.float32)
+            rms_l = T.alloc_local((1,), T.float32)
+            p_acc = T.alloc_local((1,), T.float32)
+            s_val = T.alloc_local((1,), T.float32)
+            b_val = T.alloc_local((1,), T.float32)
+            cm_l = T.alloc_local((1,), T.float32)
+            rmax_l = T.alloc_local((1,), T.float32)
+            rsum_l = T.alloc_local((1,), T.float32)
+            csum_l = T.alloc_local((1,), T.float32)
+
+            if tx < 24:
+                mix_idx = T.if_then_else(tx < 16, tx + 2 * MULT, tx - 16)
+                scale_idx = T.if_then_else(tx < 16, 2, (tx - 16) // MULT)
+                s_val[0] = scale[scale_idx]
+                b_val[0] = base[mix_idx]
+            elif tx >= 32:
+                worker = tx - 32
+                for step in T.unroll(steps):
+                    chunk = step * workers + worker
+                    if chunk < chunks:
+                        for v in T.vectorized(VEC):
+                            wv[step * VEC + v] = weight[chunk * VEC + v]
+
+            pdl.chain()
 
             if tx < 32:
-                # Reduce the split partials; RMS over the flattened streams.
-                rms = T.alloc_fragment(1, T.float32)
-                mixes = T.alloc_fragment(MIXES, T.float32)
-                rms[0] = 0
-                for i_split in T.serial(splits):
-                    rms[0] += S[i_split, pid, 0]
-                rms[0] = T.rsqrt(rms[0] / rms_group_size + rms_eps)
-                for j in T.Parallel(MIXES):
-                    mixes[j] = 0
-                    for i_split in T.serial(splits):
-                        mixes[j] += P[i_split, pid, 0, j]
-                    mixes[j] *= rms[0]
-                    mix_val[0] = mixes[j]
-                post_val[0] = T.shfl_down(mix_val[0], MULT)
-                cm_val[0] = T.shfl_down(mix_val[0], 2 * MULT)
+                rms_l[0] = 0.0
+                p_acc[0] = 0.0
+                cm_l[0] = 0.0
+                for i_split in T.unroll(splits):
+                    rms_l[0] += S[i_split, pid, 0]
+                    if tx < 24:
+                        mix_idx = T.if_then_else(tx < 16, tx + 2 * MULT, tx - 16)
+                        p_acc[0] += P[i_split, pid, 0, mix_idx]
+                rms_l[0] = T.rsqrt(rms_l[0] / rms_group_size + rms_eps)
 
-                # The new pre-mix, the post-mix and the Sinkhorn combination.
-                cm = T.alloc_fragment((MULT, MULT), T.float32)
-                for j in T.Parallel(MULT):
-                    pre_out[pid, j] = (
-                        T.sigmoid(mix_val[0] * scale[0] + base[j]) + hc_eps
+                if tx < 16:
+                    cm_l[0] = p_acc[0] * rms_l[0] * s_val[0] + b_val[0]
+                elif tx < 20:
+                    pre_out[pid, tx - 16] = (
+                        T.sigmoid(p_acc[0] * rms_l[0] * s_val[0] + b_val[0]) + hc_eps
                     )
-                    post[pid, j] = (
-                        T.sigmoid(post_val[0] * scale[1] + base[j + MULT])
+                elif tx < 24:
+                    post[pid, tx - 20] = (
+                        T.sigmoid(p_acc[0] * rms_l[0] * s_val[0] + b_val[0])
                         * post_mult
                     )
-                for j, k in T.Parallel(MULT, MULT):
-                    cm[j, k] = (
-                        cm_val[0] * scale[2]
-                        + base[j * MULT + k + MULT * 2]
-                    )
-                row_sum = T.alloc_fragment(MULT, T.float32)
-                col_sum = T.alloc_fragment(MULT, T.float32)
-                row_max = T.alloc_fragment(MULT, T.float32)
-                T.reduce_max(cm, row_max, dim=1)
-                for j, k in T.Parallel(MULT, MULT):
-                    cm[j, k] = T.exp(cm[j, k] - row_max[j])
-                T.reduce_sum(cm, row_sum, dim=1)
-                for j, k in T.Parallel(MULT, MULT):
-                    cm[j, k] = cm[j, k] / row_sum[j] + hc_eps
-                T.reduce_sum(cm, col_sum, dim=0)
-                for j, k in T.Parallel(MULT, MULT):
-                    cm[j, k] = cm[j, k] / (col_sum[k] + hc_eps)
+
+                rmax_l[0] = cm_l[0]
+                rmax_l[0] = T.max(rmax_l[0], T.shfl_xor(rmax_l[0], 2))
+                rmax_l[0] = T.max(rmax_l[0], T.shfl_xor(rmax_l[0], 1))
+                cm_l[0] = T.exp(cm_l[0] - rmax_l[0])
+                rsum_l[0] = cm_l[0]
+                rsum_l[0] += T.shfl_xor(rsum_l[0], 2)
+                rsum_l[0] += T.shfl_xor(rsum_l[0], 1)
+                cm_l[0] = cm_l[0] / rsum_l[0] + hc_eps
+                csum_l[0] = cm_l[0]
+                csum_l[0] += T.shfl_xor(csum_l[0], 8)
+                csum_l[0] += T.shfl_xor(csum_l[0], 4)
+                cm_l[0] = cm_l[0] / (csum_l[0] + hc_eps)
                 for _ in T.serial(sinkhorn_repeat - 1):
-                    T.reduce_sum(cm, row_sum, dim=1)
-                    for j, k in T.Parallel(MULT, MULT):
-                        cm[j, k] = cm[j, k] / (row_sum[j] + hc_eps)
-                    T.reduce_sum(cm, col_sum, dim=0)
-                    for j, k in T.Parallel(MULT, MULT):
-                        cm[j, k] = cm[j, k] / (col_sum[k] + hc_eps)
-                for j, k in T.Parallel(MULT, MULT):
-                    comb[pid, j, k] = cm[j, k]
+                    rsum_l[0] = cm_l[0]
+                    rsum_l[0] += T.shfl_xor(rsum_l[0], 2)
+                    rsum_l[0] += T.shfl_xor(rsum_l[0], 1)
+                    cm_l[0] = cm_l[0] / (rsum_l[0] + hc_eps)
+                    csum_l[0] = cm_l[0]
+                    csum_l[0] += T.shfl_xor(csum_l[0], 8)
+                    csum_l[0] += T.shfl_xor(csum_l[0], 4)
+                    cm_l[0] = cm_l[0] / (csum_l[0] + hc_eps)
+                if tx < 16:
+                    comb[pid, tx // MULT, tx % MULT] = cm_l[0]
             else:
                 # RMSNorm of the collapse, with the sublayer's weight, and its MXFP8
                 # cast.
                 worker = tx - 32
-                total[0] = 0
-                for i_split in T.serial(splits):
-                    total[0] += Q[i_split, pid]
-                total[0] = T.rsqrt(total[0] / hidden_size + norm_eps)
-                for step in T.serial(T.ceildiv(chunks, workers)):
+                for step in T.unroll(steps):
                     chunk = step * workers + worker
                     if chunk < chunks:
                         for v in T.vectorized(VEC):
-                            yv[v] = C[pid, chunk * VEC + v]
-                        for v in T.vectorized(VEC):
-                            wv[v] = weight[chunk * VEC + v]
+                            yv[step * VEC + v] = C[pid, chunk * VEC + v]
+                total[0] = 0.0
+                for i_split in T.unroll(splits):
+                    total[0] += Q[i_split, pid]
+                total[0] = T.rsqrt(total[0] / hidden_size + norm_eps)
+                for step in T.unroll(steps):
+                    chunk = step * workers + worker
+                    if chunk < chunks:
                         for v in T.unroll(VEC):
                             xv[v] = T.Cast(
                                 T.bfloat16,
-                                T.Cast(T.float32, yv[v])
+                                T.Cast(T.float32, yv[step * VEC + v])
                                 * total[0]
-                                * T.Cast(T.float32, wv[v]),
+                                * T.Cast(T.float32, wv[step * VEC + v]),
                             )
                         for v in T.vectorized(VEC):
                             y[pid, chunk * VEC + v] = xv[v]
@@ -466,12 +530,14 @@ def project_and_finalize_streams(
     block_M: int = BLOCK_M,
     block_H: int = BLOCK_H,
     world: int = 1,
+    with_aux: bool = False,
 ):
     """``project_streams`` and ``finalize`` in one launch: the last split CTA of each
     token tile reduces ``S``, ``P`` and ``Q`` in split order and runs ``finalize``'s
     mix split, Sinkhorn, collapse RMSNorm and MXFP8 cast for the tile's tokens."""
     assert hidden_size % block_H == 0 and mode in ("pre", "post_pre", "broadcast")
     assert 1 <= world <= 4 and (world == 1 or mode == "post_pre")
+    assert not with_aux or mode == "post_pre"
     assert hidden_size % VEC == 0 and block_M % 2 == 0
     splits = hidden_size // block_H
     streams = 1 if mode == "broadcast" else MULT
@@ -500,6 +566,356 @@ def project_and_finalize_streams(
             F_mid[i, j] = middle
             F_low[i, j] = rest - middle
 
+    @T.macro
+    def _project_finalize_body(
+        X,
+        R,
+        post_in,
+        comb_in,
+        pre_in,
+        Fn,
+        R_out,
+        P,
+        S,
+        C,
+        Q,
+        counters,
+        scale,
+        base,
+        weight,
+        post_out,
+        comb_out,
+        pre_out,
+        y,
+        yq,
+        ysf,
+        Aux,
+        sp,
+        by,
+    ):
+        T.import_source(_FUSE_HEADER)
+        pdl.chain()
+        h0 = sp * block_H
+        A_shared = T.alloc_shared((block_M, block_H), T.float32)
+        F_shared = T.alloc_shared((N, block_H), T.float32)
+        F_mid = T.alloc_shared((N, block_H), T.float32)
+        F_low = T.alloc_shared((N, block_H), T.float32)
+        last = T.alloc_shared((1,), T.int32)
+        C_local = T.alloc_fragment((block_M, N), T.float32)
+        xv = T.alloc_local((COLS,), T.bfloat16)
+        xp = T.alloc_local((world * COLS,), T.bfloat16)
+        rv = T.alloc_local((MULT * COLS,), T.bfloat16)
+        nv = T.alloc_local((COLS,), T.bfloat16)
+        av = T.alloc_local((COLS,), T.float32)
+        sq = T.alloc_local((COLS,), T.float32)
+        col = T.alloc_local((COLS,), T.float32)
+        aux_col = T.alloc_local((COLS,), T.float32)
+        coef = T.alloc_local((2 * MULT + MULT * MULT,), T.float32)
+        red = T.alloc_local((1,), T.float32)
+        wv = T.alloc_local((VEC,), T.bfloat16)
+        yv = T.alloc_local((VEC,), T.bfloat16)
+        xf = T.alloc_local((VEC,), T.float32)
+        xq = T.alloc_local((VEC,), T.float8_e4m3fn)
+        total = T.alloc_local((1,), T.float32)
+        amax = T.alloc_local((1,), T.float32)
+        rms_l = T.alloc_local((1,), T.float32)
+        p_pre = T.alloc_local((1,), T.float32)
+        p_post = T.alloc_local((1,), T.float32)
+        p_cm = T.alloc_local((1,), T.float32)
+        cm_l = T.alloc_local((1,), T.float32)
+        rmax_l = T.alloc_local((1,), T.float32)
+        rsum_l = T.alloc_local((1,), T.float32)
+        csum_l = T.alloc_local((1,), T.float32)
+        tx = T.get_thread_binding()
+        row = tx // LANES
+        c0 = (tx % LANES) * COLS
+        token = by * block_M + row
+        src = T.min(token, M - 1)
+        T.clear(C_local)
+        for i, j in T.Parallel(N - MIXES, block_H):
+            F_shared[MIXES + i, j] = 0.0
+            F_mid[MIXES + i, j] = 0.0
+            F_low[MIXES + i, j] = 0.0
+        for k in T.unroll(MULT):
+            coef[k] = pre_in[src, k]
+        if mode == "post_pre":
+            for k in T.unroll(MULT):
+                coef[MULT + k] = post_in[src, k]
+            for k in T.unroll(MULT * MULT):
+                coef[2 * MULT + k] = comb_in[src, k // MULT, k % MULT]
+        if mode != "pre" and world == 1:
+            for v in T.vectorized(COLS):
+                xv[v] = X[0, src, h0 + c0 + v]
+        if world > 1:
+            for r in T.unroll(world):
+                for v in T.vectorized(COLS):
+                    xp[r * COLS + v] = X[r, src, h0 + c0 + v]
+            for r in T.unroll(world):
+                for v in T.unroll(COLS):
+                    if r == 0:
+                        av[v] = T.Cast(T.float32, xp[v])
+                    else:
+                        av[v] = av[v] + T.Cast(T.float32, xp[r * COLS + v])
+            for v in T.unroll(COLS):
+                xv[v] = T.Cast(T.bfloat16, av[v])
+        if mode != "broadcast":
+            for m in T.unroll(MULT):
+                for v in T.vectorized(COLS):
+                    rv[m * COLS + v] = R[src, m * H + h0 + c0 + v]
+        for v in T.unroll(COLS):
+            sq[v] = 0.0
+            col[v] = 0.0
+            if with_aux:
+                aux_col[v] = 0.0
+
+        if mode == "broadcast":
+            for v in T.unroll(COLS):
+                av[v] = T.Cast(T.float32, xv[v])
+                A_shared[row, c0 + v] = av[v]
+                sq[v] = av[v] * av[v]
+            for n in T.unroll(MULT):
+                if token < M:
+                    for v in T.vectorized(COLS):
+                        R_out[token, n * H + h0 + c0 + v] = xv[v]
+                for v in T.unroll(COLS):
+                    col[v] += coef[n] * av[v]
+            load_split_tf32(Fn, h0, F_shared, F_mid, F_low)
+            T.sync_threads()
+            T.gemm(A_shared, F_shared, C_local, transpose_B=True)
+            T.gemm(A_shared, F_mid, C_local, transpose_B=True)
+            T.gemm(A_shared, F_low, C_local, transpose_B=True)
+        else:
+            for n in T.unroll(MULT):
+                if mode == "post_pre":
+                    for v in T.unroll(COLS):
+                        av[v] = coef[2 * MULT + n] * T.Cast(T.float32, rv[v])
+                        av[v] = T.fma(
+                            coef[MULT + n], T.Cast(T.float32, xv[v]), av[v]
+                        )
+                        for m in T.unroll(1, MULT):
+                            av[v] = T.fma(
+                                coef[2 * MULT + m * MULT + n],
+                                T.Cast(T.float32, rv[m * COLS + v]),
+                                av[v],
+                            )
+                        nv[v] = T.Cast(T.bfloat16, av[v])
+                    if token < M:
+                        for v in T.vectorized(COLS):
+                            R_out[token, n * H + h0 + c0 + v] = nv[v]
+                else:
+                    for v in T.unroll(COLS):
+                        nv[v] = rv[n * COLS + v]
+                for v in T.unroll(COLS):
+                    av[v] = T.Cast(T.float32, nv[v])
+                    A_shared[row, c0 + v] = av[v]
+                    sq[v] += av[v] * av[v]
+                    col[v] += coef[n] * av[v]
+                    if with_aux:
+                        aux_col[v] = T.fma(T.float32(0.25), av[v], aux_col[v])
+                load_split_tf32(Fn, n * H + h0, F_shared, F_mid, F_low)
+                T.sync_threads()
+                T.gemm(A_shared, F_shared, C_local, transpose_B=True)
+                T.gemm(A_shared, F_mid, C_local, transpose_B=True)
+                T.gemm(A_shared, F_low, C_local, transpose_B=True)
+                T.sync_threads()
+
+        if with_aux:
+            for v in T.unroll(COLS):
+                nv[v] = T.Cast(T.bfloat16, aux_col[v])
+            if token < M:
+                for v in T.vectorized(COLS):
+                    Aux[token, h0 + c0 + v] = nv[v]
+
+        for v in T.unroll(COLS):
+            nv[v] = T.Cast(T.bfloat16, col[v])
+        if token < M:
+            for v in T.vectorized(COLS):
+                C[token, h0 + c0 + v] = nv[v]
+        red[0] = 0.0
+        for v in T.unroll(COLS):
+            red[0] += T.Cast(T.float32, nv[v]) * T.Cast(T.float32, nv[v])
+        red[0] += T.shfl_xor(red[0], 4)
+        red[0] += T.shfl_xor(red[0], 2)
+        red[0] += T.shfl_xor(red[0], 1)
+        if tx % LANES == 0 and token < M:
+            Q[sp, token] = red[0]
+        red[0] = 0.0
+        for v in T.unroll(COLS):
+            red[0] += sq[v]
+        red[0] += T.shfl_xor(red[0], 4)
+        red[0] += T.shfl_xor(red[0], 2)
+        red[0] += T.shfl_xor(red[0], 1)
+        if tx % LANES == 0 and token < M:
+            S[sp, token, 0] = red[0]
+        for i, j in T.Parallel(block_M, MIXES):
+            if by * block_M + i < M:
+                P[sp, by * block_M + i, 0, j] = C_local[i, j]
+
+        T.call_extern("handle", "mhc_fence")
+        T.sync_threads()
+        if tx == 0:
+            arrived = T.atomic_add(
+                counters[by],
+                1,
+                memory_order="acq_rel",
+                return_prev=True,
+            )
+            last[0] = T.if_then_else(arrived == splits - 1, 1, 0)
+        T.sync_threads()
+        if last[0] == 1:
+            T.call_extern("handle", "mhc_fence")
+            if tx == 0:
+                counters[by] = 0
+            if tx < 32:
+                half = tx // 16
+                lane16 = tx % 16
+                r_idx = lane16 // MULT
+                c_idx = lane16 % MULT
+                for pair in T.serial(block_M // 2):
+                    tok = by * block_M + pair * 2 + half
+                    if tok < M:
+                        rms_l[0] = 0.0
+                        p_pre[0] = 0.0
+                        p_post[0] = 0.0
+                        p_cm[0] = 0.0
+                        for i_split in T.serial(splits):
+                            rms_l[0] += S[i_split, tok, 0]
+                            if lane16 < MULT:
+                                p_pre[0] += P[i_split, tok, 0, lane16]
+                                p_post[0] += P[i_split, tok, 0, lane16 + MULT]
+                            p_cm[0] += P[i_split, tok, 0, lane16 + 2 * MULT]
+                        rms_l[0] = T.rsqrt(rms_l[0] / rms_group_size + rms_eps)
+                        if lane16 < MULT:
+                            pre_out[tok, lane16] = (
+                                T.sigmoid(
+                                    p_pre[0] * rms_l[0] * scale[0] + base[lane16]
+                                )
+                                + hc_eps
+                            )
+                            post_out[tok, lane16] = (
+                                T.sigmoid(
+                                    p_post[0] * rms_l[0] * scale[1]
+                                    + base[lane16 + MULT]
+                                )
+                                * post_mult
+                            )
+                        cm_l[0] = (
+                            p_cm[0] * rms_l[0] * scale[2]
+                            + base[lane16 + 2 * MULT]
+                        )
+                        rmax_l[0] = cm_l[0]
+                        rmax_l[0] = T.max(rmax_l[0], T.shfl_xor(rmax_l[0], 2))
+                        rmax_l[0] = T.max(rmax_l[0], T.shfl_xor(rmax_l[0], 1))
+                        cm_l[0] = T.exp(cm_l[0] - rmax_l[0])
+                        rsum_l[0] = cm_l[0]
+                        rsum_l[0] += T.shfl_xor(rsum_l[0], 2)
+                        rsum_l[0] += T.shfl_xor(rsum_l[0], 1)
+                        cm_l[0] = cm_l[0] / rsum_l[0] + hc_eps
+                        csum_l[0] = cm_l[0]
+                        csum_l[0] += T.shfl_xor(csum_l[0], 8)
+                        csum_l[0] += T.shfl_xor(csum_l[0], 4)
+                        cm_l[0] = cm_l[0] / (csum_l[0] + hc_eps)
+                        for _ in T.serial(sinkhorn_repeat - 1):
+                            rsum_l[0] = cm_l[0]
+                            rsum_l[0] += T.shfl_xor(rsum_l[0], 2)
+                            rsum_l[0] += T.shfl_xor(rsum_l[0], 1)
+                            cm_l[0] = cm_l[0] / (rsum_l[0] + hc_eps)
+                            csum_l[0] = cm_l[0]
+                            csum_l[0] += T.shfl_xor(csum_l[0], 8)
+                            csum_l[0] += T.shfl_xor(csum_l[0], 4)
+                            cm_l[0] = cm_l[0] / (csum_l[0] + hc_eps)
+                        comb_out[tok, r_idx, c_idx] = cm_l[0]
+            else:
+                worker = tx - 32
+                for ti in T.serial(block_M):
+                    tok = by * block_M + ti
+                    if tok < M:
+                        total[0] = 0.0
+                        for i_split in T.serial(splits):
+                            total[0] += Q[i_split, tok]
+                        total[0] = T.rsqrt(total[0] / H + norm_eps)
+                        for step in T.serial(T.ceildiv(chunks, workers)):
+                            chunk = step * workers + worker
+                            if chunk < chunks:
+                                for v in T.vectorized(VEC):
+                                    yv[v] = C[tok, chunk * VEC + v]
+                                for v in T.vectorized(VEC):
+                                    wv[v] = weight[chunk * VEC + v]
+                                for v in T.unroll(VEC):
+                                    xv[v] = T.Cast(
+                                        T.bfloat16,
+                                        T.Cast(T.float32, yv[v])
+                                        * total[0]
+                                        * T.Cast(T.float32, wv[v]),
+                                    )
+                                for v in T.vectorized(VEC):
+                                    y[tok, chunk * VEC + v] = xv[v]
+                                amax[0] = T.float32(0)
+                                for v in T.unroll(VEC):
+                                    xf[v] = T.Cast(T.float32, xv[v])
+                                    amax[0] = T.max(amax[0], T.abs(xf[v]))
+                                amax[0] = T.max(amax[0], T.shfl_xor(amax[0], 1))
+                                amax[0] = T.max(amax[0], T.shfl_xor(amax[0], 2))
+                                cast_block_mxfp8(
+                                    xf, xq, VEC, amax[0], yq, ysf, tok, chunk * VEC
+                                )
+
+    if not with_aux:
+
+        @T.prim_func
+        def mhc_project_finalize(
+            X: T.Tensor((world, M, H), T.bfloat16),
+            R: T.Tensor((M, MULT * H), T.bfloat16),
+            post_in: T.Tensor((M, MULT), T.float32),
+            comb_in: T.Tensor((M, MULT, MULT), T.float32),
+            pre_in: T.Tensor((M, MULT), T.float32),
+            Fn: T.Tensor((MIXES, K), T.float32),
+            R_out: T.Tensor((M, MULT * H), T.bfloat16),
+            P: T.Tensor((splits, M, 1, MIXES), T.float32),
+            S: T.Tensor((splits, M, 1), T.float32),
+            C: T.Tensor((M, H), T.bfloat16),
+            Q: T.Tensor((splits, M), T.float32),
+            counters: T.Tensor((tiles,), T.int32),
+            scale: T.Tensor((3,), T.float32),
+            base: T.Tensor((MIXES,), T.float32),
+            weight: T.Tensor((H,), T.bfloat16),
+            post_out: T.Tensor((M, MULT), T.float32),
+            comb_out: T.Tensor((M, MULT, MULT), T.float32),
+            pre_out: T.Tensor((M, MULT), T.float32),
+            y: T.Tensor((M, H), T.bfloat16),
+            yq: T.Tensor((Mq, H), T.float8_e4m3fn),
+            ysf: T.Tensor((Mq, sf_width), T.uint8),
+        ):
+            with T.Kernel(splits, T.ceildiv(M, block_M), threads=threads) as (sp, by):
+                _project_finalize_body(
+                    X,
+                    R,
+                    post_in,
+                    comb_in,
+                    pre_in,
+                    Fn,
+                    R_out,
+                    P,
+                    S,
+                    C,
+                    Q,
+                    counters,
+                    scale,
+                    base,
+                    weight,
+                    post_out,
+                    comb_out,
+                    pre_out,
+                    y,
+                    yq,
+                    ysf,
+                    C,
+                    sp,
+                    by,
+                )
+
+        return mhc_project_finalize
+
     @T.prim_func
     def mhc_project_finalize(
         X: T.Tensor((world, M, H), T.bfloat16),
@@ -523,267 +939,41 @@ def project_and_finalize_streams(
         y: T.Tensor((M, H), T.bfloat16),
         yq: T.Tensor((Mq, H), T.float8_e4m3fn),
         ysf: T.Tensor((Mq, sf_width), T.uint8),
+        Aux: T.Tensor((M, H), T.bfloat16),
     ):
         with T.Kernel(splits, T.ceildiv(M, block_M), threads=threads) as (sp, by):
-            T.import_source(_FUSE_HEADER)
-            pdl.chain()
-            h0 = sp * block_H
-            A_shared = T.alloc_shared((block_M, block_H), T.float32)
-            F_shared = T.alloc_shared((N, block_H), T.float32)
-            F_mid = T.alloc_shared((N, block_H), T.float32)
-            F_low = T.alloc_shared((N, block_H), T.float32)
-            last = T.alloc_shared((1,), T.int32)
-            C_local = T.alloc_fragment((block_M, N), T.float32)
-            xv = T.alloc_local((COLS,), T.bfloat16)
-            rv = T.alloc_local((MULT * COLS,), T.bfloat16)
-            nv = T.alloc_local((COLS,), T.bfloat16)
-            av = T.alloc_local((COLS,), T.float32)
-            sq = T.alloc_local((COLS,), T.float32)
-            col = T.alloc_local((COLS,), T.float32)
-            coef = T.alloc_local((2 * MULT + MULT * MULT,), T.float32)
-            red = T.alloc_local((1,), T.float32)
-            wv = T.alloc_local((VEC,), T.bfloat16)
-            yv = T.alloc_local((VEC,), T.bfloat16)
-            xf = T.alloc_local((VEC,), T.float32)
-            xq = T.alloc_local((VEC,), T.float8_e4m3fn)
-            total = T.alloc_local((1,), T.float32)
-            amax = T.alloc_local((1,), T.float32)
-            rms_l = T.alloc_local((1,), T.float32)
-            p_pre = T.alloc_local((1,), T.float32)
-            p_post = T.alloc_local((1,), T.float32)
-            p_cm = T.alloc_local((1,), T.float32)
-            cm_l = T.alloc_local((1,), T.float32)
-            rmax_l = T.alloc_local((1,), T.float32)
-            rsum_l = T.alloc_local((1,), T.float32)
-            csum_l = T.alloc_local((1,), T.float32)
-            tx = T.get_thread_binding()
-            row = tx // LANES
-            c0 = (tx % LANES) * COLS
-            token = by * block_M + row
-            src = T.min(token, M - 1)
-            T.clear(C_local)
-            for i, j in T.Parallel(N - MIXES, block_H):
-                F_shared[MIXES + i, j] = 0.0
-                F_mid[MIXES + i, j] = 0.0
-                F_low[MIXES + i, j] = 0.0
-            for k in T.unroll(MULT):
-                coef[k] = pre_in[src, k]
-            if mode == "post_pre":
-                for k in T.unroll(MULT):
-                    coef[MULT + k] = post_in[src, k]
-                for k in T.unroll(MULT * MULT):
-                    coef[2 * MULT + k] = comb_in[src, k // MULT, k % MULT]
-            if mode != "pre" and world == 1:
-                for v in T.vectorized(COLS):
-                    xv[v] = X[0, src, h0 + c0 + v]
-            if world > 1:
-                for r in T.unroll(world):
-                    for v in T.vectorized(COLS):
-                        xv[v] = X[r, src, h0 + c0 + v]
-                    for v in T.unroll(COLS):
-                        if r == 0:
-                            av[v] = T.Cast(T.float32, xv[v])
-                        else:
-                            av[v] = av[v] + T.Cast(T.float32, xv[v])
-                for v in T.unroll(COLS):
-                    xv[v] = T.Cast(T.bfloat16, av[v])
-            if mode != "broadcast":
-                for m in T.unroll(MULT):
-                    for v in T.vectorized(COLS):
-                        rv[m * COLS + v] = R[src, m * H + h0 + c0 + v]
-            for v in T.unroll(COLS):
-                sq[v] = 0.0
-                col[v] = 0.0
-
-            if mode == "broadcast":
-                for v in T.unroll(COLS):
-                    av[v] = T.Cast(T.float32, xv[v])
-                    A_shared[row, c0 + v] = av[v]
-                    sq[v] = av[v] * av[v]
-                for n in T.unroll(MULT):
-                    if token < M:
-                        for v in T.vectorized(COLS):
-                            R_out[token, n * H + h0 + c0 + v] = xv[v]
-                    for v in T.unroll(COLS):
-                        col[v] += coef[n] * av[v]
-                load_split_tf32(Fn, h0, F_shared, F_mid, F_low)
-                T.sync_threads()
-                T.gemm(A_shared, F_shared, C_local, transpose_B=True)
-                T.gemm(A_shared, F_mid, C_local, transpose_B=True)
-                T.gemm(A_shared, F_low, C_local, transpose_B=True)
-            else:
-                for n in T.unroll(MULT):
-                    if mode == "post_pre":
-                        for v in T.unroll(COLS):
-                            av[v] = coef[2 * MULT + n] * T.Cast(T.float32, rv[v])
-                            av[v] = T.fma(
-                                coef[MULT + n], T.Cast(T.float32, xv[v]), av[v]
-                            )
-                            for m in T.unroll(1, MULT):
-                                av[v] = T.fma(
-                                    coef[2 * MULT + m * MULT + n],
-                                    T.Cast(T.float32, rv[m * COLS + v]),
-                                    av[v],
-                                )
-                            nv[v] = T.Cast(T.bfloat16, av[v])
-                        if token < M:
-                            for v in T.vectorized(COLS):
-                                R_out[token, n * H + h0 + c0 + v] = nv[v]
-                    else:
-                        for v in T.unroll(COLS):
-                            nv[v] = rv[n * COLS + v]
-                    for v in T.unroll(COLS):
-                        av[v] = T.Cast(T.float32, nv[v])
-                        A_shared[row, c0 + v] = av[v]
-                        sq[v] += av[v] * av[v]
-                        col[v] += coef[n] * av[v]
-                    load_split_tf32(Fn, n * H + h0, F_shared, F_mid, F_low)
-                    T.sync_threads()
-                    T.gemm(A_shared, F_shared, C_local, transpose_B=True)
-                    T.gemm(A_shared, F_mid, C_local, transpose_B=True)
-                    T.gemm(A_shared, F_low, C_local, transpose_B=True)
-                    T.sync_threads()
-
-            for v in T.unroll(COLS):
-                nv[v] = T.Cast(T.bfloat16, col[v])
-            if token < M:
-                for v in T.vectorized(COLS):
-                    C[token, h0 + c0 + v] = nv[v]
-            red[0] = 0.0
-            for v in T.unroll(COLS):
-                red[0] += T.Cast(T.float32, nv[v]) * T.Cast(T.float32, nv[v])
-            red[0] += T.shfl_xor(red[0], 4)
-            red[0] += T.shfl_xor(red[0], 2)
-            red[0] += T.shfl_xor(red[0], 1)
-            if tx % LANES == 0 and token < M:
-                Q[sp, token] = red[0]
-            red[0] = 0.0
-            for v in T.unroll(COLS):
-                red[0] += sq[v]
-            red[0] += T.shfl_xor(red[0], 4)
-            red[0] += T.shfl_xor(red[0], 2)
-            red[0] += T.shfl_xor(red[0], 1)
-            if tx % LANES == 0 and token < M:
-                S[sp, token, 0] = red[0]
-            for i, j in T.Parallel(block_M, MIXES):
-                if by * block_M + i < M:
-                    P[sp, by * block_M + i, 0, j] = C_local[i, j]
-
-            T.call_extern("handle", "mhc_fence")
-            T.sync_threads()
-            if tx == 0:
-                arrived = T.atomic_add(
-                    counters[by],
-                    1,
-                    memory_order="acq_rel",
-                    return_prev=True,
-                )
-                last[0] = T.if_then_else(arrived == splits - 1, 1, 0)
-            T.sync_threads()
-            if last[0] == 1:
-                T.call_extern("handle", "mhc_fence")
-                if tx == 0:
-                    counters[by] = 0
-                if tx < 32:
-                    # Two tokens per pass across warp 0's two 16-lane half-warps.
-                    half = tx // 16
-                    lane16 = tx % 16
-                    r_idx = lane16 // MULT
-                    c_idx = lane16 % MULT
-                    for pair in T.serial(block_M // 2):
-                        tok = by * block_M + pair * 2 + half
-                        if tok < M:
-                            rms_l[0] = 0.0
-                            p_pre[0] = 0.0
-                            p_post[0] = 0.0
-                            p_cm[0] = 0.0
-                            for i_split in T.serial(splits):
-                                rms_l[0] += S[i_split, tok, 0]
-                                if lane16 < MULT:
-                                    p_pre[0] += P[i_split, tok, 0, lane16]
-                                    p_post[0] += P[i_split, tok, 0, lane16 + MULT]
-                                p_cm[0] += P[i_split, tok, 0, lane16 + 2 * MULT]
-                            rms_l[0] = T.rsqrt(rms_l[0] / rms_group_size + rms_eps)
-                            if lane16 < MULT:
-                                pre_out[tok, lane16] = (
-                                    T.sigmoid(
-                                        p_pre[0] * rms_l[0] * scale[0] + base[lane16]
-                                    )
-                                    + hc_eps
-                                )
-                                post_out[tok, lane16] = (
-                                    T.sigmoid(
-                                        p_post[0] * rms_l[0] * scale[1]
-                                        + base[lane16 + MULT]
-                                    )
-                                    * post_mult
-                                )
-                            cm_l[0] = (
-                                p_cm[0] * rms_l[0] * scale[2]
-                                + base[lane16 + 2 * MULT]
-                            )
-                            rmax_l[0] = cm_l[0]
-                            rmax_l[0] = T.max(rmax_l[0], T.shfl_xor(rmax_l[0], 2))
-                            rmax_l[0] = T.max(rmax_l[0], T.shfl_xor(rmax_l[0], 1))
-                            cm_l[0] = T.exp(cm_l[0] - rmax_l[0])
-                            rsum_l[0] = cm_l[0]
-                            rsum_l[0] += T.shfl_xor(rsum_l[0], 2)
-                            rsum_l[0] += T.shfl_xor(rsum_l[0], 1)
-                            cm_l[0] = cm_l[0] / rsum_l[0] + hc_eps
-                            csum_l[0] = cm_l[0]
-                            csum_l[0] += T.shfl_xor(csum_l[0], 8)
-                            csum_l[0] += T.shfl_xor(csum_l[0], 4)
-                            cm_l[0] = cm_l[0] / (csum_l[0] + hc_eps)
-                            for _ in T.serial(sinkhorn_repeat - 1):
-                                rsum_l[0] = cm_l[0]
-                                rsum_l[0] += T.shfl_xor(rsum_l[0], 2)
-                                rsum_l[0] += T.shfl_xor(rsum_l[0], 1)
-                                cm_l[0] = cm_l[0] / (rsum_l[0] + hc_eps)
-                                csum_l[0] = cm_l[0]
-                                csum_l[0] += T.shfl_xor(csum_l[0], 8)
-                                csum_l[0] += T.shfl_xor(csum_l[0], 4)
-                                cm_l[0] = cm_l[0] / (csum_l[0] + hc_eps)
-                            comb_out[tok, r_idx, c_idx] = cm_l[0]
-                else:
-                    worker = tx - 32
-                    for ti in T.serial(block_M):
-                        tok = by * block_M + ti
-                        if tok < M:
-                            total[0] = 0.0
-                            for i_split in T.serial(splits):
-                                total[0] += Q[i_split, tok]
-                            total[0] = T.rsqrt(total[0] / H + norm_eps)
-                            for step in T.serial(T.ceildiv(chunks, workers)):
-                                chunk = step * workers + worker
-                                if chunk < chunks:
-                                    for v in T.vectorized(VEC):
-                                        yv[v] = C[tok, chunk * VEC + v]
-                                    for v in T.vectorized(VEC):
-                                        wv[v] = weight[chunk * VEC + v]
-                                    for v in T.unroll(VEC):
-                                        xv[v] = T.Cast(
-                                            T.bfloat16,
-                                            T.Cast(T.float32, yv[v])
-                                            * total[0]
-                                            * T.Cast(T.float32, wv[v]),
-                                        )
-                                    for v in T.vectorized(VEC):
-                                        y[tok, chunk * VEC + v] = xv[v]
-                                    amax[0] = T.float32(0)
-                                    for v in T.unroll(VEC):
-                                        xf[v] = T.Cast(T.float32, xv[v])
-                                        amax[0] = T.max(amax[0], T.abs(xf[v]))
-                                    amax[0] = T.max(amax[0], T.shfl_xor(amax[0], 1))
-                                    amax[0] = T.max(amax[0], T.shfl_xor(amax[0], 2))
-                                    cast_block_mxfp8(
-                                        xf, xq, VEC, amax[0], yq, ysf, tok, chunk * VEC
-                                    )
+            _project_finalize_body(
+                X,
+                R,
+                post_in,
+                comb_in,
+                pre_in,
+                Fn,
+                R_out,
+                P,
+                S,
+                C,
+                Q,
+                counters,
+                scale,
+                base,
+                weight,
+                post_out,
+                comb_out,
+                pre_out,
+                y,
+                yq,
+                ysf,
+                Aux,
+                sp,
+                by,
+            )
 
     return mhc_project_finalize
 
 
 @tilelang.jit(pass_configs=_PASS_CONFIGS)
-def post_streams(hidden_size: int, threads: int = 128):
+def post_streams(hidden_size: int, threads: int = 128, world: int = 1):
     """A sublayer's output ``x`` folded into the streams, TileKernels' ``mhc_post_fwd``
     to the bit: ``out[n] = bf16(post[n] * x + sum_m comb[m, n] * residual[m])``.
 
@@ -805,12 +995,60 @@ def post_streams(hidden_size: int, threads: int = 128):
     token's result does not depend on the batch.
     """
     assert hidden_size % (threads * VEC) == 0
+    assert world >= 1
     blocks = hidden_size // (threads * VEC)
     M = T.dynamic("M")
 
+    if world == 1:
+
+        @T.prim_func
+        def mhc_post(
+            x: T.Tensor((M, hidden_size), T.bfloat16),
+            residual: T.Tensor((M, MULT, hidden_size), T.bfloat16),
+            post: T.Tensor((M, MULT), T.float32),
+            comb: T.Tensor((M, MULT, MULT), T.float32),
+            out: T.Tensor((M, MULT, hidden_size), T.bfloat16),
+        ):
+            with T.Kernel(M * blocks, threads=threads) as pid:
+                token = pid // blocks
+                col = (pid % blocks * threads + T.get_thread_binding()) * VEC
+                xv = T.alloc_local((VEC,), T.bfloat16)
+                rv = T.alloc_local((MULT * VEC,), T.bfloat16)
+                ov = T.alloc_local((MULT * VEC,), T.bfloat16)
+                pm = T.alloc_local((MULT,), T.float32)
+                cm = T.alloc_local((MULT * MULT,), T.float32)
+                acc = T.alloc_var(T.float32)
+                for n in T.vectorized(MULT):
+                    pm[n] = post[token, n]
+                for m in T.unroll(MULT):
+                    for n in T.vectorized(MULT):
+                        cm[m * MULT + n] = comb[token, m, n]
+                for m in T.unroll(MULT):
+                    for v in T.vectorized(VEC):
+                        rv[m * VEC + v] = residual[token, m, col + v]
+                pdl.chain()
+                for v in T.vectorized(VEC):
+                    xv[v] = x[token, col + v]
+                for n in T.unroll(MULT):
+                    for v in T.unroll(VEC):
+                        acc = cm[n] * T.Cast(T.float32, rv[v])
+                        acc = T.fma(pm[n], T.Cast(T.float32, xv[v]), acc)
+                        for m in T.unroll(1, MULT):
+                            acc = T.fma(
+                                cm[m * MULT + n],
+                                T.Cast(T.float32, rv[m * VEC + v]),
+                                acc,
+                            )
+                        ov[n * VEC + v] = T.Cast(T.bfloat16, acc)
+                for n in T.unroll(MULT):
+                    for v in T.vectorized(VEC):
+                        out[token, n, col + v] = ov[n * VEC + v]
+
+        return mhc_post
+
     @T.prim_func
     def mhc_post(
-        x: T.Tensor((M, hidden_size), T.bfloat16),
+        X: T.Tensor((world, M, hidden_size), T.bfloat16),
         residual: T.Tensor((M, MULT, hidden_size), T.bfloat16),
         post: T.Tensor((M, MULT), T.float32),
         comb: T.Tensor((M, MULT, MULT), T.float32),
@@ -820,6 +1058,8 @@ def post_streams(hidden_size: int, threads: int = 128):
             token = pid // blocks
             col = (pid % blocks * threads + T.get_thread_binding()) * VEC
             xv = T.alloc_local((VEC,), T.bfloat16)
+            xp = T.alloc_local((world * VEC,), T.bfloat16)
+            av = T.alloc_local((VEC,), T.float32)
             rv = T.alloc_local((MULT * VEC,), T.bfloat16)
             ov = T.alloc_local((MULT * VEC,), T.bfloat16)
             pm = T.alloc_local((MULT,), T.float32)
@@ -834,8 +1074,17 @@ def post_streams(hidden_size: int, threads: int = 128):
                 for v in T.vectorized(VEC):
                     rv[m * VEC + v] = residual[token, m, col + v]
             pdl.chain()
-            for v in T.vectorized(VEC):
-                xv[v] = x[token, col + v]
+            for r in T.unroll(world):
+                for v in T.vectorized(VEC):
+                    xp[r * VEC + v] = X[r, token, col + v]
+            for r in T.unroll(world):
+                for v in T.unroll(VEC):
+                    if r == 0:
+                        av[v] = T.Cast(T.float32, xp[v])
+                    else:
+                        av[v] = av[v] + T.Cast(T.float32, xp[r * VEC + v])
+            for v in T.unroll(VEC):
+                xv[v] = T.Cast(T.bfloat16, av[v])
             for n in T.unroll(MULT):
                 for v in T.unroll(VEC):
                     acc = cm[n] * T.Cast(T.float32, rv[v])
@@ -853,19 +1102,76 @@ def post_streams(hidden_size: int, threads: int = 128):
 
 
 @tilelang.jit(pass_configs=_PASS_CONFIGS)
-def post_collapse_streams(hidden_size: int, threads: int = 128):
+def post_collapse_streams(hidden_size: int, threads: int = 128, world: int = 1):
     """The standalone ``post`` followed by the stream ``collapse`` in one launch:
     each stream is updated and rounded to BF16 with ``post_streams``' exact FMA
     sequence, then collapsed with ``mix`` and rounded to BF16 with
     ``collapse_streams``' exact FMA sequence, without allocating, writing or reading
     the ``[M, MULT, hidden_size]`` intermediate stream tensor."""
     assert hidden_size % (threads * VEC) == 0
+    assert world >= 1
     blocks = hidden_size // (threads * VEC)
     M = T.dynamic("M")
 
+    if world == 1:
+
+        @T.prim_func
+        def mhc_post_collapse(
+            x: T.Tensor((M, hidden_size), T.bfloat16),
+            residual: T.Tensor((M, MULT, hidden_size), T.bfloat16),
+            post: T.Tensor((M, MULT), T.float32),
+            comb: T.Tensor((M, MULT, MULT), T.float32),
+            mix: T.Tensor((M, MULT), T.float32),
+            out: T.Tensor((M, hidden_size), T.bfloat16),
+        ):
+            with T.Kernel(M * blocks, threads=threads) as pid:
+                pdl.chain()
+                token = pid // blocks
+                col = (pid % blocks * threads + T.get_thread_binding()) * VEC
+                xv = T.alloc_local((VEC,), T.bfloat16)
+                rv = T.alloc_local((MULT * VEC,), T.bfloat16)
+                sv = T.alloc_local((MULT * VEC,), T.bfloat16)
+                ov = T.alloc_local((VEC,), T.bfloat16)
+                pm = T.alloc_local((MULT,), T.float32)
+                cm = T.alloc_local((MULT * MULT,), T.float32)
+                mv = T.alloc_local((MULT,), T.float32)
+                acc = T.alloc_var(T.float32)
+                for n in T.vectorized(MULT):
+                    pm[n] = post[token, n]
+                for m in T.unroll(MULT):
+                    for n in T.vectorized(MULT):
+                        cm[m * MULT + n] = comb[token, m, n]
+                for m in T.vectorized(MULT):
+                    mv[m] = mix[token, m]
+                for v in T.vectorized(VEC):
+                    xv[v] = x[token, col + v]
+                for m in T.unroll(MULT):
+                    for v in T.vectorized(VEC):
+                        rv[m * VEC + v] = residual[token, m, col + v]
+                for n in T.unroll(MULT):
+                    for v in T.unroll(VEC):
+                        acc = cm[n] * T.Cast(T.float32, rv[v])
+                        acc = T.fma(pm[n], T.Cast(T.float32, xv[v]), acc)
+                        for m in T.unroll(1, MULT):
+                            acc = T.fma(
+                                cm[m * MULT + n],
+                                T.Cast(T.float32, rv[m * VEC + v]),
+                                acc,
+                            )
+                        sv[n * VEC + v] = T.Cast(T.bfloat16, acc)
+                for v in T.unroll(VEC):
+                    acc = T.float32(0)
+                    for m in T.unroll(MULT):
+                        acc = T.fma(mv[m], T.Cast(T.float32, sv[m * VEC + v]), acc)
+                    ov[v] = T.Cast(T.bfloat16, acc)
+                for v in T.vectorized(VEC):
+                    out[token, col + v] = ov[v]
+
+        return mhc_post_collapse
+
     @T.prim_func
     def mhc_post_collapse(
-        x: T.Tensor((M, hidden_size), T.bfloat16),
+        X: T.Tensor((world, M, hidden_size), T.bfloat16),
         residual: T.Tensor((M, MULT, hidden_size), T.bfloat16),
         post: T.Tensor((M, MULT), T.float32),
         comb: T.Tensor((M, MULT, MULT), T.float32),
@@ -877,6 +1183,8 @@ def post_collapse_streams(hidden_size: int, threads: int = 128):
             token = pid // blocks
             col = (pid % blocks * threads + T.get_thread_binding()) * VEC
             xv = T.alloc_local((VEC,), T.bfloat16)
+            xp = T.alloc_local((world * VEC,), T.bfloat16)
+            av = T.alloc_local((VEC,), T.float32)
             rv = T.alloc_local((MULT * VEC,), T.bfloat16)
             sv = T.alloc_local((MULT * VEC,), T.bfloat16)
             ov = T.alloc_local((VEC,), T.bfloat16)
@@ -891,11 +1199,20 @@ def post_collapse_streams(hidden_size: int, threads: int = 128):
                     cm[m * MULT + n] = comb[token, m, n]
             for m in T.vectorized(MULT):
                 mv[m] = mix[token, m]
-            for v in T.vectorized(VEC):
-                xv[v] = x[token, col + v]
             for m in T.unroll(MULT):
                 for v in T.vectorized(VEC):
                     rv[m * VEC + v] = residual[token, m, col + v]
+            for r in T.unroll(world):
+                for v in T.vectorized(VEC):
+                    xp[r * VEC + v] = X[r, token, col + v]
+            for r in T.unroll(world):
+                for v in T.unroll(VEC):
+                    if r == 0:
+                        av[v] = T.Cast(T.float32, xp[v])
+                    else:
+                        av[v] = av[v] + T.Cast(T.float32, xp[r * VEC + v])
+            for v in T.unroll(VEC):
+                xv[v] = T.Cast(T.bfloat16, av[v])
             for n in T.unroll(MULT):
                 for v in T.unroll(VEC):
                     acc = cm[n] * T.Cast(T.float32, rv[v])
@@ -914,6 +1231,174 @@ def post_collapse_streams(hidden_size: int, threads: int = 128):
                 out[token, col + v] = ov[v]
 
     return mhc_post_collapse
+
+
+@tilelang.jit(pass_configs=_PASS_CONFIGS)
+def post_collapse_norm_streams(
+    hidden_size: int,
+    eps: float,
+    threads: int = 128,
+    world: int = 1,
+    column: int = -1,
+):
+    """The final decoder layer's ``post``, stream ``collapse`` (with optional sink
+    detector ``column`` extraction), and output ``RMSNorm`` in one 1-CTA-per-token
+    launch, matching ``norm(post_collapse(...))`` and ``collapse(..., column=column)``
+    to the bit without materializing the ``[M, MULT, hidden_size]`` stream buffer or
+    the pre-norm ``[M, hidden_size]`` collapse tensor."""
+    assert hidden_size % (threads * VEC) == 0
+    assert threads == 128 and world >= 1 and column < hidden_size
+    steps = hidden_size // (threads * VEC)
+    warps = threads // 32
+    column_vi = (column // VEC) // threads if column >= 0 else -1
+    column_thread = (column // VEC) % threads if column >= 0 else -1
+    column_element = column % VEC if column >= 0 else 0
+    M = T.dynamic("M")
+
+    @T.macro
+    def _post_collapse_norm_row(
+        X, residual, post, comb, mix, weight, out, columns, token
+    ):
+        pdl.chain()
+        tx = T.get_thread_binding()
+        xv = T.alloc_local((VEC,), T.bfloat16)
+        xp = T.alloc_local((world * VEC,), T.bfloat16)
+        av = T.alloc_local((VEC,), T.float32)
+        rv = T.alloc_local((MULT * VEC,), T.bfloat16)
+        sv = T.alloc_local((MULT * VEC,), T.bfloat16)
+        cv = T.alloc_local((steps * VEC,), T.bfloat16)
+        wv = T.alloc_local((steps * VEC,), T.bfloat16)
+        ov = T.alloc_local((VEC,), T.bfloat16)
+        pm = T.alloc_local((MULT,), T.float32)
+        cm = T.alloc_local((MULT * MULT,), T.float32)
+        mv = T.alloc_local((MULT,), T.float32)
+        sum_local = T.alloc_local((2,), T.float32)
+        sum_val = T.alloc_local((1,), T.float32)
+        rstd = T.alloc_local((1,), T.float32)
+        sum_shared = T.alloc_shared((warps,), T.float32)
+        acc = T.alloc_var(T.float32)
+
+        for n in T.vectorized(MULT):
+            pm[n] = post[token, n]
+        for m in T.unroll(MULT):
+            for n in T.vectorized(MULT):
+                cm[m * MULT + n] = comb[token, m, n]
+        for m in T.vectorized(MULT):
+            mv[m] = mix[token, m]
+        for vi in T.unroll(steps):
+            col = (vi * threads + tx) * VEC
+            for v in T.vectorized(VEC):
+                wv[vi * VEC + v] = weight[col + v]
+
+        sum_local[0] = T.float32(0)
+        sum_local[1] = T.float32(0)
+        for vi in T.unroll(steps):
+            col = (vi * threads + tx) * VEC
+            for m in T.unroll(MULT):
+                for v in T.vectorized(VEC):
+                    rv[m * VEC + v] = residual[token, m, col + v]
+            if world == 1:
+                for v in T.vectorized(VEC):
+                    xv[v] = X[0, token, col + v]
+            else:
+                for r in T.unroll(world):
+                    for v in T.vectorized(VEC):
+                        xp[r * VEC + v] = X[r, token, col + v]
+                for r in T.unroll(world):
+                    for v in T.unroll(VEC):
+                        if r == 0:
+                            av[v] = T.Cast(T.float32, xp[v])
+                        else:
+                            av[v] = av[v] + T.Cast(T.float32, xp[r * VEC + v])
+                for v in T.unroll(VEC):
+                    xv[v] = T.Cast(T.bfloat16, av[v])
+            for n in T.unroll(MULT):
+                for v in T.unroll(VEC):
+                    acc = cm[n] * T.Cast(T.float32, rv[v])
+                    acc = T.fma(pm[n], T.Cast(T.float32, xv[v]), acc)
+                    for m in T.unroll(1, MULT):
+                        acc = T.fma(
+                            cm[m * MULT + n], T.Cast(T.float32, rv[m * VEC + v]), acc
+                        )
+                    sv[n * VEC + v] = T.Cast(T.bfloat16, acc)
+            if column >= 0:
+                if (vi == column_vi) & (tx == column_thread):
+                    for m in T.unroll(MULT):
+                        columns[token, m] = T.Cast(
+                            T.float32, sv[m * VEC + column_element]
+                        )
+            for v in T.unroll(VEC):
+                acc = T.float32(0)
+                for m in T.unroll(MULT):
+                    acc = T.fma(mv[m], T.Cast(T.float32, sv[m * VEC + v]), acc)
+                cv[vi * VEC + v] = T.Cast(T.bfloat16, acc)
+            for v in T.unroll(VEC):
+                sum_local[v % 2] += T.Cast(
+                    T.float32, cv[vi * VEC + v]
+                ) * T.Cast(T.float32, cv[vi * VEC + v])
+
+        sum_val[0] = sum_local[0] + sum_local[1]
+        sum_val[0] += T.shfl_xor(sum_val[0], 16)
+        sum_val[0] += T.shfl_xor(sum_val[0], 8)
+        sum_val[0] += T.shfl_xor(sum_val[0], 4)
+        sum_val[0] += T.shfl_xor(sum_val[0], 2)
+        sum_val[0] += T.shfl_xor(sum_val[0], 1)
+        if tx % 32 == 0:
+            sum_shared[tx // 32] = sum_val[0]
+        T.sync_threads()
+        rstd[0] = T.rsqrt(
+            (((sum_shared[0] + sum_shared[1]) + sum_shared[2]) + sum_shared[3])
+            / hidden_size
+            + eps
+        )
+        for vi in T.unroll(steps):
+            col = (vi * threads + tx) * VEC
+            for v in T.unroll(VEC):
+                ov[v] = T.Cast(
+                    T.bfloat16,
+                    T.Cast(T.float32, cv[vi * VEC + v])
+                    * rstd[0]
+                    * T.Cast(T.float32, wv[vi * VEC + v]),
+                )
+            for v in T.vectorized(VEC):
+                out[token, col + v] = ov[v]
+
+    if column < 0:
+
+        @T.prim_func
+        def mhc_post_collapse_norm(
+            X: T.Tensor((world, M, hidden_size), T.bfloat16),
+            residual: T.Tensor((M, MULT, hidden_size), T.bfloat16),
+            post: T.Tensor((M, MULT), T.float32),
+            comb: T.Tensor((M, MULT, MULT), T.float32),
+            mix: T.Tensor((M, MULT), T.float32),
+            weight: T.Tensor((hidden_size,), T.bfloat16),
+            out: T.Tensor((M, hidden_size), T.bfloat16),
+        ):
+            with T.Kernel(M, threads=threads) as pid:
+                _post_collapse_norm_row(
+                    X, residual, post, comb, mix, weight, out, post, pid
+                )
+
+        return mhc_post_collapse_norm
+
+    @T.prim_func
+    def mhc_post_collapse_norm(
+        X: T.Tensor((world, M, hidden_size), T.bfloat16),
+        residual: T.Tensor((M, MULT, hidden_size), T.bfloat16),
+        post: T.Tensor((M, MULT), T.float32),
+        comb: T.Tensor((M, MULT, MULT), T.float32),
+        mix: T.Tensor((M, MULT), T.float32),
+        weight: T.Tensor((hidden_size,), T.bfloat16),
+        out: T.Tensor((M, hidden_size), T.bfloat16),
+        columns: T.Tensor((M, MULT), T.float32),
+    ):
+        with T.Kernel(M, threads=threads) as pid:
+            _post_collapse_norm_row(
+                X, residual, post, comb, mix, weight, out, columns, pid
+            )
+
+    return mhc_post_collapse_norm
 
 
 # Shared memory each collapse block holds without using it, which caps residency at
@@ -1033,9 +1518,15 @@ def collapse_streams(hidden_size: int, threads: int = 128, column: int = -1):
     return mhc_collapse_column
 
 
-def _project_call(hidden: int, mode: str, world: int) -> prepare.TileLangCall:
+def _project_call(
+    hidden: int, mode: str, world: int, with_aux: bool = False
+) -> prepare.TileLangCall:
     """The ``project_streams`` call of a sublayer entry."""
-    return prepare.call(project_streams, hidden, mode, block_M=BLOCK_M, world=world)
+    if not with_aux:
+        return prepare.call(project_streams, hidden, mode, block_M=BLOCK_M, world=world)
+    return prepare.call(
+        project_streams, hidden, mode, block_M=BLOCK_M, world=world, with_aux=True
+    )
 
 
 def _finalize_call(
@@ -1053,8 +1544,22 @@ def _project_finalize_call(
     rms_eps: float,
     hc_eps: float,
     iterations: int,
+    with_aux: bool = False,
 ) -> prepare.TileLangCall:
     """The single-launch ``project_and_finalize_streams`` call of a sublayer entry."""
+    if not with_aux:
+        return prepare.call(
+            project_and_finalize_streams,
+            hidden,
+            mode,
+            k,
+            rms_eps,
+            hc_eps,
+            iterations,
+            rms_eps,
+            block_M=BLOCK_M,
+            world=world,
+        )
     return prepare.call(
         project_and_finalize_streams,
         hidden,
@@ -1066,17 +1571,34 @@ def _project_finalize_call(
         rms_eps,
         block_M=BLOCK_M,
         world=world,
+        with_aux=True,
     )
 
 
-def _post_call(hidden: int) -> prepare.TileLangCall:
+def _post_call(hidden: int, world: int = 1) -> prepare.TileLangCall:
     """The standalone ``post``'s call."""
-    return prepare.call(post_streams, hidden)
+    if world == 1:
+        return prepare.call(post_streams, hidden)
+    return prepare.call(post_streams, hidden, world=world)
 
 
-def _post_collapse_call(hidden: int) -> prepare.TileLangCall:
+def _post_collapse_call(hidden: int, world: int = 1) -> prepare.TileLangCall:
     """The fused ``post_collapse``'s call."""
-    return prepare.call(post_collapse_streams, hidden)
+    if world == 1:
+        return prepare.call(post_collapse_streams, hidden)
+    return prepare.call(post_collapse_streams, hidden, world=world)
+
+
+def _post_collapse_norm_call(
+    hidden: int, eps: float, world: int = 1, column: int = -1
+) -> prepare.TileLangCall:
+    """The fused ``post_collapse_norm``'s call."""
+    kwargs = {}
+    if world != 1:
+        kwargs["world"] = world
+    if column >= 0:
+        kwargs["column"] = column
+    return prepare.call(post_collapse_norm_streams, hidden, eps, **kwargs)
 
 
 def _collapse_call(hidden: int, column: int = -1) -> prepare.TileLangCall:
@@ -1093,8 +1615,8 @@ def _make(call: prepare.TileLangCall):
 
 
 @cache
-def _project(hidden: int, mode: str, world: int):
-    return _make(_project_call(hidden, mode, world))
+def _project(hidden: int, mode: str, world: int, with_aux: bool = False):
+    return _make(_project_call(hidden, mode, world, with_aux))
 
 
 @cache
@@ -1111,20 +1633,28 @@ def _project_finalize(
     rms_eps: float,
     hc_eps: float,
     iterations: int,
+    with_aux: bool = False,
 ):
     return _make(
-        _project_finalize_call(hidden, mode, world, k, rms_eps, hc_eps, iterations)
+        _project_finalize_call(
+            hidden, mode, world, k, rms_eps, hc_eps, iterations, with_aux
+        )
     )
 
 
 @cache
-def _post(hidden: int):
-    return _make(_post_call(hidden))
+def _post(hidden: int, world: int = 1):
+    return _make(_post_call(hidden, world))
 
 
 @cache
-def _post_collapse(hidden: int):
-    return _make(_post_collapse_call(hidden))
+def _post_collapse(hidden: int, world: int = 1):
+    return _make(_post_collapse_call(hidden, world))
+
+
+@cache
+def _post_collapse_norm(hidden: int, eps: float, world: int = 1, column: int = -1):
+    return _make(_post_collapse_norm_call(hidden, eps, world, column))
 
 
 @cache
@@ -1168,12 +1698,14 @@ def _mhc_pre(
     previous_output: torch.Tensor | None = None,
     previous_post: torch.Tensor | None = None,
     previous_comb: torch.Tensor | None = None,
+    aux_out: torch.Tensor | None = None,
 ) -> None:
     tokens, hidden = int(residual.shape[0]), int(residual.shape[-1])
     if tokens == 0:
         return
     streams = MULT * hidden
     world = 1
+    with_aux = aux_out is not None
     # Unused operands of a mode take a buffer of the right shape; none is read.
     if previous_output is not None:
         # (T, H), or the ranks' unreduced partials of it, (world, T, H).
@@ -1199,10 +1731,13 @@ def _mhc_pre(
     )
     retain_cuda_graph_capture_resource(scratch)
     P, S, C, Q = scratch
+    aux_args = (aux_out.view(tokens, hidden),) if with_aux else ()
     if tokens <= FINALIZE_FUSE_MAX_ROWS:
         tiles = tilelang.cdiv(tokens, BLOCK_M)
         counters = _counters(tiles, residual.device)
-        _project_finalize(hidden, mode, world, k, rms_eps, hc_eps, iterations)(
+        _project_finalize(
+            hidden, mode, world, k, rms_eps, hc_eps, iterations, with_aux
+        )(
             x if x.ndim == 3 else x.unsqueeze(0),
             source,
             mix_post,
@@ -1224,9 +1759,10 @@ def _mhc_pre(
             y,
             y_q,
             y_sf,
+            *aux_args,
         )
         return
-    _project(hidden, mode, world)(
+    _project(hidden, mode, world, with_aux)(
         x if x.ndim == 3 else x.unsqueeze(0),
         source,
         mix_post,
@@ -1238,6 +1774,7 @@ def _mhc_pre(
         S,
         C,
         Q,
+        *aux_args,
     )
     _finalize(hidden, k, rms_eps, hc_eps, iterations)(
         P, S, C, Q, scale, base, norm, post, comb, pre_out, y, y_q, y_sf
@@ -1254,8 +1791,9 @@ def _mhc_post(
     tokens, hidden = int(residual.shape[0]), int(residual.shape[-1])
     if tokens == 0:
         return
-    _post(hidden)(
-        x.view(tokens, hidden),
+    world = int(x.shape[0]) if x.ndim == 3 else 1
+    _post(hidden, world)(
+        x.view(world, tokens, hidden) if world > 1 else x.view(tokens, hidden),
         residual.view(tokens, MULT, hidden),
         post.view(tokens, MULT),
         comb.view(tokens, MULT, MULT),
@@ -1274,13 +1812,45 @@ def _mhc_post_collapse(
     tokens, hidden = int(residual.shape[0]), int(residual.shape[-1])
     if tokens == 0:
         return
-    _post_collapse(hidden)(
-        x.view(tokens, hidden),
+    world = int(x.shape[0]) if x.ndim == 3 else 1
+    _post_collapse(hidden, world)(
+        x.view(world, tokens, hidden) if world > 1 else x.view(tokens, hidden),
         residual.view(tokens, MULT, hidden),
         post.view(tokens, MULT),
         comb.view(tokens, MULT, MULT),
         mix.view(tokens, MULT),
         out.view(tokens, hidden),
+    )
+
+
+def _mhc_post_collapse_norm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    mix: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    out: torch.Tensor,
+    columns: torch.Tensor | None = None,
+    column: int = -1,
+) -> None:
+    tokens, hidden = int(residual.shape[0]), int(residual.shape[-1])
+    if tokens == 0:
+        return
+    world = int(x.shape[0]) if x.ndim == 3 else 1
+    x_in = x.view(world, tokens, hidden) if world > 1 else x.view(1, tokens, hidden)
+    col_arg = column if columns is not None else -1
+    extra = (columns.view(tokens, MULT),) if columns is not None else ()
+    _post_collapse_norm(hidden, eps, world, col_arg)(
+        x_in,
+        residual.view(tokens, MULT, hidden),
+        post.view(tokens, MULT),
+        comb.view(tokens, MULT, MULT),
+        mix.view(tokens, MULT),
+        weight.view(hidden),
+        out.view(tokens, hidden),
+        *extra,
     )
 
 
@@ -1344,6 +1914,8 @@ def _constant_mixes(
 class TileKernelsMHC(nn.Module):
     """V4.1 lagged mHC for a decoder layer: pre, post_pre, post and collapse."""
 
+    supports_fused_aux = True
+
     def __init__(self, config):
         super().__init__()
         if config.hc_mult != MULT:
@@ -1352,6 +1924,16 @@ class TileKernelsMHC(nn.Module):
         self.rms_eps = config.rms_norm_eps
         self.hc_eps = config.hc_eps
         self.iterations = config.hc_sinkhorn_iters
+
+    @staticmethod
+    def _post_worlds() -> tuple[int, ...]:
+        """The world sizes that ``post``, ``post_collapse`` and ``post_collapse_norm``
+        can launch."""
+        if sp_prefill.unreduced_enabled():
+            tp_world = get_tensor_model_parallel_world_size()
+            if tp_world > 1:
+                return (1, tp_world)
+        return (1,)
 
     def _entries(self) -> list[tuple[str, int]]:
         """The (mode, world) of every sublayer entry this layer can launch."""
@@ -1366,6 +1948,7 @@ class TileKernelsMHC(nn.Module):
         collapse, so that no forward (or CUDA graph capture) compiles."""
         hidden = self.hidden_size
         entries = self._entries()
+        post_worlds = self._post_worlds()
         # The broadcast entry projects one stream; the others all four.
         widths = (hidden, MULT * hidden)
         mix = (self.rms_eps, self.hc_eps, self.iterations)
@@ -1373,6 +1956,11 @@ class TileKernelsMHC(nn.Module):
         def calls() -> list[prepare.TileLangCall]:
             return [
                 *(_project_call(hidden, mode, world) for mode, world in entries),
+                *(
+                    _project_call(hidden, mode, world, with_aux=True)
+                    for mode, world in entries
+                    if mode == "post_pre"
+                ),
                 *(
                     _project_finalize_call(
                         hidden,
@@ -1383,10 +1971,26 @@ class TileKernelsMHC(nn.Module):
                     )
                     for mode, world in entries
                 ),
+                *(
+                    _project_finalize_call(
+                        hidden,
+                        mode,
+                        world,
+                        MULT * hidden,
+                        *mix,
+                        with_aux=True,
+                    )
+                    for mode, world in entries
+                    if mode == "post_pre"
+                ),
                 *(_finalize_call(hidden, k, *mix) for k in widths),
-                _post_call(hidden),
+                *(_post_call(hidden, w) for w in post_worlds),
                 _collapse_call(hidden),
-                _post_collapse_call(hidden),
+                *(_post_collapse_call(hidden, w) for w in post_worlds),
+                *(
+                    _post_collapse_norm_call(hidden, self.rms_eps, w)
+                    for w in post_worlds
+                ),
             ]
 
         def bind() -> None:
@@ -1400,11 +2004,16 @@ class TileKernelsMHC(nn.Module):
                     hidden if mode == "broadcast" else MULT * hidden,
                     *mix,
                 )
+                if mode == "post_pre":
+                    _project(hidden, mode, world, True)
+                    _project_finalize(hidden, mode, world, MULT * hidden, *mix, True)
             for k in widths:
                 _finalize(hidden, k, *mix)
-            _post(hidden)
+            for w in post_worlds:
+                _post(hidden, w)
+                _post_collapse(hidden, w)
+                _post_collapse_norm(hidden, self.rms_eps, w)
             _collapse(hidden)
-            _post_collapse(hidden)
             device = torch.device("cuda", torch.cuda.current_device())
             # The constant mixes and split counters, before any graph captures.
             _constant_mixes(
@@ -1427,6 +2036,7 @@ class TileKernelsMHC(nn.Module):
         previous_output=None,
         previous_post=None,
         previous_comb=None,
+        aux_out: torch.Tensor | None = None,
     ):
         """A sublayer entry: ``(streams, post-mix, combination, y, new pre-mix,
         y_mxfp8)``. ``y`` is the sublayer's normalized input and ``y_mxfp8`` its MXFP8
@@ -1470,10 +2080,24 @@ class TileKernelsMHC(nn.Module):
             previous_output,
             previous_post,
             previous_comb,
+            aux_out,
         )
         return residual if unchanged else residual_out, post, comb, y, pre_out, y_mxfp8
 
-    def post_pre(self, x, residual, post, comb, fn, scale, base, norm, pre):
+    def post_pre(
+        self,
+        x,
+        residual,
+        post,
+        comb,
+        fn,
+        scale,
+        base,
+        norm,
+        pre,
+        *,
+        aux_out: torch.Tensor | None = None,
+    ):
         return self.pre(
             residual,
             fn,
@@ -1484,11 +2108,12 @@ class TileKernelsMHC(nn.Module):
             previous_output=x,
             previous_post=post,
             previous_comb=comb,
+            aux_out=aux_out,
         )
 
     def post(self, x, residual, post, comb):
         if isinstance(x, RankOrderParts):
-            x = x.sum()
+            x = x.packed
         out = torch.empty_like(residual)
         _mhc_post(x, residual, post, comb, out)
         return out
@@ -1506,7 +2131,7 @@ class TileKernelsMHC(nn.Module):
         streams' mean when ``pre`` is None), into ``out`` when given, in one launch
         without materializing the ``[tokens, MULT, hidden]`` stream buffer."""
         if isinstance(x, RankOrderParts):
-            x = x.sum()
+            x = x.packed
         tokens, device = int(residual.shape[0]), residual.device
         if pre is None:
             pre = _constant_mixes(tokens, device)[1]
@@ -1517,6 +2142,48 @@ class TileKernelsMHC(nn.Module):
                 device=device,
             )
         _mhc_post_collapse(x, residual, post, comb, pre, out)
+        return out
+
+    def post_collapse_norm(
+        self,
+        x,
+        residual,
+        post,
+        comb,
+        pre: torch.Tensor | None,
+        weight: torch.Tensor,
+        eps: float | None = None,
+        *,
+        columns: torch.Tensor | None = None,
+        column: int = -1,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """The standalone ``post`` followed by ``collapse`` (with optional sink
+        detector ``column`` extraction) and ``RMSNorm`` with ``weight`` in one launch."""
+        if isinstance(x, RankOrderParts):
+            x = x.packed
+        tokens, device = int(residual.shape[0]), residual.device
+        if pre is None:
+            pre = _constant_mixes(tokens, device)[1]
+        if out is None:
+            out = torch.empty(
+                (tokens, self.hidden_size),
+                dtype=residual.dtype,
+                device=device,
+            )
+        norm_eps = self.rms_eps if eps is None else eps
+        _mhc_post_collapse_norm(
+            x,
+            residual,
+            post,
+            comb,
+            pre,
+            weight,
+            norm_eps,
+            out,
+            columns=columns,
+            column=column,
+        )
         return out
 
     @staticmethod
@@ -1550,10 +2217,19 @@ class TileKernelsMHC(nn.Module):
             _mhc_collapse_column(state, pre, out, columns, column)
         return out
 
-    @staticmethod
-    def collapse_column_calls(hidden: int, column: int) -> list:
-        """The declared call of ``collapse`` with ``columns`` for ``column``."""
-        return [_collapse_call(hidden, column)]
+    @classmethod
+    def collapse_column_calls(
+        cls, hidden: int, column: int, rms_eps: float | None = None
+    ) -> list:
+        """The declared calls of ``collapse`` and ``post_collapse_norm`` with
+        ``columns`` for ``column``."""
+        calls = [_collapse_call(hidden, column)]
+        if rms_eps is not None:
+            calls.extend(
+                _post_collapse_norm_call(hidden, rms_eps, w, column)
+                for w in cls._post_worlds()
+            )
+        return calls
 
 
 __all__ = [
@@ -1561,6 +2237,7 @@ __all__ = [
     "TileKernelsMHC",
     "collapse_streams",
     "finalize",
+    "post_collapse_norm_streams",
     "post_collapse_streams",
     "post_streams",
     "project_and_finalize_streams",
