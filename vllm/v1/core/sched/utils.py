@@ -25,7 +25,7 @@ def _has_repeating_pattern(
     return True
 
 
-def _has_windowed_repeating_pattern(
+def _find_windowed_repeating_pattern(
     token_ids: Sequence[int],
     min_pattern_size: int,
     max_pattern_size: int,
@@ -33,10 +33,11 @@ def _has_windowed_repeating_pattern(
     start_idx: int = 0,
     window_size: int = 160,
     min_density: float = 0.6,
-) -> bool:
-    """Check if the tail of token_ids ends with a phrase that repeats at least
-    ``min_count`` times within the last ``window_size`` tokens (allowing short
-    interspersed variations such as ``3xA + B + 2xA``) and covers at least
+) -> tuple[int, int] | None:
+    """Return ``(pattern_len, count)`` if the tail of ``token_ids`` ends with a
+    phrase that repeats at least ``min_count`` times within the last
+    ``window_size`` tokens (with at least one contiguous ``A + A`` pair so
+    parallel list enumerations do not false-positive) and covers at least
     ``min_density`` of the span from its first matched occurrence to the end.
     """
     seq = getattr(token_ids, "_x", token_ids)
@@ -44,7 +45,7 @@ def _has_windowed_repeating_pattern(
     avail = n - start_idx
     eff_min = max(min_pattern_size, 5)
     if avail < eff_min * min_count or eff_min > max_pattern_size:
-        return False
+        return None
 
     win_start = max(start_idx, n - window_size)
     last_tok = seq[n - 1]
@@ -77,6 +78,7 @@ def _has_windowed_repeating_pattern(
                 continue
             cand = seq[n - cand_len : n]
             count = 1
+            contiguous_pairs = 0
             pos = n - cand_len
             while pos - cand_len >= win_start:
                 nxt = pos - 1
@@ -85,55 +87,85 @@ def _has_windowed_repeating_pattern(
                 if nxt - cand_len + 1 < win_start:
                     break
                 if seq[nxt - cand_len + 1 : nxt + 1] == cand:
+                    if nxt == pos - 1:
+                        contiguous_pairs += 1
                     count += 1
                     pos = nxt - cand_len + 1
                     if (
                         count >= min_count
+                        and contiguous_pairs >= 1
                         and count * cand_len >= (n - pos) * min_density
                     ):
-                        return True
+                        return (cand_len, count)
                 else:
                     pos = nxt
 
         checked_patterns += 1
-        if checked_patterns >= 2:
+        if checked_patterns >= 4:
             break
 
-    return False
+    return None
 
 
-def has_thinking_loop(
+def _has_windowed_repeating_pattern(
+    token_ids: Sequence[int],
+    min_pattern_size: int,
+    max_pattern_size: int,
+    min_count: int,
+    start_idx: int = 0,
+    window_size: int = 160,
+    min_density: float = 0.6,
+) -> bool:
+    return (
+        _find_windowed_repeating_pattern(
+            token_ids,
+            min_pattern_size=min_pattern_size,
+            max_pattern_size=max_pattern_size,
+            min_count=min_count,
+            start_idx=start_idx,
+            window_size=window_size,
+            min_density=min_density,
+        )
+        is not None
+    )
+
+
+def detect_thinking_loop(
     token_ids: Sequence[int],
     start_idx: int = 0,
-) -> bool:
-    """Detect degenerate repetition loops inside a ``<think>`` block.
+) -> tuple[str, int, int] | None:
+    """Detect degenerate repetition loops and return ``(mode, pattern_len, count)``.
 
     Catches:
-    1. Short contiguous token loops (pattern length 1..3 repeated >= 8 times
-       with total repeated span >= 16 tokens).
+    1. Short contiguous token loops (pattern length 1..3 repeated >= 10 times
+      with total repeated span >= 24 tokens).
     2. Phrase/sentence contiguous loops (pattern length 4..64 repeated >= 4
-       times contiguously).
+       times contiguously with total repeated span >= 24 tokens).
     3. Interspersed/windowed phrase loops (pattern length 5..64 repeated >= 5
-       times within a 160-token window covering >= 60% of the span).
+       times within a 160-token window with >= 1 contiguous pair and covering
+       >= 60% of the span).
     """
     seq = getattr(token_ids, "_x", token_ids)
     avail = len(seq) - start_idx
-    if avail < 16:
-        return False
+    if avail < 24:
+        return None
 
     for pattern_len in range(1, 4):
-        min_count = max(8, (16 + pattern_len - 1) // pattern_len)
+        min_count = max(10, (24 + pattern_len - 1) // pattern_len)
         if pattern_len * min_count <= avail and _has_repeating_pattern(
             seq, pattern_len, min_count
         ):
-            return True
+            return ("contiguous_short", pattern_len, min_count)
 
     max_len = min(64, avail // 4)
     for pattern_len in range(4, max_len + 1):
-        if _has_repeating_pattern(seq, pattern_len, 4):
-            return True
+        min_count = max(4, (24 + pattern_len - 1) // pattern_len)
+        if pattern_len * min_count <= avail and _has_repeating_pattern(
+            seq, pattern_len, min_count
+        ):
+            return ("contiguous_phrase", pattern_len, min_count)
 
-    return _has_windowed_repeating_pattern(
+    win_match = _find_windowed_repeating_pattern(
         seq,
         min_pattern_size=5,
         max_pattern_size=64,
@@ -142,6 +174,17 @@ def has_thinking_loop(
         window_size=160,
         min_density=0.6,
     )
+    if win_match is not None:
+        return ("windowed_phrase", win_match[0], win_match[1])
+    return None
+
+
+def has_thinking_loop(
+    token_ids: Sequence[int],
+    start_idx: int = 0,
+) -> bool:
+    """Return True if ``token_ids[start_idx:]`` ends with a repetition loop."""
+    return detect_thinking_loop(token_ids, start_idx=start_idx) is not None
 
 
 def check_sequence_repetition(
@@ -158,11 +201,8 @@ def check_sequence_repetition(
         True if a repetition pattern is found, False otherwise.
     """
     max_pattern_size = params.max_pattern_size
-    min_pattern_size = params.min_pattern_size
+    min_pattern_size = max(params.min_pattern_size, 1)
     min_count = params.min_count
-
-    if min_pattern_size <= 0:
-        min_pattern_size = 1
 
     if max_pattern_size <= 0 or min_count < 2 or min_pattern_size > max_pattern_size:
         return False
@@ -197,21 +237,23 @@ def check_sequence_repetition(
 def remove_all(lst: list, items_to_remove: set) -> list:
     """Remove all items from a list that are in the items_to_remove set.
 
-    This method optimizes for the common case of removing a single item,
-    falling back to list comprehension for multiple items.
+    This function optimizes for the common case of removing a single item,
+    using list.remove() which avoids creating a new list. For multiple items,
+    it uses a list comprehension.
+
+    Note: For a single item, the input list is modified in-place and returned.
+    For multiple items, a new list is created and returned.
 
     Args:
-        lst: The list to remove items from
-        items_to_remove: Set of items to remove
+        lst: The list to remove items from.
+        items_to_remove: Set of items to remove from the list.
 
     Returns:
-        Either the modified original list (for single item removal) or
-        a new list (for multiple item removal). Callers should use the
-        returned value.
-
-    Note:
-        For single item removal, this modifies the original list in-place
-        and returns it. For multiple items, it creates and returns a new list.
+        Either the modified input list (for single item) or a new list
+        (for multiple items) with the specified items removed. Caller should
+        always use the returned value.
+        Note: for single item, it modifies the input list in-place and
+        returns it. For multiple items, it creates and returns a new list.
     """
     if not items_to_remove:
         return lst
@@ -243,7 +285,7 @@ def stops_on_next_token(request: Request, token_id: int, max_model_len: int) -> 
 def check_stop(
     request: Request,
     max_model_len: int,
-    thinking_loop_break: bool = False,
+    thinking_loop_break: bool = True,
 ) -> bool:
     assert not request.pooling_params
 
@@ -275,26 +317,30 @@ def check_stop(
     if request.num_output_tokens < sampling_params.min_tokens:
         return False
 
-    if request.thinking_disabled:
+    repetition_detection = sampling_params.repetition_detection
+    if repetition_detection is not None and (
+        repetition_detection.max_pattern_size <= 0
+        or repetition_detection.min_count < 2
+    ):
         return False
 
-    repetition_detection = sampling_params.repetition_detection
     if request.thinking_output_start >= 0:
         if request.force_thinking_end:
             return False
         start_idx = request.thinking_output_start
-        loop_detected = False
-        if thinking_loop_break and request.thinking_loop_breaks == 0:
-            loop_detected = has_thinking_loop(
+        loop_info: tuple[str, int, int] | None = None
+        if repetition_detection is not None and check_sequence_repetition(
+            request._output_token_ids,
+            repetition_detection,
+            start_idx=start_idx,
+        ):
+            loop_info = ("custom_repetition", 0, 0)
+        if loop_info is None:
+            loop_info = detect_thinking_loop(
                 request._output_token_ids, start_idx=start_idx
             )
-        if not loop_detected and repetition_detection is not None:
-            loop_detected = check_sequence_repetition(
-                request._output_token_ids,
-                repetition_detection,
-                start_idx=start_idx,
-            )
-        if loop_detected:
+        if loop_info is not None:
+            request.last_loop_info = loop_info
             if thinking_loop_break and request.thinking_loop_breaks == 0:
                 request.force_thinking_end = True
                 request.thinking_loop_breaks += 1
@@ -306,20 +352,35 @@ def check_stop(
         return False
 
     start_idx = request.thinking_end_output_idx
-    if repetition_detection is not None and check_sequence_repetition(
-        request._output_token_ids,
-        repetition_detection,
-        start_idx=start_idx,
-    ):
-        request.status = RequestStatus.FINISHED_REPETITION
-        request.stop_reason = "repetition_detected"
-        return True
+    if repetition_detection is not None:
+        if check_sequence_repetition(
+            request._output_token_ids,
+            repetition_detection,
+            start_idx=start_idx,
+        ):
+            request.last_loop_info = ("custom_repetition", 0, 0)
+            request.status = RequestStatus.FINISHED_REPETITION
+            request.stop_reason = "repetition_detected"
+            return True
+        if request.thinking_loop_breaks > 0:
+            loop_info = detect_thinking_loop(
+                request._output_token_ids, start_idx=start_idx
+            )
+            if loop_info is not None:
+                request.last_loop_info = loop_info
+                request.status = RequestStatus.FINISHED_REPETITION
+                request.stop_reason = "repetition_detected"
+                return True
+        return False
 
-    if request.thinking_loop_breaks > 0 and has_thinking_loop(
-        request._output_token_ids, start_idx=start_idx
-    ):
-        request.status = RequestStatus.FINISHED_REPETITION
-        request.stop_reason = "repetition_detected"
-        return True
+    if thinking_loop_break or request.thinking_loop_breaks > 0:
+        loop_info = detect_thinking_loop(
+            request._output_token_ids, start_idx=start_idx
+        )
+        if loop_info is not None:
+            request.last_loop_info = loop_info
+            request.status = RequestStatus.FINISHED_REPETITION
+            request.stop_reason = "repetition_detected"
+            return True
 
     return False

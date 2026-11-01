@@ -3943,13 +3943,49 @@ class Scheduler(SchedulerInterface):
                 thinking_loop_break=self.thinking_loop_break,
             )
             if not was_forced and request.force_thinking_end:
+                loop_mode, loop_pat_len, loop_count = request.last_loop_info or (
+                    "unknown",
+                    0,
+                    0,
+                )
                 logger.info(
-                    "Detected reasoning loop in request %s at %d output tokens; "
-                    "forcing reasoning end token.",
+                    "Detected reasoning loop in request %s at %d output tokens "
+                    "(mode=%s, pattern_len=%d, count=%d); forcing reasoning end token.",
                     request.request_id,
                     request.num_output_tokens,
+                    loop_mode,
+                    loop_pat_len,
+                    loop_count,
                 )
             if stopped:
+                if (
+                    request.thinking_loop_breaks > 0
+                    or request.status == RequestStatus.FINISHED_REPETITION
+                ):
+                    post_think_tokens = (
+                        max(0, request.num_output_tokens - request.thinking_end_output_idx)
+                        if request.thinking_end_output_idx > 0
+                        else 0
+                    )
+                    loop_mode, loop_pat_len, loop_count = request.last_loop_info or (
+                        "none",
+                        0,
+                        0,
+                    )
+                    logger.info(
+                        "Request %s finished after loop detection "
+                        "(breaks=%d, last_mode=%s, pattern_len=%d, count=%d): "
+                        "status=%s, stop_reason=%s, output_tokens=%d, post_think_tokens=%d.",
+                        request.request_id,
+                        request.thinking_loop_breaks,
+                        loop_mode,
+                        loop_pat_len,
+                        loop_count,
+                        request.status.name,
+                        request.stop_reason,
+                        request.num_output_tokens,
+                        post_think_tokens,
+                    )
                 del new_token_ids[num_new:]  # Trim new tokens if needed.
                 break
         return new_token_ids, stopped

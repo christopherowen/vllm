@@ -266,7 +266,7 @@ class Request:
         # - thinking_end_output_idx: index in _output_token_ids immediately
         #   after the most recent </think> marker.
         # - thinking_disabled: True when thinking is disabled for this request
-        #   so the repetition guard and marker tracking do not run.
+        #   so reasoning marker scanning and forced </think> injection do not run.
         self._reasoning_ended_init: bool | None = reasoning_ended
         self._reasoning_parser_kwargs_init: dict[str, Any] | None = (
             reasoning_parser_kwargs
@@ -275,6 +275,7 @@ class Request:
         self.thinking_end_output_idx: int = 0
         self.force_thinking_end: bool = False
         self.thinking_loop_breaks: int = 0
+        self.last_loop_info: tuple[str, int, int] | None = None
         self._reasoning_markers_initialized: bool = False
         self.thinking_disabled: bool = self._compute_thinking_disabled()
 
@@ -375,6 +376,7 @@ class Request:
         self.thinking_end_output_idx = 0
         self.force_thinking_end = False
         self.thinking_loop_breaks = 0
+        self.last_loop_info = None
         self._reasoning_markers_initialized = False
         self.thinking_disabled = self._compute_thinking_disabled()
 
@@ -443,7 +445,7 @@ class Request:
         if (
             self.thinking_output_start < 0
             and self.thinking_end_output_idx == 0
-            and cur_num_output >= start_len
+            and cur_num_output >= start_len + 3
         ):
             self.thinking_disabled = True
 

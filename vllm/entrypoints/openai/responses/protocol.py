@@ -392,20 +392,6 @@ class ResponsesRequest(OpenAIBaseModel):
             )
         return None
 
-    def _is_thinking_disabled(self, thinking_token_budget: int | None) -> bool:
-        if thinking_token_budget is not None and thinking_token_budget == 0:
-            return True
-        user_kwargs = self.chat_template_kwargs or {}
-        if "thinking" in user_kwargs:
-            return not bool(user_kwargs["thinking"])
-        if "enable_thinking" in user_kwargs:
-            return not bool(user_kwargs["enable_thinking"])
-        if user_kwargs.get("thinking_mode") == "chat":
-            return True
-        if self.reasoning is not None and self.reasoning.effort is not None:
-            return self.reasoning.effort == "none"
-        return False
-
     def to_sampling_params(
         self,
         default_max_tokens: int,
@@ -450,11 +436,7 @@ class ResponsesRequest(OpenAIBaseModel):
             extra_args["ec_transfer_params"] = self.ec_transfer_params
 
         thinking_token_budget = default_sampling_params.get("thinking_token_budget")
-        repetition_detection = (
-            None
-            if self._is_thinking_disabled(thinking_token_budget)
-            else default_sampling_params.get("repetition_detection")
-        )
+        repetition_detection = default_sampling_params.get("repetition_detection")
 
         return SamplingParams.from_optional(
             temperature=temperature,
