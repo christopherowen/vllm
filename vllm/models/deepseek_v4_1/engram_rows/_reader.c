@@ -119,6 +119,7 @@ typedef struct {
     uint32_t *control;
     int64_t *late; /* the GPU's IDs of a step's lookups the host did not know, -1 elsewhere */
     bool check_early; /* debug: an early ID must equal the GPU's */
+    bool drop_page_cache; /* evict any VFS page-cache pages for read ranges */
     record_t *timeline; /* debug: the last TIMELINE served steps (mutex), or NULL */
     uint64_t timeline_next, timeline_read;
     uint64_t step_plan_ns; /* debug (timeline): the served step's planning time, worker only */
@@ -129,7 +130,7 @@ typedef struct {
     pthread_mutex_t mutex;
     uint64_t ids_timeout_ns, delay_ns;
     failure_t failure; /* the first failure; no step is read after it */
-    uint64_t steps_done, lookups_done, early_lookups;
+    uint64_t steps_done, lookups_done, early_lookups, fadvise_bytes;
     double ids_wait_seconds, read_seconds, consumed_wait_seconds, early_read_seconds;
 } reader_t;
 
@@ -413,19 +414,37 @@ static bool late_ids(reader_t *reader, step_t step, failure_t *failure) {
     return true;
 }
 
+static uint64_t drop_plan_page_cache(reader_t *reader) {
+    if (!reader->drop_page_cache) return 0;
+    uint64_t bytes = 0;
+    for (size_t i = 0; i < reader->plan.job_count; i++) {
+        ple_job_t *job = &reader->plan.jobs[i];
+        int fd = reader->plan.files[job->file].fd;
+        if (posix_fadvise(fd, job->offset, job->length, POSIX_FADV_DONTNEED) == 0) {
+            bytes += job->length;
+        }
+    }
+    reader->plan.job_count = 0;
+    return bytes;
+}
+
 static void serve(reader_t *reader, step_t step) {
     failure_t failure = {{0}};
     uint64_t started = now_ns();
     uint32_t gpu_sequence = 0, gpu_wait_ns = 0;
     reader->step_plan_ns = 0;
+    reader->plan.job_count = 0;
     if (reader->timeline) {
         gpu_sequence = __atomic_load_n(&reader->control[CTRL_GPU_WAIT_SEQ], __ATOMIC_ACQUIRE);
         gpu_wait_ns = __atomic_load_n(&reader->control[CTRL_GPU_WAIT_NS], __ATOMIC_RELAXED);
     }
     control_store(reader, CTRL_PHASE_SEQ, step.sequence);
-    uint64_t early_count = 0;
+    uint64_t early_count = 0, fadvise_early = 0;
     double consumed_wait = 0.0, early_read = 0.0;
     bool ok = !step.early || read_early(reader, step, &failure, &consumed_wait, &early_read, &early_count);
+    if (ok && step.early && step.has_unknown) {
+        fadvise_early = drop_plan_page_cache(reader);
+    }
     uint64_t start = now_ns(), ids_at = start, read_at = start;
     if (ok && (step.has_unknown || reader->check_early)) {
         control_store(reader, CTRL_PHASE, PHASE_WAITING_IDS);
@@ -440,34 +459,33 @@ static void serve(reader_t *reader, step_t step) {
         }
         read_at = now_ns();
     }
-    pthread_mutex_lock(&reader->mutex);
     if (failure.message[0]) {
+        pthread_mutex_lock(&reader->mutex);
         if (!reader->failure.message[0]) reader->failure = failure;
-    } else {
-        reader->steps_done++;
-        reader->lookups_done += step.count;
-        reader->early_lookups += early_count;
-        reader->consumed_wait_seconds += consumed_wait;
-        reader->early_read_seconds += early_read;
-        reader->ids_wait_seconds += (double)(ids_at - start) * 1e-9;
-        reader->read_seconds += (double)(read_at - ids_at) * 1e-9;
-    }
-    pthread_mutex_unlock(&reader->mutex);
-    if (failure.message[0]) {
+        pthread_mutex_unlock(&reader->mutex);
         control_store(reader, CTRL_PHASE, PHASE_FAILED);
         return;
     }
     /* The rows are in place before the GPU can see the step. */
     __atomic_store_n(&reader->control[CTRL_ROWS_SEQ], step.sequence, __ATOMIC_RELEASE);
     control_store(reader, CTRL_PHASE, PHASE_IDLE);
+    uint64_t fadvise_late = drop_plan_page_cache(reader);
+    pthread_mutex_lock(&reader->mutex);
+    reader->steps_done++;
+    reader->lookups_done += step.count;
+    reader->early_lookups += early_count;
+    reader->fadvise_bytes += fadvise_early + fadvise_late;
+    reader->consumed_wait_seconds += consumed_wait;
+    reader->early_read_seconds += early_read;
+    reader->ids_wait_seconds += (double)(ids_at - start) * 1e-9;
+    reader->read_seconds += (double)(read_at - ids_at) * 1e-9;
     if (reader->timeline) {
         record_t record = {step.sequence, step.count, (uint32_t)early_count, gpu_sequence, gpu_wait_ns,
                            step.submitted, started, started + (uint64_t)(consumed_wait * 1e9),
                            ids_at, read_at, now_ns(), reader->step_plan_ns};
-        pthread_mutex_lock(&reader->mutex);
         reader->timeline[reader->timeline_next++ % TIMELINE] = record;
-        pthread_mutex_unlock(&reader->mutex);
     }
+    pthread_mutex_unlock(&reader->mutex);
 }
 
 /* The process's one worker and its queue of (reader, step) jobs. */
@@ -643,6 +661,8 @@ static PyObject *py_reader(PyObject *self, PyObject *args) {
     reader->ids_timeout_ns = (uint64_t)(ids_timeout * 1e9);
     reader->delay_ns = (uint64_t)(delay * 1e9);
     reader->check_early = check_early != 0;
+    const char *drop_env = getenv("SPARK_DS41F_ENGRAM_DROP_PAGE_CACHE");
+    reader->drop_page_cache = !drop_env || strcmp(drop_env, "0") != 0;
     if (timeline && !(reader->timeline = calloc(TIMELINE, sizeof(*reader->timeline)))) {
         release(reader);
         return PyErr_NoMemory();
@@ -810,7 +830,7 @@ static PyObject *py_status(PyObject *self, PyObject *capsule) {
     reader_t *reader = get_reader(capsule);
     if (!reader) return NULL;
     failure_t failure;
-    uint64_t steps, lookups, queued, early;
+    uint64_t steps, lookups, queued, early, fadvise_bytes;
     double ids_wait, read, consumed_wait, early_read;
     Py_BEGIN_ALLOW_THREADS
     pthread_mutex_lock(&queue.mutex);
@@ -823,6 +843,7 @@ static PyObject *py_status(PyObject *self, PyObject *capsule) {
     ids_wait = reader->ids_wait_seconds;
     read = reader->read_seconds;
     early = reader->early_lookups;
+    fadvise_bytes = reader->fadvise_bytes;
     consumed_wait = reader->consumed_wait_seconds;
     early_read = reader->early_read_seconds;
     pthread_mutex_unlock(&reader->mutex);
@@ -830,10 +851,11 @@ static PyObject *py_status(PyObject *self, PyObject *capsule) {
     PyObject *message = failure.message[0] ? PyUnicode_FromString(failure.message) : Py_NewRef(Py_None);
     if (!message) return NULL;
     unsigned l2_kib = __atomic_load_n(&worker_l2_kib, __ATOMIC_RELAXED);
-    PyObject *result = Py_BuildValue("{s:N,s:K,s:K,s:K,s:K,s:d,s:d,s:d,s:d,s:I}", "failure", message, "steps",
+    PyObject *result = Py_BuildValue("{s:N,s:K,s:K,s:K,s:K,s:K,s:d,s:d,s:d,s:d,s:I}", "failure", message, "steps",
                                      (unsigned long long)steps, "lookups", (unsigned long long)lookups,
                                      "early_lookups", (unsigned long long)early, "queued",
-                                     (unsigned long long)queued, "ids_wait_seconds", ids_wait,
+                                     (unsigned long long)queued, "fadvise_bytes",
+                                     (unsigned long long)fadvise_bytes, "ids_wait_seconds", ids_wait,
                                      "read_seconds", read, "consumed_wait_seconds", consumed_wait,
                                      "early_read_seconds", early_read, "worker_l2_kib", l2_kib);
     return result;

@@ -3,6 +3,7 @@
 """Native Engram with readonly accepted history and global ceil-row TP shards."""
 
 import os
+from contextlib import suppress
 from functools import lru_cache
 
 import torch
@@ -305,10 +306,18 @@ def _read_table_rows(destination, source, start):
     data = memoryview(destination.view(torch.uint8).numpy()).cast("B")
     # Unbuffered readinto has no payload-sized Python/NumPy allocation, and a
     # bounded syscall size also handles tables larger than Linux's read limit.
+    start_byte = source.offset + start * row_bytes
+    drop_cache = (
+        os.environ.get("SPARK_DS41F_ENGRAM_DROP_PAGE_CACHE", "1") != "0"
+        and hasattr(os, "posix_fadvise")
+        and hasattr(os, "POSIX_FADV_DONTNEED")
+    )
     with open(source.path, "rb", buffering=0) as checkpoint:
-        checkpoint.seek(source.offset + start * row_bytes)
+        fd = checkpoint.fileno()
+        checkpoint.seek(start_byte)
         offset = 0
         while offset < len(data):
+            chunk_start = start_byte + offset
             count = checkpoint.readinto(data[offset : offset + (8 << 20)])
             if not count:
                 raise OSError(
@@ -316,6 +325,24 @@ def _read_table_rows(destination, source, start):
                     f"{offset} of {len(data)} local bytes"
                 )
             offset += count
+            if drop_cache:
+                aligned = (chunk_start // 4096) * 4096
+                done_aligned = ((chunk_start + count) // 4096) * 4096
+                if done_aligned > aligned:
+                    with suppress(OSError):
+                        os.posix_fadvise(
+                            fd, aligned, done_aligned - aligned, os.POSIX_FADV_DONTNEED
+                        )
+        if drop_cache and len(data) > 0:
+            aligned_start = (start_byte // 4096) * 4096
+            aligned_end = start_byte + len(data)
+            with suppress(OSError):
+                os.posix_fadvise(
+                    fd,
+                    aligned_start,
+                    aligned_end - aligned_start,
+                    os.POSIX_FADV_DONTNEED,
+                )
 
 
 def _load_table(param, loaded_weight):

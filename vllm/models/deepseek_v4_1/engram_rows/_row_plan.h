@@ -151,6 +151,13 @@ static inline int ple_add_source(ple_plan_t *reader, int64_t shard, const char *
                 if (!failure.message[0]) {
                     reader->sources[reader->source_count++] = (ple_source_t){shard, offset, file, scale != 0};
                     qsort(reader->sources, reader->source_count, sizeof(*sources), ple_source_compare);
+                    const char *drop_env = getenv("SPARK_DS41F_ENGRAM_DROP_PAGE_CACHE");
+                    if (!drop_env || strcmp(drop_env, "0") != 0) {
+                        int target_fd = reader->files[file].fd;
+                        int64_t range_start = (offset / (int64_t)PLE_BLOCK) * (int64_t)PLE_BLOCK;
+                        int64_t range_end = offset + rows * (int64_t)row_bytes;
+                        (void)posix_fadvise(target_fd, range_start, range_end - range_start, POSIX_FADV_DONTNEED);
+                    }
                 }
             }
         }

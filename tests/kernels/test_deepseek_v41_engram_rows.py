@@ -625,3 +625,59 @@ def test_gather_kernel_uses_streaming_cache_hints_and_matches_reference():
         torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0, equal_nan=True)
     finally:
         rows.close()
+def _cached_pages(path: str) -> int:
+    import mmap
+
+    size = os.path.getsize(path)
+    page_size = os.sysconf("SC_PAGESIZE")
+    pages = (size + page_size - 1) // page_size
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    vec = (ctypes.c_ubyte * pages)()
+    with open(path, "rb") as f:
+        mm = mmap.mmap(f.fileno(), size, access=mmap.ACCESS_COPY)
+        try:
+            addr = ctypes.addressof(ctypes.c_char.from_buffer(mm))
+            res = libc.mincore(ctypes.c_void_p(addr), ctypes.c_size_t(size), vec)
+            assert res == 0
+        finally:
+            mm.close()
+    return sum(v & 1 for v in vec)
+
+
+def test_fadvise_dontneed_evicts_page_cache_on_registration_and_load(monkeypatch):
+    from types import SimpleNamespace
+    from vllm.models.deepseek_v4_1.common.engram import _read_table_rows
+
+    codes, _, paths = _write_table(_table_dir(), seed=33)
+    weight_path = paths[0]
+    # Flush dirty pages so they are clean in the VFS page cache, then warm them.
+    with open(weight_path, "rb") as f:
+        os.fsync(f.fileno())
+        _ = f.read()
+    assert _cached_pages(weight_path) > 0
+
+    rows = _rows(paths, tokens=4)
+    try:
+        # Source registration drops clean VFS page-cache pages for the table range.
+        assert _cached_pages(weight_path) <= 2
+        ids = torch.randint(0, TABLE_ROWS, (4, HEADS)).cuda()
+        out, _ = _step(rows, ids, 4)
+        torch.cuda.synchronize()
+        while rows.stats()["queued"]:
+            time.sleep(0.001)
+        assert rows.stats()["fadvise_bytes"] > 0
+    finally:
+        rows.close()
+
+    # Buffered _read_table_rows drops page cache by default, and retains it when disabled.
+    dest = torch.empty_like(codes)
+    source = SimpleNamespace(path=weight_path, offset=WEIGHT_OFFSET)
+    monkeypatch.setenv("SPARK_DS41F_ENGRAM_DROP_PAGE_CACHE", "0")
+    _read_table_rows(dest, source, 0)
+    assert torch.equal(dest, codes)
+    assert _cached_pages(weight_path) >= 15
+
+    monkeypatch.setenv("SPARK_DS41F_ENGRAM_DROP_PAGE_CACHE", "1")
+    _read_table_rows(dest, source, 0)
+    assert torch.equal(dest, codes)
+    assert _cached_pages(weight_path) <= 2
