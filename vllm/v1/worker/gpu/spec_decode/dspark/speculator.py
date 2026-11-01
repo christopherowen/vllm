@@ -99,11 +99,37 @@ class DSparkSpeculator(DFlashSpeculator):
         )
 
         self.use_confidence_head: bool = False
+        self._top2_branch_margin: float = float(
+            getattr(
+                self.draft_model_config.hf_config,
+                "dspark_top2_branch_margin",
+                0.0,
+            )
+        )
+        self._top2_branch_weight: float = float(
+            getattr(
+                self.draft_model_config.hf_config,
+                "dspark_top2_branch_weight",
+                1.0,
+            )
+        )
+        self._enable_top2_branch: bool = (
+            bool(
+                getattr(
+                    self.draft_model_config.hf_config,
+                    "dspark_top2_branch",
+                    False,
+                )
+            )
+            or self._top2_branch_margin > 0.0
+        )
         draft_vocab = max(
             self.draft_model_config.hf_config.vocab_size,
             getattr(self.draft_model_config.hf_config, "draft_vocab_size", None) or 0,
         )
-        shape = scratch_shape(self.max_num_reqs, draft_vocab)
+        shape = scratch_shape(
+            self.max_num_reqs, draft_vocab, top2=self._enable_top2_branch
+        )
         self._greedy_partial_values = torch.empty(
             shape, dtype=torch.float32, device=device
         )
@@ -112,10 +138,17 @@ class DSparkSpeculator(DFlashSpeculator):
         )
         # Per-request (max, global index) of this rank's vocabulary shard,
         # for vocabulary-parallel greedy drafts.
-        # (value, index) and two unused columns: 16-byte rows, which the
-        # one-shot all-gather writes in place (no staging or reshape copies).
+        # (value, index) and two slack columns (used for shard runner-up
+        # (second_value, second_index) when top-2 branch tracking is enabled):
+        # 16-byte rows, which the one-shot all-gather writes in place.
         self._greedy_shard_pairs = torch.empty(
             (self.max_num_reqs, 4), dtype=torch.float32, device=device
+        )
+        self.draft_runner_up_tokens = torch.zeros_like(self.draft_tokens)
+        self.draft_top2_margins = torch.zeros(
+            (self.max_num_reqs, self.num_speculative_steps),
+            dtype=torch.float32,
+            device=device,
         )
         # The vocabulary-parallel greedy steps' Markov embeddings, which the
         # anchor lookup and each step's selection write (with a replicated BF16
@@ -129,6 +162,9 @@ class DSparkSpeculator(DFlashSpeculator):
             (self.max_num_reqs, self.num_speculative_steps, rank),
             dtype=torch.bfloat16,
             device=device,
+        )
+        self._markov_conf_weight = torch.zeros(
+            rank, dtype=torch.float32, device=device
         )
 
     @property
@@ -183,6 +219,18 @@ class DSparkSpeculator(DFlashSpeculator):
             # The acceptance estimator is not needed when a trained confidence head
             # is available.
             self.use_acceptance_estimator = False
+        head = getattr(model.model, "confidence_head", None)
+        proj = getattr(head, "proj", None)
+        weight = getattr(proj, "weight", None)
+        rank = self._markov_step_embed.shape[1]
+        hidden = self.hidden_states.shape[1]
+        if (
+            weight is not None
+            and weight.dtype == torch.float32
+            and weight.numel() == hidden + rank
+            and rank > 0
+        ):
+            self._markov_conf_weight = weight.view(-1)[hidden:].contiguous()
         return model
 
     @property
@@ -277,6 +325,7 @@ class DSparkSpeculator(DFlashSpeculator):
         vocab_start, shard_vocab = self.model.draft_vocab_shard
         dtype, head_width, markov_width = self.model.draft_logits_local_layout
         n_spec = self.num_speculative_steps
+        use_top2 = self._enable_top2_branch
         for i in range(n_spec):
             register_greedy_markov_shard_pair_warmup(
                 base_dtype=dtype,
@@ -286,12 +335,14 @@ class DSparkSpeculator(DFlashSpeculator):
                 bias_stride=markov_width,
                 vocab=shard_vocab,
                 vocab_start=vocab_start,
+                top2=use_top2,
             )
             register_select_first_argmax_warmup(
                 ranks=get_tensor_model_parallel_world_size(),
                 output_dtype=self.draft_tokens.dtype,
                 output_stride=self.draft_tokens.stride(0),
                 output_aligned=i * self.draft_tokens.element_size() % 16 == 0,
+                top2=use_top2,
             )
         if not getattr(self, "sample_from_anchor", False):
             tilelang_inputs.declare(
@@ -311,6 +362,7 @@ class DSparkSpeculator(DFlashSpeculator):
                     self.draft_tokens.dtype,
                     get_tensor_model_parallel_world_size(),
                     table.shape[1],
+                    top2_branch=use_top2,
                 )
             )
 
@@ -405,6 +457,7 @@ class DSparkSpeculator(DFlashSpeculator):
                 prev = draft_sampled_i
                 continue
             if vocab_parallel:
+                use_top2 = self._enable_top2_branch
                 bias = self.model.markov_bias_local(markov_embed)
                 pairs = self._greedy_shard_pairs[:num_reqs]
                 greedy_markov_shard_pair(
@@ -414,15 +467,28 @@ class DSparkSpeculator(DFlashSpeculator):
                     pairs,
                     self._greedy_partial_values,
                     self._greedy_partial_indices,
+                    top2=use_top2,
                 )
                 draft_sampled_i = self.draft_tokens[:num_reqs, i]
+                has_embed = table is not None and i + 1 < n_spec
                 select_first_argmax(
                     tensor_model_parallel_all_gather(pairs, dim=-1),
                     draft_sampled_i,
                     pair_width=4,
                     embed=(
                         (table, step_embed, confidence_embeds[:, i + 1])
-                        if table is not None and i + 1 < n_spec
+                        if has_embed
+                        else None
+                    ),
+                    top2_branch=(
+                        (
+                            self._markov_conf_weight if has_embed else None,
+                            self.draft_runner_up_tokens[:num_reqs, i],
+                            self.draft_top2_margins[:num_reqs, i],
+                            self._top2_branch_margin,
+                            self._top2_branch_weight,
+                        )
+                        if use_top2
                         else None
                     ),
                 )

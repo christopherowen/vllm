@@ -18,6 +18,7 @@ def register_greedy_markov_shard_pair_warmup(
     bias_stride: int,
     vocab: int,
     vocab_start: int,
+    top2: bool = False,
 ) -> None:
     """Declare the kernels ``greedy_markov_shard_pair`` launches for base logits
     and a Markov bias of these dtypes, strides, alignment and shard width."""
@@ -33,7 +34,7 @@ def register_greedy_markov_shard_pair_warmup(
     )
     tilelang_sampling.declare(
         lambda: tilelang_sampling.greedy_calls(
-            markov=[(base_dtype, bias_dtype, vector)]
+            markov=[(base_dtype, bias_dtype, vector)], top2=top2
         )
     )
 
@@ -62,6 +63,7 @@ def register_select_first_argmax_warmup(
     output_stride: int,
     output_aligned: bool,
     pair_width: int = 4,
+    top2: bool = False,
 ) -> None:
     """Declare ``select_first_argmax`` for an output column of ``output_dtype``
     over pairs of ``pair_width`` columns (the runner's 16-byte rows)."""
@@ -69,7 +71,7 @@ def register_select_first_argmax_warmup(
 
     tilelang_sampling.declare(
         lambda: tilelang_sampling.greedy_calls(
-            select=[(output_dtype, ranks, pair_width)]
+            select=[(output_dtype, ranks, pair_width)], top2=top2
         )
     )
 
@@ -95,10 +97,14 @@ def greedy_markov_shard_pair(
     pairs: torch.Tensor,
     partial_values: torch.Tensor,
     partial_indices: torch.Tensor,
+    *,
+    top2: bool = False,
 ) -> None:
     """Write each row's ``(max, global index)`` of ``base_logits + markov_bias``
     over one vocabulary shard into the first two columns of FP32 ``pairs`` ([rows,
-    2], or [rows, 4]: 16-byte rows, which the one-shot all-gather writes in place).
+    2], or [rows, 4]: 16-byte rows, which the one-shot all-gather writes in place;
+    with ``top2=True``, columns 2 and 3 receive the shard's runner-up value and
+    global index).
 
     The value keeps the materialized sum's rounding, and the index is the
     shard-local first maximum offset by ``vocab_start`` (exact in FP32 below
@@ -109,7 +115,13 @@ def greedy_markov_shard_pair(
     from vllm.v1.worker.gpu.sample import tilelang_sampling
 
     tilelang_sampling.greedy_markov_shard_pair(
-        base_logits, markov_bias, vocab_start, pairs, partial_values, partial_indices
+        base_logits,
+        markov_bias,
+        vocab_start,
+        pairs,
+        partial_values,
+        partial_indices,
+        top2=top2,
     )
 
 
@@ -137,14 +149,21 @@ def select_first_argmax(
     output: torch.Tensor,
     pair_width: int = 2,
     embed: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    top2_branch: (
+        tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, float, float] | None
+    ) = None,
 ) -> None:
     """Reduce all-gathered shard pairs ([rows, pair_width * ranks], FP32, each
     rank's pair first in its ``pair_width`` columns) to the first maximum's global
     index, written to ``output`` (one per row). With ``embed`` (a BF16 Markov W1
-    table and two row outputs), also the selected tokens' rows of the table."""
+    table and two row outputs), also the selected tokens' rows of the table. With
+    ``top2_branch``, also reduces the global runner-up and promotes it when
+    Markov transition confidence outweighs a narrow top1-top2 logit gap."""
     from vllm.v1.worker.gpu.sample import tilelang_sampling
 
-    tilelang_sampling.select_first_argmax(pairs, output, pair_width, embed)
+    tilelang_sampling.select_first_argmax(
+        pairs, output, pair_width, embed, top2_branch=top2_branch
+    )
 
 
 def markov_anchor_embed(
@@ -161,7 +180,7 @@ def markov_anchor_embed(
     tilelang_sampling.markov_anchor_embed(ids, index, table, step_out, confidence_out)
 
 
-def scratch_shape(max_requests: int, vocabulary_size: int) -> tuple[int, int]:
+def scratch_shape(max_requests: int, vocabulary_size: int, *, top2: bool = False) -> tuple[int, int]:
     return max_requests, cdiv(vocabulary_size, _BLOCK)
 
 
