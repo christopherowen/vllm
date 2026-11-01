@@ -245,89 +245,94 @@ def indexer_score_v41(
         acc = T.alloc_fragment([block_P, heads], accum_dtype)
         total = T.alloc_fragment([block_P], accum_dtype)
 
-        for h, d in T.Parallel(heads, D):
-            Q_shared[h, d] = Q[row, h, d]
-        for h in T.Parallel(heads):
-            SFQ_shared[h, 0] = QScale[row, h]
-            W_shared[h] = T.cast(Weights[row, h], accum_dtype)
-        for i in T.serial(T.ceildiv(T.max(T.ceildiv(extent, block_P) - cta, 0), ctas)):
-            p0 = (cta + i * ctas) * block_P
-            # No load reaches past the visible positions (DeepSeek's reference reads
-            # ``index_k[:, : end_pos // ratio]``). Tile rows that ``loads`` refuses
-            # (a dense row's rows past its extent) load no key or scale and score
-            # zeros, which the store drops. Only the key and scale loads are
-            # predicated: the page read stays unconditional, so a dense tile's
-            # addresses stay affine and its loads issue together. Every candidate
-            # row loads: its position is always a visible one (a masked or padding
-            # candidate's too, ``_candidate_position``), and its score is masked at
-            # the end. Only the tile holding a candidate row's count bounds its
-            # positions by it: a tile ``whole`` below the count takes
-            # ``whole_position``, chosen once for the tile.
-            if whole is None:
-                load_keys(
-                    KPool,
-                    KScale,
-                    PageTable,
-                    row,
-                    p0,
-                    position,
-                    loads,
-                    K_shared,
-                    SFK_shared,
-                )
-            elif whole(p0):
-                load_keys(
-                    KPool,
-                    KScale,
-                    PageTable,
-                    row,
-                    p0,
-                    whole_position,
-                    loads,
-                    K_shared,
-                    SFK_shared,
-                )
-            else:
-                load_keys(
-                    KPool,
-                    KScale,
-                    PageTable,
-                    row,
-                    p0,
-                    position,
-                    loads,
-                    K_shared,
-                    SFK_shared,
-                )
-            T.mma_gemm_blockscaled(
-                K_shared,
-                Q_shared,
-                acc,
-                SFK_shared,
-                SFQ_shared,
-                transpose_B=True,
-                clear_accum=True,
-                k_start=0,
-                sf_a_granularity_k=SF_BLOCK,
-                sf_b_granularity_k=SF_BLOCK,
-            )
-            # The published rounding stages: BF16 dot, ReLU, BF16 weighted product.
-            for p, h in T.Parallel(block_P, heads):
-                dot = T.max(T.cast(T.cast(acc[p, h], T.bfloat16), accum_dtype), 0.0)
-                contrib[p, h] = T.cast(
-                    T.cast(T.fmul(dot, W_shared[h]), T.bfloat16), accum_dtype
-                )
-            T.fill(total, 0)
-            for h in T.serial(heads):  # increasing head order, FP32
-                for p in T.Parallel(block_P):
-                    total[p] += contrib[p, h]
-            for p in T.Parallel(block_P):
-                if p0 + p < extent:
-                    Scores[row, p0 + p] = T.if_then_else(
-                        slot_valid(p0, p),
-                        T.cast(total[p], T.bfloat16),
-                        -T.infinity(T.bfloat16),
+        if cta * block_P < extent:
+            for h, d in T.Parallel(heads, D):
+                Q_shared[h, d] = Q[row, h, d]
+            for h in T.Parallel(heads):
+                SFQ_shared[h, 0] = QScale[row, h]
+                W_shared[h] = T.cast(Weights[row, h], accum_dtype)
+            for i in T.serial(
+                T.ceildiv(T.max(T.ceildiv(extent, block_P) - cta, 0), ctas)
+            ):
+                p0 = (cta + i * ctas) * block_P
+                # No load reaches past the visible positions (DeepSeek's reference reads
+                # ``index_k[:, : end_pos // ratio]``). Tile rows that ``loads`` refuses
+                # (a dense row's rows past its extent) load no key or scale and score
+                # zeros, which the store drops. Only the key and scale loads are
+                # predicated: the page read stays unconditional, so a dense tile's
+                # addresses stay affine and its loads issue together. Every candidate
+                # row loads: its position is always a visible one (a masked or padding
+                # candidate's too, ``_candidate_position``), and its score is masked at
+                # the end. Only the tile holding a candidate row's count bounds its
+                # positions by it: a tile ``whole`` below the count takes
+                # ``whole_position``, chosen once for the tile.
+                if whole is None:
+                    load_keys(
+                        KPool,
+                        KScale,
+                        PageTable,
+                        row,
+                        p0,
+                        position,
+                        loads,
+                        K_shared,
+                        SFK_shared,
                     )
+                elif whole(p0):
+                    load_keys(
+                        KPool,
+                        KScale,
+                        PageTable,
+                        row,
+                        p0,
+                        whole_position,
+                        loads,
+                        K_shared,
+                        SFK_shared,
+                    )
+                else:
+                    load_keys(
+                        KPool,
+                        KScale,
+                        PageTable,
+                        row,
+                        p0,
+                        position,
+                        loads,
+                        K_shared,
+                        SFK_shared,
+                    )
+                T.mma_gemm_blockscaled(
+                    K_shared,
+                    Q_shared,
+                    acc,
+                    SFK_shared,
+                    SFQ_shared,
+                    transpose_B=True,
+                    clear_accum=True,
+                    k_start=0,
+                    sf_a_granularity_k=SF_BLOCK,
+                    sf_b_granularity_k=SF_BLOCK,
+                )
+                # The published rounding stages: BF16 dot, ReLU, BF16 weighted product.
+                for p, h in T.Parallel(block_P, heads):
+                    dot = T.max(
+                        T.cast(T.cast(acc[p, h], T.bfloat16), accum_dtype), 0.0
+                    )
+                    contrib[p, h] = T.cast(
+                        T.cast(T.fmul(dot, W_shared[h]), T.bfloat16), accum_dtype
+                    )
+                T.fill(total, 0)
+                for h in T.serial(heads):  # increasing head order, FP32
+                    for p in T.Parallel(block_P):
+                        total[p] += contrib[p, h]
+                for p in T.Parallel(block_P):
+                    if p0 + p < extent:
+                        Scores[row, p0 + p] = T.if_then_else(
+                            slot_valid(p0, p),
+                            T.cast(total[p], T.bfloat16),
+                            -T.infinity(T.bfloat16),
+                        )
 
     if not candidates:
 
@@ -1006,9 +1011,9 @@ def _select_macros(threads, topk):
 def _final_writer(threads, topk, group):
     @T.macro
     def write_final(
-        Indices, Values, Counts, Gather, row, extent, total, entry, sel_key, params
+        Indices, Values, Counts, Gather, row, extent, valid, entry, value, params
     ):
-        """Write the ``total`` selected entries (``entry(slot)``), ``-1`` padded.
+        """Write the selected entries (``entry(slot)`` where ``valid(slot)``), ``-1`` padded.
 
         Grouped entries are block ids; ``Counts`` receives their positions below
         ``extent``. ``Gather`` (candidate rows) holds candidate block ids:
@@ -1021,9 +1026,9 @@ def _final_writer(threads, topk, group):
         for i in T.serial(T.ceildiv(topk, threads)):
             slot = i * threads + tx
             if slot < topk:
-                if slot < total:
+                if valid(slot):
                     e = entry(slot)
-                    Values[row, slot] = _value16(sel_key[slot])
+                    Values[row, slot] = value(slot)
                     if Gather is not None:
                         Indices[row, slot] = (
                             Gather[row, e // CANDIDATE_BLOCK] * CANDIDATE_BLOCK
@@ -1046,7 +1051,19 @@ def _final_writer(threads, topk, group):
             if tx == 0:
                 Counts[row] = params[0]
 
-    return write_final
+    @T.macro
+    def write_empty_final(Indices, Values, Counts, row):
+        tx = T.get_thread_binding()
+        for i in T.serial(T.ceildiv(topk, threads)):
+            slot = i * threads + tx
+            if slot < topk:
+                Values[row, slot] = -T.infinity(T.bfloat16)
+                Indices[row, slot] = -1
+        if Counts is not None:
+            if tx == 0:
+                Counts[row] = 0
+
+    return write_final, write_empty_final
 
 
 @tilelang.jit(
@@ -1085,7 +1102,7 @@ def indexer_topk_segment_v41(
     assert not final or segments == 1, "a final segment must cover the row"
     per = segment // threads
     threshold, compact = _select_macros(threads, topk)
-    write_final = _final_writer(threads, topk, group)
+    write_final, write_empty_final = _final_writer(threads, topk, group)
 
     @T.macro
     def select_segment(
@@ -1139,21 +1156,34 @@ def indexer_topk_segment_v41(
             sel_key = T.alloc_shared([topk], T.int32)
             extent = _row_extent(Lengths, Active, row, width)
             if final:
-                select_segment(
-                    Scores, extent, row, 0, keys, hist, scan, params, sel_idx, sel_key
-                )
-                write_final(
-                    Indices,
-                    Values,
-                    Counts,
-                    Gather,
-                    row,
-                    extent,
-                    scan[threads - 1],
-                    lambda slot: sel_idx[slot],
-                    sel_key,
-                    params,
-                )
+                if extent > 0:
+                    select_segment(
+                        Scores,
+                        extent,
+                        row,
+                        0,
+                        keys,
+                        hist,
+                        scan,
+                        params,
+                        sel_idx,
+                        sel_key,
+                    )
+                    total = scan[threads - 1]
+                    write_final(
+                        Indices,
+                        Values,
+                        Counts,
+                        Gather,
+                        row,
+                        extent,
+                        lambda slot: slot < total,
+                        lambda slot: sel_idx[slot],
+                        lambda slot: _value16(sel_key[slot]),
+                        params,
+                    )
+                else:
+                    write_empty_final(Indices, Values, Counts, row)
             elif seg * segment < T.ceildiv(extent, group):
                 # Segments past the row's extent hold nothing; the merges skip them.
                 select_segment(
@@ -1286,7 +1316,7 @@ def indexer_topk_merge_v41(
     per = n_pad // threads
     assert n_pad * 4 <= 64 * 1024, f"{n} merge keys exceed shared memory; lower fan_in"
     threshold, compact = _select_macros(threads, topk)
-    write_final = _final_writer(threads, topk, group)
+    write_final, write_empty_final = _final_writer(threads, topk, group)
 
     @T.macro
     def body(WorkValues, WorkEntries, Lengths, Active, Gather, Indices, Values, Counts):
@@ -1304,9 +1334,35 @@ def indexer_topk_merge_v41(
                 T.ceildiv(T.ceildiv(extent, group), span), lists
             )  # input lists with entries
             base = g * fan_in * topk
-            # A final merge always writes its row; others skip groups past the extent.
-            selects = True if final else g * fan_in < live
-            if selects:
+            group_live = T.min(T.max(live - g * fan_in, 0), fan_in)
+            if group_live <= 0:
+                if final:
+                    write_empty_final(Indices, Values, Counts, row)
+            elif group_live == 1:
+                # A single live input list is already sorted by ascending entry index
+                # with -1 / -inf padding; forward it without radix selection.
+                if final:
+                    write_final(
+                        Indices,
+                        Values,
+                        Counts,
+                        Gather,
+                        row,
+                        extent,
+                        lambda slot: WorkEntries[row, base + slot] >= 0,
+                        lambda slot: WorkEntries[row, base + slot],
+                        lambda slot: WorkValues[row, base + slot],
+                        params,
+                    )
+                else:
+                    for i in T.serial(T.ceildiv(topk, threads)):
+                        slot = i * threads + tx
+                        if slot < topk:
+                            Values[row, g * topk + slot] = WorkValues[row, base + slot]
+                            Indices[row, g * topk + slot] = WorkEntries[
+                                row, base + slot
+                            ]
+            else:
                 for i in T.serial(per):
                     j = i * threads + tx
                     c = T.min(base + j, lists * topk - 1)
@@ -1329,9 +1385,9 @@ def indexer_topk_merge_v41(
                         Gather,
                         row,
                         extent,
-                        total,
+                        lambda slot: slot < total,
                         lambda slot: WorkEntries[row, sel_idx[slot]],
-                        sel_key,
+                        lambda slot: _value16(sel_key[slot]),
                         params,
                     )
                 else:

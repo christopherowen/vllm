@@ -796,6 +796,52 @@ def test_topk_routes(width, topk, group, rows=4):
         assert torch.equal(counts, expected_counts)
 
 
+@pytest.mark.parametrize(
+    "width, topk, group",
+    [
+        (4096, INDEX_TOPK, 1),  # one pass
+        (32768, INDEX_TOPK, 1),  # one merge
+        (300000, INDEX_TOPK, 1),  # two merge levels
+        (32768, CANDIDATE_BLOCKS, CANDIDATE_BLOCK),  # grouped, one pass
+        (200000, CANDIDATE_BLOCKS, CANDIDATE_BLOCK),  # grouped, one merge
+    ],
+)
+def test_topk_single_live_and_empty_fastpaths(width, topk, group):
+    """Rows with extent 0, single live segment (<= 4096 * group), and single live
+    first-level merge group (<= 65536 * group) produce exact indices, values, and counts."""
+    raw_lengths = [
+        0,
+        1,
+        17,
+        min(511 * group, width),
+        min(4096 * group, width),
+        min(4096 * group + 1, width),
+        min(16 * 4096 * group, width),
+    ]
+    rows = len(raw_lengths)
+    scores = _tie_scores(rows, width, seed=19)
+    scores[2, 5:] = float("-inf")
+    lengths = torch.tensor(raw_lengths, dtype=torch.int32, device=DEVICE)
+    active = torch.tensor([width], dtype=torch.int32, device=DEVICE)
+    op = IndexerTopK(width, topk, group)
+    indices = torch.full((rows, topk), -7, dtype=torch.int32, device=DEVICE)
+    values = torch.full((rows, topk), 42.0, dtype=torch.bfloat16, device=DEVICE)
+    counts = (
+        torch.full((rows,), -7, dtype=torch.int32, device=DEVICE) if group > 1 else None
+    )
+    op.run(scores, lengths, active, indices, values, counts=counts)
+    expected, expected_counts = _ref_topk(scores, raw_lengths, topk, group)
+    assert torch.equal(indices, expected)
+    for r in range(rows):
+        valid = indices[r] >= 0
+        assert (values[r, ~valid] == float("-inf")).all()
+        if group == 1 and valid.any():
+            assert torch.equal(values[r, valid], scores[r, indices[r, valid].long()])
+    if counts is not None:
+        assert torch.equal(counts, expected_counts)
+
+
+
 # --------------------------------------------------------------------------
 # Sparse MLA
 # --------------------------------------------------------------------------
