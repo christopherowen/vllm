@@ -436,6 +436,10 @@ class Worker(WorkerBase):
                 envs.VLLM_DS41_IKET_CTAS,
                 envs.VLLM_DS41_IKET_ITERS,
                 envs.VLLM_DS41_IKET_SKIP,
+                granularity=envs.VLLM_DS41_IKET_GRANULARITY,
+                warps=envs.VLLM_DS41_IKET_WARPS,
+                payloads=envs.VLLM_DS41_IKET_PAYLOADS,
+                cache_dir=envs.VLLM_DS41_IKET_CACHE_DIR,
             )
         if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.

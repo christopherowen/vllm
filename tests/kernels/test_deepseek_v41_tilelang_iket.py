@@ -103,14 +103,64 @@ def test_ranges_close_on_every_path():
 
 
 def test_range_ends_wait_for_barriers():
-    # A deferred-blocking barrier holds a warp only at its next memory access: each
-    # range end loads shared memory before it reads the timer.
+    # A deferred-blocking barrier holds a warp only at its next memory access:
+    # only ranges containing a block barrier (a block sync or tl::AllReduce) load
+    # shared memory before reading the timer.
     out, sites = _ranges(KERNEL)
     lines = [line.strip() for line in out.splitlines()]
     ends = [i for i, line in enumerate(lines) if line == "TL_IKET_EVENT(31);"]
     assert len(ends) == len(sites)
-    assert all(lines[i - 1] == "TL_IKET_SETTLE();" for i in ends)
+    settled_ranges = [name for name, site in sites.items() if site["settled"]]
+    assert settled_ranges == ["wait.sync", "wait.sync#2", "wait.sync#3"]
+    assert [lines[i - 1] == "TL_IKET_SETTLE();" for i in ends] == [
+        site["settled"] for site in sites.values()
+    ]
     assert out.startswith("#define TL_IKET_SETTLE() asm volatile(")
+
+    # tl::AllReduce contains a block barrier in its C++ template, so its compute
+    # range is also settled, whereas warp-only shuffles and barrier-free kernels
+    # emit no settle macro at all.
+    allreduce_code = (
+        'extern "C" __global__ void ar_kernel(float* C) {\n'
+        "  float v = tl::AllReduce<tl::SumOp, 128, 1>::run(C[threadIdx.x], red_buf);\n"
+        "  C[threadIdx.x] = v;\n"
+        "}\n"
+    )
+    ar_out, ar_sites = _ranges(allreduce_code)
+    assert ar_sites["compute.reduce"]["settled"] is True
+    assert ar_sites["store.global"]["settled"] is False
+    assert ar_out.count("TL_IKET_SETTLE();") == 1
+
+    no_barrier_code = (
+        'extern "C" __global__ void copy_kernel(const float* A, float* C) {\n'
+        "  float x = A[threadIdx.x];\n"
+        "  C[threadIdx.x] = x;\n"
+        "}\n"
+    )
+    nb_out, nb_sites = _ranges(no_barrier_code)
+    assert not any(site["settled"] for site in nb_sites.values())
+    assert "TL_IKET_SETTLE" not in nb_out
+
+    # When a sampled loop ends with a block barrier, the first range after the loop
+    # also settles before opening so the loop's final unsampled iteration's barrier
+    # does not leak into the post-loop range's start timestamp.
+    loop_tail_sync_code = (
+        'extern "C" __global__ void tail_sync_kernel(const float* A, float* C) {\n'
+        "  for (int n = 0; n < 4; ++n) {\n"
+        "    tl::mma_sync(acc, a, b);\n"
+        "    __syncthreads();\n"
+        "  }\n"
+        "  C[threadIdx.x] = acc[0];\n"
+        "}\n"
+    )
+    lt_out, _ = iket.annotate(loop_tail_sync_code, _token, ctas=1, iters=1)
+    lt_lines = [line.strip() for line in lt_out.splitlines()]
+    store_start = next(
+        i
+        for i, line in enumerate(lt_lines)
+        if "__tl_iket_v1_store.global" in line
+    )
+    assert lt_lines[store_start - 1] == "if (__tl_iket_cta) TL_IKET_SETTLE();"
 
 
 def test_pragma_stays_with_its_loop():
@@ -144,6 +194,40 @@ def test_sampled_ctas_guard_every_event():
     assert "TL_IKET_WHEN" not in unsampled
 
 
+def test_sampled_warps_and_payloads():
+    out, sites = iket.annotate(KERNEL, _token, ctas=4, warps=2, payloads=True)
+    lines = out.splitlines()
+    body = next(
+        i for i, line in enumerate(lines) if line.endswith("{") and "k_kernel" in line
+    )
+    assert lines[body + 1].startswith("  const bool __tl_iket_cta = ")
+    assert lines[body + 2].startswith("  const bool __tl_iket_warp = ")
+    assert "((blockDim.x * blockDim.y * blockDim.z + 31u) >> 5) / 2u" in lines[body + 2]
+    starts = [line.strip() for line in lines if "TL_IKET_EVENT_PAYLOAD_U32(" in line]
+    assert len(starts) == len(sites)
+    assert all(
+        s.startswith("TL_IKET_WHEN(__tl_iket_cta && __tl_iket_warp) ") for s in starts
+    )
+    # Loop ranges attach the innermost loop variable; outer ranges attach the CTA index.
+    by_range = {s["range"]: s for s in sites}
+    assert by_range["compute.mma"]["payload_expr"] == "ko"
+    assert (
+        by_range["load.global"]["payload_expr"]
+        == "((blockIdx.z * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x)"
+    )
+    assert any("TL_IKET_EVENT_PAYLOAD_U32(1, ko," in s for s in starts)
+    # Static load byte extraction records cp_async and TMA transaction sizes.
+    assert by_range["load.cp_async"]["cp_async_bytes_per_thread"] == 16
+    tma_code = (
+        'extern "C" __global__ void tma_k(const float* A) {\n'
+        "  loaded[0].expect_transaction(8192);\n"
+        "  tl::tma_load(B_desc, loaded[0], smem, 0, 0, 0);\n"
+        "}\n"
+    )
+    _, tma_sites = iket.annotate(tma_code, _token)
+    assert tma_sites[0]["tma_bytes"] == 8192
+
+
 def test_sampled_iterations_guard_loop_ranges():
     out, sites = iket.annotate(KERNEL, _token, iters=2)
     # Iterations 1 and 3 of four: the middle of each half.
@@ -156,11 +240,11 @@ def test_sampled_iterations_guard_loop_ranges():
     # The loop's trips scale its sampled iterations; a site outside it has none.
     assert {s["loop_trips"] for s in sites if s["loops"]} == {4}
     assert not any("loop_trips" in s for s in sites if not s["loops"])
-    # Each in-loop range: its start and end events, and its settle.
+    # Each in-loop range: its start and end events, and its settle on barrier ranges.
     events = [line for line in lines if line.startswith(f"TL_IKET_WHEN({stride}) ")]
     assert len(events) == 2 * len(in_loop)
     settles = [line for line in lines if line == f"if ({stride}) TL_IKET_SETTLE();"]
-    assert len(settles) == len(in_loop)
+    assert len(settles) == sum(s["settled"] for s in sites if s["loops"]) == 1
     # Ranges outside the loop, and the unrolled loop wrapped whole, have no condition;
     # none depends on the lane.
     assert 'TL_IKET_EVENT(1, "__tl_iket_v1_load.cp_async");' in lines
@@ -230,6 +314,77 @@ def test_preprocessor_conditional_skips_the_kernel():
     ]
 
 
+def test_phase_granularity_merges_waits_and_internal_sync_blocks():
+    fine_out, fine_sites = iket.annotate(KERNEL, _token, ctas=1, iters=1)
+    phase_out, phase_sites = iket.annotate(
+        KERNEL, _token, ctas=1, iters=1, granularity="phase"
+    )
+    assert [s["range"] for s in fine_sites] == [
+        "load.global",
+        "wait.sync",
+        "load.cp_async",
+        "wait.cp_async*4",
+        "wait.sync#2*4",
+        "compute.mma*4",
+        "wait.sync#3",
+        "store.global",
+    ]
+    assert [s["range"] for s in phase_sites] == [
+        "load.global",
+        "wait.sync",
+        "load.cp_async",
+        "wait*4",
+        "compute.mma*4",
+        "wait.sync#2",
+        "store.global",
+    ]
+    assert phase_sites[3]["kinds"] == ["cp_async", "sync"]
+    assert phase_sites[0]["events_per_warp_bound"] < fine_sites[0]["events_per_warp_bound"]
+
+    mla_like = (
+        'extern "C" __global__ void mla_kernel(const float* A, float* C) {\n'
+        "  float q = A[threadIdx.x];\n"
+        "  __syncthreads();\n"
+        "  __syncthreads();\n"
+        "  float k = A[threadIdx.x + 32];\n"
+        "  for (int c = 0; c < 4; ++c) {\n"
+        "    tl::cp_async_wait<0>();\n"
+        "    __syncthreads();\n"
+        "    tl::mma_sync(acc, a, b);\n"
+        "    for (int i = 0; i < 2; ++i) {\n"
+        "      __syncthreads();\n"
+        "      m[i] = tl::AllReduce<tl::MaxOp, 256, 64>::run(m[i], ws);\n"
+        "    }\n"
+        "    __syncthreads();\n"
+        "    tl::mma_sync(acc_o, p, v);\n"
+        "  }\n"
+        "  C[threadIdx.x] = acc_o[0];\n"
+        "}\n"
+    )
+    _, mla_fine = iket.annotate(mla_like, _token, ctas=1, iters=1, granularity="fine")
+    _, mla_phase = iket.annotate(mla_like, _token, ctas=1, iters=1, granularity="phase")
+    assert len(mla_fine) == 12
+    assert [s["range"] for s in mla_phase] == [
+        "load.global",
+        "wait*4",
+        "compute*4",
+        "store.global",
+    ]
+    assert mla_phase[0]["events_per_warp_bound"] == 8
+
+    with pytest.raises(ValueError, match="unknown IKET granularity"):
+        iket.annotate(KERNEL, _token, granularity="invalid")
+
+
+def test_cache_digest_isolates_sampling_settings():
+    d_all = iket._cache_digest((0, 0, "", "fine", 0, False, "/tmp/c"))
+    d_sampled = iket._cache_digest((1, 1, "", "fine", 0, False, "/tmp/c"))
+    d_phase = iket._cache_digest((1, 1, "", "phase", 0, False, "/tmp/c"))
+    d_warps = iket._cache_digest((1, 1, "", "phase", 1, True, "/tmp/c"))
+    assert len({d_all, d_sampled, d_phase, d_warps}) == 4
+    assert d_sampled == iket._cache_digest((1, 1, "", "fine", 0, False, "/tmp/other"))
+
+
 # ---------------------------------------------------------------- the mode
 
 GPU = pytest.mark.skipif(
@@ -246,7 +401,8 @@ import tilelang.language as T
 ON = sys.argv[1] == "on"
 if ON:
     from vllm.models.deepseek_v4_1.tilelang import iket
-    iket.enable(sys.argv[2])
+    cache_arg = sys.argv[3] if len(sys.argv) > 3 else None
+    iket.enable(sys.argv[2], ctas=int(sys.argv[4]) if len(sys.argv) > 4 else 0, cache_dir=cache_arg)
 
 @tilelang.jit
 def scale_add(n, threads=128):
@@ -340,6 +496,22 @@ def test_on_matches_off_and_keeps_its_own_cache(tmp_path):
     phases = {s["phase"] for s in json.loads(manifests[0].read_text())["sites"]}
     assert {"load", "wait", "store"} <= phases
     assert not (tmp_path / "iket" / "tilelang-cache").exists()
+
+
+@GPU
+def test_persistent_cache_dir_hits_and_mirrors_sources(tmp_path):
+    shared_cache = tmp_path / "iket-cache"
+    run1 = _run(tmp_path, "on", str(tmp_path / "iket-run1"), str(shared_cache), "1")
+    assert run1["cache_enabled"] and run1["source_instrumented"]
+    run2 = _run(tmp_path, "on", str(tmp_path / "iket-run2"), str(shared_cache), "1")
+    assert run2["cache_enabled"] and run2["bits"] == run1["bits"]
+    assert run2["cache_dir"] == run1["cache_dir"]
+    manifests = list(
+        (tmp_path / "iket-run2" / "sources").glob("iket_test_scale_add_kernel.*.json")
+    )
+    assert len(manifests) == 1
+    run3 = _run(tmp_path, "on", str(tmp_path / "iket-run3"), str(shared_cache), "4")
+    assert run3["cache_dir"] != run1["cache_dir"]
 
 
 @GPU

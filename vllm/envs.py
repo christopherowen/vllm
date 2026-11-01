@@ -229,6 +229,10 @@ if TYPE_CHECKING:
     VLLM_DS41_IKET_CTAS: int = 0
     VLLM_DS41_IKET_ITERS: int = 0
     VLLM_DS41_IKET_SKIP: str = ""
+    VLLM_DS41_IKET_GRANULARITY: Literal["fine", "phase"] = "fine"
+    VLLM_DS41_IKET_WARPS: int = 0
+    VLLM_DS41_IKET_PAYLOADS: bool = False
+    VLLM_DS41_IKET_CACHE_DIR: str | None = None
     WEIGHTLESS_STEER_PATH: str | None = None
     WEIGHTLESS_STEER_MODEL: str | None = None
     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
@@ -1934,6 +1938,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # With VLLM_DS41_IKET: TileLang kernels whose name this regex matches compile
     # without ranges (run-iket still records their warps' lifetimes).
     "VLLM_DS41_IKET_SKIP": lambda: os.getenv("VLLM_DS41_IKET_SKIP", ""),
+    # With VLLM_DS41_IKET: range granularity ("fine" default, or "phase" to coalesce
+    # consecutive waits and internal block barriers across same-phase siblings).
+    "VLLM_DS41_IKET_GRANULARITY": lambda: os.getenv(
+        "VLLM_DS41_IKET_GRANULARITY", "fine"
+    ),
+    # With VLLM_DS41_IKET: record ranges in about this many warps per traced CTA,
+    # evenly spaced across warp groups (0: all).
+    "VLLM_DS41_IKET_WARPS": lambda: int(os.getenv("VLLM_DS41_IKET_WARPS", "0")),
+    # With VLLM_DS41_IKET: attach uint32 payloads (innermost loop variable or CTA
+    # index) to range start events.
+    "VLLM_DS41_IKET_PAYLOADS": lambda: bool(
+        int(os.getenv("VLLM_DS41_IKET_PAYLOADS", "0"))
+    ),
+    # With VLLM_DS41_IKET: optional persistent cache root for instrumented TileLang
+    # kernels and their site manifests, keyed by a digest of iket.py and sampling.
+    "VLLM_DS41_IKET_CACHE_DIR": lambda: os.getenv("VLLM_DS41_IKET_CACHE_DIR") or None,
     # DeepSeek V4.1 GLP steering (models/deepseek_v4_1/glp.py): the GLP file and
     # the served model name whose requests alone it steers (vllm/weightless.py),
     # set together or not at all. Part of the compile key, as every variable here
