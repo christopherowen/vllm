@@ -54,7 +54,10 @@ from vllm.config import get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.models.deepseek_v4_1 import sp_prefill
 from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
-from vllm.models.deepseek_v4_1.tilelang.collectives import RankOrderParts
+from vllm.models.deepseek_v4_1.tilelang.collectives import (
+    MAX_RANK_ORDER_WORLD,
+    RankOrderParts,
+)
 from vllm.models.deepseek_v4_1.tilelang.gemm import cast_block_mxfp8, scale_words
 from vllm.models.deepseek_v4_1.tilelang.linear import (
     MXFP8Rows,
@@ -123,7 +126,7 @@ def project_streams(
     collapse is rounded to BF16, with its sum of squares ``Q``.
     """
     assert hidden_size % block_H == 0 and mode in ("pre", "post_pre", "broadcast")
-    assert 1 <= world <= 4 and (world == 1 or mode == "post_pre")
+    assert 1 <= world <= MAX_RANK_ORDER_WORLD and (world == 1 or mode == "post_pre")
     assert not with_aux or mode == "post_pre"
     splits = hidden_size // block_H
     streams = 1 if mode == "broadcast" else MULT
@@ -536,7 +539,7 @@ def project_and_finalize_streams(
     token tile reduces ``S``, ``P`` and ``Q`` in split order and runs ``finalize``'s
     mix split, Sinkhorn, collapse RMSNorm and MXFP8 cast for the tile's tokens."""
     assert hidden_size % block_H == 0 and mode in ("pre", "post_pre", "broadcast")
-    assert 1 <= world <= 4 and (world == 1 or mode == "post_pre")
+    assert 1 <= world <= MAX_RANK_ORDER_WORLD and (world == 1 or mode == "post_pre")
     assert not with_aux or mode == "post_pre"
     assert hidden_size % VEC == 0 and block_M % 2 == 0
     splits = hidden_size // block_H

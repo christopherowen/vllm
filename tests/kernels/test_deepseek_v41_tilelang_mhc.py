@@ -191,7 +191,7 @@ def test_post_pre_matches_reference(mhc, tokens):
     _check(actual, _reference(actual[0], fn, scale, base, incoming, weight), tokens)
 
 
-@pytest.mark.parametrize("world", [2, 3, 4])
+@pytest.mark.parametrize("world", [2, 3, 4, 5, 6, 7, 8])
 @pytest.mark.parametrize("tokens", [1, 9, 64, 300])
 def test_post_pre_adds_rank_order_parts(mhc, world, tokens):
     """Unreduced partials give exactly the result of their rank-order sum."""
@@ -485,7 +485,7 @@ def test_collapse_writes_the_sink_column(mhc, tokens, column):
     _assert_bits_equal(columns, state[:, :, column].float(), "columns: ")
 
 
-@pytest.mark.parametrize("world", [2, 3, 4])
+@pytest.mark.parametrize("world", [2, 3, 4, 5, 6, 7, 8])
 @pytest.mark.parametrize("tokens", [1, 6, 96, 2048])
 def test_post_of_rank_order_parts_matches_tile_kernels(mhc, world, tokens):
     """The ranks' unreduced partials are summed in rank order first (RankOrderParts),

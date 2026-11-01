@@ -37,6 +37,7 @@ import tilelang.language as T
 import torch
 
 from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
+from vllm.models.deepseek_v4_1.tilelang.collectives import MAX_RANK_ORDER_WORLD
 
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
@@ -44,7 +45,7 @@ def glp_steer_kernel(
     hc_mult: int, hidden: int, world: int, threads: int = 320, vec: int = 8
 ):
     assert hidden % (threads * vec) == 0 and threads % 32 == 0
-    assert 1 <= world <= 4
+    assert 1 <= world <= MAX_RANK_ORDER_WORLD
     chunks = hidden // (threads * vec)
     warps = threads // 32
     span = chunks * vec
