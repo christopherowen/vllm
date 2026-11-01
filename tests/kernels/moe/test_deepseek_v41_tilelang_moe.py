@@ -775,3 +775,30 @@ def test_narrow_and_wide_codes_give_the_uncoded_gemm_bits(rows, n, k, gather):
     assert torch.equal(
         out_plain[live].view(torch.int16), out_mixed[live].view(torch.int16)
     )
+
+
+def test_grouped_fp8_fp4_gemm_defers_barrier_init_and_down_stages():
+    """Empty CTAs return before barrier initialization, and decode down GEMMs use
+    two stages (2 CTAs/SM) with identical bits to three stages."""
+    plan = MoeExpertsV41Plan(384, 6, 5120, 576, swiglu_limit=LIMIT)
+    calls = plan.kernels()
+    assert calls["gate_up"][2]["num_stages"] == 3
+    assert calls["late_gate_up"][2]["num_stages"] == 3
+    assert calls["prefill_gate_up"][2]["num_stages"] == 3
+    assert calls["down"][2]["num_stages"] == 2
+    assert calls["late_down"][2]["num_stages"] == 2
+    assert calls["prefill_down"][2]["num_stages"] == 3
+
+    kernel = grouped_fp8_fp4_gemm(
+        32, 384, 576, 6, False, 32, 128, num_stages=2, coded_scales=True, narrow_codes=True
+    )
+    src = kernel.get_kernel_source()
+    early_return = src.rindex("if (expert < 0)")
+    rows_write = src.index("((int*)rows_shared)[")
+    barrier_init = src.index("loaded[0].init(")
+    fence_init = src.index("tl::fence_barrier_init()")
+    a_row_read = src.index("= ((int*)rows_shared)[")
+    assert "__syncthreads()" not in src[:early_return]
+    assert early_return < rows_write < barrier_init < fence_init < a_row_read
+    # Writing rows_shared and initializing loaded share a single __syncthreads().
+    assert src[rows_write:a_row_read].count("__syncthreads()") == 1
