@@ -405,7 +405,17 @@ class SPRows:
         local, world, tokens = self.local_rows, self.world_size, self.num_tokens
         send = torch.empty((world, local, *row_shape), dtype=dtype, device=device)
         parts = torch.empty_like(send)
-        comm = get_tp_group().device_communicator.pynccl_comm
+        dev_comm = get_tp_group().device_communicator
+        comm = dev_comm.pynccl_comm
+        roce_comm = getattr(dev_comm, "b12x_ar_comm", None)
+        should_ex = getattr(roce_comm, "should_exchange", None)
+        ex_into = getattr(roce_comm, "exchange_into", None)
+        use_roce_ex = (
+            roce_comm is not None
+            and not roce_comm.disabled
+            and should_ex is not None
+            and ex_into is not None
+        )
         slices = max(slices, 1)
         if slices == 1 and not per_block:
             flat = send.view(world * local, *row_shape)
@@ -414,7 +424,10 @@ class SPRows:
             parts[self.rank].copy_(send[self.rank])
             if then is not None:
                 then()
-            exchange_into(comm, send, parts, self.rank, world)
+            if use_roce_ex and should_ex(send):
+                ex_into(send, parts)
+            else:
+                exchange_into(comm, send, parts, self.rank, world)
             return parts
 
         def write(owner, lo, hi):
@@ -436,7 +449,10 @@ class SPRows:
                     write(owner, lo, hi)
             side.wait_stream(main)
             with torch.cuda.stream(side):
-                exchange_into(comm, send[:, lo:hi], parts[:, lo:hi], self.rank, world)
+                if use_roce_ex and should_ex(send[:, lo:hi]):
+                    ex_into(send[:, lo:hi], parts[:, lo:hi])
+                else:
+                    exchange_into(comm, send[:, lo:hi], parts[:, lo:hi], self.rank, world)
             write(self.rank, lo, hi)
         if then is not None:
             then()

@@ -695,9 +695,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
     def all_to_all_rows(self, input_: torch.Tensor, rows: int) -> torch.Tensor:
         """Row blocks of ``rows``: block r goes to rank r; the output's [s] holds
-        rank s's block (rows past this rank's real rows unwritten). PyNCCL only
-        (grouped send/recv)."""
+        rank s's block (rows past this rank's real rows unwritten)."""
         self._require_roce_policy()
+        b12x_ar_comm = self.b12x_ar_comm
+        should_a2a = getattr(b12x_ar_comm, "should_all_to_all_rows", None)
+        a2a = getattr(b12x_ar_comm, "all_to_all_rows", None)
+        if (
+            b12x_ar_comm is not None
+            and not b12x_ar_comm.disabled
+            and should_a2a is not None
+            and should_a2a(input_, rows)
+        ):
+            assert a2a is not None
+            return a2a(input_, rows)
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is None or pynccl_comm.disabled:
             raise RuntimeError("all_to_all_rows needs the PyNCCL communicator")
@@ -714,6 +724,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
+
+        b12x_ar_comm = self.b12x_ar_comm
+        should_rs = getattr(b12x_ar_comm, "should_reduce_scatter", None)
+        rs = getattr(b12x_ar_comm, "reduce_scatter", None)
+        if (
+            b12x_ar_comm is not None
+            and not b12x_ar_comm.disabled
+            and should_rs is not None
+            and should_rs(input_, dim)
+        ):
+            assert rs is not None
+            return rs(input_, dim)
 
         # Note: This will produce an incorrect answer if we don't make
         # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
