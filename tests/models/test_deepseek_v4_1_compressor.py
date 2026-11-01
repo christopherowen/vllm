@@ -464,3 +464,115 @@ def test_compressor_high_page_offsets(compressor_runners):
         expected, _ = reference.run()
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
         assert (high_backing[high_page, candidate.state_width :] == 123).all()
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_compressor_tp_sharded_fused_wkv_wgate_matches_tp1(monkeypatch, ratio):
+    """At TP4 each rank holds 1/4 of ``wkv`` (and ``wgate`` at ratio 2), projects
+    its local shard with the same 5-shard blocked K reduction, and all-gathers
+    ``_values`` (and ``_gates``) bit for bit equal to TP1 across decode and prefill."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("DeepSeek-V4.1 compression requires SM12x")
+    pytest.importorskip("tilelang")
+
+    import vllm.models.deepseek_v4_1.compressor as comp_mod
+    import vllm.v1.worker.workspace as workspace
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers import linear
+    from vllm.models.deepseek_v4_1.compressor import DeepseekCompressor
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    monkeypatch.setattr(workspace, "_manager", workspace.WorkspaceManager(device))
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+    capacity, requests, hidden = 160, 4, 5120
+
+    def make_config():
+        return SimpleNamespace(
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=capacity, max_num_seqs=requests
+            ),
+            compilation_config=SimpleNamespace(static_forward_context={}),
+            parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+            speculative_config=None,
+        )
+
+    gen = torch.Generator(device=device).manual_seed(77 + ratio)
+    wkv = (torch.randn((512, hidden), generator=gen, device=device) * 0.02).bfloat16()
+    wgate = (
+        (torch.randn((512, hidden), generator=gen, device=device) * 0.02).bfloat16()
+        if ratio == 2
+        else None
+    )
+
+    def build_rank(tp_rank: int, tp_size: int) -> DeepseekCompressor:
+        for mod in (linear, parameter):
+            monkeypatch.setattr(mod, "get_tensor_model_parallel_rank", lambda: tp_rank)
+            monkeypatch.setattr(
+                mod, "get_tensor_model_parallel_world_size", lambda: tp_size
+            )
+        comp = DeepseekCompressor(
+            make_config(), ratio, hidden, 512, prefix=f"r{tp_rank}_{tp_size}"
+        ).to(device)
+        param = comp.fused_wkv_wgate.weight
+        param.weight_loader(param, wkv, 0)
+        if ratio == 2:
+            param.weight_loader(param, wgate, 1)
+        comp.fused_wkv_wgate.quant_method.process_weights_after_loading(
+            comp.fused_wkv_wgate
+        )
+        comp.fused_wkv_wgate.quant_method.declare_layer_kernels(comp.fused_wkv_wgate)
+        comp._ensure_capacity_buffers(device, capacity, requests)
+        return comp
+
+    with torch.no_grad(), workspace.use_workspace_lane(0):
+        # Unaligned TP size (e.g. TP3) falls back to replicated fused_wkv_wgate.
+        tp3 = build_rank(0, 3)
+        assert tp3.fused_wkv_wgate.tp_size == 1
+        assert tp3.fused_wkv_wgate.weight.shape == (512 * ratio, hidden)
+
+        tp1 = build_rank(0, 1)
+        assert tp1.fused_wkv_wgate.tp_size == 1
+        assert tp1.fused_wkv_wgate.weight.shape == (512 * ratio, hidden)
+
+        tp_size = 4
+        ranks = [build_rank(r, tp_size) for r in range(tp_size)]
+        for r, comp in enumerate(ranks):
+            assert comp.fused_wkv_wgate.tp_size == tp_size
+            assert comp.fused_wkv_wgate.weight.shape == (128 * ratio, hidden)
+            assert torch.equal(
+                comp.fused_wkv_wgate.weight[:128], wkv[r * 128 : (r + 1) * 128]
+            )
+            if ratio == 2:
+                assert torch.equal(
+                    comp.fused_wkv_wgate.weight[128:], wgate[r * 128 : (r + 1) * 128]
+                )
+
+        x = torch.randn(
+            (capacity, hidden), generator=gen, device=device, dtype=torch.bfloat16
+        )
+        for rows in (1, 7, 16, 64, 160):
+            inp = x[:rows]
+            tp1._project(inp)
+            ref_values = tp1._values[:rows].clone()
+            ref_gates = tp1._gates[:rows].clone() if ratio == 2 else None
+
+            # Collect all 4 ranks' local shards, then verify _project with all_gather.
+            from vllm.models.deepseek_v4_1.tilelang.linear import project_parts
+
+            shards = []
+            for comp in ranks:
+                local = comp._local_shards[: ratio * rows].view(ratio, rows, 128)
+                project_parts(comp.fused_wkv_wgate, inp, tuple(local), rows)
+                shards.append(local.clone())
+            gathered = torch.cat(shards, dim=-1)
+
+            monkeypatch.setattr(
+                comp_mod,
+                "tensor_model_parallel_all_gather",
+                lambda tensor, dim=-1: gathered,
+            )
+            ranks[0]._project(inp)
+            assert torch.equal(ranks[0]._values[:rows], ref_values), f"rows={rows}"
+            if ratio == 2:
+                assert torch.equal(ranks[0]._gates[:rows], ref_gates), f"rows={rows}"
+            assert not ranks[0].fused_wkv_wgate.tilelang_counters.any()

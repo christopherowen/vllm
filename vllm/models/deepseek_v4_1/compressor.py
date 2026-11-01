@@ -7,6 +7,8 @@ from weakref import WeakValueDictionary
 import torch
 import torch.nn as nn
 
+from vllm.distributed.communication_op import tensor_model_parallel_all_gather
+from vllm.model_executor.layers import linear as linear_layers
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.models.deepseek_v4_1.sparse_mla import SLOT_DTYPE, DeepseekV41B12xBackend
@@ -17,11 +19,17 @@ from vllm.v1.kv_cache_interface import CircularBufferSpec
 class _SharedCompressorBuffers:
     """Transient capacity scratch shared across sequential compressor layers."""
 
-    def __init__(self, device: torch.device, t: int, r: int, ratio: int) -> None:
+    def __init__(
+        self, device: torch.device, t: int, r: int, ratio: int, tp_size: int = 1
+    ) -> None:
         def alloc(shape, dtype):
             return torch.empty(shape, dtype=dtype, device=device)
 
-        self.values = alloc((t, 512), torch.float32 if ratio == 2 else torch.bfloat16)
+        val_dtype = torch.float32 if ratio == 2 else torch.bfloat16
+        self.values = alloc((t, 512), val_dtype)
+        self.local_shards = (
+            alloc((ratio * t, 512 // tp_size), val_dtype) if tp_size > 1 else None
+        )
         self.latent = alloc((t, 512), torch.bfloat16)
         self.emitted = alloc((t,), torch.bool)
         self.slots = alloc((t,), SLOT_DTYPE)
@@ -38,7 +46,7 @@ class _SharedCompressorBuffers:
 
 
 _SHARED_BUFFERS: WeakValueDictionary[
-    tuple[torch.device, int, int, int], _SharedCompressorBuffers
+    tuple[torch.device, int, int, int, int], _SharedCompressorBuffers
 ] = WeakValueDictionary()
 
 
@@ -115,13 +123,16 @@ class DeepseekCompressor(nn.Module):
         model_cfg = getattr(vllm_config, "model_config", None)
         hf = getattr(model_cfg, "hf_config", None) if model_cfg is not None else None
         self._rope_dim = int(getattr(hf, "qk_rope_head_dim", 64))
+        tp_size = linear_layers.get_tensor_model_parallel_world_size()
+        disable_tp = tp_size <= 1 or 512 % (tp_size * 64) != 0
         self.fused_wkv_wgate = MergedColumnParallelLinear(
             hidden_size,
             [512] * compress_ratio,
             bias=False,
             return_bias=False,
+            gather_output=False,
             quant_config=None,
-            disable_tp=True,
+            disable_tp=disable_tp,
             prefix=f"{prefix}.fused_wkv_wgate",
             params_dtype=torch.bfloat16,
         )
@@ -146,6 +157,7 @@ class DeepseekCompressor(nn.Module):
         self._values = self._latent = self._emitted = self._slots = None
         self._gates = self._pending_values = self._pending_gates = None
         self._pending_tags = self._local_ids = self._row_ids = None
+        self._local_shards = None
 
     def _ensure_capacity_buffers(self, device, t, r) -> None:
         """Allocate the reusable serving storage for ``t`` tokens and ``r``
@@ -157,13 +169,17 @@ class DeepseekCompressor(nn.Module):
         dev = torch.device(device)
         if dev.type == "cuda" and dev.index is None:
             dev = torch.device("cuda", torch.cuda.current_device())
-        key = (dev, int(t), int(r), int(self.compress_ratio))
+        tp_size = int(getattr(self.fused_wkv_wgate, "tp_size", 1))
+        key = (dev, int(t), int(r), int(self.compress_ratio), tp_size)
         shared = _SHARED_BUFFERS.get(key)
         if shared is None:
-            shared = _SharedCompressorBuffers(dev, int(t), int(r), int(self.compress_ratio))
+            shared = _SharedCompressorBuffers(
+                dev, int(t), int(r), int(self.compress_ratio), tp_size
+            )
             _SHARED_BUFFERS[key] = shared
         self._shared_buffers = shared
         self._values = shared.values
+        self._local_shards = shared.local_shards
         self._latent = shared.latent
         self._emitted = shared.emitted
         self._slots = shared.slots
@@ -177,12 +193,30 @@ class DeepseekCompressor(nn.Module):
     def _project(self, hidden_states):
         from vllm.models.deepseek_v4_1.tilelang.linear import project_parts
 
+        rows = hidden_states.shape[0]
+        tp_size = int(getattr(self.fused_wkv_wgate, "tp_size", 1))
+        if tp_size <= 1:
+            project_parts(
+                self.fused_wkv_wgate,
+                hidden_states,
+                (self._values, self._gates)[: self.compress_ratio],
+                rows,
+            )
+            return
+        part_cols = 512 // tp_size
+        local = self._local_shards[: self.compress_ratio * rows].view(
+            self.compress_ratio, rows, part_cols
+        )
         project_parts(
             self.fused_wkv_wgate,
             hidden_states,
-            (self._values, self._gates)[: self.compress_ratio],
-            hidden_states.shape[0],
+            tuple(local),
+            rows,
         )
+        gathered = tensor_model_parallel_all_gather(local, dim=-1)
+        self._values[:rows].copy_(gathered[0])
+        if self.compress_ratio == 2:
+            self._gates[:rows].copy_(gathered[1])
 
     def _tilelang_calls(self) -> list:
         """The TileLang compression kernels ``_forward_tilelang`` launches, as

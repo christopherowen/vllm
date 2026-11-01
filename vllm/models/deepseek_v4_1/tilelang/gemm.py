@@ -1442,6 +1442,33 @@ SPLIT_BF16: dict[tuple[int, int], dict] = {
             64: dict(block_N=32, num_stages=2, threads=256),
         },
     ),
+    (256, 5120): dict(
+        shards=5,
+        blocked=True,
+        decode={
+            16: dict(block_N=32, num_stages=3, threads=128),
+            32: dict(block_N=32, num_stages=3, threads=128),
+            64: dict(block_N=32, num_stages=2, threads=256),
+        },
+    ),
+    (128, 5120): dict(
+        shards=5,
+        blocked=True,
+        decode={
+            16: dict(block_N=32, num_stages=3, threads=128),
+            32: dict(block_N=32, num_stages=3, threads=128),
+            64: dict(block_N=32, num_stages=2, threads=256),
+        },
+    ),
+    (64, 5120): dict(
+        shards=5,
+        blocked=True,
+        decode={
+            16: dict(block_N=32, num_stages=3, threads=128),
+            32: dict(block_N=32, num_stages=3, threads=128),
+            64: dict(block_N=32, num_stages=2, threads=256),
+        },
+    ),
 }
 
 
