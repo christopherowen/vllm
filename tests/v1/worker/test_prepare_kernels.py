@@ -334,9 +334,10 @@ def test_bounded_moe_and_router_declarations_omit_unreachable_cold_boot_kernels(
         idx_dtypes=(torch.int64,),
         max_rows=4096,
     )
+    assert target._has_mid_tiles()
     assert target._has_prefill_tiles()
     target_dispatches = target._dispatches()
-    assert len(target_dispatches) == 2
+    assert len(target_dispatches) == 3
     assert set(target_dispatches[0].kernels()) == {
         "fused",
         "count",
@@ -345,13 +346,14 @@ def test_bounded_moe_and_router_declarations_omit_unreachable_cold_boot_kernels(
         "combine_kernels",
         "fold_kernels",
     }
-    assert set(target_dispatches[1].kernels()) == {
-        "count",
-        "layout",
-        "scatter",
-        "combine_kernels",
-        "fold_kernels",
-    }
+    for disp in target_dispatches[1:]:
+        assert set(disp.kernels()) == {
+            "count",
+            "layout",
+            "scatter",
+            "combine_kernels",
+            "fold_kernels",
+        }
 
     drafter_gate = SimpleNamespace(
         weight=torch.empty((128, 5120), dtype=torch.bfloat16),

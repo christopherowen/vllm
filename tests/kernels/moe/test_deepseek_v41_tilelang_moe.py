@@ -534,15 +534,27 @@ def test_moe_swiglu_cast_equals_tile_kernels(
 
 
 def test_tile_height_follows_routes_per_expert():
-    """A call takes the prefill tiles once the average expert has a full decode tile
-    of routes; decode steps (at most 16 streams x 6 rows) and the drafter keep the
-    decode tiles, and each call's scratch is laid out at its own height."""
+    """A call steps from the 16-row decode tiles to 32-row tiles once the average
+    expert has a full 16-row tile of routes, and to 64-row prefill tiles once it has
+    a full 32-row tile; decode steps (at most 16 streams x 6 rows) and the drafter
+    keep the 16-row decode tiles, and each call's scratch is laid out at its own
+    height."""
     plan = MoeExpertsV41Plan(384, 6, 5120, 768, swiglu_limit=LIMIT)
-    assert plan.tile_height(96) == plan.tile_height(2047) == 32
+    assert plan.tile_height(96) == plan.tile_height(1023) == 16
+    assert plan.tile_height(1024) == plan.tile_height(2047) == 32
     assert plan.tile_height(2048) == plan.tile_height(24576) == 64
     drafter = MoeExpertsV41Plan(128, 3, 5120, 768, swiglu_limit=LIMIT)
-    assert drafter.tile_height(96) == 32
-    for rows, height in ((2047, 32), (2048, 64), (16384, 64)):
+    assert drafter.tile_height(96) == drafter.tile_height(682) == 16
+    assert drafter.tile_height(683) == drafter.tile_height(1365) == 32
+    assert drafter.tile_height(1366) == 64
+    for rows, height in (
+        (96, 16),
+        (1023, 16),
+        (1024, 32),
+        (2047, 32),
+        (2048, 64),
+        (16384, 64),
+    ):
         layout_rows = (
             plan.workspace_specs(rows, torch.int32)[-4][0][0]  # the gate/up output
         )
@@ -551,49 +563,96 @@ def test_tile_height_follows_routes_per_expert():
 
 
 @pytest.mark.parametrize("hidden, intermediate", [(512, 256), (384, 576), (384, 768)])
-@pytest.mark.parametrize("rows", [170, 171, 1000])
+@pytest.mark.parametrize("rows", [12, 85, 86, 170, 171, 1000])
 @pytest.mark.parametrize("idx_dtype", [torch.int32, torch.int64])
 def test_prefill_tiles_give_the_decode_tiles_bits(
     rows, idx_dtype, hidden, intermediate, num_experts=32, topk=6
 ):
-    """A call's output has the same bits at the prefill tile height as at the decode
-    one: every row's sum over K runs in the same order whatever the tile height
-    (171 rows is the first prefill call at 32 experts, top-6)."""
+    """A call's output has the same bits at the 16-row decode, 32-row mid and 64-row
+    prefill tile heights: every row's sum over K runs in the same order whatever the
+    tile height (at 32 experts, top-6: 86 rows is the first 32-row call and 171 rows
+    is the first 64-row call)."""
     w13_packed, w13_sf, _ = _experts(num_experts, 2 * intermediate, hidden, 5)
     w2_packed, w2_sf, _ = _experts(num_experts, hidden, intermediate, 6)
     x = (torch.randn((rows, hidden), generator=_gen(7), device=DEVICE) * 0.5).bfloat16()
     ids, route_weights = _routes(rows, num_experts, topk, 8, idx_dtype)
+    tokens = cast_mxfp8(x)
     outs = {}
-    for prefill_block_M in (64, 32):  # 32: the decode tiles at every size
+    for height in (16, 32, 64):
         plan = _plan(
             num_experts,
             topk,
             hidden,
             intermediate,
             swiglu_limit=LIMIT,
-            prefill_block_M=prefill_block_M,
+            decode_block_M=height,
+            block_M=height,
+            prefill_block_M=height,
         )
         weights = plan.prepare_weights(w13_packed, w13_sf, w2_packed, w2_sf)
-        outs[prefill_block_M] = torch.empty_like(x)
-        plan.run(cast_mxfp8(x), ids, route_weights, weights, outs[prefill_block_M])
-    assert _plan(
-        num_experts, topk, hidden, intermediate, swiglu_limit=LIMIT
-    ).tile_height(rows) == (64 if rows >= 171 else 32)
+        outs[height] = torch.empty_like(x)
+        plan.run(tokens, ids, route_weights, weights, outs[height])
+    tiered = _plan(num_experts, topk, hidden, intermediate, swiglu_limit=LIMIT)
+    want_height = 64 if rows >= 171 else (32 if rows >= 86 else 16)
+    assert tiered.tile_height(rows) == want_height
+    tiered_out = torch.empty_like(x)
+    tiered.run(
+        tokens,
+        ids,
+        route_weights,
+        tiered.prepare_weights(w13_packed, w13_sf, w2_packed, w2_sf),
+        tiered_out,
+    )
+    assert torch.equal(outs[16].view(torch.int16), outs[32].view(torch.int16))
     assert torch.equal(outs[64].view(torch.int16), outs[32].view(torch.int16))
+    assert torch.equal(tiered_out.view(torch.int16), outs[32].view(torch.int16))
 
 
-@pytest.mark.parametrize("intermediate", [576, 768])
-@pytest.mark.parametrize("rows", [2048, 4096])
-def test_moe_swiglu_cast_prefill_tiles_equal_tile_kernels(
-    rows, intermediate, num_experts=384, topk=6
+@pytest.mark.parametrize("hidden, intermediate", [(512, 256), (384, 576), (384, 768)])
+@pytest.mark.parametrize("rows", [171, 500])
+@pytest.mark.parametrize("idx_dtype", [torch.int32, torch.int64])
+def test_prefill_swizzle_panel_matches_unswizzled_bits(
+    rows, idx_dtype, hidden, intermediate, num_experts=32, topk=6
 ):
-    """At the prefill tile height (64 rows) the fused SwiGLU's bytes and scales still
-    equal TileKernels' kernel over the same layout."""
+    """Swizzling the prefill grouped-GEMM CTA grid across ``prefill_swizzle_panel=3``
+    consecutive M-tiles changes only CTA scheduling order and keeps every output
+    element bit-identical to ``prefill_swizzle_panel=0``."""
+    w13_packed, w13_sf, _ = _experts(num_experts, 2 * intermediate, hidden, 15)
+    w2_packed, w2_sf, _ = _experts(num_experts, hidden, intermediate, 16)
+    x = (
+        torch.randn((rows, hidden), generator=_gen(17), device=DEVICE) * 0.5
+    ).bfloat16()
+    ids, route_weights = _routes(rows, num_experts, topk, 18, idx_dtype)
+    tokens = cast_mxfp8(x)
+    outs = {}
+    for swizzle_panel in (0, 3):
+        plan = _plan(
+            num_experts,
+            topk,
+            hidden,
+            intermediate,
+            swiglu_limit=LIMIT,
+            prefill_swizzle_panel=swizzle_panel,
+        )
+        assert plan.tile_height(rows) == 64
+        weights = plan.prepare_weights(w13_packed, w13_sf, w2_packed, w2_sf)
+        outs[swizzle_panel] = torch.empty_like(x)
+        plan.run(tokens, ids, route_weights, weights, outs[swizzle_panel])
+    assert torch.equal(outs[3].view(torch.int16), outs[0].view(torch.int16))
+
+
+@pytest.mark.parametrize("block_M, rows", [(16, 96), (64, 2048), (64, 4096)])
+@pytest.mark.parametrize("intermediate", [576, 768])
+def test_moe_swiglu_cast_prefill_tiles_equal_tile_kernels(
+    block_M, rows, intermediate, num_experts=384, topk=6
+):
+    """At the 16-row decode and 64-row prefill tile heights the fused SwiGLU's bytes
+    and scales still equal TileKernels' kernel over the same layout."""
     try:
-        layout, h = _swiglu_case(rows, intermediate, num_experts, topk, block_M=64)
+        layout, h = _swiglu_case(rows, intermediate, num_experts, topk, block_M=block_M)
         live = layout["order"] >= 0
-        ours = moe_swiglu_cast(intermediate, 64, LIMIT)
-        theirs = _tile_kernels_swiglu(intermediate, num_experts, 64)
+        ours = moe_swiglu_cast(intermediate, block_M, LIMIT)
+        theirs = _tile_kernels_swiglu(intermediate, num_experts, block_M)
         a, a_sf = _swiglu_outputs(h.shape[0], intermediate)
         b, b_sf = _swiglu_outputs(h.shape[0], intermediate)
         ours(
@@ -604,7 +663,7 @@ def test_moe_swiglu_cast_prefill_tiles_equal_tile_kernels(
         assert torch.equal(a[live].view(torch.uint8), b[live].view(torch.uint8))
         assert torch.equal(a_sf[live, :cols], b_sf[live, :cols])
     finally:
-        # The plans' decode tiles: TileKernels' alignment is process-wide.
+        # The plans' mid tiles: TileKernels' alignment is process-wide.
         tile_kernels.config.set_token_alignment(32)
 
 

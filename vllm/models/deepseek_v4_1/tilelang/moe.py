@@ -631,6 +631,7 @@ def grouped_fp8_fp4_gemm(
     coded_scales: bool = False,
     narrow_codes: bool = False,
     trigger_after_loop: bool = False,
+    swizzle_panel: int = 0,
 ):
     """``C[r] = (A[row(r)] * SFA) @ (B[e] * SFB[e])^T``, ``e`` the expert of row ``r``.
 
@@ -658,6 +659,13 @@ def grouped_fp8_fp4_gemm(
     With ``trigger_after_loop`` the kernel begins with ``pdl.wait()`` and triggers its
     dependent's launch after its K loop (``pdl.trigger()``) instead of at its start, so
     the dependent launches near its end (see ``pdl``).
+
+    With ``swizzle_panel > 0``, ``T.use_swizzle(panel_size=swizzle_panel)``
+    rasterizes the ``(N / block_N, tiles)`` grid in panels of ``swizzle_panel``
+    consecutive M-tiles, stepping M-tiles first within each column block ``bx``
+    and reversing ``bx`` on odd panels, so consecutive M-tiles of the same
+    expert share each ``bx`` weight slab in L2 while keeping unused padding
+    tiles (``t >= used_tiles``) at the tail of the grid.
     """
     block_K = FP4_TMA_K
     tail = K % block_K
@@ -1361,13 +1369,16 @@ class MoeExpertsV41Plan:
 
     Each grouped-GEMM tile holds ``block_M`` routes of one expert and reads that
     expert's weight slab again, so a call's tile height is chosen by its rows
-    (``tile_height``): decode keeps ``block_M``, whose partial tiles cost least
-    when an expert has a few routes; a prefill call, where the average expert has
-    at least one full ``block_M`` tile, uses ``prefill_block_M`` rows a tile and
-    reads the weights half as often a route (GB10, one layer's experts at TP3's
-    768 columns a rank: 11% faster at 8,192 tokens, 19% at 16,384; spark-ds41f
+    (``tile_height``): decode steps and short prefills keep ``decode_block_M``
+    (16 rows, one SM120 MMA atom tall), where nearly every active expert has at
+    most 16 routes and wider tiles only pad empty rows; medium prefills, once the
+    average expert fills a ``decode_block_M`` tile, step up to ``block_M`` (32);
+    and long prefills, where the average expert has at least one full ``block_M``
+    tile, use ``prefill_block_M`` (64) rows a tile and read the weights half as
+    often a route (GB10, one layer's experts at TP3's 768 columns a rank: 11%
+    faster at 8,192 tokens, 19% at 16,384; spark-ds41f
     experiments/2026-10-26-tp3-budget-memory). A row's sum over K runs in the same
-    order at either height, so its output has the same bits.
+    order at every height, so its output has the same bits.
     """
 
     def __init__(
@@ -1378,8 +1389,10 @@ class MoeExpertsV41Plan:
         intermediate,
         *,
         swiglu_limit=None,
+        decode_block_M=16,
         block_M=32,
         prefill_block_M=64,
+        prefill_swizzle_panel=3,
         block_N=128,
         num_stages=3,
         down_num_stages=2,
@@ -1393,11 +1406,18 @@ class MoeExpertsV41Plan:
             hidden,
             intermediate,
         )
-        self.block_M, self.prefill_block_M, self.block_N = (
+        (
+            self.decode_block_M,
+            self.block_M,
+            self.prefill_block_M,
+            self.block_N,
+        ) = (
+            decode_block_M,
             block_M,
             prefill_block_M,
             block_N,
         )
+        self.prefill_swizzle_panel = prefill_swizzle_panel
         self.num_stages = num_stages
         self.down_num_stages = down_num_stages
         self.swiglu_limit = swiglu_limit
@@ -1405,8 +1425,14 @@ class MoeExpertsV41Plan:
         self.out_dtype = out_dtype
         self.idx_dtypes = tuple(idx_dtypes)
         self.max_rows = max_rows
+        mid_min_routes = decode_block_M * num_experts
         prefill_min_routes = block_M * num_experts
         decode_max_routes = (
+            mid_min_routes - 1
+            if block_M != decode_block_M
+            else (prefill_min_routes - 1 if prefill_block_M != decode_block_M else None)
+        )
+        mid_max_routes = (
             prefill_min_routes - 1 if prefill_block_M != block_M else None
         )
         if max_rows is not None:
@@ -1416,8 +1442,25 @@ class MoeExpertsV41Plan:
                 if decode_max_routes is None
                 else min(decode_max_routes, max_routes)
             )
+            mid_max_routes = (
+                max_routes
+                if mid_max_routes is None
+                else min(mid_max_routes, max_routes)
+            )
         else:
             max_routes = None
+        self.decode_dispatch = {
+            dtype: MoeDispatchV41Plan(
+                num_experts,
+                topk,
+                decode_block_M,
+                hidden,
+                dtype,
+                out_dtype,
+                max_routes=decode_max_routes,
+            )
+            for dtype in self.idx_dtypes
+        }
         self.dispatch = {
             dtype: MoeDispatchV41Plan(
                 num_experts,
@@ -1426,7 +1469,8 @@ class MoeExpertsV41Plan:
                 hidden,
                 dtype,
                 out_dtype,
-                max_routes=decode_max_routes,
+                min_routes=mid_min_routes,
+                max_routes=mid_max_routes,
             )
             for dtype in self.idx_dtypes
         }
@@ -1444,23 +1488,34 @@ class MoeExpertsV41Plan:
             for dtype in self.idx_dtypes
         }
 
-    def _has_prefill_tiles(self) -> bool:
-        return (
+    def _has_mid_tiles(self) -> bool:
+        return self.block_M != self.decode_block_M and (
             self.max_rows is None
-            or self.tile_height(self.max_rows) != self.block_M
+            or self.max_rows * self.topk >= self.decode_block_M * self.num_experts
+        )
+
+    def _has_prefill_tiles(self) -> bool:
+        return self.prefill_block_M != self.block_M and (
+            self.max_rows is None
+            or self.tile_height(self.max_rows) == self.prefill_block_M
         )
 
     def _dispatches(self) -> tuple[MoeDispatchV41Plan, ...]:
+        out = list(self.decode_dispatch.values())
+        if self._has_mid_tiles():
+            out.extend(self.dispatch.values())
         if self._has_prefill_tiles():
-            return (*self.dispatch.values(), *self.prefill_dispatch.values())
-        return tuple(self.dispatch.values())
+            out.extend(self.prefill_dispatch.values())
+        return tuple(out)
 
     def kernels(self) -> dict:
         """The grouped GEMMs and the fused SwiGLU at each reachable tile height, as
-        the calls ``bind`` makes: ``gate_up``, ``down`` and ``swiglu`` at ``block_M``;
-        at the same height ``late_gate_up`` and ``late_down``, which trigger after
-        their K loop (calls of ``LATE_TRIGGER_ROWS`` rows or more); and with a
-        ``prefill_`` prefix at ``prefill_block_M``, whose GEMMs trigger late too."""
+        the calls ``bind`` makes: ``gate_up``, ``down`` and ``swiglu`` at
+        ``decode_block_M``; at the same height ``late_gate_up`` and ``late_down``,
+        which trigger after their K loop (calls of ``LATE_TRIGGER_ROWS`` rows or
+        more); with a ``mid_`` prefix at ``block_M`` and a ``prefill_`` prefix at
+        ``prefill_block_M``, whose GEMMs trigger late and swizzle their CTA grid across
+        ``prefill_swizzle_panel`` consecutive M-tiles."""
         config = dict(
             block_N=self.block_N,
             coded_scales=True,
@@ -1472,17 +1527,24 @@ class MoeExpertsV41Plan:
             self.hidden,
             self.intermediate,
         )
-        tiers = [("", self.block_M, False)]
+        tiers = [("", self.decode_block_M, False, 0)]
         if self.max_rows is None or self.max_rows >= LATE_TRIGGER_ROWS:
-            tiers.append(("late_", self.block_M, True))
+            tiers.append(("late_", self.decode_block_M, True, 0))
+        if self._has_mid_tiles():
+            tiers.append(("mid_", self.block_M, True, 0))
         if self._has_prefill_tiles():
-            tiers.append(("prefill_", self.prefill_block_M, True))
+            tiers.append(
+                ("prefill_", self.prefill_block_M, True, self.prefill_swizzle_panel)
+            )
         kernels = {}
-        for prefix, block_M, late in tiers:
+        for prefix, block_M, late, swizzle in tiers:
             down_stages = (
                 self.down_num_stages
-                if block_M == self.block_M
+                if block_M in (self.decode_block_M, self.block_M)
                 else self.num_stages
+            )
+            gemm_config = (
+                {**config, "swizzle_panel": swizzle} if swizzle else config
             )
             kernels[f"{prefix}gate_up"] = prepare.call(
                 grouped_fp8_fp4_gemm,
@@ -1493,7 +1555,7 @@ class MoeExpertsV41Plan:
                 True,
                 block_M,
                 num_stages=self.num_stages,
-                **config,
+                **gemm_config,
                 trigger_after_loop=late,
             )
             kernels[f"{prefix}down"] = prepare.call(
@@ -1505,7 +1567,7 @@ class MoeExpertsV41Plan:
                 False,
                 block_M,
                 num_stages=down_stages,
-                **config,
+                **gemm_config,
                 trigger_after_loop=late,
             )
             if prefix != "late_":  # the SwiGLU is the same at either trigger
@@ -1518,21 +1580,33 @@ class MoeExpertsV41Plan:
         """The tile height of a call of ``rows`` tokens: ``prefill_block_M`` once the
         average expert has a full ``block_M`` tile of routes (``rows * topk >=
         block_M * num_experts``: 2,048 tokens for V4.1's 384 experts at top-6),
-        else ``block_M``. Decode steps and their CUDA graphs stay below it."""
-        if rows * self.topk >= self.block_M * self.num_experts:
+        ``block_M`` once the average expert has a full ``decode_block_M`` tile
+        (``rows * topk >= decode_block_M * num_experts``: 1,024 tokens), else
+        ``decode_block_M``. Decode steps and their CUDA graphs stay at
+        ``decode_block_M``."""
+        routes = rows * self.topk
+        if routes >= self.block_M * self.num_experts:
             return self.prefill_block_M
-        return self.block_M
+        if routes >= self.decode_block_M * self.num_experts:
+            return self.block_M
+        return self.decode_block_M
 
     def _dispatch_for(self, rows: int, idx_dtype):
         """The dispatch plan of a call at its tile height."""
-        if self.tile_height(rows) == self.block_M:
+        height = self.tile_height(rows)
+        if height == self.decode_block_M:
+            return self.decode_dispatch[idx_dtype]
+        if height == self.block_M:
             return self.dispatch[idx_dtype]
         return self.prefill_dispatch[idx_dtype]
 
     def _kernels_for(self, rows: int):
         """The (gate/up, SwiGLU, down) kernels of a call at its tile height, its
         grouped GEMMs triggering late from ``LATE_TRIGGER_ROWS`` rows."""
-        if self.tile_height(rows) != self.block_M:
+        height = self.tile_height(rows)
+        if height != self.decode_block_M:
+            if height == self.block_M:
+                return self.mid_gate_up, self.mid_swiglu, self.mid_down
             return self.prefill_gate_up, self.prefill_swiglu, self.prefill_down
         if rows >= LATE_TRIGGER_ROWS:
             return self.late_gate_up, self.swiglu, self.late_down
