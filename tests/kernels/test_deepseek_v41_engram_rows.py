@@ -605,3 +605,23 @@ def test_tilelang_engram_geometry_matches_prime_and_pcg64_contract():
         tp_rank=1,
     )
     assert caps.device.type == "cuda" and caps.tp_rank == 1
+def test_gather_kernel_uses_streaming_cache_hints_and_matches_reference():
+    from vllm.models.deepseek_v4_1.tilelang.engram_rows import engram_rows_gather_kernel
+
+    kernel = engram_rows_gather_kernel(4 * HEADS, 0, TABLE_ROWS, TP3_RANK1)
+    src = kernel.get_kernel_source()
+    assert "ld.global.cs.s64" in src
+    assert "ld.global.cs.u8" in src
+    assert "ld.global.cs.u32" in src
+
+    codes, scales, paths = _write_table(_table_dir(), seed=41)
+    rows = _rows(paths, tokens=8, columns=TP3_RANK1)
+    try:
+        gen = torch.Generator().manual_seed(42)
+        ids = torch.randint(0, TABLE_ROWS, (8, HEADS), generator=gen).cuda()
+        out, _ = _step(rows, ids, 7)
+        torch.cuda.synchronize()
+        expected = _reference(codes, scales, ids.cpu(), 7, 0, TABLE_ROWS, TP3_RANK1)
+        torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0, equal_nan=True)
+    finally:
+        rows.close()

@@ -126,6 +126,27 @@ __device__ __forceinline__ void engram_release_rows(void *control) {
     asm volatile("st.release.sys.global.u32 [%0], %1;"
                  :: "l"(ctrl + ENGRAM_CTRL_CONSUMED_SEQ), "r"(staged) : "memory");
 }
+
+// One-shot streaming loads (L2::evict_first) for step row IDs and mapped-host
+// E4M3 rows / E8M0 scales: each slot is consumed once by a single thread, so
+// streaming keeps mapped-host reads from evicting resident weights in the 24 MB L2.
+__device__ __forceinline__ long long engram_ld_cs_s64(const void *ptr) {
+    long long val;
+    asm("ld.global.cs.s64 %0, [%1];" : "=l"(val) : "l"(ptr));
+    return val;
+}
+
+__device__ __forceinline__ unsigned int engram_ld_cs_u8(const void *ptr) {
+    unsigned int val;
+    asm("ld.global.cs.u8 %0, [%1];" : "=r"(val) : "l"(ptr));
+    return val;
+}
+
+__device__ __forceinline__ unsigned int engram_ld_cs_u32(const void *ptr) {
+    unsigned int val;
+    asm("ld.global.cs.u32 %0, [%1];" : "=r"(val) : "l"(ptr));
+    return val;
+}
 """  # noqa: E501 (CUDA source)
 )
 
@@ -170,7 +191,12 @@ def column_span(columns: int) -> tuple[int, int, int]:
     return heads[0], step, len(heads)
 
 
-@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
+    }
+)
 def engram_rows_gather_kernel(
     max_lookups: int,
     shard_start: int,
@@ -195,21 +221,45 @@ def engram_rows_gather_kernel(
         out: T.Tensor((tokens, stride_cols * ROW), T.bfloat16),
     ):
         with T.Kernel(count, tokens, threads=threads) as (column, t):
+            T.import_source(_HEADER)
             tx = T.get_thread_binding()
             head = first + column * step
-            row = ids[t, head]
+            row = T.call_extern(
+                "int64", "engram_ld_cs_s64", T.address_of(ids[t, head])
+            )
             lookup = t * HEADS + head
             owned = (t < num_tokens[0]) & (row >= shard_start) & (row < shard_end)
             if owned:
-                exponent = T.cast(scales[lookup, tx * vec // 32], T.uint32)
+                exponent = T.call_extern(
+                    "uint32",
+                    "engram_ld_cs_u8",
+                    T.address_of(scales[lookup, tx * vec // 32]),
+                )
                 scale = T.reinterpret(T.shift_left(exponent, 23), T.float32)
                 scale = T.if_then_else(exponent == 0, T.float32(2.0**-127), scale)
                 scale = T.if_then_else(exponent == 255, T.float32(float("nan")), scale)
-                for i in T.vectorized(vec):
-                    out[t, column * ROW + tx * vec + i] = T.cast(
-                        T.cast(rows[lookup, tx * vec + i], T.float32) * scale,
-                        T.bfloat16,
+                if vec == 4:
+                    packed = T.call_extern(
+                        "uint32",
+                        "engram_ld_cs_u32",
+                        T.address_of(rows[lookup, tx * vec]),
                     )
+                    for i in T.vectorized(vec):
+                        byte = T.cast(
+                            T.shift_right(packed, T.uint32(8 * i)) & T.uint32(0xFF),
+                            T.uint8,
+                        )
+                        out[t, column * ROW + tx * vec + i] = T.cast(
+                            T.cast(T.reinterpret(byte, T.float8_e4m3fn), T.float32)
+                            * scale,
+                            T.bfloat16,
+                        )
+                else:
+                    for i in T.vectorized(vec):
+                        out[t, column * ROW + tx * vec + i] = T.cast(
+                            T.cast(rows[lookup, tx * vec + i], T.float32) * scale,
+                            T.bfloat16,
+                        )
             else:
                 for i in T.vectorized(vec):
                     out[t, column * ROW + tx * vec + i] = T.bfloat16(0)
