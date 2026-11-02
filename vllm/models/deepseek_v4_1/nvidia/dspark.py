@@ -30,7 +30,11 @@ from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.linear import ReplicatedLinear
-from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.logits_processor import (
+    LogitsProcessor,
+    _is_packed_head,
+    _is_plain_bf16_head,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3_dspark import (
@@ -704,21 +708,45 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             self.lm_head, self.model.norm(hidden_states), skip_gather=True
         )
 
-    def markov_bias_local(self, markov_embed: torch.Tensor) -> torch.Tensor:
-        return self.logits_processor(
-            self.model.markov_head.markov_w2, markov_embed, skip_gather=True
+    @property
+    def fuses_markov_greedy(self) -> bool:
+        """Whether ``markov_greedy_pairs_local`` can run: a TileLang packed or
+        BF16 Markov head declares the fused projection (an NVFP4 one does not),
+        and nothing scales or caps the bias."""
+        w2 = self.model.markov_head.markov_w2
+        processor = self.logits_processor
+        return (
+            processor.use_tilelang_vocab_projection
+            and processor.scale == 1.0
+            and processor.soft_cap is None
+            and (_is_packed_head(w2) or _is_plain_bf16_head(w2))
         )
 
-    @property
-    def draft_logits_local_layout(self) -> tuple[torch.dtype, int, int]:
-        """(dtype, draft logits row width, Markov bias row width) of the fresh
-        tensors ``compute_draft_logits_local`` and ``markov_bias_local`` return:
-        both heads write the head dtype, one padded vocabulary shard per row."""
-        assert self.lm_head is not None
-        return (
-            self.logits_processor.head_dtype,
-            self.lm_head.num_embeddings_per_partition,
-            self.model.markov_head.markov_w2.num_embeddings_per_partition,
+    def markov_greedy_pairs_local(
+        self,
+        markov_embed: torch.Tensor,
+        base_logits: torch.Tensor,
+        pairs: torch.Tensor,
+        *,
+        top2: bool = False,
+    ) -> None:
+        """Each row's ``(max, global index)`` of this rank's shard of
+        ``base_logits`` ([requests, padded shard], any row stride) plus the Markov
+        bias of ``markov_embed``, into the first two columns of ``pairs`` (with
+        ``top2``, the runner-up ``greedy_markov_shard_pair`` reports into the
+        other two), without the bias tensor: the Markov projection adds the base
+        logits and reduces each vocabulary tile in its epilogue."""
+        from ..tilelang.vocab import project_head_markov_greedy_pairs
+
+        vocab_start, shard_vocab = self.draft_vocab_shard
+        project_head_markov_greedy_pairs(
+            self.model.markov_head.markov_w2,
+            markov_embed,
+            base_logits,
+            vocab=shard_vocab,
+            vocab_start=vocab_start,
+            out=pairs,
+            top2=top2,
         )
 
     def apply_markov_bias_gathered(

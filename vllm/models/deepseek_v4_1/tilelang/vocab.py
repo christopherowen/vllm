@@ -48,6 +48,10 @@ ROW_TILES = (16, 32, 64, 128)
 NVFP4_GROUP = 16  # columns per FP8 E4M3 scale byte in NVFP4
 NVFP4_PACKED = NVFP4_GROUP // 2  # packed E2M1 bytes per NVFP4 group
 SHARED_MEMORY = 101_376  # dynamic shared memory per block on SM120 / SM121
+# dspark.greedy._BLOCK: greedy_markov_shard_pair keeps one partial per part of
+# this many shard columns, so the runner-up of its top-2 pairs is the best
+# maximum of the row's other parts. Vocabulary tiles divide it.
+GREEDY_PART = 2048
 
 
 def nvfp4_shared_memory_bytes(
@@ -669,6 +673,87 @@ __device__ __forceinline__ void vllm_vocab_finish_argmax(
     }
   }
 }
+
+// The block's first maximum of ``count`` (value, shard index) partials outside
+// the PART-column part ``skip_part`` (-1: none), in every thread.
+template <int THREADS, int PART>
+__device__ __forceinline__ void vllm_vocab_block_first_argmax(
+    const float* __restrict__ vals,
+    const int* __restrict__ idxs,
+    int count, int skip_part, int tx,
+    float* __restrict__ smem_v, int* __restrict__ smem_i,
+    float& out_v, int& out_i) {
+  float best_v = -CUDART_INF_F;
+  int best_i = 2147483647;
+  for (int t = tx; t < count; t += THREADS) {
+    const float v = vals[t];
+    const int idx = idxs[t];
+    if (idx / PART != skip_part &&
+        vllm_vocab_first_argmax_keep(v, idx, best_v, best_i)) {
+      best_v = v;
+      best_i = idx;
+    }
+  }
+  const int lane = tx & 31;
+  const int warp_id = tx >> 5;
+  constexpr int WARPS = THREADS >> 5;
+  #pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    const float ov = __shfl_xor_sync(0xffffffffu, best_v, offset);
+    const int oi = __shfl_xor_sync(0xffffffffu, best_i, offset);
+    if (vllm_vocab_first_argmax_keep(ov, oi, best_v, best_i)) {
+      best_v = ov;
+      best_i = oi;
+    }
+  }
+  if (lane == 0) {
+    smem_v[warp_id] = best_v;
+    smem_i[warp_id] = best_i;
+  }
+  __syncthreads();
+  best_v = smem_v[0];
+  best_i = smem_i[0];
+  #pragma unroll
+  for (int w = 1; w < WARPS; ++w) {
+    if (vllm_vocab_first_argmax_keep(smem_v[w], smem_i[w], best_v, best_i)) {
+      best_v = smem_v[w];
+      best_i = smem_i[w];
+    }
+  }
+  __syncthreads();
+  out_v = best_v;
+  out_i = best_i;
+}
+
+// vllm_vocab_finish_argmax and the row's runner-up as
+// dspark.greedy.greedy_markov_shard_pair(top2=True) reports it: the first
+// maximum of the tiles outside the pair's PART-column part, into columns 2 and
+// 3 (index 2**30 when the shard has no other part).
+template <int THREADS, int PAIR_WIDTH, int PART>
+__device__ __forceinline__ void vllm_vocab_finish_argmax_top2(
+    const float* __restrict__ partial_vals,
+    const int* __restrict__ partial_idxs,
+    float* __restrict__ pairs,
+    int row, int num_tiles, int vocab_start, int tx,
+    float* __restrict__ smem_v, int* __restrict__ smem_i) {
+  const int base = row * num_tiles;
+  float best_v, second_v;
+  int best_i, second_i;
+  vllm_vocab_block_first_argmax<THREADS, PART>(
+      partial_vals + base, partial_idxs + base, num_tiles, -1, tx, smem_v, smem_i,
+      best_v, best_i);
+  vllm_vocab_block_first_argmax<THREADS, PART>(
+      partial_vals + base, partial_idxs + base, num_tiles, best_i / PART, tx,
+      smem_v, smem_i, second_v, second_i);
+  if (tx == 0) {
+    pairs[row * PAIR_WIDTH + 0] = best_v;
+    pairs[row * PAIR_WIDTH + 1] = (float)(best_i + vocab_start);
+    pairs[row * PAIR_WIDTH + 2] = second_v;
+    pairs[row * PAIR_WIDTH + 3] = second_i < 2147483647
+                                      ? (float)(second_i + vocab_start)
+                                      : (float)(1 << 30);
+  }
+}
 """
 
 
@@ -1199,10 +1284,20 @@ def finish_vocab_greedy_pairs(
     num_tiles: int,
     pair_width: int = 4,
     threads: int = 256,
+    top2: bool = False,
 ):
     """Reduce per-tile ``(max, shard index)`` partials into each row's ``(max, global
-    index)`` pair in the first two columns of ``pairs[M, pair_width]``."""
+    index)`` pair in the first two columns of ``pairs[M, pair_width]``; with
+    ``top2``, also the runner-up ``greedy_markov_shard_pair(top2=True)`` reports
+    (the best maximum of the row's other ``GREEDY_PART``-column parts) in columns
+    2 and 3."""
+    assert not top2 or pair_width >= 4
     warps = threads // 32
+    finish = (
+        f"vllm_vocab_finish_argmax_top2<{threads}, {pair_width}, {GREEDY_PART}>"
+        if top2
+        else f"vllm_vocab_finish_argmax<{threads}, {pair_width}>"
+    )
     M = T.dynamic("M")
 
     @T.prim_func
@@ -1220,7 +1315,7 @@ def finish_vocab_greedy_pairs(
             tx = T.get_thread_binding()
             T.call_extern(
                 "handle",
-                f"vllm_vocab_finish_argmax<{threads}, {pair_width}>",
+                finish,
                 T.address_of(partial_vals[0, 0]),
                 T.address_of(partial_idxs[0, 0]),
                 T.address_of(pairs[0, 0]),
@@ -1554,6 +1649,18 @@ def _bf16_head_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dict:
     return kernels
 
 
+def _markov_greedy_finishes(finishes: dict, num_tiles: int) -> None:
+    """The pair finish of ``num_tiles`` partials (the call the other greedy heads
+    declare) and its top-2 variant, keyed ``(num_tiles, top2)``."""
+    finishes.setdefault(
+        (num_tiles, False), prepare.call(finish_vocab_greedy_pairs, num_tiles)
+    )
+    finishes.setdefault(
+        (num_tiles, True),
+        prepare.call(finish_vocab_greedy_pairs, num_tiles, top2=True),
+    )
+
+
 def _packed_head_markov_greedy_kernels(
     layer: nn.Module, out_dtype: torch.dtype
 ) -> dict:
@@ -1562,9 +1669,11 @@ def _packed_head_markov_greedy_kernels(
     n, k = int(layer.weight.shape[0]), layer.packed_bf16_in_features
     partials = {}
     finishes = {}
+    tiles = {}
     for block_M in _head_row_tiles(layer):
         config = tile_config(block_M, k)
-        num_tiles = (n + config["block_N"] - 1) // config["block_N"]
+        assert GREEDY_PART % config["block_N"] == 0
+        tiles[block_M] = (n + config["block_N"] - 1) // config["block_N"]
         partials[block_M] = prepare.call(
             packed_vocab_markov_greedy_partials,
             n,
@@ -1574,11 +1683,8 @@ def _packed_head_markov_greedy_kernels(
             out_dtype=_OUT[out_dtype],
             **config,
         )
-        finishes.setdefault(
-            num_tiles,
-            prepare.call(finish_vocab_greedy_pairs, num_tiles),
-        )
-    return {"partials": partials, "finishes": finishes}
+        _markov_greedy_finishes(finishes, tiles[block_M])
+    return {"partials": partials, "finishes": finishes, "tiles": tiles}
 
 
 def _bf16_head_greedy_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dict:
@@ -1587,12 +1693,14 @@ def _bf16_head_greedy_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dict:
     n, k = map(int, layer.weight.shape)
     partials = {}
     finishes = {}
+    tiles = {}
     for block_M in _head_row_tiles(layer):
         config = dict(BF16_HEAD_CONFIGS[block_M])
         if k % config["block_K"]:
             config["block_K"] = 64
         stages = 1 if k <= config["block_K"] else 2
-        num_tiles = (n + config["block_N"] - 1) // config["block_N"]
+        assert GREEDY_PART % config["block_N"] == 0
+        tiles[block_M] = (n + config["block_N"] - 1) // config["block_N"]
         partials[block_M] = prepare.call(
             bf16_vocab_markov_greedy_partials,
             n,
@@ -1602,11 +1710,36 @@ def _bf16_head_greedy_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dict:
             out_dtype=_OUT[out_dtype],
             **config,
         )
-        finishes.setdefault(
-            num_tiles,
-            prepare.call(finish_vocab_greedy_pairs, num_tiles),
-        )
-    return {"partials": partials, "finishes": finishes}
+        _markov_greedy_finishes(finishes, tiles[block_M])
+    return {"partials": partials, "finishes": finishes, "tiles": tiles}
+
+
+def _declare_markov_greedy(layer: nn.Module, kernels: dict) -> None:
+    """Declare a Markov head's fused greedy calls, bound as
+    ``layer.tilelang_vocab_markov_greedy[block_M]`` = (partials, pair finish,
+    top-2 finish, tiles)."""
+    partials = kernels["partials"]
+    finishes = kernels["finishes"]
+    tiles = kernels["tiles"]
+
+    def bind() -> None:
+        compiled = {
+            key: function(*args, **kwargs)
+            for key, (function, args, kwargs) in finishes.items()
+        }
+        layer.tilelang_vocab_markov_greedy = {
+            block_M: (
+                function(*args, **kwargs),
+                compiled[tiles[block_M], False],
+                compiled[tiles[block_M], True],
+                tiles[block_M],
+            )
+            for block_M, (function, args, kwargs) in partials.items()
+        }
+
+    prepare.declare(
+        lambda: list(partials.values()) + list(finishes.values()), bind=bind
+    )
 
 
 def _declare_head(layer: nn.Module, kernels: dict, out_dtype: torch.dtype) -> None:
@@ -1656,32 +1789,8 @@ def prepare_packed_head(
         bind=bind_greedy,
     )
     if getattr(layer, "tilelang_markov_head", False):
-        markov = _packed_head_markov_greedy_kernels(layer, out_dtype)
-        m_partials = markov["partials"]
-        m_finishes = markov["finishes"]
-
-        def bind_markov_greedy() -> None:
-            n, k = int(layer.weight.shape[0]), layer.packed_bf16_in_features
-            compiled_finishes = {
-                num_tiles: function(*args, **kwargs)
-                for num_tiles, (function, args, kwargs) in m_finishes.items()
-            }
-            layer.tilelang_vocab_markov_greedy = {
-                block_M: (
-                    function(*args, **kwargs),
-                    compiled_finishes[
-                        (n + tile_config(block_M, k)["block_N"] - 1)
-                        // tile_config(block_M, k)["block_N"]
-                    ],
-                    (n + tile_config(block_M, k)["block_N"] - 1)
-                    // tile_config(block_M, k)["block_N"],
-                )
-                for block_M, (function, args, kwargs) in m_partials.items()
-            }
-
-        prepare.declare(
-            lambda: list(m_partials.values()) + list(m_finishes.values()),
-            bind=bind_markov_greedy,
+        _declare_markov_greedy(
+            layer, _packed_head_markov_greedy_kernels(layer, out_dtype)
         )
 
 
@@ -1725,36 +1834,11 @@ def prepare_nvfp4_head(
 def prepare_bf16_head(
     layer: nn.Module, out_dtype: torch.dtype = torch.bfloat16
 ) -> None:
-    """Declare a BF16 head's projection and fused Markov greedy pairs for every
-    token tile, writing ``out_dtype``."""
+    """Declare a BF16 head's projection for every token tile, writing
+    ``out_dtype``, and a Markov head's fused Markov greedy pairs."""
     _declare_head(layer, _bf16_head_kernels(layer, out_dtype), out_dtype)
-    greedy = _bf16_head_greedy_kernels(layer, out_dtype)
-    partials = greedy["partials"]
-    finishes = greedy["finishes"]
-
-    def bind_greedy() -> None:
-        n = int(layer.weight.shape[0])
-        compiled_finishes = {
-            num_tiles: function(*args, **kwargs)
-            for num_tiles, (function, args, kwargs) in finishes.items()
-        }
-        layer.tilelang_vocab_markov_greedy = {
-            block_M: (
-                function(*args, **kwargs),
-                compiled_finishes[
-                    (n + BF16_HEAD_CONFIGS[block_M]["block_N"] - 1)
-                    // BF16_HEAD_CONFIGS[block_M]["block_N"]
-                ],
-                (n + BF16_HEAD_CONFIGS[block_M]["block_N"] - 1)
-                // BF16_HEAD_CONFIGS[block_M]["block_N"],
-            )
-            for block_M, (function, args, kwargs) in partials.items()
-        }
-
-    prepare.declare(
-        lambda: list(partials.values()) + list(finishes.values()),
-        bind=bind_greedy,
-    )
+    if getattr(layer, "tilelang_markov_head", False):
+        _declare_markov_greedy(layer, _bf16_head_greedy_kernels(layer, out_dtype))
 
 
 def project_head(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -1913,20 +1997,24 @@ def project_head_markov_greedy_pairs(
     vocab_start: int = 0,
     pair_width: int = 4,
     out: torch.Tensor | None = None,
+    *,
+    top2: bool = False,
 ) -> torch.Tensor:
     """Each row's ``(max, global index)`` pair of ``base_logits + x @ W^T``
     through a prepared Markov head over its ``vocab`` real columns starting
     at ``vocab_start``, written into the first two columns of ``[rows, pair_width]``
-    FP32 without materializing the Markov bias tensor."""
+    FP32 without materializing the Markov bias tensor: the pairs
+    ``greedy_markov_shard_pair`` writes from the materialized bias, to the bit
+    (with ``top2``, its runner-up in columns 2 and 3 too)."""
     if not x.is_contiguous():
         x = x.contiguous()
     rows = x.shape[0]
     n = int(layer.weight.shape[0])
     if vocab is None:
         vocab = n
-    partials_kernel, finish_kernel, num_tiles = layer.tilelang_vocab_markov_greedy[
-        row_tile(rows)
-    ]
+    partials_kernel, finish_kernel, finish_top2_kernel, num_tiles = (
+        layer.tilelang_vocab_markov_greedy[row_tile(rows)]
+    )
     partial_vals, partial_idxs, pairs = _vocab_greedy_buffers(
         layer,
         rows,
@@ -1956,12 +2044,15 @@ def project_head_markov_greedy_pairs(
             partial_idxs,
             vocab,
         )
-    finish_kernel(partial_vals, partial_idxs, pairs, vocab_start)
+    (finish_top2_kernel if top2 else finish_kernel)(
+        partial_vals, partial_idxs, pairs, vocab_start
+    )
     return pairs
 
 
 __all__ = [
     "BF16_HEAD_CONFIGS",
+    "GREEDY_PART",
     "GROUP",
     "NVFP4_GROUP",
     "PackedBf16Weight",

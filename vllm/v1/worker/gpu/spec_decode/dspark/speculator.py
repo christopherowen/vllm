@@ -42,9 +42,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
     DraftBlockTableLayout,
 )
 from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
-    greedy_markov_shard_pair,
     markov_anchor_embed,
-    register_greedy_markov_shard_pair_warmup,
     register_sample_greedy_markov_warmup,
     register_select_first_argmax_warmup,
     sample_greedy_markov,
@@ -300,11 +298,11 @@ class DSparkSpeculator(DFlashSpeculator):
         self, block_table_layouts: Sequence[DraftBlockTableLayout]
     ) -> None:
         """Also register the greedy reduction of each draft position: the
-        vocabulary-parallel one, whose base logits and Markov bias are this rank's
-        shards, written in the draft head's dtype (draft position ``i`` is column
-        ``i`` of both the base logits' ``[requests, positions, shard]`` view and
-        the draft tokens); or the full-vocabulary one, when no logits cache,
-        vocabulary map or estimator needs the logits."""
+        vocabulary-parallel one's selection over the ranks' shard pairs (draft
+        position ``i`` is column ``i`` of the draft tokens; the Markov head
+        declares the fused projection that reduces each shard, and a head
+        without one fails here); or the full-vocabulary one, when no logits
+        cache, vocabulary map or estimator needs the logits."""
         super().register_warmups(block_table_layouts)
         local_head = getattr(self.model, "supports_local_draft_argmax", lambda: False)()
         if self._draft_topk is not None:
@@ -322,21 +320,15 @@ class DSparkSpeculator(DFlashSpeculator):
                     dtype=processor.head_dtype, output_dtype=self.draft_tokens.dtype
                 )
             return
-        vocab_start, shard_vocab = self.model.draft_vocab_shard
-        dtype, head_width, markov_width = self.model.draft_logits_local_layout
+        if not self.model.fuses_markov_greedy:
+            raise RuntimeError(
+                "Vocabulary-parallel greedy drafts reduce each shard in the Markov "
+                "projection's epilogue, which only a TileLang packed or BF16 Markov "
+                "head without a logit scale or soft cap declares"
+            )
         n_spec = self.num_speculative_steps
         use_top2 = self._enable_top2_branch
         for i in range(n_spec):
-            register_greedy_markov_shard_pair_warmup(
-                base_dtype=dtype,
-                base_stride=n_spec * head_width,
-                base_aligned=i * head_width * dtype.itemsize % 16 == 0,
-                bias_dtype=dtype,
-                bias_stride=markov_width,
-                vocab=shard_vocab,
-                vocab_start=vocab_start,
-                top2=use_top2,
-            )
             register_select_first_argmax_warmup(
                 ranks=get_tensor_model_parallel_world_size(),
                 output_dtype=self.draft_tokens.dtype,
@@ -403,7 +395,6 @@ class DSparkSpeculator(DFlashSpeculator):
         if local_head:
             base_logits = self.model.compute_local_draft_logits(sample_hidden)
         elif vocab_parallel:
-            vocab_start, shard_vocab = self.model.draft_vocab_shard
             base_logits = self.model.compute_draft_logits_local(sample_hidden)
         else:
             base_logits = self.model.compute_draft_logits(sample_hidden)
@@ -458,16 +449,11 @@ class DSparkSpeculator(DFlashSpeculator):
                 continue
             if vocab_parallel:
                 use_top2 = self._enable_top2_branch
-                bias = self.model.markov_bias_local(markov_embed)
                 pairs = self._greedy_shard_pairs[:num_reqs]
-                greedy_markov_shard_pair(
-                    base_logits[:, i, :shard_vocab],
-                    bias[:, :shard_vocab],
-                    vocab_start,
-                    pairs,
-                    self._greedy_partial_values,
-                    self._greedy_partial_indices,
-                    top2=use_top2,
+                # The Markov projection adds the base logits and reduces this
+                # rank's shard: no bias tensor.
+                self.model.markov_greedy_pairs_local(
+                    markov_embed, base_logits[:, i], pairs, top2=use_top2
                 )
                 draft_sampled_i = self.draft_tokens[:num_reqs, i]
                 has_embed = table is not None and i + 1 < n_spec

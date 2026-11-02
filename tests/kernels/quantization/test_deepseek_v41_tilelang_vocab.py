@@ -504,14 +504,91 @@ def test_nvfp4_online_linear_method_tilelang_without_b12x(monkeypatch):
         assert torch.equal(logits, out)
 
 
-@pytest.mark.parametrize("n", [32320, 43092])
-@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
-def test_packed_head_markov_greedy_pairs_match_greedy_markov_shard_pair(n, out_dtype):
+# DS4.1's Markov projection (K = 256) shards: padded rows, then (real rows, first
+# global index) of a first and a last rank; "odd" ends in a partial tile.
+MARKOV_SHARDS = {
+    "tp4": (32320, ((32320, 0), (32320, 96960))),
+    "tp3": (43136, ((43136, 0), (43008, 86272))),
+    "odd": (1000, ((1000, 0), (963, 32320))),
+}
+MARKOV_ROWS = (1, 2, 3, 5, 8, 16, 17, 31, 33, 48, 64)
+
+
+def _markov_greedy_inputs(n, k, dtype, seed):
+    """Markov embeddings and a strided draft position of base logits whose first
+    rows hold exact ties (in a 2048-column part, across parts, and through
+    duplicate weight rows), NaNs and a row of -inf."""
+    generator = torch.Generator(device=DEVICE).manual_seed(seed)
+    x = torch.randn(64, k, generator=generator, device=DEVICE, dtype=torch.bfloat16)
+    base_3d = torch.randn(64, 5, n, generator=generator, device=DEVICE, dtype=dtype)
+    base = base_3d[:, 2]
+
+    def put(row, columns, values):
+        for column, value in zip(columns, values):
+            if column < n:
+                base[row, column] = value
+
+    x[:3] = 0  # a zero bias: the base logits decide
+    base[0] = -1.0
+    put(0, (7, 13, 2053, 4105), (5.0,) * 4)
+    base[1] = -1.0
+    put(1, (40, 41, 6145), (6.0, 5.5, 5.0))  # the runner-up shares the max's part
+    put(2, (900, n - 20), (float("nan"),) * 2)
+    base[3] = -float("inf")
+    put(4, (5, 100, 500), (20.0,) * 3)  # duplicate weight rows: equal biases
+    return x, base_3d
+
+
+def _assert_markov_greedy_pairs_exact(layer, x, base_3d, shards, top2):
+    """The fused pairs (with ``top2``, and runner-ups) of every row count are the
+    bits ``greedy_markov_shard_pair`` writes from the materialized bias, and
+    neither writes the slack columns without ``top2``."""
     from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
         greedy_markov_shard_pair,
         scratch_shape,
     )
 
+    for vocab, vocab_start in shards:
+        for rows in MARKOV_ROWS:
+            part = x[:rows].contiguous()
+            base_step = base_3d[:rows, 2]
+            bias = project_head(layer, part)
+            expected = torch.full((rows, 4), -7.0, dtype=torch.float32, device=DEVICE)
+            shape = scratch_shape(rows, vocab)
+            greedy_markov_shard_pair(
+                base_step[:, :vocab],
+                bias[:, :vocab],
+                vocab_start,
+                expected,
+                torch.empty(shape, dtype=torch.float32, device=DEVICE),
+                torch.empty(shape, dtype=torch.int32, device=DEVICE),
+                top2=top2,
+            )
+            actual = torch.full_like(expected, -7.0)
+            project_head_markov_greedy_pairs(
+                layer,
+                part,
+                base_step,
+                vocab=vocab,
+                vocab_start=vocab_start,
+                out=actual,
+                top2=top2,
+            )
+            assert torch.equal(
+                actual.view(torch.int32), expected.view(torch.int32)
+            ), (rows, vocab, top2)
+
+
+@pytest.mark.parametrize("top2", [False, True])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("shape", sorted(MARKOV_SHARDS))
+def test_packed_head_markov_greedy_pairs_match_greedy_markov_shard_pair(
+    shape, out_dtype, top2
+):
+    from vllm.v1.worker.gpu.spec_decode.dspark import greedy
+
+    assert packed_format.GREEDY_PART == greedy._BLOCK
+    n, shards = MARKOV_SHARDS[shape]
     k = 256
     weight = _head(n, k, seed=n + 303)
     weight[100] = weight[5]
@@ -520,36 +597,37 @@ def test_packed_head_markov_greedy_pairs_match_greedy_markov_shard_pair(n, out_d
     layer.tilelang_max_rows = 64
     layer.tilelang_markov_head = True
     prepare_packed_head(layer, out_dtype)
-    assert hasattr(layer, "tilelang_vocab_markov_greedy")
-    generator = torch.Generator(device=DEVICE).manual_seed(n + 404)
-    x = torch.randn(64, k, generator=generator, device=DEVICE, dtype=torch.bfloat16)
-    base_3d = torch.randn(
-        64, 5, n, generator=generator, device=DEVICE, dtype=out_dtype
+    assert set(layer.tilelang_vocab_markov_greedy) == {16, 32, 64}
+    x, base_3d = _markov_greedy_inputs(n, k, out_dtype, seed=n + 404)
+    _assert_markov_greedy_pairs_exact(layer, x, base_3d, shards, top2)
+
+
+@pytest.mark.parametrize("top2", [False, True])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("shape", sorted(MARKOV_SHARDS))
+def test_bf16_head_markov_greedy_pairs_match_greedy_markov_shard_pair(
+    shape, out_dtype, top2
+):
+    n, shards = MARKOV_SHARDS[shape]
+    k = 256
+    generator = torch.Generator(device=DEVICE).manual_seed(n + 505)
+    weight = (torch.randn(n, k, generator=generator, device=DEVICE) * 0.05).bfloat16()
+    weight[100] = weight[5]
+    weight[500] = weight[5]
+    layer = SimpleNamespace(
+        weight=weight, tilelang_max_rows=64, tilelang_markov_head=True
     )
-    for vocab, vocab_start in ((n, 0), (n - 37, 32320)):
-        for rows in (1, 5, 16, 17, 33, 64):
-            part = x[:rows].contiguous()
-            base_step = base_3d[:rows, 2]
-            bias = project_head(layer, part)
-            expected = torch.empty((rows, 4), dtype=torch.float32, device=DEVICE)
-            shape = scratch_shape(rows, vocab)
-            values = torch.empty(shape, dtype=torch.float32, device=DEVICE)
-            indices = torch.empty(shape, dtype=torch.int32, device=DEVICE)
-            greedy_markov_shard_pair(
-                base_step[:, :vocab],
-                bias[:, :vocab],
-                vocab_start,
-                expected,
-                values,
-                indices,
-            )
-            actual = torch.empty((rows, 4), dtype=torch.float32, device=DEVICE)
-            project_head_markov_greedy_pairs(
-                layer,
-                part,
-                base_step,
-                vocab=vocab,
-                vocab_start=vocab_start,
-                out=actual,
-            )
-            assert torch.equal(actual[:, :2], expected[:, :2]), (rows, vocab, out_dtype)
+    prepare_bf16_head(layer, out_dtype)
+    assert set(layer.tilelang_vocab_markov_greedy) == {16, 32, 64}
+    x, base_3d = _markov_greedy_inputs(n, k, out_dtype, seed=n + 606)
+    _assert_markov_greedy_pairs_exact(layer, x, base_3d, shards, top2)
+
+
+def test_only_markov_heads_declare_markov_greedy_pairs():
+    weight = _head(1000, 256, seed=17)
+    packed, bf16 = _packed_layer(weight), SimpleNamespace(weight=weight)
+    prepare_packed_head(packed)
+    prepare_bf16_head(bf16)
+    assert hasattr(packed, "tilelang_vocab_greedy")
+    assert not hasattr(packed, "tilelang_vocab_markov_greedy")
+    assert not hasattr(bf16, "tilelang_vocab_markov_greedy")
