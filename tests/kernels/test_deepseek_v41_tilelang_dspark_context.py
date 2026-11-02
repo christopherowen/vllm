@@ -365,3 +365,168 @@ def test_combine_aux_hidden_states_into_fuses_join_and_cast_mxfp8(monkeypatch):
     model.precompute_and_store_context_kv(out, positions, slots)
     assert not casts
     assert seen_provided[1].values.shape[1] == WIDTH
+
+
+def _recipe_ladder(rows):
+    # The deployment recipe's capture ladder (scripts/recipe.py capture_sizes).
+    ladder = [1, 2, 3, 4, 6, 8, *range(12, 33, 4), *range(40, rows + 1, 8)]
+    return [*(size for size in ladder if size < rows), rows]
+
+
+def _decode_config(max_num_seqs, capture_sizes, drafts=5, verification=5):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from vllm.config import (
+        CompilationConfig,
+        ParallelConfig,
+        SchedulerConfig,
+        VllmConfig,
+    )
+
+    compilation_config = CompilationConfig(
+        cudagraph_mode="FULL_AND_PIECEWISE", cudagraph_capture_sizes=capture_sizes
+    )
+    compilation_config.max_cudagraph_capture_size = capture_sizes[-1]
+    compilation_config.post_init_cudagraph_sizes()
+    vllm_config = MagicMock(spec=VllmConfig)
+    vllm_config.compilation_config = compilation_config
+    vllm_config.scheduler_config = SchedulerConfig.default_factory(
+        max_num_seqs=max_num_seqs
+    )
+    vllm_config.parallel_config = ParallelConfig()
+    vllm_config.cache_config = SimpleNamespace(use_kda_recoverssm=False)
+    vllm_config.num_speculative_tokens = drafts
+    vllm_config.num_verification_tokens = verification
+    speculative_config = MagicMock()
+    speculative_config.uses_acceptance_length_adaptation.return_value = False
+    speculative_config.uses_batch_size_dynamic_speculative_decoding.return_value = (
+        False
+    )
+    vllm_config.speculative_config = speculative_config
+    return vllm_config
+
+
+def _no_graph_pool(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm.v1.worker.gpu import cudagraph_utils
+
+    monkeypatch.setattr(
+        cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        cudagraph_utils.current_platform, "get_global_graph_pool", lambda: object()
+    )
+
+
+def _target_manager(vllm_config, decode_query_len):
+    """The target's graphs as the model runner plans them under adaptive
+    verification: FULL variable-length decode graphs beside piecewise mixed ones."""
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
+
+    manager = CudaGraphManager(
+        vllm_config,
+        torch.device("cpu"),
+        CUDAGraphMode.FULL_AND_PIECEWISE,
+        decode_query_len=decode_query_len,
+        varlen_decode=True,
+    )
+    manager._graphs_captured = True
+    return manager
+
+
+def _context_graphs(vllm_config, limit):
+    from types import SimpleNamespace
+
+    from vllm.models.deepseek_v4_1.nvidia.dspark import DSparkContextCudaGraphs
+
+    model = SimpleNamespace(
+        config=SimpleNamespace(hidden_size=8, dspark_target_layer_ids=[0, 1, 2])
+    )
+    graphs = DSparkContextCudaGraphs(
+        model,
+        vllm_config,
+        torch.zeros(limit + 4, 8, dtype=torch.bfloat16),
+        torch.zeros(limit + 4, dtype=torch.int64),
+        torch.zeros(1, limit + 4, dtype=torch.int64),
+        None,
+        limit,
+    )
+    graphs.manager._graphs_captured = True
+    return graphs
+
+
+@pytest.mark.parametrize(
+    "max_num_seqs,rows,verification",
+    [(8, 48, 5), (16, 96, 5), (8, 48, 8)],
+    ids=["tp3-triangle", "tp4-ring", "copy-drafts"],
+)
+def test_context_capture_sizes_are_the_target_decode_graph_sizes(
+    monkeypatch, max_num_seqs, rows, verification
+):
+    """The context graphs capture exactly the row counts of the target's FULL
+    decode graphs below the largest decode step, derived from the same capture
+    ladder and dense decode shapes: one source, so the two cannot drift."""
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.models.deepseek_v4_1.nvidia.dspark import _context_capture_sizes
+
+    _no_graph_pool(monkeypatch)
+    vllm_config = _decode_config(
+        max_num_seqs, _recipe_ladder(rows), verification=verification
+    )
+    target = _target_manager(vllm_config, 1 + verification)
+    target_sizes = {
+        desc.num_tokens for desc in target._capture_descs[CUDAGraphMode.FULL]
+    }
+    for limit in (rows, rows - 7):
+        sizes = _context_capture_sizes(vllm_config, limit)
+        assert sizes == sorted({n for n in target_sizes if n <= limit} | {limit})
+    assert _context_capture_sizes(vllm_config, 0) == []
+    if (max_num_seqs, verification) == (8, 5):
+        # TP3: 23 graphs, every one- and two-request total and every full-depth
+        # step exact, where powers of two captured 7.
+        assert _context_capture_sizes(vllm_config, rows) == [
+            *range(1, 13), 16, 18, 20, 24, 28, 30, 32, 36, 40, 42, 48
+        ]
+
+
+@pytest.mark.parametrize(
+    "max_num_seqs,rows", [(8, 48), (16, 96)], ids=["tp3-triangle", "tp4-ring"]
+)
+def test_context_graphs_pad_decode_rows_no_further_than_the_target(
+    monkeypatch, max_num_seqs, rows
+):
+    """Every decode step the target runs as a FULL graph replays a context graph
+    no wider than the target's: full-depth steps (6 rows a request) and every one-
+    and two-request total (adaptive verification trims drafts) exactly."""
+    from vllm.config.compilation import CUDAGraphMode
+
+    _no_graph_pool(monkeypatch)
+    vllm_config = _decode_config(max_num_seqs, _recipe_ladder(rows))
+    target = _target_manager(vllm_config, 6)
+    graphs = _context_graphs(vllm_config, rows)
+    sizes = graphs.manager.compilation_config.cudagraph_capture_sizes
+    assert graphs.manager.compilation_config.max_cudagraph_capture_size == rows
+    assert graphs.aux.shape[0] == rows
+
+    def context_rows(num_tokens):
+        desc = graphs.manager.dispatch(1, num_tokens, None, 0)
+        assert desc.cg_mode == CUDAGraphMode.FULL
+        return desc.num_tokens
+
+    for num_reqs in range(1, max_num_seqs + 1):
+        assert context_rows(6 * num_reqs) == 6 * num_reqs
+        for num_tokens in range(num_reqs, 6 * num_reqs + 1):
+            desc = target.dispatch(num_reqs, num_tokens, None, 0, max_query_len=6)
+            assert desc.cg_mode == CUDAGraphMode.FULL
+            assert num_tokens <= context_rows(num_tokens) <= desc.num_tokens
+            if num_reqs <= 2:
+                assert context_rows(num_tokens) == num_tokens
+    assert graphs.manager.dispatch(1, rows + 1, None, 0).cg_mode == (
+        CUDAGraphMode.NONE
+    )
+    assert len(graphs.manager._capture_descs[CUDAGraphMode.FULL]) == len(sizes)

@@ -41,7 +41,10 @@ from vllm.model_executor.models.utils import maybe_prefix
 from vllm.model_executor.weight_transfer import copy_weight
 from vllm.models.deepseek_v4_1.common.engram import _PaddedColumnParallelLinear
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
-from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
+from vllm.v1.worker.gpu.cudagraph_utils import (
+    CudaGraphManager,
+    dense_varlen_decode_shapes,
+)
 
 from .. import kernels, l2_prefetch
 from ..tilelang import columns, dspark_context, prepare
@@ -74,6 +77,36 @@ def _context_kv_projection(attn: nn.Module):
     return projection
 
 
+def _context_capture_sizes(vllm_config: VllmConfig, limit: int) -> list[int]:
+    """The context graphs' row counts: the target's decode graph sizes up to ``limit``.
+
+    A context graph runs at the target step's live row count. The target captures
+    its FULL decode graphs at the capture ladder and at every exact low-concurrency
+    and full-depth speculative total (``dense_varlen_decode_shapes`` at one
+    request's verification width), so these sizes pad the context no further than
+    the target pads itself: a full-depth step keeps its 6, 24 or 48 rows through
+    main_proj, its gather and the draft layers' KV front instead of 8, 32 or 64.
+    The count is the target's own decode graph count below ``limit``, which is
+    always captured: the largest decode step.
+    """
+    if limit <= 0:
+        return []
+    decode_query_len = 1 + vllm_config.num_verification_tokens
+    sizes = {limit}
+    sizes.update(
+        num_tokens
+        for _, num_tokens in dense_varlen_decode_shapes(
+            vllm_config.scheduler_config.max_num_seqs, decode_query_len, limit
+        )
+    )
+    sizes.update(
+        size
+        for size in vllm_config.compilation_config.cudagraph_capture_sizes or ()
+        if size <= limit
+    )
+    return sorted(sizes)
+
+
 class DSparkContextCudaGraphs:
     """Serial, draft-workspace-lane owner for auxiliary projection and KV prep.
 
@@ -104,15 +137,7 @@ class DSparkContextCudaGraphs:
             hidden_states.shape[0],
             vllm_config.compilation_config.max_cudagraph_capture_size,
         )
-        # Powers of two bound padding to less than 2x, independent of live rows.
-        capacities = []
-        capacity = 1
-
-        while capacity < limit:
-            capacities.append(capacity)
-            capacity *= 2
-        if limit > 0:
-            capacities.append(limit)
+        capacities = _context_capture_sizes(vllm_config, limit)
         self.aux = torch.zeros(
             (limit, self.width * self.num_aux),
             dtype=hidden_states.dtype,
