@@ -1,10 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+from collections import Counter
 from collections.abc import Sequence
 
 from vllm.sampling_params import RepetitionDetectionParams
 from vllm.v1.request import Request, RequestStatus
+
+# Output tokens a forced end of reasoning may take to land: the rest of the
+# step that found the loop and the step already in flight, each up to its
+# verification width (drafts and copy drafts).
+FORCED_REASONING_END_GRACE = 64
+# Output tokens a loop in a healthy answer must persist past its first
+# detection before the request stops. Token soup (one token dominating the
+# answer's last OUTPUT_LOOP_WINDOW tokens in many short runs, the collapse
+# seen in production) stops soon. Any other loop stops only long after
+# legitimate periodic output (a zero-filled array, a matrix, a table rule)
+# would have ended: a 256-zero C array is 780 tokens, a 16x16 matrix 792. And
+# the longest gap between detections that still counts as the same loop.
+OUTPUT_SOUP_PERSIST = 256
+OUTPUT_LOOP_PERSIST = 2048
+OUTPUT_LOOP_GAP = 64
+# ... and a loop that is not token soup must then leave fewer than one
+# distinct token in OUTPUT_LOOP_MAX_DISTINCT_INV among the answer's last
+# OUTPUT_LOOP_WINDOW tokens.
+OUTPUT_LOOP_WINDOW = 512
+OUTPUT_LOOP_MAX_DISTINCT_INV = 10
 
 
 def _has_repeating_pattern(
@@ -130,6 +151,42 @@ def _has_windowed_repeating_pattern(
     )
 
 
+def _find_dominant_token_window(
+    token_ids: Sequence[int],
+    start_idx: int = 0,
+    window_size: int = 64,
+    min_window: int = 32,
+) -> tuple[int, int] | None:
+    """Return ``(distinct, dominant_count)`` if one token makes up at least
+    60% of the last ``window_size`` tokens (at least ``min_window`` of them)
+    and the window holds at most one distinct token per eight.
+
+    This is token soup: one token repeated with a few interjections, such as
+    ``11x Vila, Estud compar, 9x Vila, Estud compar, 9x Vila``. Every run is
+    shorter than the contiguous rules need and the period is irregular, so
+    neither the contiguous nor the windowed phrase rule sees it. A run of two
+    or more alternating tokens (bit strings, ``0, 0, 0``) has no token at 60%.
+    """
+    seq = getattr(token_ids, "_x", token_ids)
+    n = len(seq)
+    wlen = min(window_size, n - start_idx)
+    if wlen < min_window:
+        return None
+    # Soup repeats its token within any eight; prose and code rarely do, and
+    # this keeps the per-token cost of the count off them.
+    if len(set(seq[n - 8 : n])) > 5:
+        return None
+    counts: dict[int, int] = {}
+    for tok in seq[n - wlen : n]:
+        counts[tok] = counts.get(tok, 0) + 1
+    if len(counts) * 8 > wlen:
+        return None
+    dominant = max(counts.values())
+    if dominant * 5 < wlen * 3:
+        return None
+    return (len(counts), dominant)
+
+
 def detect_thinking_loop(
     token_ids: Sequence[int],
     start_idx: int = 0,
@@ -144,6 +201,9 @@ def detect_thinking_loop(
     3. Interspersed/windowed phrase loops (pattern length 5..64 repeated >= 5
        times within a 160-token window with >= 1 contiguous pair and covering
        >= 60% of the span).
+    4. Token soup (one token >= 60% of the last 32..64 tokens, at most one
+       distinct token per eight); ``pattern_len`` is the number of distinct
+       tokens and ``count`` the dominant token's count.
     """
     seq = getattr(token_ids, "_x", token_ids)
     avail = len(seq) - start_idx
@@ -176,6 +236,10 @@ def detect_thinking_loop(
     )
     if win_match is not None:
         return ("windowed_phrase", win_match[0], win_match[1])
+
+    soup_match = _find_dominant_token_window(seq, start_idx=start_idx)
+    if soup_match is not None:
+        return ("token_soup", soup_match[0], soup_match[1])
     return None
 
 
@@ -326,7 +390,16 @@ def check_stop(
 
     if request.thinking_output_start >= 0:
         if request.force_thinking_end:
-            return False
+            # The worker forces the end of reasoning in the request's next
+            # scheduled step, after the step already in flight. A forced end
+            # that never arrives stops the request instead of leaving the
+            # loop unchecked until max_tokens.
+            if (
+                request.num_output_tokens - request.force_thinking_end_at
+                <= FORCED_REASONING_END_GRACE
+            ):
+                return False
+            return _finish_repetition(request)
         start_idx = request.thinking_output_start
         loop_info: tuple[str, int, int] | None = None
         if repetition_detection is not None and check_sequence_repetition(
@@ -339,48 +412,88 @@ def check_stop(
             loop_info = detect_thinking_loop(
                 request._output_token_ids, start_idx=start_idx
             )
-        if loop_info is not None:
-            request.last_loop_info = loop_info
-            if thinking_loop_break and request.thinking_loop_breaks == 0:
-                request.force_thinking_end = True
-                request.thinking_loop_breaks += 1
-                request.copy_draft_alloc = 0
-                return False
-            request.status = RequestStatus.FINISHED_REPETITION
-            request.stop_reason = "repetition_detected"
-            return True
-        return False
+        if loop_info is None:
+            return False
+        request.last_loop_info = loop_info
+        if thinking_loop_break and request.thinking_loop_breaks == 0:
+            request.force_thinking_end = True
+            request.force_thinking_end_at = request.num_output_tokens
+            request.thinking_loop_breaks += 1
+            request.copy_draft_alloc = 0
+            return False
+        return _finish_repetition(request)
 
     start_idx = request.thinking_end_output_idx
-    if repetition_detection is not None:
-        if check_sequence_repetition(
-            request._output_token_ids,
-            repetition_detection,
-            start_idx=start_idx,
-        ):
-            request.last_loop_info = ("custom_repetition", 0, 0)
-            request.status = RequestStatus.FINISHED_REPETITION
-            request.stop_reason = "repetition_detected"
-            return True
-        if request.thinking_loop_breaks > 0:
-            loop_info = detect_thinking_loop(
-                request._output_token_ids, start_idx=start_idx
-            )
-            if loop_info is not None:
-                request.last_loop_info = loop_info
-                request.status = RequestStatus.FINISHED_REPETITION
-                request.stop_reason = "repetition_detected"
-                return True
+    if repetition_detection is not None and check_sequence_repetition(
+        request._output_token_ids,
+        repetition_detection,
+        start_idx=start_idx,
+    ):
+        request.last_loop_info = ("custom_repetition", 0, 0)
+        return _finish_repetition(request)
+
+    if not (thinking_loop_break or request.thinking_loop_breaks > 0):
         return False
+    loop_info = detect_thinking_loop(request._output_token_ids, start_idx=start_idx)
+    if request.thinking_loop_breaks > 0:
+        # Reasoning already looped: stop the answer at its first loop.
+        if loop_info is None:
+            return False
+        request.last_loop_info = loop_info
+        return _finish_repetition(request)
 
-    if thinking_loop_break or request.thinking_loop_breaks > 0:
-        loop_info = detect_thinking_loop(
-            request._output_token_ids, start_idx=start_idx
-        )
-        if loop_info is not None:
-            request.last_loop_info = loop_info
-            request.status = RequestStatus.FINISHED_REPETITION
-            request.stop_reason = "repetition_detected"
-            return True
+    # The visible answer of a request whose reasoning did not loop. Legitimate
+    # answers repeat too (a zero-filled array, a table rule, a file written
+    # through a tool call) and then move on; a degenerate loop does not. Stop
+    # only a loop that persists (token soup OUTPUT_SOUP_PERSIST tokens, any
+    # other loop OUTPUT_LOOP_PERSIST) and dominates the answer's last
+    # OUTPUT_LOOP_WINDOW tokens, so a false detection costs nothing: a long
+    # run inside otherwise varied output (a 199-token separator rule in a
+    # message whose distinct-token ratio is 0.8) is never stopped.
+    num_output = request.num_output_tokens
+    if loop_info is None:
+        if (
+            request.output_loop_since >= 0
+            and num_output - request.output_loop_last > OUTPUT_LOOP_GAP
+        ):
+            request.output_loop_since = -1
+        return False
+    if request.output_loop_since < 0:
+        request.output_loop_since = num_output
+    request.output_loop_last = num_output
+    request.last_loop_info = loop_info
+    persisted = num_output - request.output_loop_since
+    if persisted < OUTPUT_SOUP_PERSIST:
+        return False
+    window = request._output_token_ids[
+        max(start_idx, num_output - OUTPUT_LOOP_WINDOW) : num_output
+    ]
+    if _is_token_soup(window):
+        return _finish_repetition(request)
+    if persisted < OUTPUT_LOOP_PERSIST:
+        return False
+    if len(set(window)) * OUTPUT_LOOP_MAX_DISTINCT_INV >= len(window):
+        return False
+    return _finish_repetition(request)
 
-    return False
+
+def _is_token_soup(window: Sequence[int]) -> bool:
+    """One token over 60% of the window, broken into many short runs (one run
+    or more every 32 tokens) by interjections: the collapse seen in production.
+    One long run (a separator rule) and an exactly periodic array (no token
+    over half of it) are not."""
+    dominant, count = Counter(window).most_common(1)[0]
+    if count * 5 < len(window) * 3:
+        return False
+    runs = sum(
+        1
+        for i, token in enumerate(window)
+        if token == dominant and (i == 0 or window[i - 1] != dominant)
+    )
+    return runs * 32 >= len(window)
+
+
+def _finish_repetition(request: Request) -> bool:
+    request.status = RequestStatus.FINISHED_REPETITION
+    request.stop_reason = "repetition_detected"
+    return True

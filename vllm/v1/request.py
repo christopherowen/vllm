@@ -274,8 +274,14 @@ class Request:
         self.thinking_output_start: int = -1
         self.thinking_end_output_idx: int = 0
         self.force_thinking_end: bool = False
+        # num_output_tokens when force_thinking_end was set.
+        self.force_thinking_end_at: int = 0
         self.thinking_loop_breaks: int = 0
         self.last_loop_info: tuple[str, int, int] | None = None
+        # The answer's current loop: num_output_tokens at its first and at its
+        # latest detection (-1 when none).
+        self.output_loop_since: int = -1
+        self.output_loop_last: int = -1
         self._reasoning_markers_initialized: bool = False
         self.thinking_disabled: bool = self._compute_thinking_disabled()
 
@@ -375,8 +381,11 @@ class Request:
         self.thinking_output_start = -1
         self.thinking_end_output_idx = 0
         self.force_thinking_end = False
+        self.force_thinking_end_at = 0
         self.thinking_loop_breaks = 0
         self.last_loop_info = None
+        self.output_loop_since = -1
+        self.output_loop_last = -1
         self._reasoning_markers_initialized = False
         self.thinking_disabled = self._compute_thinking_disabled()
 
@@ -422,25 +431,37 @@ class Request:
             return
         start_last = start_ids[-1]
         end_last = end_ids[-1]
+        # The reasoning parser's transitions: inside reasoning only the end
+        # marker leaves (a repeated start marker is reasoning text); in the
+        # answer a start marker opens reasoning again and a stray end marker
+        # is answer text. A marker the parser treats as text must not restart
+        # a loop window or cancel a forced end.
         for out_pos in range(prev_num_output + 1, cur_num_output + 1):
             all_pos = num_prompt + out_pos
             tok = all_ids[all_pos - 1]
-            if tok == end_last and all_pos >= end_len:
+            if self.thinking_output_start >= 0:
                 if (
-                    end_len == 1
-                    or tuple(all_ids[all_pos - end_len : all_pos]) == end_ids
+                    tok == end_last
+                    and all_pos >= end_len
+                    and (
+                        end_len == 1
+                        or tuple(all_ids[all_pos - end_len : all_pos]) == end_ids
+                    )
                 ):
                     self.thinking_output_start = -1
                     self.thinking_end_output_idx = out_pos
                     self.force_thinking_end = False
-                    continue
-            if tok == start_last and all_pos >= start_len:
-                if (
+                    self.output_loop_since = -1
+            elif (
+                tok == start_last
+                and all_pos >= start_len
+                and (
                     start_len == 1
                     or tuple(all_ids[all_pos - start_len : all_pos]) == start_ids
-                ):
-                    self.thinking_output_start = out_pos
-                    self.force_thinking_end = False
+                )
+            ):
+                self.thinking_output_start = out_pos
+                self.output_loop_since = -1
 
         if (
             self.thinking_output_start < 0

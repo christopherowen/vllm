@@ -4,6 +4,10 @@ import pytest
 
 from vllm.sampling_params import RepetitionDetectionParams, SamplingParams
 from vllm.v1.core.sched.utils import (
+    FORCED_REASONING_END_GRACE,
+    OUTPUT_LOOP_PERSIST,
+    OUTPUT_SOUP_PERSIST,
+    _find_dominant_token_window,
     check_sequence_repetition,
     check_stop,
     detect_thinking_loop,
@@ -459,26 +463,31 @@ class TestRepetitionDetectionIntegration:
         req_post = Request(
             request_id="natural-post-think-loop",
             prompt_token_ids=[1, 2, 128805, 198],
-            sampling_params=SamplingParams(max_tokens=512),
+            sampling_params=SamplingParams(max_tokens=4096),
             pooling_params=None,
         )
         for tok in [301, 302, 303, 128806]:
             prev_out = len(req_post._output_token_ids)
             req_post.append_output_token_ids(tok)
             req_post.update_reasoning_markers(start_ids, end_ids, prev_num_output=prev_out)
-            assert not check_stop(req_post, max_model_len=2048)
+            assert not check_stop(req_post, max_model_len=8192)
         assert req_post.thinking_loop_breaks == 0
         assert req_post.thinking_output_start == -1
 
         stopped = False
-        for tok in let_me_do_it * 4:
+        for tok in let_me_do_it * 400:
             prev_out = len(req_post._output_token_ids)
             req_post.append_output_token_ids(tok)
             req_post.update_reasoning_markers(start_ids, end_ids, prev_num_output=prev_out)
-            if check_stop(req_post, max_model_len=2048):
+            if check_stop(req_post, max_model_len=8192):
                 stopped = True
                 break
         assert stopped
+        # A healthy answer stops only once the loop has persisted.
+        assert (
+            req_post.num_output_tokens - req_post.output_loop_since
+            == OUTPUT_LOOP_PERSIST
+        )
         assert not req_post.force_thinking_end
         assert req_post.status == RequestStatus.FINISHED_REPETITION
         assert req_post.stop_reason == "repetition_detected"
@@ -487,7 +496,7 @@ class TestRepetitionDetectionIntegration:
         for init_kwargs in (
             {"prompt_token_ids": [1, 2, 128804, 128806]},
             {"reasoning_ended": True},
-            {"sampling_params": SamplingParams(max_tokens=512, thinking_token_budget=0)},
+            {"sampling_params": SamplingParams(max_tokens=4096, thinking_token_budget=0)},
             {"reasoning_parser_kwargs": {"chat_template_kwargs": {"thinking": False}}},
             {"reasoning_parser_kwargs": {"chat_template_kwargs": {"enable_thinking": False}}},
             {"reasoning_parser_kwargs": {"reasoning_effort": "none"}},
@@ -495,19 +504,19 @@ class TestRepetitionDetectionIntegration:
             req = Request(
                 request_id="think-off-default-loop",
                 prompt_token_ids=init_kwargs.get("prompt_token_ids", [1, 2, 128805, 198]),
-                sampling_params=init_kwargs.get("sampling_params", SamplingParams(max_tokens=512)),
+                sampling_params=init_kwargs.get("sampling_params", SamplingParams(max_tokens=4096)),
                 pooling_params=None,
                 reasoning_ended=init_kwargs.get("reasoning_ended"),
                 reasoning_parser_kwargs=init_kwargs.get("reasoning_parser_kwargs"),
             )
             stopped = False
-            for tok in let_me_do_it * 4:
+            for tok in let_me_do_it * 400:
                 prev_out = len(req._output_token_ids)
                 req.append_output_token_ids(tok)
                 req.update_reasoning_markers(start_ids, end_ids, prev_num_output=prev_out)
                 assert req.thinking_disabled
                 assert not req.force_thinking_end
-                if check_stop(req, max_model_len=2048):
+                if check_stop(req, max_model_len=8192):
                     stopped = True
                     break
             assert stopped
@@ -619,3 +628,250 @@ class TestRepetitionDetectionIntegration:
             assert req.thinking_loop_breaks == 0
             assert req.last_loop_info is None
             assert req.copy_draft_alloc == 6
+
+    @staticmethod
+    def _feed(req, tokens, start_ids=(128805,), end_ids=(128806,)):
+        """Append tokens one at a time as the scheduler does; return the
+        number fed when check_stop stopped the request, else None."""
+        for i, tok in enumerate(tokens, 1):
+            prev_out = len(req._output_token_ids)
+            req.append_output_token_ids(tok)
+            req.update_reasoning_markers(start_ids, end_ids, prev_num_output=prev_out)
+            if check_stop(req, max_model_len=1 << 20):
+                return i
+        return None
+
+    def test_token_soup_detected(self):
+        """One token repeated with short interjections (the production 'Vila'
+        collapse): every run is under 24 tokens and the period is irregular, so
+        only the token-soup rule sees it."""
+        vila, estud, compar, evelyn, laud = 125221, 96830, 6289, 88227, 100308
+        incident = [vila] * 11 + [estud, compar] + [vila] * 9 + [estud, compar]
+        incident += [vila] * 9
+        assert detect_thinking_loop(incident) == ("token_soup", 3, 29)
+
+        soup = []
+        for run in (12, 7, 15, 9, 11, 13):
+            soup += [vila] * run + [evelyn, laud]
+        # Longer soups may also meet the windowed rule; either catches them.
+        assert detect_thinking_loop(soup) is not None
+        # Ending on an interjection: still caught.
+        assert detect_thinking_loop(soup + [estud]) is not None
+        # Interjections of new cone tokens every few tokens: only soup.
+        cone = [evelyn, laud, estud, compar, 92036, 68908]
+        mixed = []
+        for i, run in enumerate((5, 3, 6, 4, 5, 3, 6, 4, 5, 6)):
+            mixed += [vila] * run + [cone[i % len(cone)]]
+        assert detect_thinking_loop(mixed)[0] == "token_soup"
+
+    def test_token_soup_ignores_alternations_and_prose(self):
+        """No single token dominates bit strings, zero matrices or prose."""
+        import random
+
+        rng = random.Random(0)
+        bits = [rng.choice((15, 16)) for _ in range(64)]
+        assert _find_dominant_token_window(bits) is None
+
+        # [[0, 0, 0], [0, 0, 0], ...]: '0' is under 60% of the tokens.
+        matrix = []
+        for _ in range(8):
+            matrix += [58, 15, 11, 15, 11, 15, 59, 11]
+        assert _find_dominant_token_window(matrix) is None
+
+        prose = [rng.randrange(1000, 60000) for _ in range(200)]
+        assert detect_thinking_loop(prose) is None
+
+    def test_reasoning_markers_follow_the_parser(self):
+        """A start marker inside reasoning is reasoning text, an end marker in
+        the answer is answer text, and a start marker in the answer opens
+        reasoning again, as DeepSeekV4Parser decides."""
+        req = Request(
+            request_id="markers",
+            prompt_token_ids=[1, 2, 128805, 198],
+            sampling_params=SamplingParams(max_tokens=4096),
+            pooling_params=None,
+        )
+        assert self._feed(req, [501, 502, 128805, 503]) is None
+        assert req.thinking_output_start == 0
+
+        # A loop breaks reasoning; a repeated start marker before the forced
+        # end must not cancel it.
+        assert self._feed(req, [9] * 24) is None
+        assert req.force_thinking_end and req.thinking_loop_breaks == 1
+        assert self._feed(req, [128805]) is None
+        assert req.force_thinking_end
+        assert req.thinking_output_start == 0
+
+        assert self._feed(req, [128806]) is None
+        end_idx = req.thinking_end_output_idx
+        assert end_idx == req.num_output_tokens
+        assert req.thinking_output_start == -1 and not req.force_thinking_end
+
+        # A stray end marker in the answer does not move the answer's start.
+        assert self._feed(req, [601, 128806, 602]) is None
+        assert req.thinking_end_output_idx == end_idx
+
+        # A start marker in the answer opens reasoning again.
+        assert self._feed(req, [128805, 701]) is None
+        assert req.thinking_output_start == req.num_output_tokens - 1
+
+    def test_forced_reasoning_end_that_never_arrives_stops(self):
+        """Once a reasoning loop forces the end, the loop may run on through
+        the steps in flight, but not past the grace."""
+        req = Request(
+            request_id="forced-end-lost",
+            prompt_token_ids=[1, 2, 128805, 198],
+            sampling_params=SamplingParams(max_tokens=4096),
+            pooling_params=None,
+        )
+        assert self._feed(req, [9] * 24) is None
+        assert req.force_thinking_end
+        forced_at = req.num_output_tokens
+        assert req.force_thinking_end_at == forced_at
+
+        fed = self._feed(req, [9] * (FORCED_REASONING_END_GRACE + 8))
+        assert fed == FORCED_REASONING_END_GRACE + 1
+        assert req.status == RequestStatus.FINISHED_REPETITION
+        assert req.num_output_tokens - forced_at == FORCED_REASONING_END_GRACE + 1
+
+    def test_healthy_answer_repetition_that_ends_is_not_stopped(self):
+        """A zero-filled array or a table rule in a healthy answer repeats for
+        a while and moves on: detections that stop before the persistence
+        span cost nothing, and a later loop is timed from its own start."""
+        req = Request(
+            request_id="zeros",
+            prompt_token_ids=[1, 2, 128805, 198],
+            sampling_params=SamplingParams(max_tokens=8192),
+            pooling_params=None,
+        )
+        assert self._feed(req, [301, 302, 128806]) is None
+        zeros = [44, 48] * 100  # ", 0" x 100: detected from the 24th token
+        assert self._feed(req, zeros) is None
+        assert req.output_loop_since >= 0
+        tail = list(range(2000, 2080))
+        assert self._feed(req, tail) is None
+        assert req.output_loop_since == -1
+
+        loop_start = req.num_output_tokens
+        fed = self._feed(req, [101, 102, 103, 104, 13, 198] * 400)
+        assert fed is not None
+        assert req.status == RequestStatus.FINISHED_REPETITION
+        assert req.output_loop_since > loop_start
+        assert req.num_output_tokens - req.output_loop_since == OUTPUT_LOOP_PERSIST
+
+    def test_answer_after_a_reasoning_loop_stops_at_its_first_loop(self):
+        """After a forced end the context is degenerate: no persistence."""
+        req = Request(
+            request_id="degraded",
+            prompt_token_ids=[1, 2, 128805, 198],
+            sampling_params=SamplingParams(max_tokens=4096),
+            pooling_params=None,
+        )
+        assert self._feed(req, [9] * 24 + [128806]) is None
+        assert req.thinking_loop_breaks == 1
+        vila, laud = 125221, 100308
+        fed = self._feed(req, ([vila] * 10 + [laud]) * 4)
+        assert fed is not None and fed <= 33
+        assert req.status == RequestStatus.FINISHED_REPETITION
+
+    @staticmethod
+    def _answer_request(request_id):
+        """A thinking request whose reasoning closed naturally."""
+        req = Request(
+            request_id=request_id,
+            prompt_token_ids=[1, 2, 128805, 198],
+            sampling_params=SamplingParams(max_tokens=1 << 16),
+            pooling_params=None,
+        )
+        assert TestRepetitionDetectionIntegration._feed(req, [301, 302, 128806]) is None
+        assert req.thinking_loop_breaks == 0 and req.thinking_output_start == -1
+        return req
+
+    @staticmethod
+    def _varied(n, seed):
+        import random
+
+        rng = random.Random(seed)
+        return [rng.randrange(1000, 60000) for _ in range(n)]
+
+    @staticmethod
+    def _soup(n, seed):
+        """The 2026-11-01 production collapse (#787): ' Vila' in runs of 3 to
+        12 with interjections of one to three other tokens."""
+        import random
+
+        vila, cone = 125221, [96830, 6289, 88227, 100308, 92036, 68908, 3221]
+        rng = random.Random(seed)
+        soup = []
+        while len(soup) < n:
+            if rng.random() < 0.62:
+                soup += [vila] * rng.randint(3, 12)
+            else:
+                soup += [rng.choice(cone) for _ in range(rng.randint(1, 3))]
+        return soup[:n]
+
+    def test_known_trigger_single_token_attractor_in_answer(self):
+        """The production collapse in the visible answer after normal output
+        stops soon after it starts, long before its 736 tokens of ' Vila'."""
+        req = self._answer_request("vila-soup")
+        assert self._feed(req, self._varied(1500, 1)) is None
+        fed = self._feed(req, self._soup(2330, 6))
+        assert fed is not None
+        assert req.status == RequestStatus.FINISHED_REPETITION
+        assert OUTPUT_SOUP_PERSIST < fed <= 512
+
+    def test_periodic_loop_in_healthy_answer_stops_late(self):
+        """An exactly periodic loop (a run of one token, a repeated phrase)
+        stops only once it has persisted OUTPUT_LOOP_PERSIST tokens: before
+        that it may still be legitimate output."""
+        for name, loop in {"run": [125221], "phrase": [101, 102, 103, 104, 13, 198]}.items():
+            req = self._answer_request(name)
+            assert self._feed(req, self._varied(300, 7)) is None
+            fed = self._feed(req, loop * (3000 // len(loop)))
+            assert fed is not None, name
+            assert req.num_output_tokens - req.output_loop_since == OUTPUT_LOOP_PERSIST
+            assert req.status == RequestStatus.FINISHED_REPETITION
+
+    def test_known_trigger_separator_rule_in_varied_answer_is_kept(self):
+        """Legitimate messages in the same sessions carried 199-token runs of
+        one token (separator rules) at a distinct-token ratio of 0.82-0.84.
+        Runs up to 300 inside varied output are never stopped."""
+        for run in (199, 300):
+            req = self._answer_request(f"separator-{run}")
+            stream = self._varied(400, 2) + [4521] * run + self._varied(400, 3)
+            assert self._feed(req, stream) is None, run
+            assert not req.is_finished()
+
+    def test_known_trigger_requested_repetition_is_kept(self):
+        """Requested repetition at its real token counts: 'hello' 200 times, a
+        512-zero C array (three tokens a zero: 1,548 tokens), a 16x16 matrix
+        of ones (792 tokens), a 200-row table and an answer that is one token
+        100 times: legitimate, bounded, never stopped. The 2026-11-02 soak
+        stopped a 128-zero array at its 292nd of 396 tokens."""
+        hello, comma, space, zero, one = 23714, 11, 223, 15, 16
+        open_row, close_row = [262, 58], [1592, 198]
+        cases = {
+            "hello-200": [hello] * 200,
+            "zeros-512": [zero, comma, space] * 512,
+            "ones-16x16": (open_row + [one, comma, space] * 16 + close_row) * 16,
+            "table-200": [t for i in range(200) for t in (124, 2000 + i, 124, zero, 124, 198)],
+            "one-token-100": [hello] * 100,
+        }
+        for name, stream in cases.items():
+            req = self._answer_request(name)
+            assert self._feed(req, stream + self._varied(40, 4)) is None, name
+
+    def test_known_trigger_reasoning_stall_breaks_at_once(self):
+        """The 2026-11-01 replay (#787): 'Let me do it.' repeated inside
+        reasoning at effort max. Reasoning breaks at the first loop."""
+        let_me_do_it = [101, 102, 103, 104, 13, 198]
+        req = Request(
+            request_id="stall",
+            prompt_token_ids=[1, 2, 128805, 198],
+            sampling_params=SamplingParams(max_tokens=4096),
+            pooling_params=None,
+        )
+        assert self._feed(req, self._varied(120, 5)) is None
+        assert self._feed(req, let_me_do_it * 4) is None
+        assert req.force_thinking_end and req.thinking_loop_breaks == 1
+        assert req.last_loop_info == ("contiguous_phrase", 6, 4)

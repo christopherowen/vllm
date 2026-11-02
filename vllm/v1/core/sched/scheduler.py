@@ -3937,11 +3937,31 @@ class Scheduler(SchedulerInterface):
             # Check for stop and update request state.
             # This must be called before we make the EngineCoreOutput.
             was_forced = request.force_thinking_end
+            was_suspected = request.output_loop_since >= 0
             stopped = check_stop(
                 request,
                 self.max_model_len,
                 thinking_loop_break=self.thinking_loop_break,
             )
+            if not was_suspected and request.output_loop_since >= 0:
+                loop_mode, loop_pat_len, loop_count = request.last_loop_info or (
+                    "unknown",
+                    0,
+                    0,
+                )
+                logger.info(
+                    "Suspected loop in the answer of request %s at %d output "
+                    "tokens (mode=%s, pattern_len=%d, count=%d, answer_start=%d, "
+                    "thinking_disabled=%s, breaks=%d); stopping it if it persists.",
+                    request.request_id,
+                    request.num_output_tokens,
+                    loop_mode,
+                    loop_pat_len,
+                    loop_count,
+                    request.thinking_end_output_idx,
+                    request.thinking_disabled,
+                    request.thinking_loop_breaks,
+                )
             if not was_forced and request.force_thinking_end:
                 loop_mode, loop_pat_len, loop_count = request.last_loop_info or (
                     "unknown",
