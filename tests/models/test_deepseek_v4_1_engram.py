@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import functools
 import gc
 import json
 import pickle
@@ -427,6 +428,14 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
 ):
     """Accepted GPU history, images, padding and failures cross the eager boundary."""
     make_model, weights, paths = tiny_engram_checkpoint
+    # The reader serves rows it has read before from its row cache (a checkpoint
+    # is immutable while serving). Every step of this test reads the files, so
+    # the truncation below is read.
+    monkeypatch.setattr(
+        engram_module,
+        "EngramDiskRows",
+        functools.partial(engram_module.EngramDiskRows, cache_rows=0),
+    )
     root, target, session = make_model("disk")
     resident_root, resident, resident_session = make_model("device")
     _load_checkpoint(root, tmp_path)
