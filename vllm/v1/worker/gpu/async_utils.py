@@ -216,11 +216,8 @@ class AsyncOutput(AsyncModelRunnerOutput):
         copy_draft_alloc: Any,
         copy_stream: torch.cuda.Stream,
         main_stream: torch.cuda.Stream,
-        slot_draft_limits: Any = None,
         *,
         num_reqs: int | None = None,
-        slot_draft_limits_gpu: torch.Tensor | None = None,
-        slot_draft_limits_cpu: torch.Tensor | None = None,
         alloc_event: torch.cuda.Event | None = None,
     ) -> None:
         """Copy the copy drafter's per-request allocation (``[num_reqs]`` int32),
@@ -239,18 +236,12 @@ class AsyncOutput(AsyncModelRunnerOutput):
                 copy_stream.wait_stream(main_stream)
                 copy_draft_alloc.copy_to_cpu(n)
                 self.copy_draft_alloc_np = copy_draft_alloc.np[:n]
-                if slot_draft_limits_gpu is not None and slot_draft_limits_cpu is not None:
-                    slot_draft_limits_cpu.copy_(slot_draft_limits_gpu, non_blocking=True)
-                elif slot_draft_limits is not None:
-                    slot_draft_limits.copy_to_cpu()
                 self.copy_draft_alloc_event.record(copy_stream)
             return
         self.copy_draft_alloc = copy_draft_alloc.clone()
         with stream(copy_stream, main_stream):
             copy_stream.wait_stream(main_stream)
             self.copy_draft_alloc_np = async_copy_to_np(self.copy_draft_alloc)
-            if slot_draft_limits is not None:
-                slot_draft_limits.copy_to_cpu()
             self.copy_draft_alloc_event.record(copy_stream)
 
     def get_output(self) -> ModelRunnerOutput:

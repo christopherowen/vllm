@@ -635,9 +635,8 @@ def test_a_slot_starts_afresh_with_each_request():
     assert int(drafter.alloc[0]) == 2 * INITIAL
 
 
-def test_prepare_alloc_matches_propose_and_updates_slot_draft_limits():
-    """prepare_alloc computes the same alloc as propose before DSpark runs and
-    writes each slot's valid draft count to slot_draft_limits."""
+def test_prepare_alloc_matches_propose():
+    """prepare_alloc computes the same alloc as propose before DSpark runs."""
     rng = np.random.default_rng(7)
     states = _request_state(8192)
     drafter = _drafter(states)
@@ -658,8 +657,6 @@ def test_prepare_alloc_matches_propose_and_updates_slot_draft_limits():
     )
     drafter.prepare_alloc(idx, one, zero, None)
     early_alloc = drafter.alloc[:2].clone()
-    assert int(drafter.slot_draft_limits.gpu[slot_copy]) == INITIAL
-    assert int(drafter.slot_draft_limits.gpu[slot_prose]) == BLOCK
 
     drafts, confidences, planned = drafter.propose(
         idx, *dspark, one, zero, None, matched=True
@@ -851,18 +848,16 @@ def test_prepare_alloc_skips_incomplete_prefill_requests():
     assert int(drafter.int_state[s0, 1]) == INITIAL
     assert int(drafter.int_state[s1, 1]) == 0
     assert int(drafter.alloc[1]) == BLOCK
-    assert int(drafter.slot_draft_limits.gpu[s1]) == BLOCK
     assert drafts[1, :BLOCK].tolist() == dspark_drafts[1].tolist()
     assert drafts[1, BLOCK:].tolist() == [-1] * (LOOKAHEAD - BLOCK)
     torch.testing.assert_close(confs[1, :BLOCK], dspark_conf[1])
 
 
-def test_stale_wide_allocation_rejects_placeholder_tail_and_doubles_cap_without_sync():
+def test_stale_wide_allocation_rejects_placeholder_tail_and_doubles_cap():
     """When async scheduling allocates 16 draft rows from 2 steps back while the
     previous step only offered 8 copy drafts, columns 8..15 are -1 placeholders
-    (rejected even when the target argmax is token 0), accepting all 8 valid
-    copy drafts still doubles the cap to 16, and sync_slot_draft_limits never
-    calls synchronize() on an in-flight CUDA event."""
+    (rejected even when the target argmax is token 0), and accepting all 8 valid
+    copy drafts still doubles the cap to 16."""
     rng = np.random.default_rng(19)
     states = _request_state(8192)
     drafter = _drafter(states)
@@ -900,43 +895,19 @@ def test_stale_wide_allocation_rejects_placeholder_tail_and_doubles_cap_without_
     num_sampled = torch.tensor([INITIAL + 1], dtype=torch.int32, device=DEVICE)
     verified = torch.tensor([LOOKAHEAD], dtype=torch.int32, device=DEVICE)
     drafter.prepare_alloc(idx, num_sampled, verified, None)
-    assert int(drafter.slot_draft_limits.gpu[slot]) == 2 * INITIAL
     _, _, _ = drafter.propose(
         idx, dspark_drafts, dspark_conf, num_sampled, verified, None, matched=True
     )
     assert int(drafter.int_state[slot, 0]) == 1
     assert int(drafter.int_state[slot, 1]) == 2 * INITIAL
 
-    # In-flight event: sync_slot_draft_limits queries without synchronizing.
-    class InFlightEvent:
-        def query(self) -> bool:
-            return False
-
-        def synchronize(self) -> None:
-            raise AssertionError("sync_slot_draft_limits must not block on GPU")
-
-    drafter._limits_event = InFlightEvent()  # type: ignore[assignment]
-    limits = drafter.sync_slot_draft_limits()
-    assert limits.shape == (MAX_REQS,)
-
 
 # --- The shared budget: what every rank holds alike -------------------------------
 
 
-class _InFlightEvent:
-    """A limit copy that has not landed: the host keeps the previous limits."""
-
-    def query(self) -> bool:
-        return False
-
-    def synchronize(self) -> None:
-        raise AssertionError("sync_slot_draft_limits must not block on GPU")
-
-
-def _manager(states, drafter, *, host_limits: bool):
+def _manager(states):
     """The adaptive verification manager as the runner builds it beside a copy
-    drafter: without host limits (``slot_draft_limits=None``), or, candidate-37's
-    wiring, with the drafter's non-blocking host limits. One rank."""
+    drafter. One rank."""
     from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
         AdaptiveVerificationManager,
     )
@@ -949,17 +920,16 @@ def _manager(states, drafter, *, host_limits: bool):
         row_cost=0.035,
         planned_confidences=True,
         num_draft_steps=BLOCK,
-        slot_draft_limits=drafter.sync_slot_draft_limits if host_limits else None,
     )
     manager.dead_rows_tau = 0.0
     return manager
 
 
-def _one_rank(host_limits: bool, landed: bool):
+def _one_rank():
     """One rank after the step that proposed a copy for "copy" (its history repeats)
     and DSpark's block for "prose", budgeting the next step, which the scheduler
     laid out at 16 rows for the copy (an earlier allocation) and the block for the
-    other. Its limit copy has ``landed`` or is still in flight."""
+    other."""
     from types import SimpleNamespace
 
     rng = np.random.default_rng(3)
@@ -969,7 +939,7 @@ def _one_rank(host_limits: bool, landed: bool):
     }
     states = _request_state(8192)
     drafter = _drafter(states)
-    manager = _manager(states, drafter, host_limits=host_limits)
+    manager = _manager(states)
     slots = [_set_history(states, req_id, h) for req_id, h in histories.items()]
     for slot in slots:
         states.num_computed_tokens_np[slot] = 96
@@ -989,10 +959,6 @@ def _one_rank(host_limits: bool, landed: bool):
     batch = SimpleNamespace(num_reqs=2, idx_mapping=idx)
     for _ in range(2):  # the budget reads the snapshot of the record before last
         manager.record_confidences(confidences, batch, planned=planned)
-    if landed:
-        drafter.slot_draft_limits.np[:] = drafter.slot_draft_limits.gpu.cpu().numpy()
-    else:
-        drafter._limits_event = _InFlightEvent()  # type: ignore[assignment]
     num_tokens = manager.get_num_tokens(
         {"copy": 1 + LOOKAHEAD, "prose": 1 + BLOCK},
         {"copy": [-1] * LOOKAHEAD, "prose": [-1] * BLOCK},
@@ -1003,7 +969,7 @@ def _one_rank(host_limits: bool, landed: bool):
     )
     torch.accelerator.synchronize()
     return SimpleNamespace(
-        limits=drafter.slot_draft_limits.gpu[idx].tolist(),
+        offered=drafter.int_state[idx, 1].tolist(),
         num_tokens=num_tokens,
         eligible=eligible,
         budget=budget,
@@ -1012,13 +978,11 @@ def _one_rank(host_limits: bool, landed: bool):
     )
 
 
-def test_ranks_budget_alike_whenever_their_limit_copies_land(monkeypatch):
-    """Two tensor-parallel ranks hold the same histories, proposals and confidence
-    snapshot, but one's limit copy has landed when it budgets and the other's is in
-    flight. Without host limits they budget the same step, the same drafts per
-    request and the same device layout. With them (candidate-37's wiring) the
-    landed rank caps the copy at its 8 drafts and the other at the stale 16, and
-    the two lay out different steps."""
+def test_ranks_budget_the_schedulers_drafts_alike(monkeypatch):
+    """The budget reads the scheduler's drafts and the confidence snapshot, which
+    every tensor-parallel rank holds alike, and no state of a rank's own: a copy
+    that offers 8 drafts in a step laid out for 16 is budgeted at the 16, and two
+    ranks budget the same step, drafts per request and device layout."""
     from types import SimpleNamespace
 
     from vllm.v1.worker.gpu.spec_decode import adaptive_verification
@@ -1026,17 +990,11 @@ def test_ranks_budget_alike_whenever_their_limit_copies_land(monkeypatch):
     monkeypatch.setattr(
         adaptive_verification, "get_tp_group", lambda: SimpleNamespace(world_size=1)
     )
-    landed, in_flight = _one_rank(False, True), _one_rank(False, False)
-    assert landed.limits == in_flight.limits == [INITIAL, BLOCK]
-    assert landed.eligible == in_flight.eligible == {"copy": LOOKAHEAD, "prose": BLOCK}
+    first, second = _one_rank(), _one_rank()
+    assert first.offered == second.offered == [INITIAL, 0]
+    assert first.eligible == second.eligible == {"copy": LOOKAHEAD, "prose": BLOCK}
     for field in ("num_tokens", "budget", "query_start_loc", "cu_num_logits"):
-        assert getattr(landed, field) == getattr(in_flight, field), field
-
-    landed, in_flight = _one_rank(True, True), _one_rank(True, False)
-    assert landed.eligible == {"copy": INITIAL, "prose": BLOCK}
-    assert in_flight.eligible == {"copy": LOOKAHEAD, "prose": BLOCK}
-    assert landed.num_tokens != in_flight.num_tokens
-    assert landed.query_start_loc != in_flight.query_start_loc
+        assert getattr(first, field) == getattr(second, field), field
 
 
 def _decode_with_shared_budget(states, drafter, manager, target, req_id, prompt, count):
@@ -1084,7 +1042,8 @@ def _decode_with_shared_budget(states, drafter, manager, target, req_id, prompt,
         states.draft_tokens[idx] = drafts
         manager.record_confidences(confidences, batch, planned=planned)
         reported.append(int(drafter.alloc[0]))
-        return int(drafter.slot_draft_limits.gpu[slot])
+        # The proposal's drafts: a copy's offered ones, else DSpark's block.
+        return int(drafter.int_state[slot, 1]) or BLOCK
 
     width = propose()
     while len(out) < count:
@@ -1136,7 +1095,7 @@ def test_verification_through_copy_growth_shrinkage_and_slot_reuse(monkeypatch):
     rng = np.random.default_rng(13)
     states = _request_state(8192)
     drafter = _drafter(states)
-    manager = _manager(states, drafter, host_limits=False)
+    manager = _manager(states)
 
     def prompt_for(target):
         """R, t, Y, R: with the token the prefill samples (t again, an order-2

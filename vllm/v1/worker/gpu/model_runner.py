@@ -830,12 +830,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             target_layer_names=target_attn_layer_names,
             additional_attn_cg_support=additional_attn_cg_support,
             planned_confidences=self.copy_drafter is not None,
-            # No host draft limits: each rank's non-blocking mirror of them may
-            # still hold an older proposal's, so the budget, and with it the step's
-            # layout, would depend on the rank and on when the copy landed (#852).
-            # It reads what every rank holds alike: the scheduler's drafts and the
-            # confidence snapshot (synchronized, and broadcast from rank 0).
-            slot_draft_limits=None,
             tp_invariant_confidence=getattr(
                 self.speculator, "tp_invariant_confidence", False
             ),

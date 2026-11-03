@@ -709,29 +709,27 @@ def test_live_rejected_clamps_dead_rows_out_of_estimator_observation():
     assert observed_rejected.tolist() == [0, 1, 0]
 
 
-def test_slot_draft_limits_cap_stale_wide_scheduled_drafts():
+def test_the_budget_takes_the_schedulers_drafts():
     # Step t reported alloc=16 and planned_confidences[0:16]=0.95, so the
-    # scheduler laid out 16 draft placeholders for Step t+2. When Step t+1
-    # rejects the copy and falls back to DSpark (5 valid drafts, columns 5:16
-    # zero-padded), slot_draft_limits[slot]=5 caps Step t+2's eligible drafts to
-    # 5 so zero-padded slots are never budgeted or verified.
+    # scheduler laid out 16 draft placeholders for Step t+2. Whatever Step t+1
+    # proposes, the budget takes the scheduler's 16 (the rows past a narrower
+    # proposal verify its -1 placeholders, which verification rejects): no rank's
+    # own view of the latest proposal enters the step's layout.
     manager = make_manager(
         np.full((2, 16), 0.95, dtype=np.float32),
         row_cost=0.02,
     )
     manager.num_draft_steps = 5
-    limits = np.array([5, 16], dtype=np.int32)
-    manager._slot_draft_limits = lambda: limits
 
     tokens = manager.get_num_tokens(
         {"low": 17},
         {"low": [-1] * 16},
     )
     valid_drafts, num_non_draft_tokens, draft_budget = manager._batch_budget
-    assert valid_drafts == {"low": 5}
+    assert valid_drafts == {"low": 16}
     assert num_non_draft_tokens == {"low": 1}
-    assert draft_budget == 5
-    assert tokens == 6
+    assert draft_budget == 16
+    assert tokens == 17
 
 
 def test_mid_prefill_chunks_keep_initial_unit_confidence_until_prefill_completes(

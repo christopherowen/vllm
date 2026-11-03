@@ -284,7 +284,7 @@ def copy_alloc_kernel(
     initial: int,
     idx_dtype: str,
 ):
-    """The copy allocation and per-slot valid draft count before the drafter runs."""
+    """The copy allocation before the drafter runs."""
     count = num_levels(min_match)
     num_reqs = T.dynamic("num_reqs")
     total_rows = T.dynamic("total_rows")
@@ -300,7 +300,6 @@ def copy_alloc_kernel(
         cut: T.Tensor((num_reqs,), T.int32),
         int_state: T.Tensor((state_rows, STATE_COLUMNS), T.int32),
         alloc: T.Tensor((num_reqs,), T.int32),
-        slot_limits: T.Tensor((state_rows,), T.int32),
     ):
         with T.Kernel(num_reqs, threads=_SELECT_THREADS) as r:
             tx = T.get_thread_binding()
@@ -324,12 +323,10 @@ def copy_alloc_kernel(
                         )
                 cap = T.min(T.int32(initial) << doublings, lookahead)
                 distance = total_len[slot] - source
-                offered = T.if_then_else(source >= 0, T.min(cap, distance), 0)
                 after = T.if_then_else(
                     source >= 0, T.min(T.min(2 * cap, lookahead), distance), 0
                 )
                 alloc[r] = T.max(after, block)
-                slot_limits[slot] = T.if_then_else(source >= 0, offered, block)
 
     return copy_alloc
 
@@ -353,14 +350,13 @@ def copy_alloc(
     cut: torch.Tensor,
     int_state: torch.Tensor,
     alloc: torch.Tensor,
-    slot_limits: torch.Tensor,
     min_match: int,
     lookahead: int,
     block: int,
     initial: int,
 ) -> None:
-    """``alloc[:num_reqs]`` and ``slot_limits[idx_mapping]`` from ``sources`` and
-    the current copy state (read-only), before the drafter proposes."""
+    """``alloc[:num_reqs]`` from ``sources`` and the current copy state
+    (read-only), before the drafter proposes."""
     num_reqs = idx_mapping.shape[0]
     if not num_reqs:
         return
@@ -374,7 +370,6 @@ def copy_alloc(
         cut,
         int_state,
         alloc,
-        slot_limits,
     )
 
 

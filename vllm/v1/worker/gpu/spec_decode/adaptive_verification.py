@@ -87,7 +87,6 @@ class AdaptiveVerificationManager:
         row_cost: float,
         planned_confidences: bool = False,
         num_draft_steps: int | None = None,
-        slot_draft_limits: Callable[[], np.ndarray] | np.ndarray | None = None,
         *,
         tp_invariant_confidence: bool = False,
     ):
@@ -95,7 +94,6 @@ class AdaptiveVerificationManager:
         self.num_speculative_steps = req_states.num_speculative_steps
         self.num_draft_steps = num_draft_steps or self.num_speculative_steps
         self.step_steps = self.num_speculative_steps
-        self._slot_draft_limits = slot_draft_limits
         device = req_states.device
         self._copy_stream = torch.cuda.Stream(device)
 
@@ -303,13 +301,10 @@ class AdaptiveVerificationManager:
             dtype=np.int32,
             count=len(req_ids),
         )
-        slot_limits = getattr(self, "_slot_draft_limits", None)
-        if callable(slot_limits):
-            slot_limits = slot_limits()
-        if slot_limits is not None:
-            eligible_drafts = np.minimum(scheduled_drafts, slot_limits[slots])
-        else:
-            eligible_drafts = scheduled_drafts
+        # The scheduler's drafts, not a rank's own view of the latest proposal:
+        # the budget reads only what every rank holds alike (these and the
+        # confidence snapshot), so every rank lays out the same step (#852).
+        eligible_drafts = scheduled_drafts
         num_draft_steps = getattr(self, "num_draft_steps", self.num_speculative_steps)
         step_steps = (
             num_draft_steps
@@ -516,7 +511,6 @@ def maybe_create_adaptive_verification_manager(
     target_layer_names: set[str] | None = None,
     additional_attn_cg_support: tuple[AttentionCGSupport, str | None] | None = None,
     planned_confidences: bool = False,
-    slot_draft_limits: Callable[[], np.ndarray] | np.ndarray | None = None,
     tp_invariant_confidence: bool = False,
 ) -> AdaptiveVerificationManager | None:
     if not enable_adaptive_verification:
@@ -592,7 +586,6 @@ def maybe_create_adaptive_verification_manager(
             None,
         )
         or None,
-        slot_draft_limits=slot_draft_limits,
         tp_invariant_confidence=tp_invariant_confidence,
     )
 
