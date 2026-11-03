@@ -661,6 +661,10 @@ def test_dspark_compact_context_preserves_query_anchor_and_rejections(monkeypatc
     proposer._group_causal = False
     proposer.arange = torch.arange(5, dtype=torch.int32)
     proposer.arange_np = np.arange(5, dtype=np.int32)
+    # The speculator's host staging of the draft attention metadata: query starts
+    # (max_num_reqs + 1) and sequence-length upper bounds (max_num_reqs).
+    proposer._query_start_loc_cpu = torch.zeros(5, dtype=torch.int32)
+    proposer._draft_seq_lens_cpu_upper_bound = torch.zeros(4, dtype=torch.int32)
     proposer.draft_is_prefilling = torch.zeros(4, dtype=torch.bool)
     proposer.idx_mapping = batch.idx_mapping
     proposer.attn_groups = []
