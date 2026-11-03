@@ -140,7 +140,7 @@ def test_grouped_gemm_equals_groups(count, default_vllm_config):
     scratch = torch.empty(32 << 20, dtype=torch.uint8, device=DEVICE)
     out = torch.empty((count, GROUPS * RANK), dtype=torch.bfloat16, device=DEVICE)
     with use_preallocated_workspace(scratch):
-        _block32_linear(x, out, grouped.tilelang_key, scratch)
+        _block32_linear(grouped, x, out, scratch)
         for g in range(GROUPS):
             part = nn.Module()
             part.weight = grouped.weight[g * RANK : (g + 1) * RANK]
@@ -151,9 +151,9 @@ def test_grouped_gemm_equals_groups(count, default_vllm_config):
             _declare_block32(part)
             single = torch.empty((count, RANK), dtype=torch.bfloat16, device=DEVICE)
             _block32_linear(
+                part,
                 x[:, g * width : (g + 1) * width].contiguous(),
                 single,
-                part.tilelang_key,
                 scratch,
             )
             assert torch.equal(out[:, g * RANK : (g + 1) * RANK], single), f"group {g}"
