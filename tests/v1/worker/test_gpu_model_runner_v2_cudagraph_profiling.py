@@ -815,11 +815,26 @@ def test_profile_cudagraph_memory_frees_throwaway_pool(monkeypatch, native_bytes
     allocation_bytes = 64 << 20
     memory: dict[str, int] = {}
     native_pointer = None
+    native_allocated = 0
 
     torch.accelerator.synchronize()
     gc.collect()
     torch.accelerator.empty_cache()
     memory["before"] = torch.accelerator.memory_reserved()
+
+    # The driver's free-memory reading is the one input of the native measurement
+    # the test does not control, and on a device whose memory is the host's (GB10)
+    # it moves with the host while nothing is allocated: 41 MiB of spread over 3 s
+    # on an idle node. Model it as what this process holds, Torch's reservations
+    # and the test's own cudaMalloc, so the native delta is exact; the cudaMalloc
+    # and cudaFree below still run against the driver.
+    _, total_memory = torch.accelerator.get_memory_info()
+
+    def memory_info():
+        reserved = torch.accelerator.memory_reserved()
+        return total_memory - reserved - native_allocated, total_memory
+
+    monkeypatch.setattr(torch.accelerator, "get_memory_info", memory_info)
 
     def _init(r):
         r.events.append("init")
@@ -835,11 +850,12 @@ def test_profile_cudagraph_memory_frees_throwaway_pool(monkeypatch, native_bytes
         )
 
     def _capture_model(*, profile_only: bool = False) -> int:
-        nonlocal native_pointer
+        nonlocal native_pointer, native_allocated
         before_free = torch.accelerator.get_memory_info()[0]
         if native_bytes:
             error, native_pointer = runtime.cudaMalloc(native_bytes)
             assert error == runtime.cudaError_t.cudaSuccess
+            native_allocated = native_bytes
         for owner in (
             runner.cudagraph_manager,
             runner.speculator.cudagraph_manager,
@@ -867,7 +883,7 @@ def test_profile_cudagraph_memory_frees_throwaway_pool(monkeypatch, native_bytes
         assert memory["after"] == memory["before"]
         native_before, native_after, measured = runner.cudagraph_native_memory_profile
         assert measured == graph_estimate == memory["measured"]
-        assert native_after - native_before >= native_bytes
+        assert native_after - native_before == native_bytes
     finally:
         if native_pointer is not None:
             assert (
