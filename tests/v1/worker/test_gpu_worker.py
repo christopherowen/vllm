@@ -499,6 +499,7 @@ def test_execute_model_waits_previous_pp_send_before_forward(
         model_runner=SimpleNamespace(execute_model=run_model),
         annotate_profile=lambda scheduler_output: nullcontext(),
         _pp_send_work=[previous_tensor_send],
+        _roce_failure=lambda: None,
     )
     scheduler_output = SimpleNamespace(
         total_num_scheduled_tokens=4, num_scheduled_tokens={"r0": 4}
@@ -591,6 +592,14 @@ def test_cudagraph_memory_profile_prepares_and_releases_b12x_state(
                 cudagraph_capture_sizes=[8, 4],
             )
         ),
+        # Kernel preparation and the ranks' rendezvous precede the profile; the
+        # one-shot collectives' failure report names a stopped GPU, not memory.
+        _prepare_kernels=lambda: None,
+        _startup_rendezvous=lambda phase: None,
+        _roce_failure=lambda: None,
+    )
+    worker._determine_available_memory = lambda: (
+        gpu_worker.Worker._determine_available_memory(worker)
     )
 
     monkeypatch.setattr(gpu_worker, "maybe_apply_startup_plan", lambda worker: None)
@@ -693,6 +702,9 @@ def test_post_capture_recommendation_counts_measured_graph_memory_once(
         observability_config=SimpleNamespace(
             jit_monitor_mode="off", jit_monitor_verbose=False
         ),
+        _roce_failure=lambda: None,
+        _startup_rendezvous=lambda stage: None,
+        _startup_heartbeat=None,
     )
     saved = []
     monkeypatch.setattr(
@@ -751,6 +763,9 @@ def test_serving_thread_count_is_set_before_warmup(monkeypatch):
         observability_config=SimpleNamespace(
             jit_monitor_mode="off", jit_monitor_verbose=False
         ),
+        _roce_failure=lambda: None,
+        _startup_rendezvous=lambda stage: None,
+        _startup_heartbeat=None,
     )
     monkeypatch.setattr(
         gpu_worker, "get_pp_group", lambda: SimpleNamespace(is_last_rank=False)
