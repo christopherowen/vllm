@@ -1366,11 +1366,15 @@ def indexer_topk_merge_v41(
                 for i in T.serial(per):
                     j = i * threads + tx
                     c = T.min(base + j, lists * topk - 1)
+                    # List liveness must guard the global read itself. A bitwise
+                    # conjunction evaluates WorkEntries even for unwritten lists.
                     keys[j] = T.if_then_else(
-                        (j < n)
-                        & (g * fan_in + j // topk < live)
-                        & (WorkEntries[row, c] >= 0),
-                        _key16(WorkValues[row, c]),
+                        (j < n) & (g * fan_in + j // topk < live),
+                        T.if_then_else(
+                            WorkEntries[row, c] >= 0,
+                            _key16(WorkValues[row, c]),
+                            0,
+                        ),
                         0,
                     )
                 T.sync_threads()
