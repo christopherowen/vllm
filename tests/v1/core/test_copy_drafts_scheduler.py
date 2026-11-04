@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Copy drafts in the scheduler: the verification lookahead apart from the
-drafter's block, and a copying request's rows laid out from its reported copy
-state, within the decode-row envelope.
+"""Copy drafts in the configuration and the scheduler: on wherever DSpark
+verifies greedy drafts adaptively (not an option), the verification lookahead
+apart from the drafter's block, the token budget and CUDA-graph range widened to
+the decode-row envelope, and a copying request's rows laid out from its reported
+copy state, within that envelope.
 
 The worker is scripted: every draft is accepted, and each output reports the
 copy allocation the test gives a request. The scheduler is the real async one,
@@ -23,6 +25,7 @@ pytestmark = pytest.mark.cpu_test
 
 BLOCK = 5  # DSpark's block (num_speculative_tokens)
 LOOKAHEAD = 16  # copy_drafts.max_drafts
+LADDER = [1, 2, 3, 4, 6, 8, 12, 16, 20, 24, 28, 32, 40, 48]  # the recipe's, to 48
 
 # A minimal OPT-125m configuration, so the scheduler builds without the hub
 # (test_aligned_prefill_chunks.py's).
@@ -63,17 +66,120 @@ def test_the_lookahead_is_the_block_without_copy_drafts():
     assert spec.num_verification_tokens == 64
 
 
+def test_copy_drafts_are_not_an_option():
+    with pytest.raises((TypeError, ValueError), match="copy_drafts"):
+        SpeculativeConfig(
+            model="ngram", num_speculative_tokens=BLOCK, copy_drafts=CopyDraftsConfig()
+        )
+
+
+def _dspark(tmp_path, *, adaptive=True, sample="greedy", max_len=32768):
+    from vllm.config import ModelConfig, ParallelConfig
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {**_OPT_CONFIG, "max_position_embeddings": max_len, "n_predict": BLOCK}
+        )
+    )
+    target = ModelConfig(
+        model=str(tmp_path), tokenizer_mode="skip", max_model_len=max_len
+    )
+    spec = SpeculativeConfig(
+        model=str(tmp_path),
+        method="dspark",
+        num_speculative_tokens=BLOCK,
+        enable_adaptive_verification=adaptive,
+        draft_sample_method=sample,
+        target_model_config=target,
+        target_parallel_config=ParallelConfig(),
+    )
+    return target, spec
+
+
+def test_dspark_greedy_adaptive_verification_copies(tmp_path):
+    _, spec = _dspark(tmp_path)
+    assert spec.copy_drafts == CopyDraftsConfig(
+        min_match=16, max_drafts=LOOKAHEAD, initial_drafts=8
+    )
+    assert spec.num_verification_tokens == LOOKAHEAD
+    assert _dspark(tmp_path, adaptive=False)[1].copy_drafts is None
+    assert _dspark(tmp_path, sample="probabilistic")[1].copy_drafts is None
+
+
+def _vllm_config(tmp_path, *, max_num_seqs, budget, ladder, async_scheduling=True):
+    from vllm.config import CompilationConfig, SchedulerConfig, VllmConfig
+
+    target, spec = _dspark(tmp_path)
+    rows = max_num_seqs * (1 + BLOCK)
+    return VllmConfig(
+        model_config=target,
+        speculative_config=spec,
+        scheduler_config=SchedulerConfig(
+            max_model_len=32768,
+            is_encoder_decoder=False,
+            max_num_seqs=max_num_seqs,
+            max_num_batched_tokens=budget,
+            long_prefill_token_threshold=budget - rows,
+            align_prefill_chunks=True,
+            async_scheduling=async_scheduling,
+        ),
+        compilation_config=CompilationConfig(
+            cudagraph_mode="FULL_AND_PIECEWISE",
+            max_cudagraph_capture_size=rows,
+            cudagraph_capture_sizes=list(ladder),
+        ),
+    )
+
+
 @pytest.mark.parametrize(
-    "copy_drafts",
+    "max_num_seqs, budget, ladder, rows, widened",
     [
-        CopyDraftsConfig(),  # n-gram is not DSpark with adaptive verification
+        # tp3-triangle: 8 streams, 6,144 tokens (6,096 + 48).
+        (8, 6144, LADDER, 59, [56, 59]),
+        # tp4-ring: 16 streams, 16,384 tokens (16,288 + 96).
+        (16, 16384, [*LADDER, 56, 64, 72, 80, 88, 96], 107, [104, 107]),
     ],
 )
-def test_copy_drafts_need_dspark_with_adaptive_verification(copy_drafts):
-    with pytest.raises(ValueError, match="copy_drafts requires method 'dspark'"):
-        SpeculativeConfig(
-            model="ngram", num_speculative_tokens=BLOCK, copy_drafts=copy_drafts
-        )
+def test_copy_drafts_widen_the_budget_and_graphs_to_the_envelope(
+    monkeypatch, tmp_path, max_num_seqs, budget, ladder, rows, widened
+):
+    """A recipe sized for DSpark's uniform decode rows: the budget grows by the
+    copy rows past them (the chunk threshold, so the chunk boundaries, unchanged)
+    and the capture range extends to the envelope."""
+    from vllm.platforms import current_platform
+
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    config = _vllm_config(
+        tmp_path, max_num_seqs=max_num_seqs, budget=budget, ladder=ladder
+    )
+    scheduler = config.scheduler_config
+    uniform = max_num_seqs * (1 + BLOCK)
+    assert config.max_decode_rows == rows == uniform + LOOKAHEAD - BLOCK
+    assert scheduler.long_prefill_token_threshold == budget - uniform
+    assert scheduler.max_num_batched_tokens == budget - uniform + rows
+    assert scheduler.max_num_scheduled_tokens == budget - uniform + rows
+    assert scheduler.max_num_encoder_input_tokens == budget - uniform + rows
+    if current_platform.support_static_graph_mode():
+        compilation = config.compilation_config
+        assert compilation.max_cudagraph_capture_size == rows
+        assert compilation.cudagraph_capture_sizes == [*ladder, *widened]
+
+
+def test_copy_drafts_off_without_async_scheduling(monkeypatch, tmp_path):
+    """Without async scheduling DSpark drafts alone: the lookahead, budget and
+    capture range stay the recipe's."""
+    from vllm.platforms import current_platform
+
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    config = _vllm_config(
+        tmp_path, max_num_seqs=8, budget=6144, ladder=LADDER, async_scheduling=False
+    )
+    assert config.speculative_config.copy_drafts is None
+    assert config.num_verification_tokens == BLOCK
+    assert config.max_decode_rows == 48
+    assert config.scheduler_config.max_num_batched_tokens == 6144
+    if current_platform.support_static_graph_mode():
+        assert config.compilation_config.cudagraph_capture_sizes == LADDER
 
 
 def _scheduler(monkeypatch, tmp_path, *, copy_drafts: bool, max_num_seqs: int):

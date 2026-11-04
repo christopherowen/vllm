@@ -1790,15 +1790,17 @@ class VllmConfig:
         if (
             self.speculative_config is not None
             and self.speculative_config.copy_drafts is not None
+            and not (
+                self.scheduler_config.async_scheduling and self.use_v2_model_runner
+            )
         ):
             # The scheduler lays out a copying request's rows from the copy
-            # state the V2 runner returns with each step's output.
-            if not self.scheduler_config.async_scheduling:
-                raise ValueError("copy_drafts requires async scheduling")
-            if not self.use_v2_model_runner:
-                raise ValueError("copy_drafts requires the V2 model runner")
-            if self.parallel_config.pipeline_parallel_size > 1:
-                raise ValueError("copy_drafts does not support pipeline parallelism")
+            # state the V2 runner returns with each step's output, a step ahead.
+            logger.info_once(
+                "Copy drafts are off: they need async scheduling on the V2 model "
+                "runner; DSpark drafts alone."
+            )
+            self.speculative_config.copy_drafts = None
 
         if (
             self.observability_config.per_request_spec_decode_metrics != "none"
@@ -2402,6 +2404,7 @@ class VllmConfig:
         worker is configured to handle.
         """
         if self.speculative_config is not None:
+            self._fit_copy_decode_rows()
             scheduled_token_delta = (
                 self.speculative_config.max_num_new_slots_for_drafting
             )
@@ -2434,6 +2437,67 @@ class VllmConfig:
                     " support the speculative decoding settings."
                     f" Got {max_num_batched_tokens=} and {scheduled_token_delta=}."
                 )
+
+    def _fit_copy_decode_rows(self) -> None:
+        """Copy drafts widen a step's decode rows (``max_decode_rows``) past every
+        request at the uniform decode width. A budget sized for an aligned
+        prefill chunk beside the uniform rows grows by the difference, so a
+        whole chunk still fits beside them and the chunks still end where
+        ``long_prefill_token_threshold`` puts them (temperature-0 determinism)."""
+        scheduler = self.scheduler_config
+        uniform_rows = scheduler.max_num_seqs * self.uniform_decode_query_len
+        threshold = scheduler.long_prefill_token_threshold
+        budget = scheduler.max_num_batched_tokens
+        if not (
+            scheduler.align_prefill_chunks
+            and threshold > 0
+            and threshold + uniform_rows <= budget < threshold + self.max_decode_rows
+        ):
+            return
+        widened = threshold + self.max_decode_rows
+        scheduler.max_num_batched_tokens = widened
+        # The encoder budgets default to the token budget (SchedulerConfig).
+        if scheduler.max_num_encoder_input_tokens == budget:
+            scheduler.max_num_encoder_input_tokens = widened
+        if scheduler.encoder_cache_size == budget:
+            scheduler.encoder_cache_size = widened
+        logger.info_once(
+            "Copy drafts widen max_num_batched_tokens from %d to %d: an aligned "
+            "%d-token prefill chunk beside %d decode rows.",
+            budget,
+            widened,
+            threshold,
+            self.max_decode_rows,
+        )
+
+    def _fit_copy_capture_sizes(self) -> None:
+        """A CUDA-graph capture range that ends at every request at the uniform
+        decode width extends to the decode rows copy drafts widen a step to
+        (``max_decode_rows``), on the default ladder's stride of 8 and ending at
+        them, so a step with a copying request replays a full graph too."""
+        compilation = self.compilation_config
+        uniform_rows = (
+            self.scheduler_config.max_num_seqs * self.uniform_decode_query_len
+        )
+        rows = self.max_decode_rows
+        sizes = compilation.cudagraph_capture_sizes
+        largest = compilation.max_cudagraph_capture_size
+        if largest is None and sizes:
+            largest = max(sizes)
+        if rows <= uniform_rows or largest != uniform_rows:
+            return
+        compilation.max_cudagraph_capture_size = rows
+        if sizes:
+            compilation.cudagraph_capture_sizes = [
+                *sizes,
+                *range(uniform_rows // 8 * 8 + 8, rows, 8),
+                rows,
+            ]
+        logger.info_once(
+            "Copy drafts widen the CUDA-graph capture range from %d to %d rows.",
+            uniform_rows,
+            rows,
+        )
 
     def _set_cudagraph_sizes(self):
         """
@@ -2490,6 +2554,7 @@ class VllmConfig:
             and not self.model_config.enforce_eager
             and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
         ):
+            self._fit_copy_capture_sizes()
             # determine the initial max_cudagraph_capture_size
             max_cudagraph_capture_size = (
                 self.compilation_config.max_cudagraph_capture_size
@@ -2506,8 +2571,11 @@ class VllmConfig:
                 )
                 decode_query_len = self.uniform_decode_query_len
                 max_num_seqs = self.scheduler_config.max_num_seqs
+                # At least every decode row a step may hold (copy drafts widen
+                # one request past the uniform width).
                 max_cudagraph_capture_size = min(
-                    max_num_seqs * decode_query_len * 2, default_max_graph_size
+                    max(max_num_seqs * decode_query_len * 2, self.max_decode_rows),
+                    default_max_graph_size,
                 )
                 if decode_query_len > 1:
                     # A uniform decode batch is decode_query_len tokens per

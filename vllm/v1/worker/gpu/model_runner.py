@@ -419,10 +419,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             else None
         )
         if copy_drafts is not None and self.speculator is not None:
-            if vllm_config.use_request_boundary_checkpoints:
-                raise ValueError(
-                    "copy_drafts does not support request-boundary checkpoints"
-                )
             self.copy_drafter = CopyDrafter(
                 copy_drafts,
                 self.req_states,
@@ -836,11 +832,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         if self.copy_drafter is not None and self.adaptive_verification is None:
             # The draft budget decides how many of a copy's drafts a step
-            # verifies; the drafter's checkpoint must carry a confidence head.
-            raise ValueError(
-                "copy_drafts requires adaptive verification, which this drafter "
-                "does not provide"
+            # verifies: a drafter whose checkpoint has no confidence head has
+            # no adaptive verification, and DSpark drafts alone.
+            logger.info(
+                "Copy drafts are off: the drafter's checkpoint has no confidence "
+                "head for adaptive verification."
             )
+            self.copy_drafter = None
 
         self.block_tables = BlockTables(
             block_sizes=block_sizes,
@@ -3605,11 +3603,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.sampler._get_contexts(input_batch.idx_mapping),
                     self.sampler.watermarking.gpu[input_batch.idx_mapping],
                 )
-            verified = None
             if self.copy_drafter is not None and num_spec_tokens_to_schedule > 0:
-                # Match the updated histories and publish next-step alloc and
-                # slot draft limits before the drafter runs, so the async output
-                # copy completes on output_copy_stream while DSpark executes.
+                # Match the updated histories, update the copy state and publish
+                # next-step alloc on output_copy_stream beside the drafter: DSpark
+                # does not wait for them, and the async output copy of the alloc
+                # does not wait for DSpark.
                 # Requests still mid-prefill after this step have not reached the
                 # end of their prompt yet and must not be matched.
                 match_idx_mapping = None
@@ -3641,6 +3639,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     verified,
                     self._dead_row_cut if verified is not None else None,
                     match_idx_mapping=match_idx_mapping,
+                    copy_stream=self.output_copy_stream,
+                    main_stream=self.main_stream,
                 )
                 self.copy_drafter.attach_async_output(
                     async_output,
@@ -3689,13 +3689,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # verification (fixed draft counts); its rows verify none.
                 draft_tokens, confidences, planned_confidences = (
                     self.copy_drafter.propose(
-                        input_batch.idx_mapping,
-                        draft_tokens,
-                        confidences,
-                        num_sampled,
-                        verified,
-                        self._dead_row_cut if verified is not None else None,
-                        matched=True,
+                        input_batch.idx_mapping, draft_tokens, confidences
                     )
                 )
             num_draft_tokens = draft_tokens.shape[1]

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Copy drafts beside DSpark (``SpeculativeConfig.copy_drafts``).
+"""Copy drafts beside DSpark (``SpeculativeConfig.copy_drafts``), on wherever
+DSpark verifies greedy drafts adaptively.
 
 After DSpark drafts, each request whose context ends with text it has seen
 before (an exact suffix match of at least ``min_match`` tokens over its own
@@ -21,6 +22,12 @@ proposal is verified (async scheduling): each proposal also reports
 ``alloc``, the drafts of the proposal after it if this one is accepted in full,
 which the scheduler gives the request's step after next (within its decode-row
 envelope), and the planned confidences the budget reads at that step.
+
+A step's copy work reads only the committed history and the copy state, never
+DSpark's drafts, so all of it but the proposal itself (``prepare_alloc``: the
+match, the state's update, the choice and the allocation) runs before DSpark
+does, on the output copy stream beside it; ``propose`` waits for it and writes
+the proposals.
 """
 
 from typing import Any
@@ -31,6 +38,7 @@ from vllm.config.speculative import CopyDraftsConfig
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu import tilelang_inputs
+from vllm.v1.worker.gpu.async_utils import stream
 from vllm.v1.worker.gpu.spec_decode import tilelang_copy
 from vllm.v1.worker.gpu.states import RequestState
 
@@ -88,7 +96,16 @@ class CopyDrafter:
             torch.cuda.Event(blocking=True) for _ in range(self._ring_size)
         ]
         self.alloc = self._alloc_buffers[0].gpu
-        self._select_alloc = torch.zeros(max_reqs, dtype=torch.int32, device=device)
+        # The step's choice per request (source, offered drafts, next drafts) and
+        # acceptance estimate, from prepare_alloc for propose, in batch order.
+        self.chosen = torch.zeros(
+            (max_reqs, tilelang_copy.CHOSEN_COLUMNS), dtype=torch.int32, device=device
+        )
+        self.estimates = torch.zeros(max_reqs, dtype=torch.float32, device=device)
+        # prepare_alloc's work on a side stream: the stream that must wait for it
+        # before reading its results, and the event that marks its end.
+        self._prepared = torch.cuda.Event()
+        self._prepared_waiter: torch.cuda.Stream | None = None
         # A step that verified no drafts: nothing to judge.
         self._no_drafts = torch.zeros(max_reqs, dtype=torch.int32, device=device)
         self._new_rows: list[int] = []
@@ -127,21 +144,51 @@ class CopyDrafter:
         dead_row_cut: torch.Tensor | None,
         *,
         match_idx_mapping: torch.Tensor | None = None,
+        copy_stream: torch.cuda.Stream | None = None,
+        main_stream: torch.cuda.Stream | None = None,
     ) -> None:
-        """Match the batch's updated histories and write ``alloc[:num_reqs]``
-        before the drafter runs, so the async output copy does not wait behind the
-        drafter."""
+        """Match the batch's updated histories, update their copy state from this
+        step's verification, and write the step's choice and ``alloc[:num_reqs]``,
+        so the async output copy does not wait behind the drafter.
+
+        With ``copy_stream`` the work runs there, after ``main_stream``'s work so
+        far and beside what ``main_stream`` runs next (DSpark); ``propose`` makes
+        ``main_stream`` wait for it. Without, it runs on the current stream.
+        """
+        self._join()
         self._ring_idx = (self._ring_idx + 1) % self._ring_size
         self.alloc = self._alloc_buffers[self._ring_idx].gpu
         num_reqs = idx_mapping.shape[0]
         if verified is None:
             verified = self._no_drafts[:num_reqs]
-        history = self.req_states.all_token_ids.gpu
+        if copy_stream is None:
+            self._prepare(
+                idx_mapping, match_idx_mapping, num_sampled, verified, dead_row_cut
+            )
+            return
+        assert main_stream is not None
+        with stream(copy_stream, main_stream):
+            copy_stream.wait_stream(main_stream)
+            self._prepare(
+                idx_mapping, match_idx_mapping, num_sampled, verified, dead_row_cut
+            )
+            self._prepared.record(copy_stream)
+        self._prepared_waiter = main_stream
+
+    def _prepare(
+        self,
+        idx_mapping: torch.Tensor,
+        match_idx_mapping: torch.Tensor | None,
+        num_sampled: torch.Tensor,
+        verified: torch.Tensor,
+        dead_row_cut: torch.Tensor | None,
+    ) -> None:
+        num_reqs = idx_mapping.shape[0]
         total_len = self.req_states.total_len.gpu
         sources = self.sources[:num_reqs]
         tilelang_copy.copy_match(
             idx_mapping if match_idx_mapping is None else match_idx_mapping,
-            history,
+            self.req_states.all_token_ids.gpu,
             total_len,
             sources,
             self.min_match,
@@ -154,12 +201,21 @@ class CopyDrafter:
             verified,
             verified if dead_row_cut is None else dead_row_cut,
             self.int_state,
+            self.float_state,
+            self.chosen[:num_reqs],
+            self.estimates[:num_reqs],
             self.alloc[:num_reqs],
             self.min_match,
             self.lookahead,
             self.num_draft_steps,
             self.initial,
         )
+
+    def _join(self) -> None:
+        """Make the stream that reads prepare_alloc's results wait for them."""
+        if self._prepared_waiter is not None:
+            self._prepared_waiter.wait_event(self._prepared)
+            self._prepared_waiter = None
 
     def attach_async_output(
         self,
@@ -184,56 +240,29 @@ class CopyDrafter:
         idx_mapping: torch.Tensor,
         dspark_drafts: torch.Tensor,
         dspark_confidences: torch.Tensor,
-        num_sampled: torch.Tensor,
-        verified: torch.Tensor | None,
-        dead_row_cut: torch.Tensor | None,
-        *,
-        matched: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """The batch's drafts, confidences and planned confidences
-        (``[num_reqs, lookahead]``), and ``alloc[:num_reqs]``.
+        (``[num_reqs, lookahead]``), from this step's ``prepare_alloc``.
 
         Args:
-            idx_mapping: The batch's request slots.
+            idx_mapping: The batch's request slots, as ``prepare_alloc``'s.
             dspark_drafts: DSpark's drafts, ``[num_reqs, num_draft_steps]``.
             dspark_confidences: Their confidences (``[>= num_reqs, steps]``).
-            num_sampled: The tokens this step committed per request.
-            verified: The drafts this step verified per request (adaptive
-                verification's admitted counts), None if it verified none.
-            dead_row_cut: The live drafts per request, None without dead rows.
-            matched: Whether ``prepare_alloc`` already matched this step's
-                histories into ``sources[:num_reqs]``.
         """
         num_reqs = idx_mapping.shape[0]
-        if verified is None:
-            verified = self._no_drafts[:num_reqs]
-        history = self.req_states.all_token_ids.gpu
-        total_len = self.req_states.total_len.gpu
-        sources = self.sources[:num_reqs]
-        if not matched:
-            tilelang_copy.copy_match(
-                idx_mapping, history, total_len, sources, self.min_match
-            )
         drafts = self.drafts[:num_reqs]
         confidences = self.confidences[:num_reqs]
         planned = self.planned[:num_reqs]
-        tilelang_copy.copy_select(
+        self._join()
+        tilelang_copy.copy_apply(
             idx_mapping,
-            history,
-            total_len,
-            sources,
+            self.req_states.all_token_ids.gpu,
+            self.chosen[:num_reqs],
+            self.estimates[:num_reqs],
             dspark_drafts[:num_reqs],
             dspark_confidences[:num_reqs, : self.num_draft_steps],
-            num_sampled,
-            verified,
-            verified if dead_row_cut is None else dead_row_cut,
-            self.int_state,
-            self.float_state,
             drafts,
             confidences,
             planned,
-            self._select_alloc[:num_reqs] if matched else self.alloc[:num_reqs],
-            self.min_match,
-            self.initial,
         )
         return drafts, confidences, planned

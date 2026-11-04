@@ -4,6 +4,7 @@
 import copy
 import functools
 from collections.abc import Callable, Mapping
+from dataclasses import field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
@@ -385,7 +386,11 @@ class CopyDraftsConfig:
     such position, in place of DSpark's drafts; DSpark drafts everywhere else.
     The search reads only the request's own history: nothing is shared between
     requests. Drafts never change what is committed, only how many tokens a
-    step verifies."""
+    step verifies.
+
+    Not an option: DSpark with greedy drafts and adaptive verification always
+    copies, at these defaults (``SpeculativeConfig.copy_drafts``). The fields
+    parametrize the kernels and their tests."""
 
     MAX_LEVEL = 256
     """The longest suffix compared: a match of 256 tokens ranks above every
@@ -667,12 +672,13 @@ class SpeculativeConfig:
     """For Qwen3 DSpark drafting, evaluate the Markov projection only for the
     top-k base-logit candidates. Requires draft tensor parallel size 1."""
 
-    copy_drafts: CopyDraftsConfig | None = None
+    copy_drafts: CopyDraftsConfig | None = field(default=None, init=False)
     """Copy drafts from the request's own history beside DSpark
-    (``CopyDraftsConfig``). Its ``max_drafts`` is the verification lookahead
-    (``num_verification_tokens``); ``num_speculative_tokens`` stays DSpark's
-    block. Requires DSpark with adaptive verification, greedy drafts and async
-    scheduling."""
+    (``CopyDraftsConfig``), derived, not an option: on wherever DSpark verifies
+    greedy drafts adaptively, unless the engine cannot carry them
+    (``VllmConfig``: async scheduling on the V2 model runner). Its
+    ``max_drafts`` is the verification lookahead (``num_verification_tokens``);
+    ``num_speculative_tokens`` stays DSpark's block."""
 
     @property
     def num_verification_tokens(self) -> int:
@@ -1793,33 +1799,20 @@ class SpeculativeConfig:
                 "adaptive_verification_row_cost requires DSpark adaptive verification"
             )
 
-        if self.copy_drafts is not None:
+        if (
+            self.method == "dspark"
+            and self.enable_adaptive_verification
+            and self.draft_sample_method == "greedy"
+        ):
             # The draft budget decides how many of a copy's drafts a step
             # verifies; copy drafts are one-hot proposals, as greedy DSpark
-            # drafts are, so no draft logits exist for them.
-            if self.method != "dspark" or not self.enable_adaptive_verification:
-                raise ValueError(
-                    "copy_drafts requires method 'dspark' with "
-                    "enable_adaptive_verification"
+            # drafts are, so no draft logits exist for them. The lookahead is at
+            # least DSpark's block.
+            self.copy_drafts = CopyDraftsConfig(
+                max_drafts=max(
+                    CopyDraftsConfig().max_drafts, self.num_speculative_tokens
                 )
-            if self.draft_sample_method != "greedy":
-                raise ValueError("copy_drafts requires draft_sample_method 'greedy'")
-            copy_drafts = self.copy_drafts
-            if copy_drafts.max_drafts < self.num_speculative_tokens:
-                raise ValueError(
-                    f"copy_drafts.max_drafts ({copy_drafts.max_drafts}) must be at "
-                    f"least num_speculative_tokens ({self.num_speculative_tokens})"
-                )
-            if copy_drafts.initial_drafts > copy_drafts.max_drafts:
-                raise ValueError(
-                    f"copy_drafts.initial_drafts ({copy_drafts.initial_drafts}) "
-                    f"must not exceed max_drafts ({copy_drafts.max_drafts})"
-                )
-            if copy_drafts.min_match > CopyDraftsConfig.MAX_LEVEL:
-                raise ValueError(
-                    f"copy_drafts.min_match ({copy_drafts.min_match}) must not "
-                    f"exceed {CopyDraftsConfig.MAX_LEVEL}"
-                )
+            )
 
         if (
             self.adaptive_speculative_tokens_initial is not None
