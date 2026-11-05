@@ -112,13 +112,36 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
     def _build_tilelang(self, cm, table) -> None:
         """The step's request starts and positions, then each token's request,
         position, slot and visible length, in one launch."""
-        from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
-
-        tl_metadata.builder(
+        self.prepare_cudagraph_replay(
             cm.query_start_loc,
             cm.seq_lens,
             table,
             cm.slot_mapping,
+            cm.num_reqs,
+            cm.num_actual_tokens,
+        )
+
+    def prepare_cudagraph_replay(
+        self,
+        query_start_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        num_reqs: int,
+        num_tokens: int,
+    ) -> None:
+        """Refresh captured metadata from device inputs at a fixed graph shape.
+
+        This hook launches only the already prepared integer kernel; it neither
+        reads host sequence lengths nor replaces a captured output buffer.
+        """
+        from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
+
+        tl_metadata.builder(
+            query_start_loc,
+            seq_lens,
+            block_table,
+            slot_mapping,
             self.starts,
             self.request_positions,
             self.counts,
@@ -126,8 +149,8 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
             self.reqs,
             self.slots,
             self.lengths,
-            cm.num_reqs,
-            cm.num_actual_tokens,
+            num_reqs,
+            num_tokens,
             page=self.page,
             ratio=self.ratio,
             circular=self.circular,

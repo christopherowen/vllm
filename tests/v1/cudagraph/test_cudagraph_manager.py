@@ -26,6 +26,92 @@ from vllm.v1.worker.gpu.pcp_manager import PCPManager
 pytestmark = pytest.mark.cpu_test
 
 
+@pytest.mark.parametrize("mode", [CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_dflash_metadata_refresh_precedes_query_and_keeps_live_inputs(
+    monkeypatch, mode, enabled
+):
+    """Only opted-in FULL graphs refresh metadata, from the same mutable buffers."""
+    from vllm.v1.worker.gpu.spec_decode.dflash import cudagraph
+
+    inputs = SimpleNamespace(
+        query_start_loc=torch.arange(5, dtype=torch.int32) * 5,
+        seq_lens=torch.tensor([11, 21, 0, 0], dtype=torch.int32),
+    )
+    tables = SimpleNamespace(
+        input_block_tables=[torch.ones(4, 2, dtype=torch.int32)],
+        slot_mappings=torch.ones(1, 20, dtype=torch.int64),
+    )
+    events: list[object] = []
+
+    def refresh(starts, seq, table, slots, nr, nt):
+        assert (nr, nt) == (2, 10)
+        assert starts.shape == (3,) and seq.shape == (2,)
+        assert table.shape == (2, 2) and slots.shape == (10,)
+        events.append(("refresh", seq[1].item(), table[1, 0].item(), slots[5].item()))
+
+    group = SimpleNamespace(
+        get_metadata_builder=lambda: SimpleNamespace(prepare_cudagraph_replay=refresh)
+    )
+    monkeypatch.setattr(
+        cudagraph, "_prepare_dflash_inputs_to_capture", lambda *a, **kw: ({}, {})
+    )
+
+    def capture(self, create_forward, progress_bar_desc):
+        desc = BatchExecutionDescriptor(mode, 10, 2, 5)
+        forward = create_forward(desc, warmup=False)
+        forward(mode)
+        # A completed/cancelled request's slot is reused before the next query.
+        inputs.seq_lens[1] = 7
+        tables.input_block_tables[0][1, 0] = 3
+        tables.slot_mappings[0, 5] = 17
+        forward(mode)
+
+    monkeypatch.setattr(cudagraph.CudaGraphManager, "capture", capture)
+    manager = cudagraph.DFlashCudaGraphManager.__new__(cudagraph.DFlashCudaGraphManager)
+    manager.max_num_reqs, manager.dp_size = 4, 1
+    manager.capture(
+        lambda *a: events.append("query"),
+        inputs,
+        tables,
+        [[group]],
+        None,
+        1024,
+        causal=False,
+        capture_attn_metadata=enabled,
+    )
+    assert events == (
+        [("refresh", 21, 1, 1), "query", ("refresh", 7, 3, 17), "query"]
+        if enabled and mode == CUDAGraphMode.FULL
+        else ["query", "query"]
+    )
+
+
+@pytest.mark.parametrize("guard", [None, "draft_cp", "table_cp", "model", "builder"])
+def test_dflash_metadata_replay_retains_eager_fallback_guards(guard):
+    from vllm.v1.worker.gpu.model_states.interface import ModelState
+    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+
+    class Model:
+        prepare_draft_attn_metadata = ModelState.prepare_draft_attn_metadata
+
+    if guard == "model":
+        Model.prepare_draft_attn_metadata = lambda *a, **kw: {}
+    builder = SimpleNamespace(prepare_cudagraph_replay=lambda *a: None)
+    groups = [[SimpleNamespace(get_metadata_builder=lambda: builder)]]
+    if guard == "builder":
+        groups[0].append(SimpleNamespace(get_metadata_builder=lambda: object()))
+    speculator = SimpleNamespace(
+        draft_cp_size=2 if guard == "draft_cp" else 1,
+        block_tables=SimpleNamespace(cp_size=2 if guard == "table_cp" else 1),
+        model_state=Model(),
+        attn_groups=groups,
+    )
+    assert DFlashSpeculator._compute_full_cg_needs_attn_metadata_build(speculator) == (
+        guard is not None
+    )
+
+
 def test_exact_single_request_prefill_descriptor_does_not_pad_other_batches(
     monkeypatch,
 ):
@@ -541,10 +627,7 @@ def test_varlen_decode_captures_dense_low_concurrency_product(monkeypatch):
             for num_reqs in (1, 2)
             for num_tokens in range(num_reqs, num_reqs * decode_query_len + 1)
         ),
-        *(
-            (num_reqs, num_reqs * decode_query_len)
-            for num_reqs in (3, 4)
-        ),
+        *((num_reqs, num_reqs * decode_query_len) for num_reqs in (3, 4)),
     }
     captured_shapes = {(desc.num_reqs, desc.num_tokens) for desc in full_descs}
     assert dense_shapes <= captured_shapes

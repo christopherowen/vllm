@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable, Mapping
+from functools import partial
 
 import torch
 
@@ -84,6 +85,8 @@ class DFlashCudaGraphManager(CudaGraphManager):
         max_model_len: int,
         causal: bool | Mapping[int, bool],
         progress_bar_desc: str = "Capturing CUDA graphs",
+        *,
+        capture_attn_metadata: bool = False,
     ) -> None:
         def create_forward_fn(
             desc: BatchExecutionDescriptor,
@@ -109,13 +112,42 @@ class DFlashCudaGraphManager(CudaGraphManager):
             )
             attn_metadata, slot_mappings = attn_state
 
-            return lambda cg_mode: forward_fn(
-                num_reqs,
-                num_tokens,
-                attn_metadata,
-                slot_mappings,
-                num_tokens_across_dp,
-                cg_mode,
-            )
+            metadata_updates = []
+            if capture_attn_metadata and desc.cg_mode == CUDAGraphMode.FULL:
+                for group_id, groups in enumerate(attn_groups):
+                    for group in groups:
+                        prepare = getattr(
+                            group.get_metadata_builder(),
+                            "prepare_cudagraph_replay",
+                            None,
+                        )
+                        if callable(prepare):
+                            metadata_updates.append(
+                                partial(
+                                    prepare,
+                                    input_buffers.query_start_loc[: num_reqs + 1],
+                                    input_buffers.seq_lens[:num_reqs],
+                                    block_tables.input_block_tables[group_id][
+                                        :num_reqs
+                                    ],
+                                    block_tables.slot_mappings[group_id, :num_tokens],
+                                    num_reqs,
+                                    num_tokens,
+                                )
+                            )
+
+            def forward(cg_mode: CUDAGraphMode) -> None:
+                for update in metadata_updates:
+                    update()
+                forward_fn(
+                    num_reqs,
+                    num_tokens,
+                    attn_metadata,
+                    slot_mappings,
+                    num_tokens_across_dp,
+                    cg_mode,
+                )
+
+            return forward
 
         super().capture(create_forward_fn, progress_bar_desc)
