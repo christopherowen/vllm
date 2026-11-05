@@ -23,6 +23,88 @@ from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadata
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
+@cuda
+@pytest.mark.parametrize("ratio,circular", [(1, False), (4, False), (1, True)])
+def test_draft_metadata_graph_matches_eager_after_slot_reuse(
+    monkeypatch, ratio, circular
+):
+    """Replay refreshes every readable integer row after padding and request reuse,
+    with the kernel cache frozen before capture."""
+    import importlib
+
+    import tilelang.cache
+
+    from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadataBuilder
+    from vllm.models.deepseek_v4_1.tilelang import metadata, prepare
+
+    cache_module = importlib.import_module(tilelang.cache.freeze.__module__)
+    monkeypatch.setattr(cache_module, "_frozen_reason", None)
+    names = (
+        "starts",
+        "request_positions",
+        "counts",
+        "positions",
+        "reqs",
+        "slots",
+        "lengths",
+    )
+    shapes = (5, 4, 2, 128, 128, 128, 128)
+    dtypes = (
+        torch.int32,
+        torch.int64,
+        torch.int32,
+        torch.int64,
+        torch.int32,
+        torch.int64,
+        torch.int32,
+    )
+
+    def builder():
+        obj = DeepseekV41B12xMetadataBuilder.__new__(DeepseekV41B12xMetadataBuilder)
+        obj.page, obj.ratio, obj.circular = 128, ratio, circular
+        for name, shape, dtype in zip(names, shapes, dtypes):
+            setattr(obj, name, torch.full((shape,), -101, dtype=dtype, device="cuda"))
+        return obj
+
+    captured, eager = builder(), builder()
+    starts = torch.arange(5, dtype=torch.int32, device="cuda") * 5
+    seq = torch.ones(4, dtype=torch.int32, device="cuda") * 10
+    table = torch.ones((4, 4), dtype=torch.int32, device="cuda")
+    slots = torch.ones(20, dtype=torch.int64, device="cuda")
+    cm = SimpleNamespace(
+        query_start_loc=starts,
+        seq_lens=seq,
+        slot_mapping=slots,
+        num_reqs=4,
+        num_actual_tokens=20,
+    )
+    metadata.builder_kernel(4, 128, ratio, circular)
+    captured._build_tilelang(cm, table)
+    torch.accelerator.synchronize()
+    prepare.freeze("drafter metadata replay test")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured.prepare_cudagraph_replay(starts, seq, table, slots, 4, 20)
+
+    for lengths, blocks in (
+        ([133, 301, 75, 202], [1, 5, 9, 13]),
+        ([134, 0, 76, 0], [1, 0, 9, 0]),
+        ([135, 7, 77, 51], [1, 17, 9, 21]),
+    ):
+        seq.copy_(torch.tensor(lengths, dtype=torch.int32))
+        table.copy_(torch.tensor(blocks, dtype=torch.int32)[:, None].expand(4, 4))
+        graph.replay()
+        eager._build_tilelang(cm, table)
+        for name in names:
+            assert torch.equal(getattr(captured, name), getattr(eager, name)), name
+        expected = [
+            p
+            for length in lengths
+            for p in (range(length - 5, length) if length else [-1] * 5)
+        ]
+        assert captured.positions[:20].tolist() == expected
+
+
 def test_boundary_is_full_resolution_source_after_encoder():
     config = SimpleNamespace(
         num_hidden_layers=40,
@@ -477,7 +559,7 @@ def test_packing_trailing_dimensions_invalid_rows_and_scatter(transpose):
 @cuda
 def test_scaled_row_address_above_signed_int32():
     # High row IDs must be converted BEFORE multiplying the row/page stride.
-    if torch.cuda.mem_get_info()[0] < 3 * 1024**3:
+    if torch.accelerator.memory.get_memory_info()[0] < 3 * 1024**3:
         pytest.skip("Needs a 2 GiB address-span allocation")
     source = torch.empty((2**23 + 2, 256), dtype=torch.uint8, device="cuda")
     source[2**23 + 1].fill_(173)

@@ -184,6 +184,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.max_model_len,
             causal=self._group_causal,
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
+            capture_attn_metadata=not self._full_cg_needs_attn_metadata_build,
         )
         # Only V4.1 DSpark supplies this hook. Other draft models retain their
         # existing eager context path and graph policy.
@@ -482,6 +483,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         for groups in self.attn_groups:
             for group in groups:
                 builder = group.get_metadata_builder()
+                if callable(getattr(builder, "prepare_cudagraph_replay", None)):
+                    # The query graph refreshes this builder's device buffers
+                    # before attention reads them, including padded requests.
+                    continue
                 if (
                     type(builder).__name__ != "FlashAttentionMetadataBuilder"
                     or getattr(builder, "aot_schedule", True)
@@ -744,10 +749,8 @@ class DFlashSpeculator(DraftModelSpeculator):
             cp_size = self.draft_cp_size
             cp_interleave = self.draft_cp_interleave
         else:
-            cp_rank, cp_size, cp_interleave = (
-                self.block_tables.get_group_cp_parameters(
-                    self.draft_kv_cache_group_id
-                )
+            cp_rank, cp_size, cp_interleave = self.block_tables.get_group_cp_parameters(
+                self.draft_kv_cache_group_id
             )
         if len(self.draft_kv_cache_group_ids) == 1:
             gid = self.draft_kv_cache_group_ids[0]
@@ -831,7 +834,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                     for slots in self._context_slot_mappings
                 ]
             # Each layer uses the context slots of its own KV-cache group. V4.1 can
-            # replay bounded decode context graphs; compact prefills use eager projection.
+            # replay bounded decode context graphs; compact prefills use eager
+            # projection.
             # Dummy runs reserve workspace without clobbering real cache entries.
             if dummy_run:
                 context_slots: torch.Tensor | list[torch.Tensor | None] | None = None
