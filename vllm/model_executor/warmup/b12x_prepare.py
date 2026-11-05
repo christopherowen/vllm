@@ -110,7 +110,10 @@ def _planned_decode_counts(
                 {
                     tokens
                     for _, tokens in dense_varlen_decode_shapes(
-                        max_reqs, query_len, limit
+                        max_reqs,
+                        query_len,
+                        limit,
+                        worker.vllm_config.uniform_decode_query_len,
                     )
                 }
             )

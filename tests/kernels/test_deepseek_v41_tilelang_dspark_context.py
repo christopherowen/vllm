@@ -397,6 +397,7 @@ def _decode_config(max_num_seqs, capture_sizes, drafts=5, verification=5):
     vllm_config.parallel_config = ParallelConfig()
     vllm_config.cache_config = SimpleNamespace(use_kda_recoverssm=False)
     vllm_config.num_speculative_tokens = drafts
+    vllm_config.uniform_decode_query_len = 1 + drafts
     vllm_config.num_verification_tokens = verification
     speculative_config = MagicMock()
     speculative_config.uses_acceptance_length_adaptation.return_value = False
@@ -462,8 +463,8 @@ def _context_graphs(vllm_config, limit):
 
 @pytest.mark.parametrize(
     "max_num_seqs,rows,verification",
-    [(8, 48, 5), (16, 96, 5), (8, 48, 8)],
-    ids=["tp3-triangle", "tp4-ring", "copy-drafts"],
+    [(8, 48, 5), (16, 96, 5), (8, 48, 8), (8, 59, 16), (16, 107, 16)],
+    ids=["tp3-triangle", "tp4-ring", "copy-drafts", "copy-tp3", "copy-tp4"],
 )
 def test_context_capture_sizes_are_the_target_decode_graph_sizes(
     monkeypatch, max_num_seqs, rows, verification
@@ -486,6 +487,11 @@ def test_context_capture_sizes_are_the_target_decode_graph_sizes(
         sizes = _context_capture_sizes(vllm_config, limit)
         assert sizes == sorted({n for n in target_sizes if n <= limit} | {limit})
     assert _context_capture_sizes(vllm_config, 0) == []
+    assert all(
+        n * 6 in _context_capture_sizes(vllm_config, rows)
+        for n in range(1, max_num_seqs + 1)
+        if n * 6 <= rows
+    )
     if (max_num_seqs, verification) == (8, 5):
         # TP3: 23 graphs, every one- and two-request total and every full-depth
         # step exact, where powers of two captured 7.
