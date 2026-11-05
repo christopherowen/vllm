@@ -836,6 +836,27 @@ def test_narrow_and_wide_codes_give_the_uncoded_gemm_bits(rows, n, k, gather):
     )
 
 
+@pytest.mark.parametrize("gather,k", [(True, 512), (False, 576), (False, 768)])
+def test_grouped_gemm_emits_requested_prefill_swizzle(gather, k):
+    """Bit equality alone cannot detect a scheduling option that is ignored."""
+    for panel in (0, 3):
+        kernel = grouped_fp8_fp4_gemm(
+            32,
+            384,
+            k,
+            6,
+            gather,
+            64,
+            128,
+            coded_scales=True,
+            narrow_codes=True,
+            trigger_after_loop=True,
+            swizzle_panel=panel,
+        )
+        source = kernel.get_kernel_source()
+        assert ("rasterization2DRow<3>" in source) == (panel == 3)
+
+
 def test_grouped_fp8_fp4_gemm_defers_barrier_init_and_down_stages():
     """Empty CTAs return before barrier initialization, and decode down GEMMs use
     two stages (2 CTAs/SM) with identical bits to three stages."""

@@ -807,6 +807,8 @@ def grouped_fp8_fp4_gemm(
     @T.macro
     def body(A, SFA, B, BT, SFB, SFBase, Order, TileExpert, C, SFB8=None, Narrow=None):
         with T.Kernel(T.ceildiv(N, block_N), tiles, threads=threads) as (bx, t):
+            if swizzle_panel > 0:
+                T.use_swizzle(panel_size=swizzle_panel)
             if gather or trigger_after_loop:
                 if trigger_after_loop:
                     pdl.wait()
