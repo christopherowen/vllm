@@ -95,7 +95,9 @@ def dense_varlen_decode_shapes(
         native_rows = (
             (min(rows, max_num_reqs), rows)
             for rows in range(
-                uniform_query_len, max_num_reqs * uniform_query_len + 1, uniform_query_len
+                uniform_query_len,
+                max_num_reqs * uniform_query_len + 1,
+                uniform_query_len,
             )
             if rows <= max_capture_tokens
         )
