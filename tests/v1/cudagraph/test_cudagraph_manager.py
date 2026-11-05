@@ -622,11 +622,18 @@ def test_copy_verification_keeps_native_full_depth_captures(monkeypatch, max_num
                 continue
             desc = manager.dispatch(reqs, rows, None, 0, max_query_len=width)
             assert desc.cg_mode == CUDAGraphMode.FULL
-            assert (desc.num_reqs, desc.num_tokens) == (reqs, rows)
+            if width == 6:
+                assert desc.num_tokens == rows and desc.num_reqs >= reqs
+            else:
+                assert (desc.num_reqs, desc.num_tokens) == (reqs, rows)
     for reqs in (1, 2):
         for rows in range(reqs, reqs * 17 + 1):
             desc = manager.dispatch(reqs, rows, None, 0, max_query_len=17)
             assert (desc.num_reqs, desc.num_tokens) == (reqs, rows)
+    # Native row totals also serve more, shallower requests.
+    mixed_depth = manager.dispatch(7, 36, None, 0, max_query_len=17)
+    assert mixed_depth.cg_mode == CUDAGraphMode.FULL
+    assert mixed_depth.num_tokens == 36
     # Queries outside the verification limit still use the mixed path.
     mixed = manager.dispatch(3, 36, None, 0, max_query_len=18)
     assert mixed.cg_mode == CUDAGraphMode.PIECEWISE

@@ -71,8 +71,8 @@ def dense_varlen_decode_shapes(
     ``_DENSE_VARLEN_DECODE_MAX_REQS`` requests, including odd heterogeneous and
     adaptively trimmed totals) and the full-depth speculative batch for each
     higher request count up to ``max_num_reqs``. When copy drafts widen the
-    verification limit, retain full-depth batches at the drafter's ordinary
-    ``uniform_query_len`` too.
+    verification limit, retain ordinary full-depth row totals with room for
+    any valid request count, using ``uniform_query_len``.
     """
     dense_reqs = min(_DENSE_VARLEN_DECODE_MAX_REQS, max_num_reqs)
     dense = (
@@ -82,15 +82,22 @@ def dense_varlen_decode_shapes(
         if num_tokens <= max_capture_tokens
     )
     widths = {decode_query_len}
-    if uniform_query_len is not None and 1 < uniform_query_len < decode_query_len:
-        widths.add(uniform_query_len)
     uniform = (
         (num_reqs, num_reqs * width)
         for num_reqs in range(dense_reqs + 1, max_num_reqs + 1)
         for width in sorted(widths)
         if width > 1 and num_reqs * width <= max_capture_tokens
     )
-    return (*dense, *uniform)
+    native_rows = ()
+    if uniform_query_len is not None and 1 < uniform_query_len < decode_query_len:
+        native_rows = (
+            (min(rows, max_num_reqs), rows)
+            for rows in range(
+                uniform_query_len, max_num_reqs * uniform_query_len + 1, uniform_query_len
+            )
+            if rows <= max_capture_tokens
+        )
+    return tuple(dict.fromkeys((*dense, *uniform, *native_rows)))
 
 
 _DEBUG_GRAPH_MEMORY_ACCOUNTING = (
