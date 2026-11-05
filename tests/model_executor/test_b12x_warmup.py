@@ -771,7 +771,9 @@ def _config_worker(
         runner.decode_query_len = decode_query_len
     return SimpleNamespace(
         vllm_config=SimpleNamespace(
-            compilation_config=compilation, speculative_config=spec
+            compilation_config=compilation,
+            speculative_config=spec,
+            uniform_decode_query_len=1 + speculative_tokens,
         ),
         scheduler_config=SimpleNamespace(
             max_num_batched_tokens=128, max_num_seqs=max_seqs
