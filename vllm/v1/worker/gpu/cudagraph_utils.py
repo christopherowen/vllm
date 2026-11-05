@@ -60,14 +60,19 @@ _DENSE_VARLEN_DECODE_MAX_REQS = 2
 
 
 def dense_varlen_decode_shapes(
-    max_num_reqs: int, decode_query_len: int, max_capture_tokens: int
+    max_num_reqs: int,
+    decode_query_len: int,
+    max_capture_tokens: int,
+    uniform_query_len: int | None = None,
 ) -> tuple[tuple[int, int], ...]:
     """Return request and token counts of exact variable-length decode graphs.
 
     Covers every valid token total for low-concurrency batches (``1`` to
     ``_DENSE_VARLEN_DECODE_MAX_REQS`` requests, including odd heterogeneous and
     adaptively trimmed totals) and the full-depth speculative batch for each
-    higher request count up to ``max_num_reqs``.
+    higher request count up to ``max_num_reqs``. When copy drafts widen the
+    verification limit, retain full-depth batches at the drafter's ordinary
+    ``uniform_query_len`` too.
     """
     dense_reqs = min(_DENSE_VARLEN_DECODE_MAX_REQS, max_num_reqs)
     dense = (
@@ -76,10 +81,14 @@ def dense_varlen_decode_shapes(
         for num_tokens in range(num_reqs, num_reqs * decode_query_len + 1)
         if num_tokens <= max_capture_tokens
     )
+    widths = {decode_query_len}
+    if uniform_query_len is not None and 1 < uniform_query_len < decode_query_len:
+        widths.add(uniform_query_len)
     uniform = (
-        (num_reqs, num_reqs * decode_query_len)
+        (num_reqs, num_reqs * width)
         for num_reqs in range(dense_reqs + 1, max_num_reqs + 1)
-        if decode_query_len > 1 and num_reqs * decode_query_len <= max_capture_tokens
+        for width in sorted(widths)
+        if width > 1 and num_reqs * width <= max_capture_tokens
     )
     return (*dense, *uniform)
 
@@ -519,7 +528,10 @@ class CudaGraphManager:
             for num_active_loras, (dense_num_reqs, num_tokens) in product(
                 self.lora_capture_cases,
                 dense_varlen_decode_shapes(
-                    self.max_num_reqs, self.decode_query_len, max_cg_capture_size
+                    self.max_num_reqs,
+                    self.decode_query_len,
+                    max_cg_capture_size,
+                    self.vllm_config.uniform_decode_query_len,
                 ),
             ):
                 desc = BatchExecutionDescriptor(

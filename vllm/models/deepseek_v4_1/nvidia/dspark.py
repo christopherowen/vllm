@@ -100,7 +100,10 @@ def _context_capture_sizes(vllm_config: VllmConfig, limit: int) -> list[int]:
     sizes.update(
         num_tokens
         for _, num_tokens in dense_varlen_decode_shapes(
-            vllm_config.scheduler_config.max_num_seqs, decode_query_len, limit
+            vllm_config.scheduler_config.max_num_seqs,
+            decode_query_len,
+            limit,
+            vllm_config.uniform_decode_query_len,
         )
     )
     sizes.update(

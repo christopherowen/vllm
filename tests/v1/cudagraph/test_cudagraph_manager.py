@@ -390,6 +390,7 @@ def _create_decode_vllm_config(
     vllm_config.parallel_config = ParallelConfig()
     vllm_config.cache_config = SimpleNamespace(use_kda_recoverssm=use_kda_recoverssm)
     vllm_config.num_speculative_tokens = num_speculative_tokens
+    vllm_config.uniform_decode_query_len = 1 + num_speculative_tokens
     if dynamic_spec_schedule is None and num_speculative_tokens == 0:
         vllm_config.speculative_config = None
     else:
@@ -599,6 +600,54 @@ def test_varlen_decode_covers_odd_c2_and_non_divisor_uniform_batches(monkeypatch
         )
         assert desc.cg_mode == CUDAGraphMode.FULL
         assert (desc.num_reqs, desc.num_tokens) == (num_reqs, num_tokens)
+
+
+@pytest.mark.parametrize("max_num_seqs", [8, 16])
+def test_copy_verification_keeps_native_full_depth_captures(monkeypatch, max_num_seqs):
+    """Copy lookahead must not replace the ordinary six-row DSpark shapes."""
+    cap = max_num_seqs * 6 + 11
+    sizes = [1, 2, 3, 4, 6, 8, *range(12, 33, 4), *range(40, cap, 8), cap]
+    manager = _make_spec_decode_manager(
+        monkeypatch,
+        decode_query_len=17,
+        capture_sizes=sizes,
+        num_speculative_tokens=5,
+        max_num_seqs=max_num_seqs,
+        varlen_decode=True,
+    )
+    for reqs in range(1, max_num_seqs + 1):
+        for width in (6, 17):
+            rows = reqs * width
+            if rows > cap:
+                continue
+            desc = manager.dispatch(reqs, rows, None, 0, max_query_len=width)
+            assert desc.cg_mode == CUDAGraphMode.FULL
+            assert (desc.num_reqs, desc.num_tokens) == (reqs, rows)
+    for reqs in (1, 2):
+        for rows in range(reqs, reqs * 17 + 1):
+            desc = manager.dispatch(reqs, rows, None, 0, max_query_len=17)
+            assert (desc.num_reqs, desc.num_tokens) == (reqs, rows)
+    # Queries outside the verification limit still use the mixed path.
+    mixed = manager.dispatch(3, 36, None, 0, max_query_len=18)
+    assert mixed.cg_mode == CUDAGraphMode.PIECEWISE
+    assert all(d.num_tokens <= cap for d in manager._capture_descs[CUDAGraphMode.FULL])
+
+    from vllm.model_executor.warmup.b12x_prepare import b12x_workload
+
+    config = manager.vllm_config
+    config.speculative_config.num_speculative_tokens = 5
+    config.speculative_config.enable_adaptive_verification = True
+    worker = SimpleNamespace(
+        vllm_config=config,
+        scheduler_config=config.scheduler_config,
+        model_config=SimpleNamespace(dtype=torch.bfloat16, max_model_len=1048576),
+        model_runner=SimpleNamespace(decode_query_len=17, cudagraph_manager=None),
+    )
+    weights = b12x_workload(worker, stage="weights")
+    worker.model_runner.cudagraph_manager = manager
+    state = b12x_workload(worker, stage="state")
+    assert set(manager.planned_token_counts()) <= set(weights.fixed_token_counts)
+    assert weights.fixed_token_counts == state.fixed_token_counts
 
 
 @pytest.mark.parametrize(
