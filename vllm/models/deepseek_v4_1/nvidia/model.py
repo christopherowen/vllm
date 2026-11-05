@@ -404,20 +404,20 @@ class DeepseekV4DecoderLayer(nn.Module):
             # residual updates and experts only need the selected replay rows.
             del x_q
             if sp_rows is not None:
-                # Normalize local rows, gather only the normalized global KV
-                # input, and exchange the selected replay rows of the carry.
-                x = sp_rows.gather(x)
-                residual, post_mix, res_mix, attn_pre = gather_sp_rows(
-                    sp_rows, ced_indices, residual, post_mix, res_mix, attn_pre
+                # Global KV projects local rows and gathers its narrow latent.
+                # Decoder queries and residual updates only need replay rows.
+                self.attn.prepare_global_kv(positions, x, sp_rows=sp_rows)
+                x, residual, post_mix, res_mix, attn_pre = gather_sp_rows(
+                    sp_rows, ced_indices, x, residual, post_mix, res_mix, attn_pre
                 )
                 sp_rows = None
             else:
+                self.attn.prepare_global_kv(positions, x)
+                x = gather_rows(x, ced_indices)
                 residual = gather_rows(residual, ced_indices)
                 post_mix = gather_rows(post_mix, ced_indices)
                 res_mix = gather_rows(res_mix, ced_indices)
                 attn_pre = gather_rows(attn_pre, ced_indices)
-            self.attn.prepare_global_kv(positions, x)
-            x = gather_rows(x, ced_indices)
             x_q = self.mhc.cast_rows(x)
             positions = (
                 gather_rows(positions, ced_indices)
@@ -810,7 +810,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
     ) -> torch.Tensor | IntermediateTensors:
         sp = None
         # With CED the encoder layers (before ced_decoder_start) still run on
-        # every row; the boundary gathers global KV inputs and compact carries.
+        # every row; the boundary gathers global KV latents and compact carries.
         sp_layers_available = ced_indices is None or (
             self.ced_decoder_start is not None
             and self.start_layer < self.ced_decoder_start
@@ -927,10 +927,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if (
                 sp is not None
                 and boundary_indices is not None
-                and boundary_indices.numel() * sp.world_size >= sp.num_tokens
+                and not layer.attn.ced_sp_saves_bytes(
+                    sp, boundary_indices.numel(), layer.hc_mult
+                )
             ):
-                # A dense selection (including prompt logprobs) would exchange
-                # more compact slots than full rows. Keep the full-carry path.
+                # Dense replay or a replicated compressor can erase the payload
+                # saving. Include the narrow projection gather before choosing SP.
                 hidden_states, residual, post_mix, res_mix, pre_mix = (
                     None if t is None else sp.gather(t)
                     for t in (hidden_states, residual, post_mix, res_mix, pre_mix)

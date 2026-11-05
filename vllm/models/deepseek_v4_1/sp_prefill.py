@@ -9,7 +9,8 @@ layer (mHC mixes, norms, the Engram gate, the residual carry) on every token.
 For a long prefill forward, SP turns the per-layer all-reduces into dim-0
 reduce-scatters so that each rank owns 1/N of the rows for that work, and
 all-gathers the rows back before the ops that need all of them. Weights stay
-exactly as in ordinary TP; nothing is replicated. The static
+exactly as in ordinary TP, except that the CED boundary retains one full
+ratio-one BF16 compressor weight for its local-row projection. The static
 ``_use_sequence_parallel`` construction flag stays off: this mode changes no
 module.
 
@@ -29,9 +30,10 @@ only where it cannot apply: tensor parallel size 1, pipeline parallelism,
 static sequence parallelism and request boundary checkpoints. With CED
 compaction, only the encoder layers before ``ced_decoder_start`` run on
 every row: SP covers those and the boundary's row-wise normalization. The
-boundary gathers its normalized input for full global KV construction and only
-the selected replay rows of its residual carry. Dense selections keep the full
-carry gather when compact slots would cost at least as many rows.
+boundary projects local global-KV rows and gathers their 512-column values,
+plus the selected replay rows of its normalized input and residual carry.
+Selections keep the full carry gather when compact slots plus the narrow
+projection gather would cost at least as many bytes.
 
 ## Rows
 

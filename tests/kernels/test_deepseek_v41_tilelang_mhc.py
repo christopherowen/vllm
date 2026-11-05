@@ -972,3 +972,58 @@ def test_rank_order_parts_device_and_compacted_final_collapse_sink_columns(
     )
     assert parts.device == residual.device
     assert parts.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("world", [3, 4])
+@pytest.mark.parametrize("tokens", [207, 6144, 16384])
+def test_ced_boundary_local_rows_match_full_rank_order_entry(mhc, world, tokens):
+    """CED must keep native mHC bits across the full-to-local row dispatch."""
+    from vllm.models.deepseek_v4_1.sp_prefill import SPRows
+
+    layout = SPRows(tokens, world, 0)
+    padded = layout.padded_rows
+    residual, fn, scale, base, weight, incoming = _inputs(padded, seed=3641)
+    gen = torch.Generator(device=DEVICE).manual_seed(3642)
+    parts = torch.randn(world, padded, HIDDEN, device=DEVICE, generator=gen).bfloat16()
+    post = torch.rand(padded, 4, device=DEVICE, generator=gen)
+    comb = torch.softmax(torch.randn(padded, 4, 4, device=DEVICE, generator=gen), -1)
+    for nonfinite in (False, True):
+        if nonfinite:
+            residual[0, 0, 0] = float("nan")
+            parts[0, 1, 1] = float("inf")
+            parts[1, 2, 2] = -float("inf")
+        full = mhc.pre(
+            residual[:tokens],
+            fn,
+            scale,
+            base,
+            weight,
+            incoming[:tokens],
+            previous_output=RankOrderParts(parts[:, :tokens].contiguous()),
+            previous_post=post[:tokens],
+            previous_comb=comb[:tokens],
+        )
+        for rank in range(world):
+            sp = SPRows(tokens, world, rank)
+            rows = slice(sp.start, sp.start + sp.local_rows)
+            local = mhc.pre(
+                residual[rows],
+                fn,
+                scale,
+                base,
+                weight,
+                incoming[rows],
+                previous_output=RankOrderParts(parts[:, rows].contiguous()),
+                previous_post=post[rows],
+                previous_comb=comb[rows],
+            )
+            valid = min(sp.local_rows, tokens - sp.start)
+            expected = slice(sp.start, sp.start + valid)
+            for actual, reference in zip(local[:5], full[:5], strict=True):
+                _assert_bytes_equal(actual[:valid], reference[expected])
+            # The boundary discards the eager cast and casts only selected replay
+            # rows; its row-local cast must obey the same native contract too.
+            for field in ("values", "scales"):
+                _assert_bytes_equal(
+                    getattr(local[5], field)[:valid], getattr(full[5], field)[expected]
+                )

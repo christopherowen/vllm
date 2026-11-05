@@ -191,7 +191,13 @@ class _Attention(nn.Module):
         super().__init__()
         self.index, self.shared, self.rows = index, shared, rows
 
-    def prepare_global_kv(self, positions, hidden):
+    def ced_sp_saves_bytes(self, sp_rows, replay_rows, hc_mult):
+        # This arithmetic stand-in has no compressor or projected-value gather.
+        return replay_rows * sp_rows.world_size < sp_rows.num_tokens
+
+    def prepare_global_kv(self, positions, hidden, *, sp_rows=None):
+        if sp_rows is not None:
+            hidden = sp_rows.gather(hidden)
         self.shared["global"] = hidden.mean(dim=0)
         self.shared["global_rows"] = hidden.shape[0]
 
