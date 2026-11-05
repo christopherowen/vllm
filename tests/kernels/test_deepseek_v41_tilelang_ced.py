@@ -425,3 +425,40 @@ def test_ced_slots_and_routing_mask_match_the_torch_chain(rows):
     expected = (indices >= 0) & ~gather_rows(is_padding, indices)
     actual = ced.routing_mask(indices, is_padding)
     assert actual.dtype == torch.bool and torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("world_size", [2, 3, 4])
+@pytest.mark.parametrize("rows", [1, 2, 31, 32, 33, 6144, 16384])
+def test_ced_sp_indices_and_graph_replay(world_size, rows):
+    from vllm.models.deepseek_v4_1.tilelang import ced
+
+    local_rows = (rows + world_size - 1) // world_size
+    values = [-1, 0, rows - 1, rows, rows + 3, 0]
+    values += [
+        boundary + delta
+        for boundary in range(local_rows, rows, local_rows)
+        for delta in (-1, 0, 1)
+    ]
+    indices = torch.tensor(values, dtype=torch.int64, device="cuda")
+    local, merged = torch.empty_like(indices), torch.empty_like(indices)
+    kernel = ced.sp_indices_kernel()
+    for rank in range(world_size):
+        start = rank * local_rows
+        kernel(indices, local, merged, start, local_rows, rows)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            kernel(indices, local, merged, start, local_rows, rows)
+        for shift in (0, 1, -2):
+            changed = torch.tensor(values, dtype=torch.int64) + shift
+            indices.copy_(changed)
+            graph.replay()
+            valid = (changed >= 0) & (changed < rows)
+            own = valid & (changed >= start) & (changed < start + local_rows)
+            want_local = torch.where(own, changed - start, -1)
+            want_merged = torch.where(
+                valid,
+                changed // local_rows * len(values) + torch.arange(len(values)),
+                -1,
+            )
+            assert torch.equal(local.cpu(), want_local)
+            assert torch.equal(merged.cpu(), want_merged)

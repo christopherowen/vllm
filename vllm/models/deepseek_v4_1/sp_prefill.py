@@ -28,9 +28,10 @@ which every rank shares, so no agreement between ranks is needed. SP is off
 only where it cannot apply: tensor parallel size 1, pipeline parallelism,
 static sequence parallelism and request boundary checkpoints. With CED
 compaction, only the encoder layers before ``ced_decoder_start`` run on
-every row: SP covers those, and the carried rows are gathered back in full
-before the boundary layer, which builds the decoder's global KV from every
-row and then compacts.
+every row: SP covers those and the boundary's row-wise normalization. The
+boundary gathers its normalized input for full global KV construction and only
+the selected replay rows of its residual carry. Dense selections keep the full
+carry gather when compact slots would cost at least as many rows.
 
 ## Rows
 

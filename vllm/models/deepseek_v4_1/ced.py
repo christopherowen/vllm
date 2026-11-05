@@ -14,6 +14,7 @@ from .tilelang import ced as ced_kernels
 from .tilelang import columns, prepare
 
 if TYPE_CHECKING:
+    from .sp_prefill import SPRows
     from .sparse_mla import DeepseekV41B12xMetadata
 
 CED_WINDOW = 128
@@ -41,6 +42,35 @@ def gather_rows(source: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
     if output.numel():
         ced_kernels.copy_rows(source, indices, output, scatter=False)
     return output
+
+
+def gather_sp_rows(
+    sp: SPRows, indices: torch.Tensor, *sources: torch.Tensor
+) -> tuple[torch.Tensor, ...]:
+    """Select global rows from local SP carries without gathering the full carry.
+
+    Each rank contributes one slot per selected row; only its owning rank fills
+    the slot. After a grouped gather, integer selection reads that owner's slot.
+    No floating-point reduction is introduced, including for signed zero and NaN.
+    """
+    from .sp_prefill import SPRows
+
+    for source in sources:
+        if source.shape[0] != sp.local_rows:
+            raise ValueError(
+                f"CED SP gather expects {sp.local_rows} rows, got {source.shape}"
+            )
+    if not indices.numel():
+        return tuple(source[:0] for source in sources)
+    local = torch.empty_like(indices)
+    merged = torch.empty_like(indices)
+    ced_kernels.sp_indices_kernel()(
+        indices, local, merged, sp.start, sp.local_rows, sp.num_tokens
+    )
+    selected = tuple(gather_rows(source, local) for source in sources)
+    compact = SPRows(indices.numel() * sp.world_size, sp.world_size, sp.rank)
+    gathered = compact.gather_many(*selected)
+    return tuple(gather_rows(source, merged) for source in gathered)
 
 
 def scatter_rows(
@@ -194,6 +224,7 @@ class CEDState:
         prepare.declare(
             lambda: [
                 prepare.call(ced_kernels.indices_kernel, self.max_requests),
+                prepare.call(ced_kernels.sp_indices_kernel),
                 prepare.call(ced_kernels.token_metadata_kernel),
                 prepare.call(ced_kernels.routing_mask_kernel),
                 prepare.call(ced_kernels.slots_kernel),
