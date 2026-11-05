@@ -608,11 +608,14 @@ def test_prefill_tiles_give_the_decode_tiles_bits(
     assert torch.equal(tiered_out.view(torch.int16), outs[32].view(torch.int16))
 
 
-@pytest.mark.parametrize("hidden, intermediate", [(512, 256), (384, 576), (384, 768)])
+@pytest.mark.parametrize(
+    "hidden, intermediate, num_experts",
+    [(512, 256, 32), (384, 576, 32), (384, 768, 32), (5120, 576, 8), (5120, 768, 8)],
+)
 @pytest.mark.parametrize("rows", [171, 500])
 @pytest.mark.parametrize("idx_dtype", [torch.int32, torch.int64])
 def test_prefill_swizzle_panel_matches_unswizzled_bits(
-    rows, idx_dtype, hidden, intermediate, num_experts=32, topk=6
+    rows, idx_dtype, hidden, intermediate, num_experts, topk=6
 ):
     """Swizzling the prefill grouped-GEMM CTA grid across ``prefill_swizzle_panel=3``
     consecutive M-tiles changes only CTA scheduling order and keeps every output
@@ -836,25 +839,19 @@ def test_narrow_and_wide_codes_give_the_uncoded_gemm_bits(rows, n, k, gather):
     )
 
 
-@pytest.mark.parametrize("gather,k", [(True, 512), (False, 576), (False, 768)])
-def test_grouped_gemm_emits_requested_prefill_swizzle(gather, k):
-    """Bit equality alone cannot detect a scheduling option that is ignored."""
-    for panel in (0, 3):
-        kernel = grouped_fp8_fp4_gemm(
-            32,
-            384,
-            k,
-            6,
-            gather,
-            64,
-            128,
-            coded_scales=True,
-            narrow_codes=True,
-            trigger_after_loop=True,
-            swizzle_panel=panel,
-        )
-        source = kernel.get_kernel_source()
+@pytest.mark.parametrize("intermediate", [576, 768])
+@pytest.mark.parametrize("stage", ["gate_up", "down"])
+def test_grouped_gemm_emits_requested_prefill_swizzle(intermediate, stage):
+    """The opt-in must change code; the default keeps the prior unswizzled path."""
+    sources = {}
+    for panel in (None, 0, 3):
+        options = {} if panel is None else {"prefill_swizzle_panel": panel}
+        plan = MoeExpertsV41Plan(384, 6, 5120, intermediate, **options)
+        factory, args, kwargs = plan.kernels()[f"prefill_{stage}"]
+        source = factory(*args, **kwargs).get_kernel_source()
         assert ("rasterization2DRow<3>" in source) == (panel == 3)
+        sources[panel] = source
+    assert sources[None] == sources[0]
 
 
 def test_grouped_fp8_fp4_gemm_defers_barrier_init_and_down_stages():
