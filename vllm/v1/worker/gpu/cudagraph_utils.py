@@ -90,7 +90,16 @@ def dense_varlen_decode_shapes(
         for width in sorted(widths)
         if width > 1 and num_reqs * width <= max_capture_tokens
     )
-    return (*dense, *uniform)
+    native_rows = ()
+    if uniform_query_len is not None and 1 < uniform_query_len < decode_query_len:
+        native_rows = (
+            (min(rows, max_num_reqs), rows)
+            for rows in range(
+                uniform_query_len, max_num_reqs * uniform_query_len + 1, uniform_query_len
+            )
+            if rows <= max_capture_tokens
+        )
+    return tuple(dict.fromkeys((*dense, *uniform, *native_rows)))
 
 
 _DEBUG_GRAPH_MEMORY_ACCOUNTING = (
