@@ -608,11 +608,14 @@ def test_prefill_tiles_give_the_decode_tiles_bits(
     assert torch.equal(tiered_out.view(torch.int16), outs[32].view(torch.int16))
 
 
-@pytest.mark.parametrize("hidden, intermediate", [(512, 256), (384, 576), (384, 768)])
+@pytest.mark.parametrize(
+    "hidden, intermediate, num_experts",
+    [(512, 256, 32), (384, 576, 32), (384, 768, 32), (5120, 576, 8), (5120, 768, 8)],
+)
 @pytest.mark.parametrize("rows", [171, 500])
 @pytest.mark.parametrize("idx_dtype", [torch.int32, torch.int64])
 def test_prefill_swizzle_panel_matches_unswizzled_bits(
-    rows, idx_dtype, hidden, intermediate, num_experts=32, topk=6
+    rows, idx_dtype, hidden, intermediate, num_experts, topk=6
 ):
     """Swizzling the prefill grouped-GEMM CTA grid across ``prefill_swizzle_panel=3``
     consecutive M-tiles changes only CTA scheduling order and keeps every output
@@ -625,7 +628,7 @@ def test_prefill_swizzle_panel_matches_unswizzled_bits(
     ids, route_weights = _routes(rows, num_experts, topk, 18, idx_dtype)
     tokens = cast_mxfp8(x)
     outs = {}
-    for swizzle_panel in (0, 3):
+    for swizzle_panel in (0, 2, 3):
         plan = _plan(
             num_experts,
             topk,
@@ -638,6 +641,7 @@ def test_prefill_swizzle_panel_matches_unswizzled_bits(
         weights = plan.prepare_weights(w13_packed, w13_sf, w2_packed, w2_sf)
         outs[swizzle_panel] = torch.empty_like(x)
         plan.run(tokens, ids, route_weights, weights, outs[swizzle_panel])
+    assert torch.equal(outs[2].view(torch.int16), outs[0].view(torch.int16))
     assert torch.equal(outs[3].view(torch.int16), outs[0].view(torch.int16))
 
 
@@ -834,6 +838,27 @@ def test_narrow_and_wide_codes_give_the_uncoded_gemm_bits(rows, n, k, gather):
     assert torch.equal(
         out_plain[live].view(torch.int16), out_mixed[live].view(torch.int16)
     )
+
+
+@pytest.mark.parametrize("intermediate", [576, 768])
+@pytest.mark.parametrize("stage", ["gate_up", "down"])
+def test_grouped_gemm_emits_requested_prefill_swizzle(intermediate, stage):
+    """Prefill defaults to panel 2, keeps decode/mid unswizzled, and honors explicit panels."""
+    sources = {}
+    for panel in (None, 0, 2, 3):
+        options = {} if panel is None else {"prefill_swizzle_panel": panel}
+        plan = MoeExpertsV41Plan(384, 6, 5120, intermediate, **options)
+        calls = plan.kernels()
+        for key in ("gate_up", "down", "late_gate_up", "late_down", "mid_gate_up", "mid_down"):
+            _, _, d_kwargs = calls[key]
+            assert d_kwargs.get("swizzle_panel", 0) == 0
+        factory, args, kwargs = calls[f"prefill_{stage}"]
+        source = factory(*args, **kwargs).get_kernel_source()
+        assert ("rasterization2DRow<2>" in source) == (panel in (None, 2))
+        assert ("rasterization2DRow<3>" in source) == (panel == 3)
+        sources[panel] = source
+    assert sources[None] == sources[2]
+    assert sources[0] != sources[2]
 
 
 def test_grouped_fp8_fp4_gemm_defers_barrier_init_and_down_stages():

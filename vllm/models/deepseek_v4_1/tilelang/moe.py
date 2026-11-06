@@ -664,8 +664,9 @@ def grouped_fp8_fp4_gemm(
     rasterizes the ``(N / block_N, tiles)`` grid in panels of ``swizzle_panel``
     consecutive M-tiles, stepping M-tiles first within each column block ``bx``
     and reversing ``bx`` on odd panels, so consecutive M-tiles of the same
-    expert share each ``bx`` weight slab in L2 while keeping unused padding
-    tiles (``t >= used_tiles``) at the tail of the grid.
+    expert can access each ``bx`` weight slab closer together. Cache benefit
+    depends on occupancy and panel boundaries. Empty logical tiles still return
+    early but can interleave with live CTAs inside a partial panel.
     """
     block_K = FP4_TMA_K
     tail = K % block_K
@@ -807,6 +808,8 @@ def grouped_fp8_fp4_gemm(
     @T.macro
     def body(A, SFA, B, BT, SFB, SFBase, Order, TileExpert, C, SFB8=None, Narrow=None):
         with T.Kernel(T.ceildiv(N, block_N), tiles, threads=threads) as (bx, t):
+            if swizzle_panel > 0:
+                T.use_swizzle(panel_size=swizzle_panel)
             if gather or trigger_after_loop:
                 if trigger_after_loop:
                     pdl.wait()
@@ -1392,7 +1395,7 @@ class MoeExpertsV41Plan:
         decode_block_M=16,
         block_M=32,
         prefill_block_M=64,
-        prefill_swizzle_panel=3,
+        prefill_swizzle_panel=2,
         block_N=128,
         num_stages=3,
         down_num_stages=2,
@@ -1514,8 +1517,8 @@ class MoeExpertsV41Plan:
         ``decode_block_M``; at the same height ``late_gate_up`` and ``late_down``,
         which trigger after their K loop (calls of ``LATE_TRIGGER_ROWS`` rows or
         more); with a ``mid_`` prefix at ``block_M`` and a ``prefill_`` prefix at
-        ``prefill_block_M``, whose GEMMs trigger late and swizzle their CTA grid across
-        ``prefill_swizzle_panel`` consecutive M-tiles."""
+        ``prefill_block_M``, whose GEMMs trigger late and optionally swizzle across
+        ``prefill_swizzle_panel`` consecutive M-tiles (default 2; decode/mid keep 0)."""
         config = dict(
             block_N=self.block_N,
             coded_scales=True,
