@@ -8,6 +8,7 @@ particular retention policy or that a published endpoint survives eviction.
 """
 
 import random
+from collections import deque
 from dataclasses import replace
 
 import pytest
@@ -288,10 +289,14 @@ def test_branches_and_cancellation_do_not_complete_each_others_state(
 
 @pytest.mark.parametrize("generated", [129, 257, 513])
 @pytest.mark.parametrize("order", [0, 31])
-def test_preemption_does_not_skip_private_generated_history(generated, order):
+@pytest.mark.parametrize("input_stream", [None, "active", "final-input"])
+def test_preemption_recovery_scopes_fixed_prompts(generated, order, input_stream):
     manager, roles = make_manager(None, order)
     prompt = list(range(1024))
     req = request("resumed", prompt)
+    if input_stream is not None:
+        req.streaming_queue = deque()
+        req.resumable = input_stream == "active"
     assert manager.allocate_slots(req, len(prompt)) is not None
     req.num_computed_tokens = len(prompt)
     req.append_output_token_ids(list(range(1024, 1024 + generated)))
@@ -306,8 +311,21 @@ def test_preemption_does_not_skip_private_generated_history(generated, order):
     fresh_prompt = request("fresh", req.all_token_ids)
     _, later_hit = verify_hit(manager, roles, fresh_prompt)
     assert later_hit > len(prompt) - WINDOW
-    blocks, hit = verify_hit(manager, roles, req, cap=len(prompt) - WINDOW)
-    assert hit == 768
+    cap = len(prompt) - WINDOW if input_stream is None else req.num_tokens - WINDOW
+    blocks, hit = verify_hit(manager, roles, req, cap=cap)
+    assert hit == (768 if input_stream is None else later_hit)
     assert manager.allocate_slots(req, req.num_tokens - hit, hit, blocks) is not None
     manager.free(req)
     assert manager.block_pool.get_num_free_blocks() == 2047
+
+
+@pytest.mark.parametrize("input_stream", [None, "active", "final-input"])
+def test_worker_receives_durable_input_stream_identity(input_stream):
+    from vllm.v1.core.sched.output import NewRequestData
+
+    req = request("identity", list(range(1024)))
+    if input_stream is not None:
+        req.streaming_queue = deque()
+        req.resumable = input_stream == "active"
+    data = NewRequestData.from_request(req, (), prefill_token_ids=req.all_token_ids)
+    assert data.is_streaming_input is (input_stream is not None)

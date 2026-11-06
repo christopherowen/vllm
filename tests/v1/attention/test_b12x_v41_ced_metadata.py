@@ -1015,3 +1015,42 @@ def test_startup_warmup_covers_live_compaction_without_jit(monkeypatch):
         # The decoder's routing mask gathers the step's padding mask.
         is_padding = torch.zeros(sum(lengths), dtype=torch.bool, device="cuda")
         assert not gather_rows(is_padding, indices).any()
+
+
+@pytest.mark.parametrize("is_streaming_input", [False, True])
+def test_original_prompt_recovery_excludes_input_stream_sessions(is_streaming_input):
+    from vllm.models.deepseek_v4_1.nvidia.model_state import DeepseekV41ModelState
+    from vllm.v1.core.sched.output import NewRequestData
+
+    state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
+    state.rope_state = state.prompt_embeds_state = None
+    state.steering = state.steered_requests = None
+    state.disk_engram_models, state._prefill_tokens = (), {}
+    state._ced_prompt_logprobs, state._ced_prefix_start = set(), {}
+    state._ced_recovery_prompt_end = {}
+    state._ced_streaming_prefix_start = None
+    data = NewRequestData(
+        req_id="resumed",
+        prompt_token_ids=list(range(1024)),
+        prefill_token_ids=list(range(1281)),
+        mm_features=[],
+        sampling_params=None,
+        pooling_params=None,
+        block_ids=(),
+        num_computed_tokens=768,
+        lora_request=None,
+        is_streaming_input=is_streaming_input,
+    )
+    state.add_request(0, data)
+    batch = SimpleNamespace(
+        req_ids=["resumed"],
+        num_scheduled_tokens=[512],
+        num_computed_prefill_tokens_np=[768],
+        prefill_len_np=[1281],
+    )
+    full, floors, limits = state._ced_rows(batch)
+    assert full == [False]
+    assert floors == ([1153] if is_streaming_input else [896])
+    assert limits == ([127] if is_streaming_input else [384])
+    state.remove_request("resumed")
+    assert state._ced_recovery_prompt_end == {}
