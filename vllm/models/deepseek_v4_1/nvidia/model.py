@@ -55,7 +55,7 @@ from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 from .. import kernels, l2_prefetch, sp_prefill
 from ..attention import DeepseekV4Attention
-from ..ced import ced_decoder_start, gather_rows, scatter_rows
+from ..ced import ced_decoder_start, gather_rows, gather_sp_rows, scatter_rows
 from ..common.engram import Engram, EngramLayout, NgramHashState
 from ..glp import glp_steering
 
@@ -402,14 +402,23 @@ class DeepseekV4DecoderLayer(nn.Module):
         if ced_indices is not None:
             # Decoder global KV needs every encoder row, but decoder queries,
             # residual updates and experts only need the selected replay rows.
-            self.attn.prepare_global_kv(positions, x)
             del x_q
-            x = gather_rows(x, ced_indices)
+            if sp_rows is not None:
+                # Global KV projects local rows and gathers its narrow latent.
+                # Decoder queries and residual updates only need replay rows.
+                self.attn.prepare_global_kv(positions, x, sp_rows=sp_rows)
+                x, residual, post_mix, res_mix, attn_pre = gather_sp_rows(
+                    sp_rows, ced_indices, x, residual, post_mix, res_mix, attn_pre
+                )
+                sp_rows = None
+            else:
+                self.attn.prepare_global_kv(positions, x)
+                x = gather_rows(x, ced_indices)
+                residual = gather_rows(residual, ced_indices)
+                post_mix = gather_rows(post_mix, ced_indices)
+                res_mix = gather_rows(res_mix, ced_indices)
+                attn_pre = gather_rows(attn_pre, ced_indices)
             x_q = self.mhc.cast_rows(x)
-            residual = gather_rows(residual, ced_indices)
-            post_mix = gather_rows(post_mix, ced_indices)
-            res_mix = gather_rows(res_mix, ced_indices)
-            attn_pre = gather_rows(attn_pre, ced_indices)
             positions = (
                 gather_rows(positions, ced_indices)
                 if ced_positions is None
@@ -801,7 +810,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
     ) -> torch.Tensor | IntermediateTensors:
         sp = None
         # With CED the encoder layers (before ced_decoder_start) still run on
-        # every row; SP covers them and hands full rows to the boundary layer.
+        # every row; the boundary gathers global KV latents and compact carries.
         sp_layers_available = ced_indices is None or (
             self.ced_decoder_start is not None
             and self.start_layer < self.ced_decoder_start
@@ -915,9 +924,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             start=self.start_layer,
         ):
             boundary_indices = ced_indices if idx == self.ced_decoder_start else None
-            if sp is not None and boundary_indices is not None:
-                # The CED boundary layer builds the decoder's global KV from every
-                # encoder row, then compacts; gather the carried rows first.
+            if (
+                sp is not None
+                and boundary_indices is not None
+                and not layer.attn.ced_sp_saves_bytes(
+                    sp, boundary_indices.numel(), layer.hc_mult
+                )
+            ):
+                # Dense replay or a replicated compressor can erase the payload
+                # saving. Include the narrow projection gather before choosing SP.
                 hidden_states, residual, post_mix, res_mix, pre_mix = (
                     None if t is None else sp.gather(t)
                     for t in (hidden_states, residual, post_mix, res_mix, pre_mix)
@@ -951,6 +966,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 ced_input_ids=ced_input_ids,
                 aux_out=pending_aux_out,
             )
+            if boundary_indices is not None:
+                sp = None  # The boundary returns replicated compact decoder rows.
             if pending_aux_out is not None:
                 aux_hidden_state = pending_aux_out
                 pending_aux_out = None

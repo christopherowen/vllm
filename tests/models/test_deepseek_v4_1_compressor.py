@@ -576,3 +576,49 @@ def test_compressor_tp_sharded_fused_wkv_wgate_matches_tp1(monkeypatch, ratio):
             if ratio == 2:
                 assert torch.equal(ranks[0]._gates[:rows], ref_gates), f"rows={rows}"
             assert not ranks[0].fused_wkv_wgate.tilelang_counters.any()
+
+
+@pytest.mark.parametrize("world_size", [3, 4])
+def test_sp_global_projection_matches_native_shards_at_prefill_boundaries(world_size):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("DeepSeek-V4.1 compression requires SM12x")
+    pytest.importorskip("tilelang")
+    from vllm.models.deepseek_v4_1 import sp_prefill
+    from vllm.models.deepseek_v4_1.tilelang.gemm import bf16_gemm
+
+    gen = torch.Generator(device="cuda").manual_seed(3601)
+    weight = (torch.randn(512, 5120, device="cuda", generator=gen) * 0.02).bfloat16()
+    inputs = torch.randn(16384, 5120, device="cuda", generator=gen).bfloat16()
+    # Preserve the deployed column shard's five blocked K parts in both layouts.
+    part_cols = 128 if world_size == 4 else 512
+    base = bf16_gemm(part_cols, 5120, shards=5, blocked=True, out_dtype="bfloat16")
+    candidate = bf16_gemm(512, 5120, shards=5, blocked=True, out_dtype="bfloat16")
+    for nonfinite in (False, True):
+        if nonfinite:
+            inputs[0, 0] = float("nan")
+            inputs[1, 1] = float("inf")
+            inputs[2, 2] = -float("inf")
+        for tokens in (205, 206, 207, 385, 6144, 16384):
+            x = inputs[:tokens]
+            columns = []
+            for start in range(0, 512, part_cols):
+                out = torch.empty(
+                    tokens, part_cols, device="cuda", dtype=torch.bfloat16
+                )
+                base(x, weight[start : start + part_cols], out)
+                columns.append(out)
+            expected = torch.cat(columns, dim=-1)
+            row_parts = []
+            for rank in range(world_size):
+                sp = sp_prefill.SPRows(tokens, world_size, rank)
+                out = torch.empty(
+                    sp.local_rows, 512, device="cuda", dtype=torch.bfloat16
+                )
+                candidate(sp.local_slice(x), weight, out)
+                row_parts.append(out)
+            actual = torch.cat(row_parts)[:tokens]
+            assert torch.equal(actual.view(torch.int16), expected.view(torch.int16)), (
+                world_size,
+                tokens,
+                nonfinite,
+            )

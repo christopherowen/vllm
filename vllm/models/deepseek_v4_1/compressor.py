@@ -124,6 +124,8 @@ class DeepseekCompressor(nn.Module):
         hf = getattr(model_cfg, "hf_config", None) if model_cfg is not None else None
         self._rope_dim = int(getattr(hf, "qk_rope_head_dim", 64))
         tp_size = linear_layers.get_tensor_model_parallel_world_size()
+        self._sp_enabled = compress_ratio == 1 and tp_size > 1
+        self._sp_weight = self._sp_kernel = None
         disable_tp = tp_size <= 1 or 512 % (tp_size * 64) != 0
         self.fused_wkv_wgate = MergedColumnParallelLinear(
             hidden_size,
@@ -256,6 +258,22 @@ class DeepseekCompressor(nn.Module):
             ),
         ]
 
+    def _sp_projection_call(self):
+        """Use the original TP shard's K reduction for the full row projection."""
+        from vllm.models.deepseek_v4_1.tilelang import prepare
+        from vllm.models.deepseek_v4_1.tilelang.gemm import bf16_gemm
+
+        layer = self.fused_wkv_wgate
+        split = layer.quant_method._split(layer)
+        return prepare.call(
+            bf16_gemm,
+            512,
+            layer.weight.shape[1],
+            out_dtype="bfloat16",
+            shards=split["shards"],
+            blocked=split["blocked"],
+        )
+
     def declare_kernels(self) -> None:
         """Declare the TileLang compression kernels (the worker calls this after
         loading); binding allocates the serving storage and ratio 1's placeholder
@@ -264,13 +282,31 @@ class DeepseekCompressor(nn.Module):
         from vllm.models.deepseek_v4_1.tilelang import compress as tl
         from vllm.models.deepseek_v4_1.tilelang import prepare
 
+        sp_call = (
+            self._sp_projection_call() if getattr(self, "_sp_enabled", False) else None
+        )
+
         def bind() -> None:
             device = self.fused_wkv_wgate.weight.device
             self._ensure_capacity_buffers(device, self.capacity, self.requests)
             if self.compress_ratio == 1:
                 tl.placeholder(self.requests, device)
+            if sp_call is not None:
+                # The decode projection retains its original TP weight and kernels.
+                # TP3 already stores all 512 columns; aligned TP gathers this one
+                # ratio-one weight once before memory profiling (5 MiB at H=5120).
+                weight = self.fused_wkv_wgate.weight.detach()
+                self._sp_weight = (
+                    tensor_model_parallel_all_gather(weight, dim=0)
+                    if self.fused_wkv_wgate.tp_size > 1
+                    else weight
+                )
+                self._sp_kernel = prepare.launch(sp_call)
 
-        prepare.declare(self._tilelang_calls, bind=bind)
+        prepare.declare(
+            lambda: self._tilelang_calls() + ([] if sp_call is None else [sp_call]),
+            bind=bind,
+        )
 
     def _forward_tilelang(
         self,
@@ -282,11 +318,13 @@ class DeepseekCompressor(nn.Module):
         token_positions=None,
         cos_sin=None,
         kv_page_size=None,
+        values=None,
     ):
         """The TileLang compression: at ratio 2 the requests' carries from the state
         ring, then one launch over the step's rows that also saves the ring."""
         from vllm.models.deepseek_v4_1.tilelang import compress as tl
 
+        values = self._values if values is None else values
         kv_kwargs = {}
         if kv_cache is not None and token_positions is not None and cos_sin is not None:
             kv_kwargs = dict(
@@ -297,7 +335,7 @@ class DeepseekCompressor(nn.Module):
             )
         if self.compress_ratio == 1:
             tl.compress(
-                rows, 1, self._values, None, self.norm.weight,
+                rows, 1, values, None, self.norm.weight,
                 metadata.query_start_loc, metadata.request_positions, self._row_ids,
                 metadata.slot_mapping, metadata.live_counts, self._latent,
                 self._emitted, self._slots, **kv_kwargs,
@@ -331,11 +369,27 @@ class DeepseekCompressor(nn.Module):
         token_positions=None,
         cos_sin=None,
         kv_page_size=None,
+        sp_rows=None,
     ):
         rows = hidden_states.shape[0]
         if self._values is None:
             raise RuntimeError("compressor kernels must be bound before forwarding")
-        self._project(hidden_states)
+        values = None
+        if sp_rows is not None:
+            if self.compress_ratio != 1 or self._sp_kernel is None:
+                raise RuntimeError(
+                    "ratio-one SP projection must be bound before forwarding"
+                )
+            if rows != sp_rows.local_rows:
+                raise ValueError("SP compressor input does not match local rows")
+            local = self._values[:rows]
+            # Always use the prefill GEMM, even for a short local slice: it keeps
+            # the global prefill's K reduction and needs no decode workspace.
+            self._sp_kernel(hidden_states, self._sp_weight, local)
+            values = sp_rows.gather(local)
+            rows = sp_rows.num_tokens
+        else:
+            self._project(hidden_states)
         self._forward_tilelang(
             rows,
             metadata,
@@ -344,5 +398,6 @@ class DeepseekCompressor(nn.Module):
             token_positions=token_positions,
             cos_sin=cos_sin,
             kv_page_size=kv_page_size,
+            values=values,
         )
         return self._latent[:rows], self._slots[:rows]

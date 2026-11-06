@@ -959,14 +959,35 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         swa = self._query_metadata(metadata[self.swa_cache_layer.prefix])
         self.insert_context_kv(kv, positions, swa.slot_mapping[: kv.shape[0]])
 
-    def prepare_global_kv(self, positions, hidden_states):
+    def ced_sp_saves_bytes(self, sp_rows, replay_rows, hc_mult):
+        """Keep the compact boundary only when its gathered payload is smaller.
+
+        TP3's compressor already holds the full weight, so a new row gather must
+        also earn back its cost. Aligned TP replaces an existing column gather.
+        Include SP padding and every replicated compact slot in both estimates.
+        """
+        compressor = self.compressor
+        if type(compressor) is not DeepseekCompressor or compressor.compress_ratio != 1:
+            return False
+        # Native carries: BF16 hidden/residual, FP32 pre/post/residual mixes.
+        carry_bytes = 2 * self.hidden_size * (hc_mult + 1)
+        carry_bytes += 4 * (hc_mult * hc_mult + 2 * hc_mult)
+        latent_bytes = 512 * 2
+        before = sp_rows.padded_rows * carry_bytes
+        if compressor.fused_wkv_wgate.tp_size > 1:
+            before += sp_rows.num_tokens * latent_bytes
+        after = replay_rows * sp_rows.world_size * carry_bytes
+        after += sp_rows.padded_rows * latent_bytes
+        return after < before
+
+    def prepare_global_kv(self, positions, hidden_states, *, sp_rows=None):
         """Build full-row global KV before the CED boundary gathers decoder rows."""
         if self.compressor is None or hidden_states.shape[0] == 0:
             return
-        self._prepare_global_kv(positions, hidden_states)
+        self._prepare_global_kv(positions, hidden_states, sp_rows=sp_rows)
 
     @eager_break_during_capture
-    def _prepare_global_kv(self, positions, hidden_states):
+    def _prepare_global_kv(self, positions, hidden_states, *, sp_rows=None):
         if not self._ready:
             raise RuntimeError("V4.1 attention metadata is not prepared")
         metadata = get_forward_context().attn_metadata
@@ -975,7 +996,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         indexer = self.indexer
         if indexer is None:
             raise RuntimeError("V4.1 global KV source requires an indexer")
-        rows = hidden_states.shape[0]
+        if sp_rows is not None and (
+            type(self.compressor) is not DeepseekCompressor
+            or self.compressor.compress_ratio != 1
+        ):
+            hidden_states = sp_rows.gather(hidden_states)
+            sp_rows = None
+        rows = hidden_states.shape[0] if sp_rows is None else sp_rows.num_tokens
+        sp_kwargs = {} if sp_rows is None else {"sp_rows": sp_rows}
         # These are deliberately original metadata, never the decoder views.
         main = metadata[self._owner().prefix]
         state = (
@@ -999,9 +1027,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 token_positions=positions,
                 cos_sin=self.rotary_emb.cos_sin_cache,
                 kv_page_size=self._main_page,
+                **sp_kwargs,
             )
         else:
-            latent, slots = self.compressor(hidden_states, main, state)
+            latent, slots = self.compressor(hidden_states, main, state, **sp_kwargs)
         self._issue_wo_prefetch(rows, after="compressor")
         # Index K consumes the ordinary-normalized PRE-RoPE latent; norm, RoPE
         # and the paged MXFP4 write run in one kernel. At decode sizes, wk's

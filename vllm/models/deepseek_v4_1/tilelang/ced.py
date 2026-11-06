@@ -10,6 +10,35 @@ import tilelang.language as T
 _PASS = {tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
 
 
+@tilelang.jit(pass_configs=_PASS)
+def sp_indices_kernel():
+    """Map selected global rows to local rows and owning gathered slots."""
+    count = T.dynamic("count")
+
+    @T.prim_func
+    def ced_sp_indices(
+        indices: T.Tensor((count,), T.int64),
+        local: T.Tensor((count,), T.int64),
+        merged: T.Tensor((count,), T.int64),
+        start: T.int64,
+        local_rows: T.int64,
+        total_rows: T.int64,
+    ):
+        with T.Kernel(T.ceildiv(count, 256), threads=256) as block:
+            for lane in T.Parallel(256):
+                row = block * 256 + lane
+                if row < count:
+                    index = indices[row]
+                    valid = (index >= 0) & (index < total_rows)
+                    own = valid & (index >= start) & (index < start + local_rows)
+                    local[row] = T.if_then_else(own, index - start, -1)
+                    merged[row] = T.if_then_else(
+                        valid, index // local_rows * count + row, -1
+                    )
+
+    return ced_sp_indices
+
+
 # Predicated global loads (zero when off). They are volatile, so the compiler
 # keeps them where they are written, ahead of the stores and branches that use
 # them, instead of sinking each into its first use.
