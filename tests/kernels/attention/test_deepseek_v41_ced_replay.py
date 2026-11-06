@@ -64,13 +64,36 @@ def aligned_chunks(threshold, start, end):
     return chunks
 
 
-def model_state_stager(prefix):
+def model_state_stager(prefix, *, original_prompt_end=None, prefill_end=None):
     """Stages each chunk as serving does: the model state's ``_stage_ced``."""
     from vllm.models.deepseek_v4_1.nvidia.model_state import DeepseekV41ModelState
 
     state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
     state.ced_state = CEDState(4, 8192, (128, 256, 384, 512, 8192), DEVICE)
     state._ced_prompt_logprobs, state._ced_prefix_start = set(), {"prompt": prefix}
+    state._ced_recovery_prompt_end = {}
+    if original_prompt_end is not None:
+        # Exercise the real request admission hook: a resumed request keeps the
+        # original prompt length while its prefill ids include accepted outputs.
+        from vllm.v1.core.sched.output import NewRequestData
+
+        state.rope_state = state.prompt_embeds_state = None
+        state.steering = state.steered_requests = None
+        state.disk_engram_models, state._prefill_tokens = (), {}
+        state.add_request(
+            0,
+            NewRequestData(
+                req_id="prompt",
+                prompt_token_ids=list(range(original_prompt_end)),
+                mm_features=[],
+                sampling_params=None,
+                pooling_params=None,
+                block_ids=(),
+                num_computed_tokens=prefix,
+                lora_request=None,
+                prefill_token_ids=list(range(prefill_end)),
+            ),
+        )
 
     def stage(start, rows, prompt_end, starts, seq):
         state._stage_ced(
@@ -80,8 +103,12 @@ def model_state_stager(prefix):
                 query_start_loc=starts,
                 seq_lens=seq,
                 num_scheduled_tokens=np.array([rows]),
-                num_computed_prefill_tokens_np=np.array([start]),
-                prefill_len_np=np.array([prompt_end]),
+                num_computed_prefill_tokens_np=np.array(
+                    [min(start, prompt_end if prefill_end is None else prefill_end)]
+                ),
+                prefill_len_np=np.array(
+                    [prompt_end if prefill_end is None else prefill_end]
+                ),
             )
         )
         return state.ced_state
@@ -89,12 +116,14 @@ def model_state_stager(prefix):
     return stage
 
 
-def decoder_stack(prompt_end, chunks, stage, seed=5):
+def decoder_stack(prompt_end, chunks, stage, seed=5, encoder=None):
     """The stack's last-layer rows for the kept positions of every step, in
     ``{position: row}``, the last step's kept row winning."""
     gen = torch.Generator(device=DEVICE).manual_seed(seed)
     # The encoder's output: one fixed row a position, whatever the chunking.
-    encoder = torch.randn((prompt_end, HEAD_DIM), generator=gen, device=DEVICE)
+    if encoder is None:
+        encoder = torch.randn((prompt_end, HEAD_DIM), generator=gen, device=DEVICE)
+    assert encoder.shape == (prompt_end, HEAD_DIM)
     scales = torch.linspace(0.5, 1.5, HEADS, device=DEVICE)
     sinks = torch.linspace(-1.0, 1.0, HEADS, device=DEVICE)
     pages = prompt_end // PAGE + 2
@@ -107,7 +136,7 @@ def decoder_stack(prompt_end, chunks, stage, seed=5):
     rope = rope_table(prompt_end + 1)
     plan = SparseMlaV41Plan(
         HEADS, CED_WINDOW, 0, 128, swa_page_size=PAGE,
-        max_rows=256, decode_max_rows=256, split_max_rows=256,
+        max_rows=512, decode_max_rows=256, split_max_rows=512,
     )  # fmt: skip
     outputs = {}
     for start, rows in chunks:
@@ -176,3 +205,50 @@ def test_chunkings_give_the_same_decoder_rows(final_rows):
             prompt_end,
         )
         assert torch.equal(rows, reference), (threshold, prefix, chunks)
+
+
+@pytest.mark.parametrize("generated_rows", [129, 257])
+@pytest.mark.parametrize("resumed_chunk", [64, 512])
+def test_preempted_decode_rebuilds_original_decoder_history(
+    generated_rows, resumed_chunk
+):
+    """Losing private windows must not change an in-flight continuation.
+
+    The first run completes one prompt and then computes accepted generated rows
+    one at a time. The second run has lost every private decoder page; its worker
+    input contains the same original prompt plus the accepted output suffix, as
+    MRV2 sends after preemption. All encoder rows are identical and untouched.
+    Comparing the final row traverses three real TileLang SWA layers, so dropping
+    the early generated rows cannot hide behind one layer's 128-token horizon.
+    """
+    original_end = 1024
+    total = original_end + generated_rows
+    # Values are deterministic dyadic fractions; no random sampler or model
+    # weights participate. Both executions receive the exact same encoder rows.
+    positions = torch.arange(total, device=DEVICE, dtype=torch.float32)[:, None]
+    columns = torch.arange(HEAD_DIM, device=DEVICE, dtype=torch.float32)[None, :]
+    encoder = ((positions % 17) - 8) / 512 + ((columns % 11) - 5) / 1024
+    uninterrupted = decoder_stack(
+        total,
+        [(0, original_end), *((p, 1) for p in range(original_end, total))],
+        model_state_stager(
+            0, original_prompt_end=original_end, prefill_end=original_end
+        ),
+        encoder=encoder,
+    )
+    expected = uninterrupted[total - 1]
+    assert torch.isfinite(expected).all()
+
+    # Last legal 256-token encoder hit before the ORIGINAL prompt replay floor.
+    # This deliberately provides enough encoder history to reconstruct the exact
+    # continuation; changing only the cache-hit cap cannot make this test pass.
+    hit = (original_end - CED_WINDOW) // 256 * 256
+    resumed = decoder_stack(
+        total,
+        aligned_chunks(resumed_chunk, hit, total),
+        model_state_stager(hit, original_prompt_end=original_end, prefill_end=total),
+        encoder=encoder,
+    )
+    actual = resumed[total - 1]
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)

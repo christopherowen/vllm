@@ -68,12 +68,15 @@ def plan_ced(
 ) -> CEDPlan | None:
     """The CPU bounds of a step's decoder rows: each request's last ``CED_WINDOW``
     rows, or every row where ``keep_full``. ``limits`` (``replay_rows``) lowers a
-    request's kept rows further. None when every request keeps all its rows;
-    ``max_query_len`` keeps the window bound, so the decoder runs in the mode it
-    would without the limits."""
+    request's kept rows further, or expands them while recovering accepted
+    outputs after preemption. None when every request keeps all its rows;
+    ``max_query_len`` keeps at least the window bound, so short limited chunks
+    retain their original decoder mode."""
     bounds = tuple(
-        int(q) if full else min(int(q), CED_WINDOW)
-        for q, full in zip(query_lengths, keep_full)
+        int(q)
+        if full
+        else min(int(q), max(CED_WINDOW, int(limits[i]) if limits is not None else 0))
+        for i, (q, full) in enumerate(zip(query_lengths, keep_full))
     )
     kept = (
         bounds
@@ -92,7 +95,7 @@ def plan_ced(
 
 
 def replay_rows(
-    query_lengths, computed, prefill_lens, prefix_start, keep_full
+    query_lengths, computed, prefill_lens, prefix_start, keep_full, prompt_lens=None
 ) -> tuple[list[int], list[int]]:
     """Each request's replay floor and kept-row limit, anchored at its prompt end.
 
@@ -104,25 +107,30 @@ def replay_rows(
     logits the runner discards (a chunked prefill samples no token); the requests
     kernel replays that row from itself. Wherever the prompt's chunks end, each
     replayed row then sees the same decoder rows, and the drafter, whose context
-    rows are the kept rows, the same context. ``prefill_len`` is what the runner
-    prefills: the prompt, and the outputs a resumed request recomputes.
+    rows are the kept rows, the same context. ``prefill_len`` includes accepted
+    outputs after preemption; ``prompt_lens`` preserves the original prompt end.
+    Recovery must replay every generated row after that original floor: bounding
+    recovery to the final window would change the earlier rows that deeper
+    decoder layers consume.
 
     A decoding request keeps up to ``CED_WINDOW`` rows from its prefix start: its
     rows lie past the prompt's floor, whose window no longer reaches it. A
     ``keep_full`` request (prompt logprobs) keeps every row from its prefix start.
     """
     floors, limits = [], []
-    for q, start, total, prefix, full in zip(
-        query_lengths, computed, prefill_lens, prefix_start, keep_full
+    for i, (q, start, total, prefix, full) in enumerate(
+        zip(query_lengths, computed, prefill_lens, prefix_start, keep_full)
     ):
         start, total, prefix = int(start), int(total), int(prefix)
+        prompt_end = total if prompt_lens is None else int(prompt_lens[i])
         if full:
             floors.append(prefix)
             limits.append(KEEP_ALL)
         elif start < total:
-            floor = max(prefix, total - CED_WINDOW)
+            floor = max(prefix, prompt_end - CED_WINDOW)
             floors.append(floor)
-            limits.append(min(max(start + int(q) - floor, 1), CED_WINDOW))
+            limit = max(start + int(q) - floor, 1)
+            limits.append(limit if prompt_end < total else min(limit, CED_WINDOW))
         else:
             floors.append(prefix)
             limits.append(CED_WINDOW)

@@ -420,6 +420,7 @@ def test_model_state_skips_mark_rows_when_no_steered_request_is_scheduled(monkey
     state._steering_rows_dirty_len = 0
     state._ced_prompt_logprobs = set()
     state._ced_prefix_start = {}
+    state._ced_recovery_prompt_end = {}
     state._ced_streaming_prefix_start = None
     state._prefill_tokens = {}
     state.disk_engram_models = ()
@@ -466,7 +467,8 @@ def test_model_state_skips_mark_rows_when_no_steered_request_is_scheduled(monkey
     assert state._steering_rows_dirty_len == 12
     assert bool((state.steering.rows[:12] == 1).all())
 
-    # 3. Next step schedules only stock-0: clears the 12 dirty rows once without mark_rows.
+    # 3. Next step schedules only stock-0: clears the 12 dirty rows once,
+    # without mark_rows.
     state.prepare_inputs(_batch(["stock-0"], [0], 6), None)
     assert len(marked_calls) == 1
     assert len(uva_copies) == 1

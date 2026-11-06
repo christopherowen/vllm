@@ -16,8 +16,8 @@ from vllm.models.deepseek_v4_1.ced import (
     ced_decoder_start,
     replay_rows,
 )
-from vllm.models.deepseek_v4_1.tilelang import ced as ced_kernels
 from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadata
+from vllm.models.deepseek_v4_1.tilelang import ced as ced_kernels
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
@@ -57,6 +57,7 @@ class DeepseekV41ModelState(DefaultModelState):
         self.ced_state: CEDState | None = None
         self._ced_prompt_logprobs: set[str] = set()
         self._ced_prefix_start: dict[str, int] = {}
+        self._ced_recovery_prompt_end: dict[str, int] = {}
         self._ced_batch: InputBatch | None = None
         self.max_cudagraph_query_len: int | None = None
         if ced_decoder_start(self.model_config.hf_config) is not None:
@@ -196,12 +197,18 @@ class DeepseekV41ModelState(DefaultModelState):
         prefix_start = pending[1] if streaming else new_req_data.num_computed_tokens
         self._ced_streaming_prefix_start = None
         self._ced_prefix_start[new_req_data.req_id] = prefix_start
+        prefill_ids = new_req_data.prefill_token_ids
+        if prefill_ids is not None and len(prefill_ids) > new_req_data.prompt_len:
+            self._ced_recovery_prompt_end[new_req_data.req_id] = new_req_data.prompt_len
+        else:
+            self._ced_recovery_prompt_end.pop(new_req_data.req_id, None)
 
     def remove_request(self, req_id: str) -> None:
         super().remove_request(req_id)
         self._prefill_tokens.pop(req_id, None)
         self._ced_prompt_logprobs.discard(req_id)
         self._ced_prefix_start.pop(req_id, None)
+        self._ced_recovery_prompt_end.pop(req_id, None)
         steered_ids = getattr(self, "_steered_req_ids", None)
         if steered_ids is not None:
             steered_ids.discard(req_id)
@@ -226,6 +233,7 @@ class DeepseekV41ModelState(DefaultModelState):
             and num_reqs == 1
             and num_tokens == self.single_request_prefill_cudagraph_tokens
             and not any(req in self._ced_prompt_logprobs for req in req_ids)
+            and not any(req in self._ced_recovery_prompt_end for req in req_ids)
         )
 
     def finalize_cudagraph_inputs(self, model_inputs, cg_mode):
@@ -250,6 +258,14 @@ class DeepseekV41ModelState(DefaultModelState):
             batch.prefill_len_np[:nr],
             [self._ced_prefix_start.get(req_id, 0) for req_id in req_ids],
             keep_full,
+            (
+                [
+                    self._ced_recovery_prompt_end.get(req_id, total)
+                    for req_id, total in zip(req_ids, batch.prefill_len_np[:nr])
+                ]
+                if self._ced_recovery_prompt_end
+                else None
+            ),
         )
         return keep_full, floors, limits
 
