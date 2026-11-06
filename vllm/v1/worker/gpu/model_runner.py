@@ -3247,6 +3247,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_tokens=input_batch.num_tokens,
         )
 
+        from vllm.models.deepseek_v4_1 import route_capture
+
+        route_capture.begin(
+            input_batch,
+            batch_desc.cg_mode,
+            dummy_run,
+            self.model_state.num_new_sampled_tokens_per_step,
+            unsupported=(
+                ubatch_state is not None
+                or self.pcp_manager is not None
+                or self.batch_sharder is not None
+                or self.parallel_config.data_parallel_size != 1
+                or self.parallel_config.pipeline_parallel_size != 1
+                or not self.model_config.enforce_eager
+            ),
+        )
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
@@ -3309,6 +3325,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     model_output = self.model(**model_inputs)
 
         self.kv_connector.finish_forward()
+        route_capture.end()
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:

@@ -179,6 +179,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         router = getattr(self.ffn.experts, "router", None)
         if router is not None:
             router._ds41_is_ced_decoder = self.attn.is_ced_decoder
+            router._ds41_capture_attention_key = self.attn.swa_cache_layer.prefix
 
         self.attn_norm = kernels.rms_norm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = kernels.rms_norm(self.hidden_size, self.rms_norm_eps)

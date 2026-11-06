@@ -199,6 +199,11 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
         limit = self.quant_config.gemm1_clamp_limit
         router = getattr(layer, "router", None)
         idx_dtype = getattr(router, "indices_dtype", None)
+        self._route_capture_layer = layer.layer_name
+        self._route_capture_attention_key = getattr(
+            router, "_ds41_capture_attention_key", None
+        )
+        self._route_capture_decoder = getattr(router, "_ds41_is_ced_decoder", False)
         # The plan's geometry; its kernels are declared when the worker prepares
         # kernels (``declare_kernels``).
         self._plan = moe.MoeExpertsV41Plan(
@@ -324,6 +329,17 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
             shared = self.combine_addend
         if self.defer_combine:
             assert self.fold_shared, "only a folded combine is deferred"
+        from vllm.models.deepseek_v4_1 import route_capture
+
+        route_capture.record(
+            self._route_capture_layer,
+            self._route_capture_attention_key,
+            self._route_capture_decoder,
+            self._plan,
+            topk_ids,
+            topk_weights,
+            weights,
+        )
         combine = self._plan.run(
             _provided_mxfp8(hidden_states),
             topk_ids,
