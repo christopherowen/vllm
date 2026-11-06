@@ -10,6 +10,7 @@ from logging import Logger
 from string import Template
 from typing import Any
 
+import anyio
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -38,13 +39,6 @@ async def listen_for_disconnect(request: Request) -> None:
     while True:
         message = await request.receive()
         if message["type"] == "http.disconnect":
-            # If load tracking is enabled *and* the counter exists, decrement
-            # it. Combines the previous nested checks into a single condition
-            # to satisfy the linter rule.
-            if getattr(
-                request.app.state, "enable_server_load_tracking", False
-            ) and hasattr(request.app.state, "server_load_metrics"):
-                request.app.state.server_load_metrics -= 1
             break
 
 
@@ -80,21 +74,52 @@ def with_cancellation(handler_func):
         handler_task = asyncio.create_task(handler_func(*args, **kwargs))
         cancellation_task = asyncio.create_task(listen_for_disconnect(request))
 
-        done, pending = await asyncio.wait(
-            [handler_task, cancellation_task], return_when=asyncio.FIRST_COMPLETED
-        )
-        for task in pending:
-            task.cancel()
-
-        if handler_task in done:
-            return handler_task.result()
-        return None
+        tasks = (handler_task, cancellation_task)
+        try:
+            try:
+                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                if handler_task in done:
+                    return handler_task.result()
+                # A broken receive channel is an error, not a client disconnect.
+                cancellation_task.result()
+                return None
+            finally:
+                # The route owns both children until it hands off the response.
+                # Cancelling without joining lets an abort overlap the caller's retry;
+                # cancellation of the route itself must also release both children.
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                # Starlette middleware may cancel an AnyIO scope. Keep asynchronous
+                # cleanup alive inside that scope, and retrieve both task outcomes.
+                with anyio.CancelScope(shield=True):
+                    interrupted = None
+                    while True:
+                        try:
+                            # wait() does not cancel children when its caller is
+                            # cancelled again while their cleanup is running.
+                            await asyncio.wait(tasks)
+                            break
+                        except asyncio.CancelledError as exc:
+                            interrupted = exc
+                    for task in tasks:
+                        if not task.cancelled():
+                            task.exception()
+                    if interrupted is not None:
+                        raise interrupted
+        except BaseException:
+            # A response produced by the handler may be abandoned while we
+            # join the listener. No response background task will release it.
+            decrement_server_load(request)
+            raise
 
     return wrapper
 
 
 def decrement_server_load(request: Request):
-    request.app.state.server_load_metrics -= 1
+    if getattr(request.state, "_server_load_counted", False):
+        request.state._server_load_counted = False
+        request.app.state.server_load_metrics -= 1
 
 
 def load_aware_call(func):
@@ -115,10 +140,13 @@ def load_aware_call(func):
             raw_request.app.state.server_load_metrics = 0
 
         raw_request.app.state.server_load_metrics += 1
+        raw_request.state._server_load_counted = True
         try:
             response = await func(*args, **kwargs)
-        except Exception:
-            raw_request.app.state.server_load_metrics -= 1
+        except BaseException:
+            # This call owns the count until a response takes it over.
+            # In particular, CancelledError is not an Exception.
+            decrement_server_load(raw_request)
             raise
 
         if isinstance(response, (JSONResponse, StreamingResponse)):
@@ -138,7 +166,7 @@ def load_aware_call(func):
                 tasks.add_task(decrement_server_load, raw_request)
                 response.background = tasks
         else:
-            raw_request.app.state.server_load_metrics -= 1
+            decrement_server_load(raw_request)
 
         return response
 
