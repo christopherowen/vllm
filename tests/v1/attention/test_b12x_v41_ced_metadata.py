@@ -211,6 +211,7 @@ def test_compacted_short_chunks_run_eagerly():
     state._ced_prompt_logprobs = set()
     state._ced_prefix_start = {"decode": 0, "hit": 16256}
     state._ced_recovery_prompt_end = {}
+    state._ced_streaming_prefix_start = None
 
     def batch(rows, prompt_end, prefilling=True):
         return SimpleNamespace(
@@ -328,6 +329,7 @@ def test_prompt_logprobs_zero_keeps_every_prompt_row(monkeypatch):
     state._ced_prompt_logprobs = set()
     state._ced_prefix_start = {}
     state._ced_recovery_prompt_end = {}
+    state._ced_streaming_prefix_start = None
     state.disk_engram_models, state._prefill_tokens = (), {}
     batch = SimpleNamespace(
         num_reqs=2,
@@ -470,6 +472,7 @@ def test_prompt_chunks_replay_from_the_prompt_end(monkeypatch, prompt_end, steps
     state.ced_state = CEDState(4, 8192, (128, 256, 384, 512, 8192), "cuda")
     state._ced_prompt_logprobs, state._ced_prefix_start = set(), {}
     state._ced_recovery_prompt_end = {}
+    state._ced_streaming_prefix_start = None
     state.disk_engram_models, state._prefill_tokens = (), {}
     state.add_request(
         0,
@@ -801,6 +804,7 @@ def test_streaming_update_preserves_private_decoder_history(monkeypatch):
     state._ced_prompt_logprobs = set()
     state._ced_prefix_start = {"stream": 256}
     state._ced_recovery_prompt_end = {}
+    state._ced_streaming_prefix_start = None
     state.disk_engram_models, state._prefill_tokens = (), {}
     # The update's one new prompt token, at 1024.
     batch = SimpleNamespace(
@@ -847,6 +851,7 @@ def test_large_full_capture_decodes_small_live_prefix(monkeypatch):
     state._ced_prompt_logprobs = set()
     state._ced_prefix_start = {}
     state._ced_recovery_prompt_end = {}
+    state._ced_streaming_prefix_start = None
     state.lookback_token_ids = None
     state.disk_engram_models = ()
     state.device = torch.device("cuda")
