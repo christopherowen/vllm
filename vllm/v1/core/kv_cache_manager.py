@@ -391,9 +391,20 @@ class KVCacheManager:
         # Recompute at least one token for logits, or the configured suffix
         # needed to rebuild request-private decoder state. Lookup may round
         # this boundary down further to the cache-hit alignment.
-        max_cache_hit_length = max(
-            0, request.num_tokens - max(1, self.coordinator.prefill_replay_tokens)
+        replay_tokens = self.coordinator.prefill_replay_tokens
+        # After preemption the generated suffix is still part of the same
+        # request. Private decoder windows must be reconstructed from the
+        # original prompt boundary, not from a new boundary at the output end.
+        # Otherwise their deeper layers consume a different decoder history.
+        # Input streams can change CED floors between phases. A single prompt
+        # anchor cannot reproduce that history; retain their existing policy.
+        fixed_prompt = request.streaming_queue is None
+        replay_end = (
+            request.num_prompt_tokens
+            if replay_tokens and fixed_prompt
+            else request.num_tokens
         )
+        max_cache_hit_length = max(0, replay_end - max(1, replay_tokens))
         computed_blocks, num_new_computed_tokens, num_uncached = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length

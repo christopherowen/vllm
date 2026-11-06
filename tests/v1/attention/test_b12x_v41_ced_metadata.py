@@ -78,6 +78,49 @@ def test_replay_rows_anchor_at_the_prompt_end():
     assert replay_rows([4096], [0], [8192], [64], [True]) == ([64], [KEEP_ALL])
 
 
+@pytest.mark.parametrize("generated", [1, 127, 128, 129, 255, 256, 257, 8193])
+@pytest.mark.parametrize("chunk_size", [64, 128, 256, 512, 4096])
+def test_recovery_keeps_all_rows_from_original_prompt_floor(generated, chunk_size):
+    # Original prompt and accepted outputs belong to one execution. A new
+    # private decoder cache needs the original prompt tail AND every output row,
+    # even when recovery's prefill is much longer than its sliding window.
+    prompt_end, prefix = 1024, 768
+    total = prompt_end + generated
+    required = set(range(prompt_end - CED_WINDOW, total))
+    written = set()
+    for start in range(prefix, total, chunk_size):
+        rows = min(chunk_size, total - start)
+        floors, limits = replay_rows(
+            [rows], [start], [total], [prefix], [False], [prompt_end]
+        )
+        plan = plan_ced([rows], [False], (16384,), limits)
+        kept = rows if plan is None else plan.num_tokens
+        first = start + rows - kept
+        floor = min(floors[0], first)
+        for position in range(first, start + rows):
+            if position in required:
+                assert floor == prompt_end - CED_WINDOW
+                # Earlier required state is either in this step or was written
+                # by a prior step, independently of the chosen chunk size.
+                visible = set(range(max(position - 127, floor), position))
+                assert visible <= written | set(range(first, position))
+        written.update(range(first, start + rows))
+    assert required <= written
+
+
+def test_recovery_limits_survive_mixed_batch_reordering():
+    inputs = [(6, 5000, 5000, 256, 5000), (512, 768, 1281, 768, 1024)]
+    for order in ((0, 1), (1, 0)):
+        rows, computed, totals, prefixes, prompts = zip(*(inputs[i] for i in order))
+        floors, limits = replay_rows(
+            rows, computed, totals, prefixes, [False, False], prompts
+        )
+        plan = plan_ced(rows, [False, False], (128, 256, 512, 1024), limits)
+        assert plan.num_tokens == 390  # six decode rows, 384 recovery rows
+        assert [floors[order.index(i)] for i in range(2)] == [256, 896]
+        assert [limits[order.index(i)] for i in range(2)] == [128, 384]
+
+
 def _aligned_chunks(threshold, start, end):
     """The scheduler's aligned prefill chunks ``(start, rows)`` of a prompt computed
     from ``start``, when every step has room for a whole chunk."""
@@ -167,6 +210,8 @@ def test_compacted_short_chunks_run_eagerly():
     state.ced_state = object()
     state._ced_prompt_logprobs = set()
     state._ced_prefix_start = {"decode": 0, "hit": 16256}
+    state._ced_recovery_prompt_end = {}
+    state._ced_streaming_prefix_start = None
 
     def batch(rows, prompt_end, prefilling=True):
         return SimpleNamespace(
@@ -283,6 +328,8 @@ def test_prompt_logprobs_zero_keeps_every_prompt_row(monkeypatch):
     state.ced_state, starts, seq = _state([4096, 4096])
     state._ced_prompt_logprobs = set()
     state._ced_prefix_start = {}
+    state._ced_recovery_prompt_end = {}
+    state._ced_streaming_prefix_start = None
     state.disk_engram_models, state._prefill_tokens = (), {}
     batch = SimpleNamespace(
         num_reqs=2,
@@ -297,6 +344,7 @@ def test_prompt_logprobs_zero_keeps_every_prompt_row(monkeypatch):
         0,
         SimpleNamespace(
             req_id="logprobs",
+            prefill_token_ids=None,
             num_computed_tokens=0,
             sampling_params=SimpleNamespace(prompt_logprobs=0),
             mm_features=[],
@@ -423,11 +471,17 @@ def test_prompt_chunks_replay_from_the_prompt_end(monkeypatch, prompt_end, steps
     state.steering, state.steered_requests = None, None
     state.ced_state = CEDState(4, 8192, (128, 256, 384, 512, 8192), "cuda")
     state._ced_prompt_logprobs, state._ced_prefix_start = set(), {}
+    state._ced_recovery_prompt_end = {}
+    state._ced_streaming_prefix_start = None
     state.disk_engram_models, state._prefill_tokens = (), {}
     state.add_request(
         0,
         SimpleNamespace(
-            req_id="long", num_computed_tokens=0, sampling_params=None, mm_features=[]
+            req_id="long",
+            num_computed_tokens=0,
+            sampling_params=None,
+            mm_features=[],
+            prefill_token_ids=None,
         ),
     )
     staged = []
@@ -749,6 +803,8 @@ def test_streaming_update_preserves_private_decoder_history(monkeypatch):
     state.ced_state, starts, seq = _state([1], [1025])
     state._ced_prompt_logprobs = set()
     state._ced_prefix_start = {"stream": 256}
+    state._ced_recovery_prompt_end = {}
+    state._ced_streaming_prefix_start = None
     state.disk_engram_models, state._prefill_tokens = (), {}
     # The update's one new prompt token, at 1024.
     batch = SimpleNamespace(
@@ -762,6 +818,7 @@ def test_streaming_update_preserves_private_decoder_history(monkeypatch):
     )
     updated = SimpleNamespace(
         req_id="stream",
+        prefill_token_ids=None,
         num_computed_tokens=1024,
         sampling_params=None,
         mm_features=[],
@@ -793,6 +850,8 @@ def test_large_full_capture_decodes_small_live_prefix(monkeypatch):
     state.ced_state, starts, seq = _state([256])
     state._ced_prompt_logprobs = set()
     state._ced_prefix_start = {}
+    state._ced_recovery_prompt_end = {}
+    state._ced_streaming_prefix_start = None
     state.lookback_token_ids = None
     state.disk_engram_models = ()
     state.device = torch.device("cuda")
@@ -956,3 +1015,42 @@ def test_startup_warmup_covers_live_compaction_without_jit(monkeypatch):
         # The decoder's routing mask gathers the step's padding mask.
         is_padding = torch.zeros(sum(lengths), dtype=torch.bool, device="cuda")
         assert not gather_rows(is_padding, indices).any()
+
+
+@pytest.mark.parametrize("is_streaming_input", [False, True])
+def test_original_prompt_recovery_excludes_input_stream_sessions(is_streaming_input):
+    from vllm.models.deepseek_v4_1.nvidia.model_state import DeepseekV41ModelState
+    from vllm.v1.core.sched.output import NewRequestData
+
+    state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
+    state.rope_state = state.prompt_embeds_state = None
+    state.steering = state.steered_requests = None
+    state.disk_engram_models, state._prefill_tokens = (), {}
+    state._ced_prompt_logprobs, state._ced_prefix_start = set(), {}
+    state._ced_recovery_prompt_end = {}
+    state._ced_streaming_prefix_start = None
+    data = NewRequestData(
+        req_id="resumed",
+        prompt_token_ids=list(range(1024)),
+        prefill_token_ids=list(range(1281)),
+        mm_features=[],
+        sampling_params=None,
+        pooling_params=None,
+        block_ids=(),
+        num_computed_tokens=768,
+        lora_request=None,
+        is_streaming_input=is_streaming_input,
+    )
+    state.add_request(0, data)
+    batch = SimpleNamespace(
+        req_ids=["resumed"],
+        num_scheduled_tokens=[512],
+        num_computed_prefill_tokens_np=[768],
+        prefill_len_np=[1281],
+    )
+    full, floors, limits = state._ced_rows(batch)
+    assert full == [False]
+    assert floors == ([1153] if is_streaming_input else [896])
+    assert limits == ([127] if is_streaming_input else [384])
+    state.remove_request("resumed")
+    assert state._ced_recovery_prompt_end == {}

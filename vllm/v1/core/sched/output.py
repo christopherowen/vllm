@@ -51,6 +51,8 @@ class NewRequestData:
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
+    # Durable even after the final input sentinel clears Request.resumable.
+    is_streaming_input: bool = False
     boundary_checkpoint: BoundaryCheckpoint | None = None
     boundary_checkpoint_blocks: tuple[tuple[int, ...], ...] | None = None
     recurrent_instruction_boundary: int | None = None
@@ -80,6 +82,7 @@ class NewRequestData:
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
+            is_streaming_input=request.streaming_queue is not None,
             boundary_checkpoint=request.boundary_checkpoint,
             boundary_checkpoint_blocks=request.boundary_checkpoint_blocks,
             recurrent_instruction_boundary=request.recurrent_instruction_boundary,
